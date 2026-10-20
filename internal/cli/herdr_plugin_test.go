@@ -40,6 +40,7 @@ func TestHerdrPluginContextCWD(t *testing.T) {
 			want: ` /repo/with boundary whitespace `,
 		},
 	}
+	t.Setenv(herdrPluginRootEnv, "")
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := herdrPluginContextCWD(tt.raw)
@@ -50,6 +51,47 @@ func TestHerdrPluginContextCWD(t *testing.T) {
 				t.Fatalf("cwd=%q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHerdrPluginContextCWDSkipsFocusedPluginPane(t *testing.T) {
+	t.Setenv(herdrPluginRootEnv, "/plugins/crabbox")
+	for _, focused := range []string{"/plugins/crabbox", "/plugins/crabbox/bin", "/plugins/crabbox/"} {
+		raw := fmt.Sprintf("{\"focused_pane_cwd\":%q,\"workspace_cwd\":\"/repo\"}", focused)
+		got, err := herdrPluginContextCWD(raw)
+		if err != nil {
+			t.Fatalf("focused=%q: %v", focused, err)
+		}
+		if got != "/repo" {
+			t.Fatalf("focused=%q cwd=%q, want /repo", focused, got)
+		}
+	}
+	// A sibling directory that merely shares the prefix is a real project.
+	got, err := herdrPluginContextCWD("{\"focused_pane_cwd\":\"/plugins/crabbox-app\",\"workspace_cwd\":\"/repo\"}")
+	if err != nil || got != "/plugins/crabbox-app" {
+		t.Fatalf("sibling cwd=%q err=%v, want /plugins/crabbox-app", got, err)
+	}
+}
+
+func TestHerdrPluginContextCWDSkipsSymlinkedPluginRoot(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "plugin-link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip(err)
+	}
+	t.Setenv(herdrPluginRootEnv, link)
+	raw := fmt.Sprintf("{\"focused_pane_cwd\":%q,\"workspace_cwd\":\"/repo\"}", real)
+	got, err := herdrPluginContextCWD(raw)
+	if err != nil || got != "/repo" {
+		t.Fatalf("cwd=%q err=%v, want /repo", got, err)
+	}
+}
+
+func TestHerdrPluginContextCWDRejectsOnlyPluginRoot(t *testing.T) {
+	t.Setenv(herdrPluginRootEnv, "/plugins/crabbox")
+	_, err := herdrPluginContextCWD("{\"focused_pane_cwd\":\"/plugins/crabbox\",\"workspace_cwd\":\"/plugins/crabbox\"}")
+	if err == nil || !strings.Contains(err.Error(), "plugin directory") {
+		t.Fatalf("err=%v, want plugin directory error", err)
 	}
 }
 
