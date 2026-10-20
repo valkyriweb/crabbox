@@ -1,0 +1,548 @@
+package proxmox
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+const fixedProxmoxCreateIntentVersion = 1
+
+var fixedProxmoxLeaseKind = core.FixedLeaseKind{
+	RemoveKeyAfterRejection: true,
+	ClaimProvider:           core.FixedProxmoxClaimProvider,
+	IntentVersion:           fixedProxmoxCreateIntentVersion,
+	Label:                   "Proxmox",
+	DeletionState:           "deleting",
+	ResourcePlural:          "Proxmox VMs",
+	TerminalIdentityLabels: []string{
+		"crabbox", "provider", "lease", "slug", "provider_key",
+		"fixed_intent_sha256", "node", "template_id",
+	},
+}
+
+func fixedProxmoxFingerprint(cfg core.Config, req core.AcquireRequest, providerScope, publicKey string) (string, error) {
+	return core.FixedIntentFingerprint("", core.FixedIntentFields{
+		{Name: "labels", Value: core.DirectLeaseLabels(cfg, req.RequestedLeaseID, core.NormalizeLeaseSlug(req.RequestedSlug), "proxmox", "", req.Keep, time.Unix(0, 0))},
+		{Name: "sshPort", Value: cfg.SSHPort}, {Name: "providerScope", Value: providerScope},
+		{Name: "node", Value: strings.TrimSpace(cfg.Proxmox.Node)}, {Name: "templateId", Value: cfg.Proxmox.TemplateID},
+		{Name: "storage", Value: strings.TrimSpace(cfg.Proxmox.Storage), OmitEmpty: true},
+		{Name: "pool", Value: strings.TrimSpace(cfg.Proxmox.Pool), OmitEmpty: true},
+		{Name: "bridge", Value: strings.TrimSpace(cfg.Proxmox.Bridge), OmitEmpty: true},
+		{Name: "user", Value: strings.TrimSpace(cfg.SSHUser)}, {Name: "workRoot", Value: strings.TrimSpace(cfg.WorkRoot)},
+		{Name: "fullClone", Value: cfg.Proxmox.FullClone}, {Name: "serverType", Value: strings.TrimSpace(cfg.ServerType)},
+		{Name: "desktopTemplateId", Value: cfg.Proxmox.DesktopTemplateID, OmitEmpty: true},
+		{Name: "browserTemplateId", Value: cfg.Proxmox.BrowserTemplateID, OmitEmpty: true},
+		{Name: "targetOS", Value: strings.TrimSpace(cfg.TargetOS)}, {Name: "requestedSlug", Value: core.NormalizeLeaseSlug(req.RequestedSlug), OmitEmpty: true},
+		{Name: "keep", Value: req.Keep}, {Name: "ttlNanoseconds", Value: cfg.TTL.Nanoseconds()},
+		{Name: "idleNanoseconds", Value: cfg.IdleTimeout.Nanoseconds()}, {Name: "sshPublicKey", Value: strings.TrimSpace(publicKey)},
+	})
+}
+
+func (b *leaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
+	if !core.IsCanonicalLeaseID(req.RequestedLeaseID) || req.RequestedCheckpointID != "" || b.Cfg.TargetOS != core.TargetLinux {
+		return core.LeaseTarget{}, core.Exit(2, "fixed Proxmox creation requires a canonical lease ID and a Linux template")
+	}
+	if b.Cfg.Proxmox.TemplateID <= 0 {
+		return core.LeaseTarget{}, core.Exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
+	}
+	leaseID := strings.TrimSpace(req.RequestedLeaseID)
+	cfg := b.Cfg
+	cfg.ServerType = (Provider{}).ServerTypeForConfig(cfg)
+	providerScope := strings.TrimSpace(core.ProviderClaimScope("proxmox", cfg))
+	if providerScope == "" {
+		return core.LeaseTarget{}, core.Exit(2, "Proxmox cluster scope is unavailable; refusing fixed lease creation")
+	}
+	client, err := newClient(cfg)
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	var publicKey, fingerprint string
+	acquired, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
+		Kind: fixedProxmoxLeaseKind, LeaseID: leaseID, CheckpointID: req.RequestedCheckpointID,
+		RepoRoot: req.Repo.Root, Reclaim: req.Reclaim, TargetOS: cfg.TargetOS,
+		WindowsMode: cfg.WindowsMode, TTL: cfg.TTL, IdleTimeout: cfg.IdleTimeout,
+	}, core.FixedLeaseOperations[core.Server]{Admission: &core.FixedAdmission{}, PlanReservationKey: "proxmox-vmid", DescribeIntent: func(ctx context.Context, claim *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
+		if exists {
+			if !fixedProxmoxLeaseKind.IsFixedClaim(*claim) || claim.ProviderScope != providerScope {
+				return core.FixedLeaseBinding{}, core.Exit(4, "lease_id_conflict: fixed Proxmox claim scope changed")
+			}
+		}
+		var err error
+		publicKey, err = core.PrepareFixedSSHKey(&cfg, leaseID, core.FixedKeyPolicy{RequireExisting: exists})
+		if err != nil {
+			return core.FixedLeaseBinding{}, err
+		}
+		fingerprint, err = fixedProxmoxFingerprint(cfg, req, providerScope, publicKey)
+		if err != nil {
+			return core.FixedLeaseBinding{}, err
+		}
+		binding := core.FixedLeaseBinding{ProviderScope: providerScope, Fingerprint: fingerprint}
+		if exists {
+			return binding, nil
+		}
+		servers, err := client.ListCrabboxServersCluster(ctx)
+		if err != nil {
+			return core.FixedLeaseBinding{}, err
+		}
+		binding.AllocateSlug, binding.RequestedSlug, binding.Inventory = true, req.RequestedSlug, servers
+		return binding, nil
+	}, ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[core.Server], error) {
+		claim, intent := tx.Claim, tx.Claim.FixedCreateIntent
+		var result core.FixedObservation[core.Server]
+		if claim.ProviderScope != providerScope || intent.ProviderScope != providerScope {
+			return result, core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s provider scope changed", leaseID)
+		}
+		server, found, err := b.findFixedProxmoxServer(ctx, client, *claim)
+		if err != nil {
+			return result, fixedProxmoxAuthorizationRejection(err)
+		}
+		vmid, node, err := fixedProxmoxAttempt(*claim)
+		if err != nil {
+			return result, err
+		}
+		if found {
+			if err := validateFixedProxmoxLocalBinding(*claim); err != nil {
+				return result, err
+			}
+			if claim.CloudImmutableID == "" || server.Labels["state"] != "ready" {
+				return result, core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has an unresolved generation or readiness binding; inspect and release the attempt", leaseID)
+			}
+			if err := validateFixedProxmoxServer(server, *claim, vmid, node); err != nil {
+				return result, err
+			}
+			result.Candidates = []core.Server{server}
+		} else if vmid != 0 {
+			present, err := client.VMExistsInCluster(ctx, strconv.Itoa(vmid))
+			if err != nil {
+				return result, fmt.Errorf("reconcile fixed Proxmox VMID %d: %w", vmid, err)
+			}
+			if present {
+				return result, core.Exit(4, "lease_id_conflict: fixed Proxmox VMID %d exists without matching lease identity", vmid)
+			}
+			return result, core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has an unresolved clone attempt; retain its claim for recovery", leaseID)
+		} else {
+			result.CanSubmit = true
+		}
+		return result, nil
+	}, Plan: func(ctx context.Context, claim core.LeaseClaim) (core.FixedAttemptPlan, error) {
+		vmid, err := reserveFixedProxmoxVMID(ctx, client, claim)
+		if err != nil {
+			return core.FixedAttemptPlan{}, fixedProxmoxAuthorizationRejection(err)
+		}
+		node := strings.TrimSpace(cfg.Proxmox.Node)
+		return core.FixedAttemptPlan{
+			Values:          map[string]string{"vmid": strconv.Itoa(vmid), "node": node},
+			UniqueProviders: []string{"proxmox", core.FixedProxmoxClaimProvider}, UniqueLabel: "Proxmox",
+			Identity: core.FixedResourceBinding{CloudID: strconv.Itoa(vmid), NumericID: int64(vmid)},
+			Labels:   fixedProxmoxIdentityLabels(cfg, leaseID, claim.Slug, fingerprint, node),
+		}, nil
+	}, Submit: func(ctx context.Context, tx *core.FixedTransaction) (core.Server, error) {
+		claim, intent := tx.Claim, tx.Claim.FixedCreateIntent
+		vmid, node, err := fixedProxmoxAttempt(*claim)
+		if err != nil {
+			return core.Server{}, err
+		}
+
+		fmt.Fprintf(b.RT.Stderr, "provisioning provider=proxmox lease=%s slug=%s node=%s template=%d vmid=%d keep=%v fixed=true\n", leaseID, intent.Slug, cfg.Proxmox.Node, cfg.Proxmox.TemplateID, vmid, req.Keep)
+		server, err := client.CreateServerWithVMID(ctx, cfg, publicKey, leaseID, intent.Slug, req.Keep, vmid, maps.Clone(claim.Labels), func(created core.Server) error {
+			if err := validateFixedProxmoxServer(created, *claim, vmid, node); err != nil {
+				return err
+			}
+			return tx.Bind(core.FixedResourceBinding{ImmutableID: created.ImmutableID, Labels: created.Labels})
+		})
+		if err != nil {
+			var apiErr *core.ProxmoxError
+			clonePath := fmt.Sprintf("/nodes/%s/qemu/%d/clone", url.PathEscape(cfg.Proxmox.Node), cfg.Proxmox.TemplateID)
+			if errors.As(err, &apiErr) && apiErr.NativeAuthRejection && apiErr.Method == http.MethodPost && apiErr.Path == clonePath &&
+				(apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
+				return core.Server{}, &core.FixedCreateRejected{Err: err}
+			}
+			return core.Server{}, fmt.Errorf("Proxmox clone outcome or identity is uncertain; claim retained for lease %s (VMID %d). Restore permissions and inspect the VM and clone task before recovery with crabbox stop --force --provider proxmox --id %s: %w", leaseID, vmid, leaseID, err)
+		}
+		return server, nil
+	}, PrepareAccess: func(ctx context.Context, tx *core.FixedTransaction, server core.Server) (core.LeaseTarget, error) {
+		claim := tx.Claim
+		attemptVMID, attemptNode, err := fixedProxmoxAttempt(*claim)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if claim.CloudImmutableID == "" {
+			return core.LeaseTarget{}, core.Exit(4, "lease_id_conflict: fixed Proxmox clone has no durable generation")
+		}
+		if err := validateFixedProxmoxServer(server, *claim, attemptVMID, attemptNode); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		target := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
+		if err := waitForSSHReadyFunc(ctx, &target, b.RT.Stderr, "bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		server.Labels = maps.Clone(server.Labels)
+		server.Labels["state"] = "ready"
+		if err := client.SetLabelsOnNode(ctx, server.HostID, server.CloudID, server.Labels); err != nil {
+			return core.LeaseTarget{}, fmt.Errorf("persist Proxmox fixed lease labels: %w", err)
+		}
+		return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+	}})
+	return core.CompleteFixedAcquisition(acquired, err, req)
+}
+
+func fixedProxmoxAuthorizationRejection(err error) error {
+	var apiErr *core.ProxmoxError
+	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
+		return &core.FixedCreateRejected{Err: err}
+	}
+	return err
+}
+
+func reserveFixedProxmoxVMID(ctx context.Context, client proxmoxClient, claim core.LeaseClaim) (int, error) {
+	const maxVMID = 999999999
+	claims, err := core.ListLeaseClaims()
+	if err != nil {
+		return 0, err
+	}
+	bound := make(map[int]string)
+	for _, other := range claims {
+		if other.LeaseID == claim.LeaseID || (other.Provider != "proxmox" && other.Provider != core.FixedProxmoxClaimProvider) {
+			continue
+		}
+		if fixedProxmoxLeaseKind.IsFixedClaim(other) && other.FixedCreateIntent.State == "released" {
+			continue
+		}
+		// Include legacy and differently scoped claims conservatively: a node
+		// change does not create a separate cluster VMID namespace.
+		if id, err := strconv.Atoi(other.CloudID); err == nil && id > 0 {
+			bound[id] = other.LeaseID
+		}
+		if other.CloudNumericID > 0 && other.CloudNumericID <= maxVMID {
+			bound[int(other.CloudNumericID)] = other.LeaseID
+		}
+	}
+	vmid, err := client.NextVMID(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if vmid < 100 || vmid > maxVMID {
+		return 0, core.Exit(4, "lease_id_conflict: Proxmox selected invalid VMID %d", vmid)
+	}
+	conflict := bound[vmid]
+	conflictVMID := vmid
+	reservationError := func(err error) (int, error) {
+		if conflict != "" {
+			return 0, fmt.Errorf("cannot reserve a free Proxmox VMID: local claim %s retains VMID %d; inspect its VM and clone task, then recover an absent prepared attempt with crabbox stop --provider proxmox --id %s --force: %w", conflict, conflictVMID, conflict, err)
+		}
+		return 0, fmt.Errorf("cannot reserve a free Proxmox VMID: %w", err)
+	}
+	ids, err := client.ListVMIDsInCluster(ctx)
+	if err != nil {
+		return reservationError(err)
+	}
+	used := make(map[int]bool, len(ids)+len(bound))
+	for _, id := range ids {
+		used[id] = true
+	}
+	for id := range bound {
+		used[id] = true
+	}
+	for candidate := vmid; candidate <= maxVMID; candidate++ {
+		if !used[candidate] {
+			return candidate, nil
+		}
+		if conflict == "" && bound[candidate] != "" {
+			conflict, conflictVMID = bound[candidate], candidate
+		}
+	}
+	return reservationError(fmt.Errorf("no available VMID through %d", maxVMID))
+}
+
+func fixedProxmoxIdentityLabels(cfg core.Config, leaseID, slug, fingerprint, node string) map[string]string {
+	labels := core.FixedIdentityLabels("proxmox", leaseID, slug, fingerprint, map[string]string{"node": node, "template_id": strconv.Itoa(cfg.Proxmox.TemplateID)})
+	requested := core.DirectLeaseLabels(cfg, leaseID, slug, "proxmox", "", false, time.Unix(0, 0))
+	for _, key := range []string{"desktop", "browser", "desktop_env"} {
+		if value, ok := requested[key]; ok {
+			labels[key] = value
+		}
+	}
+	return labels
+}
+
+func fixedProxmoxAttempt(claim core.LeaseClaim) (int, string, error) {
+	rules := core.FixedClaimRules{Kind: fixedProxmoxLeaseKind, States: []string{"prepared", "acquired", "deleting"},
+		NoFailedAttempts: true, EmptyAttemptMustBePristine: true, RequireIntentScope: true}
+	if err := core.ValidateFixedClaim(claim, rules); err != nil {
+		return 0, "", err
+	}
+	attempt, err := core.ReadFixedAttempt[map[string]string](claim.FixedCreateIntent, core.FixedAttemptFormat{ExactKeys: 2, Required: []string{"node"}, PositiveIntegers: []string{"vmid"}})
+	if err != nil || attempt == nil {
+		return 0, "", err
+	}
+	vmid, _ := strconv.Atoi((*attempt)["vmid"])
+	node := strings.TrimSpace((*attempt)["node"])
+	rules.Scope, rules.ExpectedID, rules.NumericMatchesID = claim.FixedCreateIntent.ProviderScope, strconv.Itoa(vmid), true
+	rules.GenerationAfterPrepared = true
+	rules.RequiredLabels = []string{"template_id", "node"}
+	rules.BoundLabels = fixedProxmoxIdentityLabels(core.Config{}, claim.LeaseID, claim.Slug, claim.FixedCreateIntent.Fingerprint, node)
+	delete(rules.BoundLabels, "template_id")
+	if err := core.ValidateFixedClaim(claim, rules); err != nil {
+		return 0, "", err
+	}
+	return vmid, node, nil
+}
+
+func (b *leaseBackend) findFixedProxmoxServer(ctx context.Context, client proxmoxClient, claim core.LeaseClaim) (core.Server, bool, error) {
+	return core.InspectFixedCandidate(ctx, fixedProxmoxLeaseKind, claim, client.ListCrabboxServersCluster, func(server core.Server) bool {
+		return strings.TrimSpace(server.Labels["lease"]) == claim.LeaseID || server.CloudID == claim.CloudID || server.Labels["provider_key"] == core.ProviderKeyForLease(claim.LeaseID)
+	})
+}
+
+func validateFixedProxmoxServer(server core.Server, claim core.LeaseClaim, vmid int, attemptNode string) error {
+	intent := claim.FixedCreateIntent
+	for _, key := range []string{"desktop", "browser", "desktop_env"} {
+		if server.Labels[key] != claim.Labels[key] {
+			return core.Exit(4, "lease_id_conflict: Proxmox VM for lease %s changed its %s capability", claim.LeaseID, key)
+		}
+	}
+	if vmid <= 0 || server.CloudID != strconv.Itoa(vmid) || server.ID != 0 && server.ID != int64(vmid) ||
+		server.Provider != "proxmox" || server.HostID == "" || server.ImmutableID == "" ||
+		server.Labels["crabbox"] != "true" || server.Labels["provider"] != "proxmox" ||
+		server.Labels["lease"] != claim.LeaseID || server.Labels["slug"] != intent.Slug ||
+		server.Labels["provider_key"] != core.ProviderKeyForLease(claim.LeaseID) ||
+		server.Labels["fixed_intent_sha256"] != intent.Fingerprint ||
+		server.Labels["node"] != attemptNode ||
+		server.Labels["template_id"] != claim.Labels["template_id"] {
+		return core.Exit(4, "lease_id_conflict: Proxmox VM for lease %s does not match its durable fixed identity", claim.LeaseID)
+	}
+	if claim.CloudID != "" && server.CloudID != claim.CloudID ||
+		claim.CloudImmutableID != "" && server.ImmutableID != claim.CloudImmutableID {
+		return core.Exit(4, "lease_id_conflict: Proxmox VM for lease %s does not match its bound VMID and vmgenid", claim.LeaseID)
+	}
+	if attemptNode == "" {
+		return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has no durable source node", claim.LeaseID)
+	}
+	return nil
+}
+
+func (b *leaseBackend) ReclaimAndStop(ctx context.Context, req core.StopRequest) error {
+	if !core.IsCanonicalLeaseID(req.ID) {
+		return core.Exit(2, "Proxmox prepared-claim recovery requires stop --force --provider proxmox --id <canonical-id>")
+	}
+	if err := b.releaseFixed(ctx, core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: req.ID}}, false, true); err != nil {
+		return err
+	}
+	fmt.Fprintf(b.RT.Stderr, "lease=%s prepared claim settled (VM absent); fixed lease ID remains terminal\n", req.ID)
+	return nil
+}
+
+func (b *leaseBackend) releaseFixed(ctx context.Context, req core.ReleaseLeaseRequest, requireCleanupEligible, recoverPrepared bool) error {
+	leaseID := strings.TrimSpace(req.Lease.LeaseID)
+	if leaseID == "" {
+		leaseID = proxmoxClaimLabelLeaseID(req.Lease.Server)
+	}
+	client, err := newClient(b.Cfg)
+	if err != nil {
+		return err
+	}
+	expected, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		return err
+	}
+	if !exists || !fixedProxmoxLeaseKind.IsFixedClaim(expected) {
+		return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has no durable ownership claim", leaseID)
+	}
+	kind := fixedProxmoxLeaseKind
+	if recoverPrepared {
+		kind.AfterTerminal = func(claim core.LeaseClaim) error {
+			return core.RemoveStoredTestboxConnectionArtifacts(claim.LeaseID)
+		}
+	}
+	verifyAbsent := func(vmid int) error {
+		if recoverPrepared {
+			if err := client.VerifyNoActiveCloneTasks(ctx); err != nil {
+				return err
+			}
+		}
+		remaining, err := client.ListCrabboxServersCluster(ctx)
+		if err != nil {
+			return fmt.Errorf("verify fixed Proxmox release inventory: %w", err)
+		}
+		for _, candidate := range remaining {
+			if candidate.CloudID == strconv.Itoa(vmid) || candidate.Labels["lease"] == leaseID || candidate.Labels["provider_key"] == core.ProviderKeyForLease(leaseID) {
+				return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s still has a surviving VM", leaseID)
+			}
+		}
+		var present bool
+		if recoverPrepared {
+			present, err = client.VMIdentityExistsInCluster(ctx, strconv.Itoa(vmid), core.LeaseProviderName(leaseID, expected.Slug))
+		} else {
+			present, err = client.VMExistsInCluster(ctx, strconv.Itoa(vmid))
+		}
+		if err != nil {
+			return fmt.Errorf("verify fixed Proxmox VMID %d absence: %w", vmid, err)
+		}
+		if present {
+			return core.Exit(4, "lease_id_conflict: fixed Proxmox VMID %d or requested name still exists; claim retained", vmid)
+		}
+		return nil
+	}
+	checkpointID := req.CheckpointID
+	return core.DeleteFixedResource(ctx, kind, expected, core.FixedLeaseOperations[core.Server]{
+		Release: &core.FixedReleasePolicy{CheckpointID: &checkpointID},
+		ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[core.Server], error) {
+			claim := tx.Claim
+			var result core.FixedObservation[core.Server]
+			if strings.TrimSpace(core.ProviderClaimScope("proxmox", b.Cfg)) != claim.ProviderScope || claim.ProviderScope != claim.FixedCreateIntent.ProviderScope {
+				return result, core.Exit(4, "lease_id_conflict: fixed Proxmox provider scope changed before release")
+			}
+			if claim.FixedCreateIntent.State == "released" {
+				err := fixedProxmoxLeaseKind.ValidateTerminalClaim(*claim, core.LeaseClaim{}, leaseID, validateFixedProxmoxTerminalClaim)
+				return core.FixedObservation[core.Server]{AbsenceProven: err == nil}, err
+			}
+			if recoverPrepared && (claim.FixedCreateIntent.State != "prepared" || claim.CloudImmutableID != "") {
+				return result, core.Exit(4, "Proxmox forced absence recovery requires a prepared claim without a bound generation; inspect the VM and use ordinary stop")
+			}
+			vmid, node, err := fixedProxmoxAttempt(*claim)
+			if err != nil {
+				return result, err
+			}
+			if vmid == 0 {
+				return result, core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has no durable clone attempt", leaseID)
+			}
+			server, found, err := b.findFixedProxmoxServer(ctx, client, *claim)
+			if err != nil {
+				return result, err
+			}
+			if found {
+				if recoverPrepared {
+					return result, core.Exit(4, "lease_id_conflict: Proxmox prepared attempt has a matching VM; claim retained for inspection")
+				}
+				if err := validateFixedProxmoxLocalBinding(*claim); err != nil {
+					return result, err
+				}
+				if err := validateFixedProxmoxServer(server, *claim, vmid, node); err != nil {
+					return result, err
+				}
+				if claim.CloudImmutableID == "" {
+					return result, core.Exit(4, "lease_id_conflict: fixed Proxmox attempt has no bound vmgenid; retain for inspection")
+				}
+				if requireCleanupEligible {
+					if eligible, reason := core.ShouldCleanupServer(server, time.Now().UTC()); !eligible {
+						return result, fmt.Errorf("Proxmox VM no longer eligible: %s", reason)
+					}
+				}
+				result.Candidates = []core.Server{server}
+				return result, nil
+			}
+			if claim.FixedCreateIntent.State == "prepared" && !recoverPrepared {
+				return result, core.Exit(4, "lease_id_conflict: absence cannot settle an unresolved Proxmox clone attempt; inspect the clone task, then use crabbox stop --force --provider proxmox --id %s for checked absence recovery", leaseID)
+			}
+			err = verifyAbsent(vmid)
+			result.AbsenceProven = err == nil
+			return result, err
+		},
+		DeleteExact: func(ctx context.Context, tx *core.FixedTransaction, server core.Server) error {
+			vmid, node, err := fixedProxmoxAttempt(*tx.Claim)
+			if err != nil {
+				return err
+			}
+			check := func(live core.Server) error {
+				if err := validateFixedProxmoxServer(live, *tx.Claim, vmid, node); err != nil {
+					return err
+				}
+				if requireCleanupEligible {
+					if eligible, reason := core.ShouldCleanupServer(live, time.Now().UTC()); !eligible {
+						return fmt.Errorf("Proxmox VM %s no longer eligible: %s", live.CloudID, reason)
+					}
+				}
+				return nil
+			}
+			if err := client.DeleteServerOnNodeChecked(ctx, server.HostID, server.CloudID, check); err != nil {
+				return err
+			}
+			return verifyAbsent(vmid)
+		},
+	})
+}
+
+func validateFixedProxmoxTerminalClaim(claim core.LeaseClaim) error {
+	if claim.CloudID == "" || claim.CloudID != strconv.FormatInt(claim.CloudNumericID, 10) ||
+		claim.Labels["lease"] != claim.LeaseID || claim.Labels["provider"] != "proxmox" ||
+		claim.Labels["fixed_intent_sha256"] != claim.FixedCreateIntent.Fingerprint {
+		return core.Exit(4, "lease_id_conflict: fixed Proxmox lease %s has an invalid terminal VM identity", claim.LeaseID)
+	}
+	return nil
+}
+
+// Controller and direct-claim scopes differ; validate both before retaining a receipt.
+func (b *leaseBackend) ValidateConfirmedAbsentTerminalReceipt(claim core.LeaseClaim, req core.ConfirmedAbsentLocalCleanupRequest) error {
+	expected := req.ExpectedProviderIdentity
+	controllerScope, err := (Provider{}).ControllerProviderScope(b.Cfg)
+	if err != nil {
+		return err
+	}
+	claimScope := strings.TrimSpace(core.ProviderClaimScope("proxmox", b.Cfg))
+	if expected.LeaseID == "" || expected.AttemptLeaseID == "" || expected.Slug == "" || expected.ResourceID == "" ||
+		req.ProviderScope != controllerScope || claimScope == "" || claim.ProviderScope != claimScope {
+		return core.Exit(4, "Proxmox terminal receipt requires complete matching identity and scope")
+	}
+	if err := core.ValidateProviderIdentityExpectation(expected); err != nil {
+		return err
+	}
+	if err := fixedProxmoxLeaseKind.ValidateTerminalClaim(claim, core.LeaseClaim{}, expected.LeaseID, validateFixedProxmoxTerminalClaim); err != nil {
+		return err
+	}
+	if claim.LeaseID != expected.AttemptLeaseID || claim.Slug != expected.Slug || claim.CloudID != expected.ResourceID {
+		return core.Exit(4, "Proxmox terminal receipt identity changed")
+	}
+	return nil
+}
+
+func (b *leaseBackend) RetainLeaseClaimAfterRelease(lease core.LeaseTarget) bool {
+	retained, err := b.retainLeaseClaimAfterRelease(lease, core.LeaseClaim{})
+	return retained || err != nil
+}
+
+func (b *leaseBackend) RetainLeaseClaimAfterReleaseWithClaim(lease core.LeaseTarget, previous core.LeaseClaim) (bool, error) {
+	return b.retainLeaseClaimAfterRelease(lease, previous)
+}
+
+func (b *leaseBackend) retainLeaseClaimAfterRelease(lease core.LeaseTarget, previous core.LeaseClaim) (bool, error) {
+	fixedEvidence := strings.TrimSpace(lease.Server.Labels["fixed_intent_sha256"]) != ""
+	return fixedProxmoxLeaseKind.RetainClaimAfterRelease(lease.LeaseID, previous, fixedEvidence, validateFixedProxmoxTerminalClaim, nil)
+}
+
+// Another local owner of this VMID makes lifecycle mutations ambiguous, even
+// when the remote labels still point at this fixed operation.
+func validateFixedProxmoxLocalBinding(claim core.LeaseClaim) error {
+	return core.ValidateFixedLocalClaimUniqueness(fixedProxmoxLeaseKind, claim, "proxmox", core.FixedProxmoxClaimProvider)
+}
+
+func (b *leaseBackend) validateFixedCleanupCandidate(claim core.LeaseClaim, server core.Server, inventory []core.Server) error {
+	vmid, node, err := fixedProxmoxAttempt(claim)
+	if err != nil {
+		return err
+	}
+	if claim.ProviderScope != core.ProviderClaimScope("proxmox", b.Cfg) || claim.CloudImmutableID == "" {
+		return core.Exit(4, "lease_id_conflict: fixed Proxmox cleanup has no exact scope/generation binding")
+	}
+	count := 0
+	for _, candidate := range inventory {
+		if candidate.CloudID == claim.CloudID || candidate.Labels["lease"] == claim.LeaseID || candidate.Labels["provider_key"] == core.ProviderKeyForLease(claim.LeaseID) {
+			count++
+		}
+	}
+	if count != 1 {
+		return core.Exit(4, "lease_id_conflict: ambiguous fixed Proxmox cleanup inventory")
+	}
+	if err := validateFixedProxmoxLocalBinding(claim); err != nil {
+		return err
+	}
+	return validateFixedProxmoxServer(server, claim, vmid, node)
+}

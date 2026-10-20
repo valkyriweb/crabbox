@@ -1,8 +1,14 @@
 package xcpng
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
 	"strings"
 	"testing"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/fat16"
 )
 
 func TestCloudInitPayloadIncludesSSHUserKeyAndBootstrap(t *testing.T) {
@@ -173,6 +179,19 @@ func TestBuildConfigDriveImageRejectsOversizedPayload(t *testing.T) {
 	}
 	if _, err := buildConfigDriveImage(payload); err == nil || !strings.Contains(err.Error(), "config-drive payload is too large") {
 		t.Fatalf("err=%v, want oversized payload validation", err)
+	}
+}
+
+func TestBuildFAT16ImagePreservesXCPngEncoding(t *testing.T) {
+	image, err := buildFAT16Image("cidata", []fat16.File{
+		{Name: "user-data", Data: []byte("#cloud-config\nusers:\n- name: alice\n")},
+		{Name: "meta-data", Data: []byte("instance-id: crabbox-test\nlocal-hostname: my-app\n")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fmt.Sprintf("%x", sha256.Sum256(image)), "a752d9264be7b8d65d7aa76c88b29390db32c01aeb32583018ec5046df8ea2b6"; got != want {
+		t.Fatalf("sha256=%s, want %s", got, want)
 	}
 }
 
@@ -351,5 +370,31 @@ func TestDataISOArgsUseXorrisoMkisofsMode(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("args missing %q: %s", want, joined)
 		}
+	}
+}
+
+func TestBuildFAT16ImagePreservesXCPngErrors(t *testing.T) {
+	const maxDataBytes = ((20480 - (1 + 2*40 + 512*32/512)) / 4) * 4 * 512
+	oversized := bytes.Repeat([]byte{'x'}, maxDataBytes+1)
+	files256 := make([]fat16.File, 256)
+	for i := range files256 {
+		files256[i] = fat16.File{Name: fmt.Sprintf("f%03d", i)}
+	}
+	cases := []struct {
+		name, suffix string
+		files        []fat16.File
+	}{
+		{"blank-name-order", "file name is required", []fat16.File{{Name: " ", Data: oversized}}},
+		{"capacity-plus-one", "payload is too large", []fat16.File{{Name: "payload.bin", Data: oversized}}},
+		{"directory-256-files", "directory is too large", files256},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			image, err := buildFAT16Image("cidata", test.files)
+			var exitErr core.ExitError
+			if image != nil || !core.AsExitError(err, &exitErr) || exitErr.Code != 2 || exitErr.Message != "config-drive "+test.suffix {
+				t.Fatalf("imageNil=%v err=%#v", image == nil, err)
+			}
+		})
 	}
 }

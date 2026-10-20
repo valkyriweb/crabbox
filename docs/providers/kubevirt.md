@@ -52,6 +52,10 @@ When `sshKey` is empty, Crabbox generates a per-lease key. When it is set,
 `sshPublicKey` may contain the matching public key text or a public-key file
 path; otherwise Crabbox reads `<sshKey>.pub`.
 
+Repository-local config may provide inline `sshPublicKey` text but cannot
+select `sshKey` or a file-form `sshPublicKey`. Configure operator key paths in
+trusted user config, environment variables, or explicit flags.
+
 Provider flags use the `--kubevirt-*` prefix. Environment overrides use the
 `CRABBOX_KUBEVIRT_*` prefix.
 
@@ -59,6 +63,18 @@ Local path fields expand `~` from config files, environment overrides, and
 flags. This applies to `kubectl`, `virtctl`, `kubeconfig`, `template`,
 `sshKey`, and file-form `sshPublicKey`. `workRoot` is a guest path and is not
 shell-expanded.
+
+Empty file and environment strings retain prior values; visited flags can
+assign empty values before validation. File and flag path expansion follows
+accepted input, while environment processing also expands retained fallback
+paths. Saving configuration omits empty strings but preserves an explicit
+`deleteOnRelease: false`. Applying configuration does not rewrite the original
+file values or remove settings that were ignored for that input source.
+
+A custom top-level work root is inherited when the provider work root is blank
+or still at its default. A custom provider work root takes precedence. Command
+forwarding and backend configuration share this decision; guest-root trimming
+and the initial routing projection remain separate steps.
 
 Local lease claims are scoped by the same kubeconfig, context, and namespace
 tuple that Crabbox passes to `kubectl` and `virtctl`. `kubevirt.context` is
@@ -206,7 +222,10 @@ The live harness also needs `jq` and `rg` on the operator machine. Use
 Kubernetes context. Use `CRABBOX_LIVE_KUBEVIRT_NAMESPACE` when the configured
 namespace is not the target namespace. `CRABBOX_LIVE_COMMAND` overrides the
 remote smoke command; by default it accepts either a Go repo (`go.mod`) or a
-Node repo (`package.json`).
+Node repo (`package.json`). After local helper tools are available, the harness
+refuses to run before `doctor`, `warmup`, or any mutating provider command
+unless a VM template is configured through `CRABBOX_LIVE_KUBEVIRT_TEMPLATE`,
+`CRABBOX_KUBEVIRT_TEMPLATE`, or `kubevirt.template`.
 
 ## Troubleshooting
 

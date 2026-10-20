@@ -7,15 +7,22 @@ Read when:
 - changing AWS provisioning code in the CLI (`internal/cli/aws.go`) or coordinator
   (`worker/src/aws.ts`).
 
-AWS is Crabbox's broadest managed provider. It leases full SSH-reachable EC2
-boxes and supports four targets: Linux, native Windows, Windows WSL2, and EC2
-Mac. AWS is one of the four brokerable providers, so it can run two ways:
+AWS is Crabbox's broadest managed provider. Its normal CLI path leases full
+SSH-reachable EC2 boxes and supports four targets: Linux, native Windows,
+Windows WSL2, and EC2 Mac. AWS is one of the five brokerable providers, so that
+path can run two ways:
 
 - **Brokered** — the coordinator holds the AWS credentials and provisions
   on your behalf. The CLI still talks SSH/rsync directly to the runner.
 - **Direct** — no broker configured. The CLI uses the local AWS credential chain
   (`AWS_PROFILE`, env keys, or shared config) and provisions itself. This is the
   usual path for provider debugging.
+
+A specialized third shape, the
+[private AWS workspace service](aws-private-workspaces.md), exposes only the
+route-scoped workspace API. It uses an exact server-side small-instance
+allowlist and SSM bootstrap in one dedicated account/Region; it is not an SSH
+class or a client-selectable capacity fallback.
 
 ## Targets
 
@@ -42,6 +49,22 @@ Spot is blocked or when an account only has On-Demand quota. Set
 `capacity.fallback: on-demand` (or `CRABBOX_CAPACITY_FALLBACK=on-demand`) to fall
 back to On-Demand automatically after Spot capacity/quota rejections.
 
+During acquisition, Crabbox stops waiting when EC2 reports `shutting-down` or
+`terminated`, or a closed Spot request reports `instance-terminated-*`. The
+error includes the instance ID and AWS reason, such as
+`Server.SpotInstanceTermination` or `instance-terminated-no-capacity`. Direct
+SSH/Windows bootstrap and coordinator SSM waits recheck EC2 every 15 seconds;
+address waits check on every poll. Spot-request diagnostics use
+`ec2:DescribeSpotInstanceRequests` when allowed; terminal EC2 state still ends
+the wait if that optional read is denied.
+
+Post-launch failure follows existing cleanup ownership: ordinary direct
+acquisitions roll back their created instance and key, fixed-ID acquisitions
+retain their bound claim for `stop`, and brokered acquisitions leave cleanup
+with the coordinator. The existing candidate/market fallback handles launch
+rejections; it does not replace an already-bound instance during readiness.
+Use `--market on-demand` for a new acquisition after a Spot reclaim when needed.
+
 Crabbox tries an ordered list of instance candidates for the requested class
 (below). An explicit `--type` is exact: if EC2 rejects it, Crabbox fails clearly
 instead of silently picking another type. During capacity incidents, prefer
@@ -49,8 +72,10 @@ instead of silently picking another type. During capacity incidents, prefer
 192 vCPUs before fallback.
 
 Give AWS more regional headroom with `CRABBOX_CAPACITY_REGIONS` or
-`capacity.regions`. Both brokered and direct launches try the primary region
-first, then each configured region in order. Pin specific zones with
+`capacity.regions`. Brokered launches try the requested `aws.region` first,
+then the coordinator's preferred region and configured capacity regions. Direct
+launches try the primary region first, then each configured region in order. Pin
+specific zones with
 `CRABBOX_CAPACITY_AVAILABILITY_ZONES`. The public coordinator defaults its pool
 to:
 
@@ -117,7 +142,12 @@ from the C8i/M8i/M8i-flex/R8i families; Crabbox rejects unsupported families
   architecture. Pass `--arch arm64` for Graviton/ARM64 capacity and
   `--os ubuntu:24.04` for the previous LTS. Supported selectors:
   `ubuntu:26.04` and `ubuntu:24.04`.
-- **Windows** resolves the latest Windows Server 2022 English Full Base AMI.
+- **Windows** defaults to the latest Windows Server 2025 English Full Base AMI.
+  Pass `--target windows --os windows-server:2025` to select stock Server 2025, or
+  `--os windows-server:2022` to select stock Server 2022 explicitly. Both work
+  with native Windows and WSL2. Without a Windows selector, brokered promoted
+  Windows images still win; an explicit selector bypasses unversioned promotions.
+  See [Windows images](../providers/aws.md#windows-images) for precedence.
 - **macOS** resolves the matching Amazon EC2 macOS AMI for the chosen instance
   family (arm64 for Apple silicon, x86_64 for `mac1.metal`).
 
@@ -129,12 +159,22 @@ also bake and promote trusted AWS images with `crabbox image` (see the
 
 Crabbox imports or reuses an EC2 key pair, creates or reuses the
 `crabbox-runners` security group when none is supplied, and opens only the SSH
-ports to the configured CIDRs or the detected request source. The default root
-volume is 400 GB gp3, encrypted; override with `CRABBOX_AWS_ROOT_GB` /
-`aws.rootGB`. VNC stays behind the SSH tunnel.
+ports to the configured CIDRs or the detected request source. Root volumes are
+encrypted gp3, sized by machine class (40 GB for `tiny` up to 400 GB for `beast`)
+and raised to the image's root snapshot minimum; override with
+`CRABBOX_AWS_ROOT_GB` / `aws.rootGB`. VNC stays behind the SSH tunnel.
 
 Supplying `CRABBOX_AWS_SECURITY_GROUP_ID` makes ingress policy your
 responsibility. Set `CRABBOX_AWS_SUBNET_ID` to launch into a non-default VPC.
+
+The dedicated private-workspace mode does not inherit these SSH defaults. It
+requires a private subnet with no direct internet-gateway route, a separate
+no-ingress workspace security group whose egress is TCP 443, no public address
+or key pair, IMDSv2, an encrypted gp3 root volume, and SSM-only bootstrap. Its
+recommended small policy is `t3a.small,t3.small` with two-vCPU/4096-MiB ceilings
+and a 20 GiB disk. See
+[Private AWS Workspaces](aws-private-workspaces.md) for the fail-closed
+deployment and live proof.
 
 Account-level AWS guardrails should cover every region Crabbox can allocate in:
 
@@ -161,23 +201,32 @@ done
 ### Orphan sweep
 
 The brokered coordinator can sweep stray AWS instances itself. When
-`CRABBOX_AWS_ORPHAN_SWEEP_ENABLED` is not disabled and AWS broker credentials are
-present, the Fleet Durable Object alarm periodically scans `CRABBOX_AWS_REGION`
+`CRABBOX_AWS_ORPHAN_SWEEP_ENABLED` is not disabled and AWS credentials are
+available, the Fleet Durable Object alarm periodically scans `CRABBOX_AWS_REGION`
 plus `CRABBOX_CAPACITY_REGIONS` for Crabbox-tagged EC2 instances; the Worker cron
 handler bootstraps the alarm for idle fleets after a deploy or config change. The
 sweep uses equivalent pg-boss scheduling and reconciliation on Node/PostgreSQL. The
-sweep only terminates confirmed orphan candidates when
-`CRABBOX_AWS_ORPHAN_SWEEP_DELETE=1`; otherwise it stores the latest report for
-admin inspection. Tune cadence and grace with
+sweep only terminates candidates with an exact retained coordinator lease
+binding when `CRABBOX_AWS_ORPHAN_SWEEP_DELETE=1`; provider tags alone remain
+report-only. Otherwise it stores the latest report for admin inspection. Tune
+cadence and grace with
 `CRABBOX_AWS_ORPHAN_SWEEP_INTERVAL_SECONDS` and
 `CRABBOX_AWS_ORPHAN_SWEEP_GRACE_SECONDS`.
 
 ## EC2 Mac Hosts
 
 EC2 Mac instances run only on Dedicated Hosts, and host lifecycle is explicit
-operator work. Brokered mode can pin a host with `CRABBOX_HOST_ID`
-(legacy alias `CRABBOX_AWS_MAC_HOST_ID`); without one it tries to discover an
-available host in the region.
+operator work. Admin-authenticated brokered mode can pin a host with
+`CRABBOX_HOST_ID` (legacy alias `CRABBOX_AWS_MAC_HOST_ID`). A normal broker user
+can pin a host only when a released AWS macOS lease proves that the same owner
+and organization previously used it; other host pins remain admin-only. If that
+lease retained its instance, Crabbox reactivates the existing lease and instance
+instead of launching a replacement onto the single-capacity host. Reactivation
+requires the retained instance to already provide every requested desktop,
+browser, and code capability. A terminated Mac instance can leave its host
+unavailable during AWS's sanitization window, so occupied explicit pins fail
+immediately; unpinned launches use automatic available-host discovery in the
+region.
 
 ```sh
 crabbox admin providers identity --provider aws --region eu-west-1
@@ -220,13 +269,18 @@ grants separately with `crabbox admin providers policy --provider aws` and
 
 ## Credentials And Configuration
 
-### Broker secrets
+### Broker credentials
+
+Existing Worker deployments accept the static credential contract below. The
+Node runtime can instead use its AWS default credential chain. The dedicated
+ECS private-workspace deployment requires temporary task-role credentials and
+rejects static access keys.
 
 ```text
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN              optional
-CRABBOX_HOST_ID               optional; pins a brokered host such as an EC2 Mac Dedicated Host
+CRABBOX_HOST_ID               optional; admin-only except owner reuse of a released Mac host
 CRABBOX_AWS_MAC_HOST_ID       optional legacy alias for CRABBOX_HOST_ID
 ```
 
@@ -243,7 +297,7 @@ CRABBOX_AWS_AMI
 CRABBOX_AWS_SECURITY_GROUP_ID
 CRABBOX_AWS_SUBNET_ID
 CRABBOX_AWS_INSTANCE_PROFILE
-CRABBOX_AWS_ROOT_GB           default 400
+CRABBOX_AWS_ROOT_GB           unset: class default, clamped to AMI minimum
 CRABBOX_AWS_SSH_CIDRS
 CRABBOX_HOST_ID
 CRABBOX_AWS_MAC_HOST_ID       legacy alias
@@ -259,6 +313,10 @@ CRABBOX_CAPACITY_HINTS
 CRABBOX_CAPACITY_LARGE_CLASSES
 ```
 
+Private workspace settings and their required combinations are documented in
+[Private AWS Workspaces](aws-private-workspaces.md#configuration). They are
+deployment policy, not request fields.
+
 The same values are available as `aws.*` keys (`region`, `ami`,
 `securityGroupId`, `subnetId`, `instanceProfile`, `rootGB`, `sshCIDRs`,
 `macHostId`) and `capacity.*` keys (`market`, `fallback`, `regions`,
@@ -266,7 +324,7 @@ The same values are available as `aws.*` keys (`region`, `ami`,
 
 Related docs:
 
-- [Providers](providers.md)
+- [Provider Reference](../providers/README.md)
 - [Capacity and fallback](capacity-fallback.md)
 - [Linux VNC](vnc-linux.md)
 - [Windows VNC](vnc-windows.md)

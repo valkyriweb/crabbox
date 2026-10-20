@@ -6,8 +6,8 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,9 +18,14 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-const defaultEndpoint = "https://api.us.ovhcloud.com/1.0"
+var (
+	errOVHCrossOriginRedirect = errors.New("ovh refused cross-origin redirect")
+	errOVHInvalidRedirect     = errors.New("ovh refused invalid redirect")
+	errOVHRedirectLimit       = errors.New("ovh redirect stopped after 10 redirects")
+)
 
 type clientConfig struct {
 	Endpoint          string
@@ -194,7 +199,7 @@ type InstanceCreateRequest struct {
 func newClient(cfg core.Config, rt core.Runtime) (*Client, error) {
 	endpoint := strings.TrimSpace(cfg.OVH.Endpoint)
 	if endpoint == "" {
-		endpoint = defaultEndpoint
+		endpoint = core.OVHConfigDefaultEndpoint
 	}
 	return newClientWithConfig(clientConfig{
 		Endpoint:          endpoint,
@@ -229,6 +234,7 @@ func newClientWithConfig(cfg clientConfig) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
+	httpClient = secureOVHHTTPClient(httpClient, endpoint)
 	return &Client{
 		endpoint:          endpoint,
 		applicationKey:    applicationKey,
@@ -239,6 +245,43 @@ func newClientWithConfig(cfg clientConfig) (*Client, error) {
 			return time.Now().Unix()
 		},
 	}, nil
+}
+
+func secureOVHHTTPClient(source *http.Client, trusted *url.URL) *http.Client {
+	client := *source
+	originalCheckRedirect := source.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !core.SameHTTPOrigin(trusted, req.URL) {
+			return errOVHCrossOriginRedirect
+		}
+		if originalCheckRedirect != nil {
+			return originalCheckRedirect(req, via)
+		}
+		if len(via) >= 10 {
+			return errOVHRedirectLimit
+		}
+		return nil
+	}
+	return &client
+}
+
+func sanitizeOVHClientError(err error) error {
+	// net/http wraps redirect failures with the untrusted Location URL. Return
+	// only stable sentinels so provider diagnostics cannot retain it.
+	if errors.Is(err, errOVHCrossOriginRedirect) {
+		return errOVHCrossOriginRedirect
+	}
+	if errors.Is(err, errOVHRedirectLimit) {
+		return errOVHRedirectLimit
+	}
+	var requestErr *url.Error
+	if errors.As(err, &requestErr) && strings.Contains(requestErr.Err.Error(), "failed to parse Location header") {
+		return errOVHInvalidRedirect
+	}
+	if err != nil && strings.Contains(err.Error(), "invalid redirect location") {
+		return errOVHInvalidRedirect
+	}
+	return err
 }
 
 func (c *Client) AuthTime(ctx context.Context) (int64, error) {
@@ -362,33 +405,15 @@ func (c *Client) do(ctx context.Context, method, requestPath string, body any, o
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return sanitizeOVHClientError(err)
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body := redactSecrets(strings.TrimSpace(string(data)), c.applicationKey, c.applicationSecret, c.consumerKey)
-		if len(body) > 400 {
-			body = body[:400]
-		}
-		if readErr != nil {
-			if body != "" {
-				body += "; "
-			}
-			body += "response body read failed: " + readErr.Error()
-		}
-		return &APIError{Operation: method + " " + requestPath, Status: resp.StatusCode, Body: body}
-	}
-	if readErr != nil {
-		return fmt.Errorf("ovh %s %s response body: %w", method, requestPath, readErr)
-	}
-	if out == nil || len(data) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("ovh %s %s decode: %w", method, requestPath, err)
-	}
-	return nil
+	return shared.DecodeStatusFirstJSONResponse(resp, out, "ovh "+method+" "+requestPath, func(status int, data []byte, readErr error) error {
+		body := shared.RedactedResponseBody(data, readErr, 400, func(value string) string {
+			return redactSecrets(value, c.applicationKey, c.applicationSecret, c.consumerKey)
+		})
+		return &APIError{Operation: method + " " + requestPath, Status: status, Body: body}
+	})
 }
 
 func (c *Client) ensureServerTime(ctx context.Context) error {
@@ -510,7 +535,7 @@ func isOVHEndpointHost(host string) bool {
 func normalizeEndpointAlias(endpoint string) string {
 	switch strings.ToLower(strings.TrimSpace(endpoint)) {
 	case "":
-		return defaultEndpoint
+		return core.OVHConfigDefaultEndpoint
 	case "ovh-us":
 		return "https://api.us.ovhcloud.com/1.0"
 	case "ovh-ca":

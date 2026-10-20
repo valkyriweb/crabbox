@@ -14,6 +14,8 @@ crabbox warmup --provider azure --arch arm64 --class fast
 crabbox warmup --browser
 crabbox warmup --tailscale
 crabbox warmup --slug update-flow-smoke
+crabbox warmup --provider aws --lease-id cbx_abcdef123456 --slug update-flow-smoke
+crabbox warmup --provider local-container --lease-id cbx_abcdef123456 --slug update-flow-smoke
 crabbox warmup --pond alpha --slug db
 crabbox warmup --provider aws --target windows --desktop
 crabbox warmup --provider azure --target windows
@@ -22,6 +24,36 @@ crabbox warmup --actions-runner
 crabbox warmup --provider ssh --target macos --static-host mac-studio.example.com
 crabbox warmup --provider ssh --target windows --static-host win-dev.example.com --static-work-root 'C:\crabbox' --browser
 ```
+
+## Lifetime rollout canary
+
+Administrators can explicitly enroll a new coordinator-managed AWS on-demand
+lease in enforced maximum-age cleanup, even while the coordinator's default
+lifetime mode is off or report-only:
+
+```sh
+CRABBOX_AWS_REGION=eu-west-1 crabbox warmup --provider aws --class tiny --type t3.small --market on-demand --keep --ttl 45m --idle-timeout 10m --lifetime-canary 6m --lifetime-retention 5m
+```
+
+Set the AWS Region with `CRABBOX_AWS_REGION`; warmup accepts neither `--region`
+nor `--aws-region`.
+
+Supply both `--lifetime-canary <duration>` (compute lifetime from creation) and
+`--lifetime-retention <duration>` (root-disk retention after confirmed stop).
+Each must be a whole number of seconds between `1m` and `744h` (31 days).
+These are explicit rollout flags, not configuration defaults. They require a
+new managed AWS on-demand lease without a dedicated Mac host; direct and
+registered leases are rejected. Existing fixed-ID requests must match their
+original policy. The coordinator enforces administrator authorization and
+records `lifetimePolicy.source: "admin-canary"`.
+
+An explicit configured admin credential takes precedence for this canary;
+otherwise the configured broker credential must already have admin access.
+Inspect the resulting policy and warnings with `status`, `inspect`, `list`, or
+`admin leases`. Neither activity nor `--keep` extends the compute deadline.
+The retained root disk is permanently deleted after its retention period.
+Use [`admin extend-lifetime`](admin.md#extend-lifetime) before stopping starts
+to request an audited extension.
 
 ## Output
 
@@ -35,25 +67,174 @@ warmup complete total=42.1s
 ```
 
 The canonical lease ID is `cbx_...`; the friendly `slug` is an auto-generated
-`<adjective>-<noun>` handle (or a normalized `--slug` you requested). Reuse
+`<adjective>-<noun>-<eight-hex-fingerprint>` handle (or a normalized `--slug`
+you requested). Fixed-ID replay preserves its original naming contract. Reuse
 either with later `run`, `status`, `ssh`, `inspect`, and `stop` commands.
-Scripts should prefer the canonical ID. Add `--timing-json` to emit a final
+Scripts should prefer the canonical ID. On success, add `--timing-json` to emit a final
 JSON timing record (provider, lease ID, slug, total duration, exit code) on
 stderr.
+
+For a fixed-ID coordinator request rejected by a quota before lease admission,
+`--timing-json` emits a failure record on **stdout**, separately from diagnostic
+text on stderr. Its optional `creationRejected`
+object has this shape (shown with the relevant existing timing fields):
+
+```json
+{"provider":"aws","exitCode":1,"creationRejected":{"version":1,"requestedLeaseId":"cbx_0123456789ab","code":"cost_limit_exceeded"}}
+```
+
+The top-level provider is the canonical requested provider. `requestedLeaseId`
+identifies the request; `leaseId` and `slug` are absent because no allocated
+identity is reported. The original error diagnostic and nonzero exit remain.
+This applies to ordinary and minimum-resource fixed-create requests through the
+coordinator. It does not change successful output or commands without
+`--timing-json`.
+
+Version 1 qualifies only the original typed HTTP 429 `cost_limit_exceeded`
+response for that exact create request. Cancellation, deadlines, an earlier
+uncertain response followed by replay, errors after acceptance, other error
+codes, direct-provider creation, and checkpoint forks do not produce this
+result. A nonzero exit alone never proves rejection or completed cleanup.
+
+Consumers must require one complete newline-terminated stdout result, the
+supported version and code, the matching requested provider and ID, no lease
+receipt, and a failed invocation without interruption. Keep stdout and stderr
+separate: JSON in stderr diagnostics is never creation-rejection evidence.
+Successful timing output remains on stderr. Missing,
+malformed, duplicate, unknown, or mismatched results remain inconclusive,
+including partial output or a signal before complete evidence. Older clients
+without this result retain the existing recovery path. The result describes
+creation rejection; it does not confirm removal of local request state or
+authorize cleanup of another request.
+
+For Blacksmith Testbox with a configured coordinator, the lease summary appears
+as soon as the ready Testbox is retained. Final completion and timing follow the
+optional portal inventory sync, and the total includes that bookkeeping. The
+sync has one five-second budget (or the caller's earlier cancellation/deadline).
+A sync failure prints a warning on stderr but warmup still succeeds and retains
+the ready lease; it does not allocate again or stop the Testbox.
 
 Warmup records a local claim binding the lease to the current repo checkout. Use
 `--reclaim` to overwrite an existing claim for that lease.
 
+If a coordinator lease ends while provisioning, warmup reports the lease ID,
+terminal state, and recorded failure cause. When the coordinator retains the
+cause in cleanup metadata because a resource may still exist, warmup includes
+that diagnostic. Use `crabbox inspect --id <lease>` to check the retained
+provisioning and cleanup evidence before recovery.
+
+Warmup requires an explicit provider selection from `--provider`,
+`CRABBOX_PROVIDER`, user or repository config, broker config, or an applicable
+recorded lease route. With no selection it exits before provider initialization
+and points to `crabbox providers recommend`.
+
+For ordinary `local-container` warmups without `--lease-id`, the default
+`--keep=true` also covers SSH readiness failure: once Docker has returned an
+exact container identity, Crabbox persists a scoped `provisioning` claim before
+inspecting the container or waiting for SSH. Cancellation or timeout retains
+that pending lease and prints exact inspect, reclaim, and cleanup commands.
+`warmup --keep=false` rolls an ordinary container and all per-lease local state
+back instead. Fixed-ID local-container warmups retain their durable create
+attempt so an interrupted operation can be safely replayed.
+
 ## Lifetime: TTL and idle timeout
 
-- `--ttl <duration>` is the maximum wall-clock lifetime. Default `90m`.
+- `--ttl <duration>` is the maximum wall-clock lifetime. Default `30m`.
 - `--idle-timeout <duration>` releases the lease after no touch for that long.
   Default `30m`.
+
+`--keep=true` remains the default so the lease can be reused across runs. Set
+`warmup.keep: false` in user or repository config to change this default;
+`CRABBOX_WARMUP_KEEP` overrides config, and an explicit `--keep` wins over both.
+This setting applies only to `warmup`; it does not change `run --keep`.
+`lease.idleTimeout` (or top-level `idleTimeout`) configures the idle window;
+`CRABBOX_IDLE_TIMEOUT` overrides config and `--idle-timeout` overrides both.
+
+For managed coordinator leases, TTL counts from admission and remains a hard
+wall-clock cap. Provisioning does not consume idle time: `lastTouchedAt` and the
+idle deadline start when the coordinator publishes the active lease. Expiry is
+then the earlier of admission plus TTL and activation plus idle timeout; later
+plain heartbeats extend only the idle deadline. Choose a TTL that covers provisioning
+and intended use. A TTL exhausted during provisioning still triggers cleanup.
+The CLI's lease labels reflect these authoritative coordinator timestamps.
+
+Managed coordinator leases expire automatically regardless of keep. New direct
+GCP VMs also honor recorded expiry through their guest-side expiry guard when
+the attached service account can delete the VM. The expiry is the earlier of
+TTL and idle timeout; GCP guests still marked running or provisioning retain
+the 12-hour stale-state grace period. Kept guests without valid expiry metadata
+are left alone.
+
+Manual `crabbox cleanup` always skips `keep=true` machines, including expired
+ones. It is separate from automatic expiry. For direct providers without an
+automatic idle reaper, use `warmup.keep: false` and schedule cleanup, or stop the
+lease explicitly. Existing GCP guests retain their installed guard; recreate
+them to receive the updated idle reaper. See [cleanup](cleanup.md) and the
+provider documentation for supported lifecycle behavior.
+
+Tenki is an exception: kept leases are sticky and ignore TTL, and native idle
+expiry is unsupported. Use `--keep=false` to pass TTL as Tenki's maximum duration,
+which pauses the sandbox when reached. Explicitly stop the lease to destroy it.
 
 ## Naming and grouping
 
 `--slug <slug>` requests a human-chosen slug for a new lease. Crabbox normalizes
 it and may append a short suffix if an active lease already uses that slug.
+
+`--lease-id cbx_<12 lowercase hex>` is the automation idempotency contract for
+providers that explicitly support fixed identities. Direct AWS, Azure, DigitalOcean,
+Machine0, Daytona, Incus, Tenki, RunPod, Parallels, Proxmox, Boat, Apple Container, and local-container leases,
+Agent Sandbox delegated leases, managed coordinator leases, and explicitly capable
+external providers accept it. Replaying the same normalized create intent
+returns or joins the same live lease, including after the creating process loses
+its response. A managed coordinator reports `fixed_lease_terminal` when that
+same intent has already ended, or `422 provisioning_failed` with the original
+diagnostics when it failed with no possible provider machine. Reusing the ID with a different provider, slug
+request, SSH key, machine or container shape, capabilities, lifetime, or other
+immutable create input fails with `lease_id_conflict` before another provider
+create. Slugs remain display aliases and are never used as the idempotency key.
+
+Daytona binds the native organization before allocation and preserves that scope
+across credential rotation. See [Daytona fixed operation IDs](../providers/daytona.md#fixed-operation-ids)
+for API-key organization discovery and positive cleanup-witness requirements.
+
+Boat retains the original keyed creation intent and permits one recovery
+submission within the native 24-hour window, further limited by the intent TTL.
+Keep the original account and local state: endpoint and organization scope do
+not distinguish two personal account keys. See
+[Boat fixed lease IDs](../providers/ascii-box.md#fixed-lease-ids).
+
+Concurrent fixed-ID warmup and fork commands sharing a local state directory
+wait for the current acquisition to finish registration and preparation. A
+cancelled waiter makes no provider changes. If preparation fails after a fixed
+lease was acquired, the CLI retains it: retry the original command or explicitly
+stop the ID. A failed replay never owns automatic deletion of an adopted lease.
+
+Coordinator-backed fixed-ID creation uses a versioned `PUT /v1/leases/<id>`
+route. An older coordinator therefore rejects the request before provisioning;
+the CLI never falls back to slug lookup or legacy create behavior. After an
+ambiguous fixed create response, the CLI repeats that exact PUT to atomically
+confirm the same intent before it may poll lease status with GET.
+
+For coordinator-backed creates, recovering an uncertain response does not restart
+the provisioning deadline or shorten it to the recovery window. Once the same
+create is confirmed, readiness uses the remaining original creation budget and
+honors caller cancellation. Fixed-ID leases remain available for explicit recovery
+or stop; ordinary creates keep their token-bound cancellation cleanup.
+
+A fixed lease ID is single-use. Direct AWS, Azure, DigitalOcean, Machine0, Daytona,
+Incus, Tenki, RunPod, Parallels, Proxmox, Boat, Apple Container, and local-container
+acquisitions fail closed if their bound resource later disappears. Successful
+stop and missing-resource cleanup replace the live local claim with a compact
+terminal tombstone, so the ID remains rejected after release. Use a new
+operation ID for every later lease. If an AWS launch or local-container create
+attempt was durably recorded but its resource is not yet visible, replay fails
+closed without resubmitting it; retry later to adopt the resource after
+provider inventory converges.
+
+Agent Sandbox retains its fixed acquisition and terminal receipts through delegated
+execution and adapter cleanup. See [Agent Sandbox fixed lease IDs](../providers/agent-sandbox.md#fixed-lease-ids)
+for Kubernetes identity checks and foreground deletion requirements.
 
 `--pond <name>` tags a new lease into a named pond (stored as a reserved
 provider label); `crabbox list --pond <name>` filters by it. When combined with
@@ -72,7 +253,8 @@ Capabilities are opt-in features requested at warm time and validated against
 the provider's feature set. See [capabilities](../features/capabilities.md).
 
 - `--desktop` provisions a visible UI and loopback-bound VNC for automation and
-  operator takeover. Linux defaults to Xvfb, a slim XFCE, and x11vnc. Use
+  operator takeover. Managed cloud Linux and new local containers default to
+  resize-capable TigerVNC with a slim XFCE session. Use
   `--desktop-env wayland` for the experimental labwc/WayVNC profile on
   Ubuntu 26.04-compatible images, or `--desktop-env gnome` for a GNOME-apps
   profile with GNOME Panel taskbars over labwc/WayVNC (GNOME-profile app
@@ -91,7 +273,13 @@ Reusing a lease later requires matching capability labels.
 
 ## OS image
 
-`--os` selects a portable Linux OS image; `ubuntu:26.04` is the default.
+`--os` selects an OS image. Linux supports `ubuntu:26.04` (the default) and
+`ubuntu:24.04`. AWS Windows supports `windows-server:2022` and
+`windows-server:2025` with `--target windows`, including WSL2 mode. Without a
+Windows selector, brokered promoted Windows images still win and stock Windows
+Server 2022 remains the fallback. A Windows selector requests the stock image
+for that release instead of an unversioned promoted image; see
+[AWS Windows images](../providers/aws.md#windows-images).
 Explicit provider image flags and config values still win for exact AMIs, URNs,
 image families, or provider image names.
 
@@ -114,6 +302,13 @@ reachability layer, not a provider — static hosts should put a MagicDNS name o
 [Tailscale](../features/tailscale.md).
 
 ## Provider notes
+
+### blaxel
+
+`--provider blaxel` creates a Crabbox-owned Blaxel Linux sandbox and waits for
+the sandbox to become ready. Warmup prints the `blx_<sandbox-id>` lease ID and a
+friendly slug for later `run --id`, `status`, and `stop` calls. It does not
+prepare SSH, browser, desktop, code-server, or Actions runner surfaces.
 
 ### ssh (static / bring-your-own host)
 
@@ -144,17 +339,32 @@ username, and password must come from config or environment before warmup can
 create a lease. Keep the XAPI endpoint on a management network or VPN, prefer
 trusted certificates, and treat `--xcp-ng-insecure-tls` as private-lab only.
 
+### coder
+
+`--provider coder` creates or reuses a Linux Coder workspace through the local
+`coder` CLI. New workspaces require `--coder-template` or `coder.template`.
+Crabbox connects through `coder ssh --stdio`, so no raw public host or provider
+SSH key is needed. Run `crabbox doctor --provider coder` first; if the local
+Coder CLI is not logged in, doctor reports `auth=missing_login` without
+mutating workspaces.
+
 ### aws — Windows
 
 `--provider aws --target windows --windows-mode normal --desktop` creates a real
-AWS Windows Server lease. EC2Launch user data installs OpenSSH Server, Git for
-Windows, TightVNC Server, a per-lease local administrator named `crabbox`, and a
-loopback VNC password retrievable through `crabbox vnc --id <lease>`.
+AWS Windows Server lease. EC2Launch user data enables the initial OpenSSH
+connection on port `22`. Crabbox then runs its Windows bootstrap over that
+connection, installing Git for Windows and TightVNC, configuring the final SSH
+ports and a per-lease local administrator named `crabbox`, and preparing a
+loopback VNC password retrievable through `crabbox vnc --id <lease>`. Crabbox's
+OpenSSH, Git, and TightVNC downloads are SHA-256 verified before use. An explicitly
+selected workload port does not remove an advertised initial bootstrap route;
+see [Windows bootstrap](../features/vnc-windows.md).
 
 `--provider aws --target windows --windows-mode wsl2` still creates a Windows
 Server host, then enables WSL, VirtualMachinePlatform, and HypervisorPlatform,
 reboots as needed, updates the WSL kernel, imports an Ubuntu rootfs, and
-prepares the Linux-side `crabbox-ready` toolchain. The launch enables nested
+prepares the Linux-side `crabbox-ready` toolchain. The rootfs uses a versioned
+URL and pinned SHA-256 verified before import. The launch enables nested
 virtualization and uses C8i, M8i, or R8i instance families. Commands and sync
 then use the POSIX WSL contract.
 
@@ -162,7 +372,8 @@ then use the POSIX WSL contract.
 
 `--provider azure --target windows` creates a native Windows Server lease, uses
 the VM Agent Custom Script Extension to install OpenSSH Server and Git for
-Windows, and configures the `crabbox` user for SSH/sync/run. Add `--desktop` to
+Windows, verifies both downloads by pinned SHA-256, and configures the `crabbox`
+user for SSH/sync/run. Add `--desktop` to
 run the shared Windows desktop bootstrap over SSH, install TightVNC, configure
 auto-logon, and expose VNC through the normal SSH tunnel. With
 `--windows-mode wsl2`, Crabbox enables WSL2 over SSH and uses the POSIX WSL
@@ -173,9 +384,11 @@ sync/run/actions contract. Azure Windows does not provision browser/code.
 Azure leases use managed `StandardSSD_LRS` OS disks by default so native
 disk-snapshot checkpoints can be created and forked. Use
 `--azure-os-disk ephemeral` only for stateless leases that don't need native
-Azure checkpoint/fork support. Use `--azure-os-disk ephemeral-preview` for
-Azure's public-preview full-caching ephemeral OS disk mode; `--azure-os-disk
-auto` resolves to managed.
+Azure checkpoint/fork support. This mode enables GA full caching and requires
+at least eight vCPUs plus sufficient local storage on a supported VM family.
+See [Azure disk requirements](../features/azure.md#os-disk-mode).
+`ephemeral-preview` is removed; use `ephemeral`. `--azure-os-disk auto` resolves
+to managed.
 
 `--azure-backend dynamic-sessions` keeps `--provider azure` as the family
 selector while routing to the `azure-dynamic-sessions` delegated backend.
@@ -196,15 +409,28 @@ loader readiness or `crabbox run --script <file>` to load code. The provider
 does not start a Linux machine and does not support Actions runner registration,
 SSH, desktop, browser, code-server, ports, `--class`, or `--type`.
 
+### cloudflare-sandbox
+
+`--provider cloudflare-sandbox` creates a Cloudflare-managed Linux sandbox
+through the configured Sandbox bridge and keeps it until explicit `stop`.
+Warmed sandboxes use `cfsbx_...` local claims and can be reused by Crabbox slug
+or lease ID. The provider is delegated-run only: it supports archive sync and
+command execution through the bridge, but not SSH, Tailscale, browser, desktop,
+code-server, URL sessions, storage mounts, checkpoints, or Actions runner
+hydration.
+
 ### aws — macOS
 
 `--provider aws --target macos --desktop` launches an EC2 Mac instance on an
 already allocated Dedicated Host. Crabbox can discover an available host in the
 selected region, or pin one with `CRABBOX_HOST_ID` / `hostId`
 (`CRABBOX_AWS_MAC_HOST_ID` and `aws.macHostId` remain AWS compatibility
-aliases). Use `--market on-demand`, and expect EC2 Mac host lifecycle rules to
-dominate cleanup and cost. Warmup never allocates a Dedicated Host implicitly;
-trusted operators manage host lifecycle with
+aliases). Org-member broker requests can pin a host only when the coordinator
+has an exact allocation record for that host, the current org, and the requested
+region. Historical leases do not grant pin access; other explicit host pins
+require admin authentication. Use `--market on-demand`, and
+expect EC2 Mac host lifecycle rules to dominate cleanup and cost. Warmup never
+allocates a Dedicated Host implicitly; trusted operators manage host lifecycle with
 `crabbox admin hosts offerings|quota|list|allocate|release --provider aws --target macos`.
 The default SSH user is `ec2-user`; the VNC password from `crabbox vnc` is the
 per-lease macOS account password set by bootstrap.
@@ -216,32 +442,49 @@ self-hosted GitHub Actions runner for the current repository. Most projects
 should instead prefer [`crabbox actions hydrate --id <lease>`](actions.md) after
 warmup, because it also dispatches the workflow and waits for the ready marker.
 
+A new warmup does not adopt an existing lease by slug or pinned host. An occupied
+host returns a conflict identifying its lease; inspect or explicitly stop that
+lease before requesting a new one. `--lease-id` replays only the same fixed ID
+and create intent. If a coordinator returns another ID, the CLI stops before
+bootstrap, key migration, or failure cleanup.
+
 ## Flags
 
 ```text
---provider <name>                  provider (see crabbox providers); default hetzner
+--provider <name>                  provider (see crabbox providers); defaults to configured selection
 --profile <name>                   configuration profile
 --class <name>                     machine class; default beast
---arch amd64|arm64                 CPU architecture; arm64 supports Linux on AWS/Azure and native Windows on Azure
---os ubuntu:26.04|ubuntu:24.04     portable Linux OS image selector
+--arch amd64|arm64                 CPU architecture; arm64 supports Linux on AWS/Azure/Apple Container and native Windows on Azure
+--os <selector>                   Ubuntu or AWS Windows Server OS image selector
 --type <provider-type>             provider server/instance type
 --market spot|on-demand            capacity market (AWS)
+--min-vcpus <count>                minimum vCPUs for new AWS Linux leases; 0 disables
+--min-memory-mib <MiB>             minimum memory for new AWS Linux leases; 0 disables
 --slug <slug>                      request a friendly slug for a new lease
+--lease-id cbx_<12 lowercase hex> fixed lease ID for idempotent automation
 --pond <name>                      tag this lease into a pond
 --expose <port>                    declare a TCP port reachable over the SSH-mesh plane; repeatable
 --cache-volume [name=]key:path     require a provider-backed cache volume; repeatable
---ttl <duration>                   maximum lease lifetime; default 90m
+--ttl <duration>                   maximum lease lifetime; default 30m
 --idle-timeout <duration>          release after idle; default 30m
 --desktop                          provision/require a visible desktop + VNC
 --desktop-env xfce|wayland|gnome   Linux desktop environment
 --browser                          provision/require a browser binary
 --code                             provision/require code-server
+--image-min-os <version>           require a minimum promoted-image OS version
+--image-sdk <name=version>         require a minimum SDK version; repeatable
+--image-runtime <name=version>     require a minimum runtime version; repeatable
+--image-require-browser            require browser support in the promoted image
+--image-require-webview2           require WebView2 support in the promoted image
+--image-require-desktop            require desktop support in the promoted image
 --target linux|macos|windows       target OS
 --windows-mode normal|wsl2         Windows mode
 --static-host <host>               static SSH host (provider=ssh)
 --static-user <user>               static SSH user
 --static-port <port>               static SSH port
 --static-work-root <path>          static target work root
+--static-start-command <json-argv>  local argv run before the SSH readiness wait
+--static-stop-command <json-argv>   local argv run after the last local lease on the host
 --network auto|tailscale|public    network mode for the printed SSH endpoint
 --tailscale                        join new managed Linux leases to the tailnet
 --tailscale-tags <a,b,c>           Tailscale tags for new managed leases
@@ -249,12 +492,12 @@ warmup, because it also dispatches the workflow and waits for the ready marker.
 --tailscale-auth-key-env <env>     env var holding a direct-provider Tailscale auth key
 --tailscale-exit-node <name|100.x> Tailscale exit node
 --tailscale-exit-node-allow-lan-access
---keep                             keep the box after warmup; default true
+--keep                             retain across runs; recorded expiry still applies; default warmup.keep (true)
 --actions-runner                   register the box as an ephemeral GitHub Actions runner
 --reclaim                          overwrite an existing local claim for this lease
 --timing-json                      print a final JSON timing record on stderr
 --azure-backend vm|dynamic-sessions
---azure-os-disk managed|ephemeral|ephemeral-preview|auto
+--azure-os-disk managed|ephemeral|auto
 ```
 
 Provider-specific flags (for example `--azure-backend`, `--e2b-template`,
@@ -262,7 +505,28 @@ Provider-specific flags (for example `--azure-backend`, `--e2b-template`,
 `crabbox warmup --provider <name> --help` to see the set for a given provider,
 and `crabbox providers` to list all providers and their capabilities.
 
+Image requirement flags currently select AWS promoted images. Crabbox verifies
+the full requirement set before reserving a lease or calling AWS. Explicit AMI,
+snapshot, and stock-image overrides cannot be verified against the promotion
+catalog and fail closed when combined with image requirements.
+The CLI sends capability-aware creates to a dedicated coordinator route, so an
+older coordinator returns not found instead of silently ignoring requirements.
+Image requirements cannot be combined with `run --pool` because current pool
+entries do not record or prove image capabilities.
+
 ## SSH keys
+
+SSH readiness is checked immediately, then retried after 250 ms, 500 ms, 1 s,
+2 s, 4 s, and at most 5 s between later attempts. Each attempt must still pass
+SSH host trust, authentication, and the provider's readiness command. The delay
+is in addition to connection/probe time; cancellation and the overall readiness
+deadline also interrupt pending probes and retry waits.
+
+Once a direct Linux target authenticates, an unready guest is checked inside a
+single SSH session every 250 ms for up to 30 seconds. The session uses the same
+`crabbox-ready` or custom readiness command, reports progress every five seconds,
+and returns to ordinary probing on failure or timeout. Windows, WSL2, macOS,
+and provider proxy routes retain their existing probes.
 
 New leases use per-lease SSH keys under the user config directory (RSA for
 AWS/Azure Windows, ed25519 otherwise):
@@ -273,3 +537,18 @@ AWS/Azure Windows, ed25519 otherwise):
 
 On macOS and Linux this is typically `~/Library/Application Support/crabbox/...`
 or `~/.config/crabbox/...` respectively.
+
+Static power hooks require a trusted `static.power.dedicated: true` contract.
+Use a distinct `static.id` for concurrent acquisitions; same-ID acquisition and
+prepared reuse are refused while custody remains. See [Power hooks](../providers/ssh.md#power-hooks).
+
+Optional resource minimums and supported creation/reuse combinations are documented
+in [capacity fallback](../features/capacity-fallback.md#optional-aws-resource-minimums).
+
+Ordinary lease lifetime defaults to 30m with a 4h maximum. The coordinator may
+clamp requested TTL/idle values and prints a policy notice through the CLI.
+Use [extend](extend.md) for an explicit extension. `run` requests auto-extension
+only while executing the user command, when fewer than 10 minutes remain, adding
+30 minutes up to the effective maximum. Policy or a creation-fixed provider
+deadline can disable this; setup and sync-only phases do not auto-extend.
+See [lifetime policy](../features/lifecycle-cleanup.md#ordinary-lifetime-policy).

@@ -1,10 +1,185 @@
 package all
 
 import (
+	"flag"
+	"io"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
+
+func manualBatchBFlagMask(cfg core.Config, owner string) uint64 {
+	ledger := reflect.ValueOf(cfg).FieldByName("inputProvenance")
+	facts := ledger.MapIndex(reflect.ValueOf(owner).Convert(ledger.Type().Key()))
+	if !facts.IsValid() {
+		return 0
+	}
+	return facts.FieldByName("values").Uint() | facts.FieldByName("intents").Uint()
+}
+
+func TestManualBatchBProviderFlagInputFacts(t *testing.T) {
+	for _, owner := range []string{"freestyle", "github-codespaces", "hostinger", "hyperv", "incus", "islo", "mxc", "nebius", "nomad", "nvidia-brev"} {
+		provider, err := core.ProviderFor(owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defaults := core.BaseConfig()
+		defaults.Provider = ""
+		catalog := flag.NewFlagSet("catalog", flag.ContinueOnError)
+		provider.RegisterFlags(catalog, defaults)
+		catalog.VisitAll(func(entry *flag.Flag) {
+			t.Run(owner+"/"+entry.Name, func(t *testing.T) {
+				cfg := defaults
+				fs := flag.NewFlagSet("test", flag.ContinueOnError)
+				fs.SetOutput(io.Discard)
+				values := provider.RegisterFlags(fs, cfg)
+				_ = provider.ApplyFlags(&cfg, fs, values)
+				if manualBatchBFlagMask(cfg, owner) != 0 {
+					t.Fatal("unvisited flags acquired an input fact")
+				}
+				raw := entry.DefValue
+				if getter, ok := entry.Value.(flag.Getter); ok {
+					switch getter.Get().(type) {
+					case bool:
+						raw = "false"
+					case int:
+						raw = "1"
+					case time.Duration:
+						raw = "5m"
+					}
+				}
+				if strings.Contains(entry.Name, "timeout") && !strings.HasSuffix(entry.Name, "-secs") {
+					raw = "5m"
+				}
+				if err := fs.Set(entry.Name, raw); err != nil {
+					t.Fatal("ordinary flag fixture did not parse")
+				}
+				// A later provider validation error does not erase an accepted value.
+				_ = provider.ApplyFlags(&cfg, fs, values)
+				if manualBatchBFlagMask(cfg, owner) != 1<<3 {
+					t.Fatal("accepted flag did not record exactly its flag source")
+				}
+			})
+		})
+	}
+}
+
+func TestManualBatchBFlagPartialErrors(t *testing.T) {
+	for _, tc := range []struct {
+		owner    string
+		args     []string
+		wantFact bool
+	}{
+		{"incus", []string{"--incus-start-timeout="}, false},
+		{"incus", []string{"--incus-instance-type=invalid"}, false},
+		{"incus", []string{"--incus-project=sample", "--incus-instance-type=invalid"}, true},
+		{"nomad", []string{"--nomad-alloc-ready-timeout=invalid"}, false},
+		{"nomad", []string{"--nomad-region=sample", "--nomad-alloc-ready-timeout=invalid"}, true},
+	} {
+		provider, err := core.ProviderFor(tc.owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := core.BaseConfig()
+		cfg.Provider = ""
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		values := provider.RegisterFlags(fs, cfg)
+		if err := fs.Parse(tc.args); err != nil {
+			t.Fatal("partial-error fixture did not parse")
+		}
+		_ = provider.ApplyFlags(&cfg, fs, values)
+		if got := manualBatchBFlagMask(cfg, tc.owner) != 0; got != tc.wantFact {
+			t.Fatalf("partial flag input fact=%t, want=%t for %s", got, tc.wantFact, tc.owner)
+		}
+	}
+}
+
+func TestManualBatchBCodespacesGenericTypeInput(t *testing.T) {
+	provider, err := core.ProviderFor("github-codespaces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := core.BaseConfig()
+	cfg.Provider, cfg.TargetOS = "github-codespaces", core.TargetLinux
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.String("type", "", "shared machine type")
+	if err := fs.Set("type", " sample-machine "); err != nil {
+		t.Fatal(err)
+	}
+	// The shared type is applied before the provider-values type assertion.
+	if err := provider.ApplyFlags(&cfg, fs, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHubCodespaces.Machine != "sample-machine" || manualBatchBFlagMask(cfg, "github-codespaces") != 1<<3 {
+		t.Fatal("accepted shared type mapping lost its provider input fact")
+	}
+}
+
+func TestProviderActionsRunnerRestrictions(t *testing.T) {
+	restricted := map[string]bool{"local-container": true, "apple-container": true, "multipass": true, "serve": true}
+	for _, name := range core.RegisteredProviderNames() {
+		provider, err := core.ProviderFor(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := provider.Spec().ActionsRunnerUnsupported; got != restricted[name] {
+			t.Fatalf("provider=%s ActionsRunnerUnsupported=%t, want %t", name, got, restricted[name])
+		}
+	}
+}
+
+func TestProviderAuthenticationDeclarations(t *testing.T) {
+	methods := map[core.ProviderAuthenticationMethod]bool{
+		"api_key": true, "api_token": true, "session_token": true,
+		"api_credentials": true, "username_password": true, "cli": true,
+		"sdk_credentials": true, "native_config": true, "ssh": true,
+		"local_context": true, "external_contract": true, "shared_secret": true,
+		"identity_token": true, "coordinator": true, "none": true,
+	}
+	names := core.RegisteredProviderNames()
+	if len(names) == 0 {
+		t.Fatal("no providers registered")
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			provider, err := core.ProviderFor(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authentication := provider.Spec().Authentication
+			if len(authentication) == 0 {
+				t.Fatal("missing static authentication declaration")
+			}
+			routes := map[string]bool{}
+			for _, route := range authentication {
+				if route.Route == "" || strings.TrimSpace(route.Route) != route.Route || routes[route.Route] {
+					t.Fatalf("empty, padded or duplicate route %q", route.Route)
+				}
+				routes[route.Route] = true
+				if len(route.Methods) == 0 || strings.TrimSpace(route.Description) == "" {
+					t.Fatalf("route %q lacks methods or explanation", route.Route)
+				}
+				seen := map[core.ProviderAuthenticationMethod]bool{}
+				for _, method := range route.Methods {
+					if !methods[method] || seen[method] {
+						t.Fatalf("route %q has unsupported or duplicate method %q", route.Route, method)
+					}
+					seen[method] = true
+				}
+			}
+			original := authentication[0].Methods[0]
+			authentication[0].Methods[0] = "test-only-mutation"
+			if provider.Spec().Authentication[0].Methods[0] != original {
+				t.Fatal("Spec authentication shares mutable method storage")
+			}
+		})
+	}
+}
 
 func TestAppleContainerRegistersWithoutAliasCollision(t *testing.T) {
 	for _, alias := range []string{"apple-container", "apple", "applecontainer"} {
@@ -12,8 +187,8 @@ func TestAppleContainerRegistersWithoutAliasCollision(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", alias, err)
 		}
-		if provider.Name() != "apple-container" {
-			t.Fatalf("ProviderFor(%q).Name=%q want apple-container", alias, provider.Name())
+		if provider.Spec().Name != "apple-container" {
+			t.Fatalf("ProviderFor(%q).Name=%q want apple-container", alias, provider.Spec().Name)
 		}
 	}
 	// The bare "container" alias must keep pointing at local-container.
@@ -21,8 +196,8 @@ func TestAppleContainerRegistersWithoutAliasCollision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProviderFor(container): %v", err)
 	}
-	if got.Name() != "local-container" {
-		t.Fatalf("'container' alias now resolves to %q; apple-container must not steal it", got.Name())
+	if got.Spec().Name != "local-container" {
+		t.Fatalf("'container' alias now resolves to %q; apple-container must not steal it", got.Spec().Name)
 	}
 }
 
@@ -31,16 +206,16 @@ func TestDockerSandboxRegistersWithoutAliasCollision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProviderFor(docker-sandbox): %v", err)
 	}
-	if provider.Name() != "docker-sandbox" {
-		t.Fatalf("ProviderFor(docker-sandbox).Name=%q", provider.Name())
+	if provider.Spec().Name != "docker-sandbox" {
+		t.Fatalf("ProviderFor(docker-sandbox).Name=%q", provider.Spec().Name)
 	}
 	for _, alias := range []string{"docker", "container", "local-docker"} {
 		got, err := core.ProviderFor(alias)
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", alias, err)
 		}
-		if got.Name() != "local-container" {
-			t.Fatalf("%q alias now resolves to %q; docker-sandbox must not steal local-container aliases", alias, got.Name())
+		if got.Spec().Name != "local-container" {
+			t.Fatalf("%q alias now resolves to %q; docker-sandbox must not steal local-container aliases", alias, got.Spec().Name)
 		}
 	}
 }
@@ -50,12 +225,37 @@ func TestOpenSandboxRegistersWithoutAliasCollision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProviderFor(opensandbox): %v", err)
 	}
-	if provider.Name() != "opensandbox" {
-		t.Fatalf("ProviderFor(opensandbox).Name=%q", provider.Name())
+	if provider.Spec().Name != "opensandbox" {
+		t.Fatalf("ProviderFor(opensandbox).Name=%q", provider.Spec().Name)
 	}
 	for _, alias := range []string{"osb", "open-sandbox"} {
-		if got, err := core.ProviderFor(alias); err == nil && got.Name() == "opensandbox" {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "opensandbox" {
 			t.Fatalf("%q alias unexpectedly resolves to opensandbox; v1 should reserve aliases", alias)
+		}
+	}
+}
+
+func TestCuaRegistersCanonicalWithoutAliases(t *testing.T) {
+	provider, err := core.ProviderFor("cua")
+	if err != nil {
+		t.Fatalf("ProviderFor(cua): %v", err)
+	}
+	if provider.Spec().Name != "cua" {
+		t.Fatalf("ProviderFor(cua).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Kind != core.ProviderKindServiceControl || spec.Family != "cua" || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("cua spec=%#v", spec)
+	}
+	if len(spec.Targets) != 3 || spec.Targets[0].OS != core.TargetLinux || spec.Targets[1].OS != core.TargetMacOS || spec.Targets[2].OS != core.TargetWindows || spec.Targets[2].WindowsMode != core.WindowsModeNormal {
+		t.Fatalf("cua targets=%#v", spec.Targets)
+	}
+	if spec.Features.Has(core.FeatureArchiveSync) || spec.Features.Has(core.FeatureCleanup) {
+		t.Fatalf("cua features=%v", spec.Features)
+	}
+	for _, alias := range []string{"cua-cloud", "cua-sandbox", "trycua"} {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "cua" {
+			t.Fatalf("%q alias unexpectedly resolves to cua", alias)
 		}
 	}
 }
@@ -66,12 +266,145 @@ func TestNvidiaBrevRegistersCanonicalAndAliases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", name, err)
 		}
-		if provider.Name() != "nvidia-brev" {
-			t.Fatalf("ProviderFor(%q).Name=%q want nvidia-brev", name, provider.Name())
+		if provider.Spec().Name != "nvidia-brev" {
+			t.Fatalf("ProviderFor(%q).Name=%q want nvidia-brev", name, provider.Spec().Name)
 		}
-		if _, ok := provider.(core.DoctorProvider); !ok {
-			t.Fatalf("ProviderFor(%q) does not expose doctor", name)
+	}
+}
+
+func TestVastRegistersCanonicalAndAliases(t *testing.T) {
+	for _, name := range []string{"vast", "vast-ai", "vastai"} {
+		provider, err := core.ProviderFor(name)
+		if err != nil {
+			t.Fatalf("ProviderFor(%q): %v", name, err)
 		}
+		if provider.Spec().Name != "vast" {
+			t.Fatalf("ProviderFor(%q).Name=%q want vast", name, provider.Spec().Name)
+		}
+	}
+	provider, err := core.ProviderFor("vast")
+	if err != nil {
+		t.Fatalf("ProviderFor(vast): %v", err)
+	}
+	spec := provider.Spec()
+	if spec.Family != "vast" || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("vast spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("vast targets=%#v", spec.Targets)
+	}
+	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("vast features=%v missing %s", spec.Features, feature)
+		}
+	}
+}
+
+func TestLambdaRegistersAsBuiltInProvider(t *testing.T) {
+	provider, err := core.ProviderFor("lambda")
+	if err != nil {
+		t.Fatalf("ProviderFor(lambda): %v", err)
+	}
+	if provider.Spec().Name != "lambda" {
+		t.Fatalf("ProviderFor(lambda).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever || len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("lambda spec=%#v", spec)
+	}
+	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureTailscale} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("lambda features=%v missing %s", spec.Features, feature)
+		}
+	}
+}
+
+func TestNebiusRegistersWithoutAliases(t *testing.T) {
+	provider, err := core.ProviderFor("nebius")
+	if err != nil {
+		t.Fatalf("ProviderFor(nebius): %v", err)
+	}
+	if provider.Spec().Name != "nebius" {
+		t.Fatalf("ProviderFor(nebius).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Family != "nebius" || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("nebius spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("nebius targets=%#v", spec.Targets)
+	}
+	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("nebius features=%v missing %s", spec.Features, feature)
+		}
+	}
+	for _, alias := range []string{"nebius-ai", "nebius-compute", "nb"} {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "nebius" {
+			t.Fatalf("%q alias unexpectedly resolves to nebius", alias)
+		}
+	}
+}
+
+func TestNomadRegistersWithoutAliases(t *testing.T) {
+	provider, err := core.ProviderFor("nomad")
+	if err != nil {
+		t.Fatalf("ProviderFor(nomad): %v", err)
+	}
+	if provider.Spec().Name != "nomad" {
+		t.Fatalf("ProviderFor(nomad).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Family != "nomad" || spec.Kind != core.ProviderKindDelegatedRun || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("nomad spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("nomad targets=%#v", spec.Targets)
+	}
+	if !spec.Features.Has(core.FeatureCleanup) {
+		t.Fatalf("nomad features=%v, want cleanup after Wave 2 lifecycle", spec.Features)
+	}
+	if !spec.Features.Has(core.FeatureArchiveSync) {
+		t.Fatalf("nomad features=%v, want archive-sync after Wave 3 run sync", spec.Features)
+	}
+	for _, alias := range []string{"nomad-provider", "nomad-run", "hashicorp-nomad"} {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "nomad" {
+			t.Fatalf("%q alias unexpectedly resolves to nomad", alias)
+		}
+	}
+}
+
+func TestSealosDevboxRegistersWithRequestedAliases(t *testing.T) {
+	provider, err := core.ProviderFor("sealos-devbox")
+	if err != nil {
+		t.Fatalf("ProviderFor(sealos-devbox): %v", err)
+	}
+	if provider.Spec().Name != "sealos-devbox" {
+		t.Fatalf("ProviderFor(sealos-devbox).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Family != "sealos" || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("sealos-devbox spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("sealos-devbox targets=%#v", spec.Targets)
+	}
+	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("sealos-devbox features=%v missing %s", spec.Features, feature)
+		}
+	}
+	for _, alias := range []string{"sealos", "sealos-dev"} {
+		got, err := core.ProviderFor(alias)
+		if err != nil {
+			t.Fatalf("ProviderFor(%q): %v", alias, err)
+		}
+		if got.Spec().Name != "sealos-devbox" {
+			t.Fatalf("ProviderFor(%q).Name=%q want sealos-devbox", alias, got.Spec().Name)
+		}
+	}
+	if got, err := core.ProviderFor("devbox"); err == nil && got.Spec().Name == "sealos-devbox" {
+		t.Fatal(`"devbox" alias unexpectedly resolves to sealos-devbox`)
 	}
 }
 
@@ -80,8 +413,8 @@ func TestAgentSandboxRegistersWithoutAliases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProviderFor(agent-sandbox): %v", err)
 	}
-	if provider.Name() != "agent-sandbox" {
-		t.Fatalf("ProviderFor(agent-sandbox).Name=%q", provider.Name())
+	if provider.Spec().Name != "agent-sandbox" {
+		t.Fatalf("ProviderFor(agent-sandbox).Name=%q", provider.Spec().Name)
 	}
 	spec := provider.Spec()
 	if spec.Kind != core.ProviderKindDelegatedRun || spec.Coordinator != core.CoordinatorNever || len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
@@ -91,7 +424,7 @@ func TestAgentSandboxRegistersWithoutAliases(t *testing.T) {
 		t.Fatalf("agent-sandbox features=%v", spec.Features)
 	}
 	for _, alias := range []string{"agentsandbox", "asb", "sandbox"} {
-		if got, err := core.ProviderFor(alias); err == nil && got.Name() == "agent-sandbox" {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "agent-sandbox" {
 			t.Fatalf("%q alias unexpectedly resolves to agent-sandbox", alias)
 		}
 	}
@@ -102,8 +435,8 @@ func TestSuperserveRegistersWithoutAliases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProviderFor(superserve): %v", err)
 	}
-	if provider.Name() != "superserve" {
-		t.Fatalf("ProviderFor(superserve).Name=%q", provider.Name())
+	if provider.Spec().Name != "superserve" {
+		t.Fatalf("ProviderFor(superserve).Name=%q", provider.Spec().Name)
 	}
 	spec := provider.Spec()
 	if spec.Kind != core.ProviderKindDelegatedRun || spec.Coordinator != core.CoordinatorNever || len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
@@ -113,8 +446,48 @@ func TestSuperserveRegistersWithoutAliases(t *testing.T) {
 		t.Fatalf("superserve features=%v", spec.Features)
 	}
 	for _, alias := range []string{"ss", "sup", "super-serve"} {
-		if got, err := core.ProviderFor(alias); err == nil && got.Name() == "superserve" {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "superserve" {
 			t.Fatalf("%q alias unexpectedly resolves to superserve", alias)
+		}
+	}
+}
+
+func TestScalewayRegistersWithoutAliases(t *testing.T) {
+	provider, err := core.ProviderFor("scaleway")
+	if err != nil {
+		t.Fatalf("ProviderFor(scaleway): %v", err)
+	}
+	if provider.Spec().Name != "scaleway" {
+		t.Fatalf("ProviderFor(scaleway).Name=%q", provider.Spec().Name)
+	}
+	if provider.Spec().Aliases != nil {
+		t.Fatalf("scaleway aliases=%v, want none", provider.Spec().Aliases)
+	}
+	spec := provider.Spec()
+	if spec.Kind != core.ProviderKindSSHLease || spec.Family != "scaleway" || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("scaleway spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("scaleway targets=%#v", spec.Targets)
+	}
+	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureTailscale} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("scaleway features=%v missing %s", spec.Features, feature)
+		}
+	}
+}
+
+func TestCrownestRegistersWithoutAliases(t *testing.T) {
+	provider, err := core.ProviderFor("crownest")
+	if err != nil {
+		t.Fatalf("ProviderFor(crownest): %v", err)
+	}
+	if provider.Spec().Name != "crownest" {
+		t.Fatalf("ProviderFor(crownest).Name=%q", provider.Spec().Name)
+	}
+	for _, alias := range []string{"cn", "crow", "nest"} {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "crownest" {
+			t.Fatalf("%q alias unexpectedly resolves to crownest", alias)
 		}
 	}
 }
@@ -125,16 +498,16 @@ func TestNamespaceInstanceRegistersWithoutAliasCollision(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", name, err)
 		}
-		if provider.Name() != "namespace-instance" {
-			t.Fatalf("ProviderFor(%q).Name=%q", name, provider.Name())
+		if provider.Spec().Name != "namespace-instance" {
+			t.Fatalf("ProviderFor(%q).Name=%q", name, provider.Spec().Name)
 		}
 	}
 	provider, err := core.ProviderFor("namespace")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if provider.Name() != "namespace-devbox" {
-		t.Fatalf("namespace alias resolves to %q; want namespace-devbox", provider.Name())
+	if provider.Spec().Name != "namespace-devbox" {
+		t.Fatalf("namespace alias resolves to %q; want namespace-devbox", provider.Spec().Name)
 	}
 }
 
@@ -143,8 +516,8 @@ func TestVercelSandboxRegistersWithoutAliases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProviderFor(vercel-sandbox): %v", err)
 	}
-	if provider.Name() != "vercel-sandbox" {
-		t.Fatalf("ProviderFor(vercel-sandbox).Name=%q", provider.Name())
+	if provider.Spec().Name != "vercel-sandbox" {
+		t.Fatalf("ProviderFor(vercel-sandbox).Name=%q", provider.Spec().Name)
 	}
 	spec := provider.Spec()
 	if spec.Family != "vercel" || spec.Kind != core.ProviderKindDelegatedRun || spec.Coordinator != core.CoordinatorNever {
@@ -157,9 +530,31 @@ func TestVercelSandboxRegistersWithoutAliases(t *testing.T) {
 		t.Fatalf("vercel-sandbox features=%v", spec.Features)
 	}
 	for _, alias := range []string{"vercel", "vsb", "sandbox"} {
-		if got, err := core.ProviderFor(alias); err == nil && got.Name() == "vercel-sandbox" {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "vercel-sandbox" {
 			t.Fatalf("%q alias unexpectedly resolves to vercel-sandbox", alias)
 		}
+	}
+}
+
+func TestBlaxelRegistersCanonicalWithoutAliases(t *testing.T) {
+	provider, err := core.ProviderFor("blaxel")
+	if err != nil {
+		t.Fatalf("ProviderFor(blaxel): %v", err)
+	}
+	if provider.Spec().Name != "blaxel" {
+		t.Fatalf("ProviderFor(blaxel).Name=%q", provider.Spec().Name)
+	}
+	for _, alias := range []string{"blx", "sandbox"} {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "blaxel" {
+			t.Fatalf("%q alias unexpectedly resolves to blaxel", alias)
+		}
+	}
+	spec := provider.Spec()
+	if spec.Family != "blaxel" || spec.Kind != core.ProviderKindDelegatedRun || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("blaxel spec=%#v", spec)
+	}
+	if !spec.Features.Has(core.FeatureArchiveSync) || !spec.Features.Has(core.FeatureCleanup) || !spec.Features.Has(core.FeatureRunSession) {
+		t.Fatalf("blaxel features=%#v", spec.Features)
 	}
 }
 
@@ -169,8 +564,8 @@ func TestAnthropicSandboxRuntimeRegistersCanonicalAndAlias(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", name, err)
 		}
-		if provider.Name() != "anthropic-sandbox-runtime" {
-			t.Fatalf("ProviderFor(%q).Name=%q", name, provider.Name())
+		if provider.Spec().Name != "anthropic-sandbox-runtime" {
+			t.Fatalf("ProviderFor(%q).Name=%q", name, provider.Spec().Name)
 		}
 	}
 	spec := mustProvider(t, "anthropic-sandbox-runtime").Spec()
@@ -185,15 +580,15 @@ func TestCloudflareDynamicWorkersRegistersCanonicalAndAliases(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", name, err)
 		}
-		if provider.Name() != "cloudflare-dynamic-workers" {
-			t.Fatalf("ProviderFor(%q).Name=%q", name, provider.Name())
+		if provider.Spec().Name != "cloudflare-dynamic-workers" {
+			t.Fatalf("ProviderFor(%q).Name=%q", name, provider.Spec().Name)
 		}
 	}
-	if provider := mustProvider(t, "cloudflare"); provider.Name() != "cloudflare" {
-		t.Fatalf("cloudflare resolved to %q; dynamic workers must not replace Cloudflare Containers", provider.Name())
+	if provider := mustProvider(t, "cloudflare"); provider.Spec().Name != "cloudflare" {
+		t.Fatalf("cloudflare resolved to %q; dynamic workers must not replace Cloudflare Containers", provider.Spec().Name)
 	}
-	if provider := mustProvider(t, "cf"); provider.Name() != "cloudflare" {
-		t.Fatalf("cf alias resolved to %q; dynamic workers must not steal it", provider.Name())
+	if provider := mustProvider(t, "cf"); provider.Spec().Name != "cloudflare" {
+		t.Fatalf("cf alias resolved to %q; dynamic workers must not steal it", provider.Spec().Name)
 	}
 	spec := mustProvider(t, "cloudflare-dynamic-workers").Spec()
 	if spec.Family != "cloudflare" || spec.Kind != core.ProviderKindDelegatedRun || spec.Coordinator != core.CoordinatorNever {
@@ -209,17 +604,51 @@ func TestCloudflareDynamicWorkersRegistersCanonicalAndAliases(t *testing.T) {
 	}
 }
 
+func TestCloudflareSandboxRegistersWithoutAliasCollision(t *testing.T) {
+	provider, err := core.ProviderFor("cloudflare-sandbox")
+	if err != nil {
+		t.Fatalf("ProviderFor(cloudflare-sandbox): %v", err)
+	}
+	if provider.Spec().Name != "cloudflare-sandbox" {
+		t.Fatalf("ProviderFor(cloudflare-sandbox).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Family != "cloudflare" || spec.Kind != core.ProviderKindDelegatedRun || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("cloudflare-sandbox spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("cloudflare-sandbox targets=%#v", spec.Targets)
+	}
+	for _, feature := range []core.Feature{core.FeatureArchiveSync, core.FeatureCleanup, core.FeatureRunSession} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("cloudflare-sandbox features=%v missing %s", spec.Features, feature)
+		}
+	}
+	for _, alias := range []string{"cloudflare", "cf", "cloudflare-dynamic-workers", "cf-dynamic", "cfdw", "sandbox"} {
+		got, err := core.ProviderFor(alias)
+		if err == nil && got.Spec().Name == "cloudflare-sandbox" {
+			t.Fatalf("%q alias unexpectedly resolves to cloudflare-sandbox", alias)
+		}
+	}
+	if provider := mustProvider(t, "cloudflare"); provider.Spec().Name != "cloudflare" {
+		t.Fatalf("cloudflare resolved to %q; sandbox must not replace Cloudflare Containers", provider.Spec().Name)
+	}
+	if provider := mustProvider(t, "cf"); provider.Spec().Name != "cloudflare" {
+		t.Fatalf("cf alias resolved to %q; sandbox must not steal it", provider.Spec().Name)
+	}
+	if provider := mustProvider(t, "cloudflare-dynamic-workers"); provider.Spec().Name != "cloudflare-dynamic-workers" {
+		t.Fatalf("cloudflare-dynamic-workers resolved to %q; sandbox must not replace Dynamic Workers", provider.Spec().Name)
+	}
+}
+
 func TestCodeSandboxRegistersCanonicalAndAliases(t *testing.T) {
 	for _, name := range []string{"codesandbox", "csb", "code-sandbox"} {
 		provider, err := core.ProviderFor(name)
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", name, err)
 		}
-		if provider.Name() != "codesandbox" {
-			t.Fatalf("ProviderFor(%q).Name=%q want codesandbox", name, provider.Name())
-		}
-		if _, ok := provider.(core.DoctorProvider); !ok {
-			t.Fatalf("ProviderFor(%q) does not expose doctor", name)
+		if provider.Spec().Name != "codesandbox" {
+			t.Fatalf("ProviderFor(%q).Name=%q want codesandbox", name, provider.Spec().Name)
 		}
 	}
 	spec := mustProvider(t, "codesandbox").Spec()
@@ -239,93 +668,928 @@ func TestCodeSandboxRegistersCanonicalAndAliases(t *testing.T) {
 	}
 }
 
+func TestGitHubCodespacesRegistersCanonicalAndAliases(t *testing.T) {
+	for _, name := range []string{"github-codespaces", "codespaces", "gh-codespaces"} {
+		provider, err := core.ProviderFor(name)
+		if err != nil {
+			t.Fatalf("ProviderFor(%q): %v", name, err)
+		}
+		if provider.Spec().Name != "github-codespaces" {
+			t.Fatalf("ProviderFor(%q).Name=%q want github-codespaces", name, provider.Spec().Name)
+		}
+	}
+	spec := mustProvider(t, "github-codespaces").Spec()
+	if spec.Family != "github-codespaces" || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("github-codespaces spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("github-codespaces targets=%#v", spec.Targets)
+	}
+	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("github-codespaces features=%v missing %s", spec.Features, feature)
+		}
+	}
+}
+
 func TestIncusRegistersAsBuiltInProvider(t *testing.T) {
 	provider, err := core.ProviderFor("incus")
 	if err != nil {
 		t.Fatalf("ProviderFor(incus): %v", err)
 	}
-	if provider.Name() != "incus" {
-		t.Fatalf("ProviderFor(incus).Name=%q", provider.Name())
+	if provider.Spec().Name != "incus" {
+		t.Fatalf("ProviderFor(incus).Name=%q", provider.Spec().Name)
 	}
 }
 
-func TestAppleVZRegistersAsBuiltInProvider(t *testing.T) {
-	for _, name := range []string{"apple-vz", "applevz"} {
+func TestVultrRegistersAsBuiltInProvider(t *testing.T) {
+	provider, err := core.ProviderFor("vultr")
+	if err != nil {
+		t.Fatalf("ProviderFor(vultr): %v", err)
+	}
+	if provider.Spec().Name != "vultr" {
+		t.Fatalf("ProviderFor(vultr).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Family != "vultr" || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("vultr spec=%#v", spec)
+	}
+	if !spec.Features.Has(core.FeatureSSH) || !spec.Features.Has(core.FeatureCrabboxSync) || !spec.Features.Has(core.FeatureCleanup) {
+		t.Fatalf("vultr features=%#v", spec.Features)
+	}
+	if spec.Features.Has(core.FeatureTailscale) {
+		t.Fatalf("vultr must not advertise tailscale before lifecycle proof: %#v", spec.Features)
+	}
+}
+
+func TestFirecrackerRegistersWithoutAliases(t *testing.T) {
+	provider, err := core.ProviderFor("firecracker")
+	if err != nil {
+		t.Fatalf("ProviderFor(firecracker): %v", err)
+	}
+	if provider.Spec().Name != "firecracker" {
+		t.Fatalf("ProviderFor(firecracker).Name=%q", provider.Spec().Name)
+	}
+	spec := provider.Spec()
+	if spec.Family != "firecracker" || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
+		t.Fatalf("firecracker spec=%#v", spec)
+	}
+	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
+		t.Fatalf("firecracker targets=%#v", spec.Targets)
+	}
+	for _, feature := range []core.Feature{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup} {
+		if !spec.Features.Has(feature) {
+			t.Fatalf("firecracker features=%v missing %s", spec.Features, feature)
+		}
+	}
+	for _, alias := range []string{"fc", "firecracker-vm"} {
+		if got, err := core.ProviderFor(alias); err == nil && got.Spec().Name == "firecracker" {
+			t.Fatalf("%q alias unexpectedly resolves to firecracker", alias)
+		}
+	}
+}
+
+func TestAppleVMRegistersAsBuiltInProvider(t *testing.T) {
+	for _, name := range []string{"apple-vm", "applevm"} {
 		provider, err := core.ProviderFor(name)
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", name, err)
 		}
-		if provider.Name() != "apple-vz" {
-			t.Fatalf("ProviderFor(%q).Name=%q want apple-vz", name, provider.Name())
+		if provider.Spec().Name != "apple-vm" {
+			t.Fatalf("ProviderFor(%q).Name=%q want apple-vm", name, provider.Spec().Name)
 		}
 	}
 }
 
-func TestAllBuiltInProvidersExposeDoctor(t *testing.T) {
-	providers := []string{
+func TestAllBuiltInProviderNamesCoverRegistry(t *testing.T) {
+	want := core.RegisteredProviderNames()
+	got := append([]string(nil), allBuiltInProviderNames()...)
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("allBuiltInProviderNames()=%v, registered providers=%v", got, want)
+	}
+}
+
+func TestProviderKindFeatureContracts(t *testing.T) {
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if spec.Kind == core.ProviderKindSSHLease && !spec.Features.Has(core.FeatureSSH) {
+			t.Fatalf("%s kind=%s must advertise %s", name, spec.Kind, core.FeatureSSH)
+		}
+		if spec.Features.Has(core.FeatureCrabboxSync) && (spec.Kind != core.ProviderKindSSHLease || !spec.Features.Has(core.FeatureSSH)) {
+			t.Fatalf("%s advertises %s but kind=%s features=%v", name, core.FeatureCrabboxSync, spec.Kind, spec.Features)
+		}
+		for _, feature := range []core.Feature{core.FeatureDesktop, core.FeatureBrowser, core.FeatureCode} {
+			if spec.Features.Has(feature) && (spec.Kind != core.ProviderKindSSHLease || !spec.Features.Has(core.FeatureSSH)) {
+				t.Fatalf("%s advertises %s but kind=%s features=%v", name, feature, spec.Kind, spec.Features)
+			}
+		}
+		// Archive sync is a delegated-run feature, except for SSH-lease
+		// hybrids whose run and sync planes are delegated to provider APIs
+		// (for example daytona's toolbox archive sync).
+		if spec.Features.Has(core.FeatureArchiveSync) &&
+			spec.Kind != core.ProviderKindDelegatedRun &&
+			!(spec.Kind == core.ProviderKindSSHLease && spec.Features.Has(core.FeatureSSH)) {
+			t.Fatalf("%s advertises %s but kind=%s features=%v", name, core.FeatureArchiveSync, spec.Kind, spec.Features)
+		}
+		for _, feature := range []core.Feature{
+			core.FeatureModuleRun,
+			core.FeatureShellScriptRun,
+			core.FeatureRunProof,
+			core.FeatureRunArtifacts,
+			core.FeatureRunDownloads,
+			core.FeatureMCP,
+		} {
+			if spec.Features.Has(feature) && spec.Kind != core.ProviderKindDelegatedRun {
+				t.Fatalf("%s advertises %s but kind=%s", name, feature, spec.Kind)
+			}
+		}
+		if spec.Features.Has(core.FeaturePreparedArtifactWorkspace) && !spec.Features.Has(core.FeatureRunArtifacts) {
+			t.Fatalf("%s advertises a prepared artifact workspace without run artifacts", name)
+		}
+		if spec.Features.Has(core.FeaturePauseResume) && spec.Kind != core.ProviderKindDelegatedRun && spec.Kind != core.ProviderKindSSHLease {
+			t.Fatalf("%s advertises %s but kind=%s", name, core.FeaturePauseResume, spec.Kind)
+		}
+		if err := core.ValidateRunSessionFeatureSpec(spec); err != nil {
+			t.Fatalf("%s has invalid %s contract: %v", name, core.FeatureRunSession, err)
+		}
+	}
+}
+
+func TestArchiveSyncFeatureGatesDelegatedSyncOptions(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		// SSH-lease hybrids that delegate run and sync (archive-sync) go
+		// through the same option gate as delegated-run providers.
+		if spec.Kind != core.ProviderKindDelegatedRun &&
+			!(spec.Kind == core.ProviderKindSSHLease && spec.Features.Has(core.FeatureArchiveSync)) {
+			continue
+		}
+		err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{SyncOnly: true})
+		if spec.Features.Has(core.FeatureArchiveSync) {
+			if err != nil {
+				t.Fatalf("%s advertises %s but rejects --sync-only: %v", name, core.FeatureArchiveSync, err)
+			}
+			if err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{ForceSyncLarge: true}); err != nil {
+				t.Fatalf("%s advertises %s but rejects --force-sync-large: %v", name, core.FeatureArchiveSync, err)
+			}
+			if err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{ChecksumSync: true}); err == nil {
+				t.Fatalf("%s advertises %s but accepts --checksum", name, core.FeatureArchiveSync)
+			}
+			checked++
+			continue
+		}
+		if err == nil {
+			t.Fatalf("%s accepts --sync-only without %s", name, core.FeatureArchiveSync)
+		}
+		if err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{ForceSyncLarge: true}); err == nil {
+			t.Fatalf("%s accepts --force-sync-large without %s", name, core.FeatureArchiveSync)
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureArchiveSync)
+	}
+}
+
+func TestDelegatedScriptFeaturesGateScriptMode(t *testing.T) {
+	checked := 0
+	script := &core.RunScriptSpec{Source: "worker.mjs", Data: []byte("export default {}")}
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if spec.Kind != core.ProviderKindDelegatedRun {
+			continue
+		}
+		err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{
+			ScriptRequested: true,
+			Script:          script,
+		})
+		if spec.Features.Has(core.FeatureModuleRun) {
+			if err != nil {
+				t.Fatalf("%s advertises %s but rejects script mode: %v", name, core.FeatureModuleRun, err)
+			}
+			if err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{Command: []string{"node", "worker.mjs"}}); err == nil {
+				t.Fatalf("%s advertises %s but accepts trailing command argv", name, core.FeatureModuleRun)
+			}
+			if err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{
+				ScriptRequested: true,
+				ShellMode:       true,
+			}); err == nil {
+				t.Fatalf("%s advertises %s but accepts --shell", name, core.FeatureModuleRun)
+			}
+			checked++
+			continue
+		}
+		if spec.Features.Has(core.FeatureShellScriptRun) {
+			if err != nil {
+				t.Fatalf("%s advertises %s but rejects script mode: %v", name, core.FeatureShellScriptRun, err)
+			}
+			if err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{
+				ScriptRequested: true,
+				Script:          &core.RunScriptSpec{Source: "script.sh", Data: []byte("printf '%s' \"$1\"")},
+				Command:         []string{"argument"},
+			}); err != nil {
+				t.Fatalf("%s rejects shell-script arguments: %v", name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("%s accepts script mode without %s or %s", name, core.FeatureModuleRun, core.FeatureShellScriptRun)
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureModuleRun)
+	}
+}
+
+func TestRunProofFeatureGatesEmitProof(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if spec.Kind != core.ProviderKindDelegatedRun {
+			continue
+		}
+		err := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{EmitProof: "/tmp/proof.md"})
+		if spec.Features.Has(core.FeatureRunProof) {
+			if err != nil {
+				t.Fatalf("%s advertises %s but rejects --emit-proof: %v", name, core.FeatureRunProof, err)
+			}
+			checked++
+			continue
+		}
+		if err == nil {
+			t.Fatalf("%s accepts --emit-proof without %s", name, core.FeatureRunProof)
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureRunProof)
+	}
+}
+
+func TestProviderKindRequiresBackendInterface(t *testing.T) {
+	sshLeaseProviders := 0
+	delegatedRunProviders := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s kind=%s; add an offline conformance config for it", name, spec.Kind)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		switch spec.Kind {
+		case core.ProviderKindSSHLease:
+			if _, ok := backend.(core.SSHLeaseBackend); !ok {
+				t.Fatalf("%s kind=%s but backend %T is not SSHLeaseBackend", name, spec.Kind, backend)
+			}
+			sshLeaseProviders++
+		case core.ProviderKindDelegatedRun:
+			if _, ok := backend.(core.DelegatedRunBackend); !ok {
+				t.Fatalf("%s kind=%s but backend %T is not DelegatedRunBackend", name, spec.Kind, backend)
+			}
+			delegatedRunProviders++
+		case core.ProviderKindServiceControl:
+			// Service-control providers expose command-specific interfaces instead of
+			// the two lease/run backend shapes.
+		default:
+			t.Fatalf("%s has unknown provider kind %q", name, spec.Kind)
+		}
+	}
+	if sshLeaseProviders == 0 {
+		t.Fatalf("no providers advertised kind=%s; conformance test is stale", core.ProviderKindSSHLease)
+	}
+	if delegatedRunProviders == 0 {
+		t.Fatalf("no providers advertised kind=%s; conformance test is stale", core.ProviderKindDelegatedRun)
+	}
+}
+
+func TestRunSessionFeatureRequiresCompatibleBackendAndValidHandle(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if !spec.Features.Has(core.FeatureRunSession) {
+			if err := core.ValidateRunSessionForSpec(spec, core.RunResult{Session: &core.RunSessionHandle{
+				Provider:       name,
+				LeaseID:        "cbx_test",
+				CleanupCommand: "crabbox stop --provider " + name + " cbx_test",
+			}}); err == nil {
+				t.Fatalf("%s accepts a run session without %s", name, core.FeatureRunSession)
+			}
+			continue
+		}
+		if err := core.ValidateRunSessionFeatureSpec(spec); err != nil {
+			t.Fatalf("%s advertises invalid %s contract: %v", name, core.FeatureRunSession, err)
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises %s; add an offline conformance config for it", name, core.FeatureRunSession)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		switch spec.Kind {
+		case core.ProviderKindDelegatedRun:
+			if _, ok := backend.(core.DelegatedRunBackend); !ok {
+				t.Fatalf("%s advertises %s but backend %T is not DelegatedRunBackend", name, core.FeatureRunSession, backend)
+			}
+		case core.ProviderKindSSHLease:
+			if _, ok := backend.(core.SSHLeaseBackend); !ok {
+				t.Fatalf("%s advertises %s but backend %T is not SSHLeaseBackend", name, core.FeatureRunSession, backend)
+			}
+		default:
+			t.Fatalf("%s advertises %s but kind=%s", name, core.FeatureRunSession, spec.Kind)
+		}
+		if err := core.ValidateRunSessionForSpec(spec, core.RunResult{Session: &core.RunSessionHandle{
+			Provider:       name,
+			LeaseID:        "cbx_test",
+			CleanupCommand: "crabbox stop --provider " + name + " cbx_test",
+		}}); err != nil {
+			t.Fatalf("%s rejects a valid %s handle: %v", name, core.FeatureRunSession, err)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureRunSession)
+	}
+}
+
+func TestRunSessionFeatureRejectsInvalidSSHProviderFeatureSets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec core.ProviderSpec
+		want string
+	}{
+		{
+			name: "missing ssh",
+			spec: core.ProviderSpec{Name: "invalid-ssh-session", Kind: core.ProviderKindSSHLease, Features: core.FeatureSet{core.FeatureCleanup, core.FeatureRunSession}},
+			want: string(core.FeatureSSH),
+		},
+		{
+			name: "missing cleanup",
+			spec: core.ProviderSpec{Name: "invalid-ssh-session", Kind: core.ProviderKindSSHLease, Features: core.FeatureSet{core.FeatureSSH, core.FeatureRunSession}},
+			want: string(core.FeatureCleanup),
+		},
+		{
+			name: "service control",
+			spec: core.ProviderSpec{Name: "invalid-service-session", Kind: core.ProviderKindServiceControl, Features: core.FeatureSet{core.FeatureRunSession}},
+			want: "unsupported provider kind",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := core.ValidateRunSessionFeatureSpec(tc.spec)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestInteractiveLeaseFeaturesRequireSSHLeaseBackends(t *testing.T) {
+	counts := map[core.Feature]int{
+		core.FeatureDesktop: 0,
+		core.FeatureBrowser: 0,
+		core.FeatureCode:    0,
+	}
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		features := []core.Feature{core.FeatureDesktop, core.FeatureBrowser, core.FeatureCode}
+		if !hasAnyFeature(spec.Features, features...) {
+			continue
+		}
+		if spec.Kind != core.ProviderKindSSHLease || !spec.Features.Has(core.FeatureSSH) {
+			t.Fatalf("%s advertises interactive lease features %v but kind=%s features=%v", name, features, spec.Kind, spec.Features)
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises interactive lease features %v; add an offline conformance config for it", name, spec.Features)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.SSHLeaseBackend); !ok {
+			t.Fatalf("%s advertises interactive lease features %v but backend %T is not SSHLeaseBackend", name, spec.Features, backend)
+		}
+		for _, feature := range features {
+			if spec.Features.Has(feature) {
+				counts[feature]++
+			}
+		}
+	}
+	for _, feature := range []core.Feature{core.FeatureDesktop, core.FeatureBrowser, core.FeatureCode} {
+		if counts[feature] == 0 {
+			t.Fatalf("no providers advertised %s; conformance test is stale", feature)
+		}
+	}
+}
+
+func TestCleanupFeatureRequiresCleanupBackend(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		if !provider.Spec().Features.Has(core.FeatureCleanup) {
+			continue
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises %s; add an offline conformance config for it", name, core.FeatureCleanup)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.CleanupBackend); !ok {
+			t.Fatalf("%s advertises %s but backend %T is not CleanupBackend", name, core.FeatureCleanup, backend)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureCleanup)
+	}
+}
+
+func TestCacheVolumeFeatureGatesRequiredCacheVolumes(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		cfg := core.BaseConfig()
+		cfg.Provider = name
+		cfg.Cache.Volumes = []core.CacheVolumeConfig{{
+			Name:     "pnpm",
+			Key:      "repo-linux-node24-lock",
+			Path:     "/var/cache/crabbox/pnpm",
+			Required: true,
+		}}
+		err := core.ValidateCacheVolumesForProvider(cfg)
+		if provider.Spec().Features.Has(core.FeatureCacheVolume) {
+			if err != nil {
+				t.Fatalf("%s advertises %s but rejects required cache volume: %v", name, core.FeatureCacheVolume, err)
+			}
+			checked++
+			continue
+		}
+		if err == nil {
+			t.Fatalf("%s accepts required cache volume without %s", name, core.FeatureCacheVolume)
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureCacheVolume)
+	}
+}
+
+func TestDirectTailscaleFeatureRequiresMetadataBackend(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if !spec.Features.Has(core.FeatureTailscale) || spec.Kind != core.ProviderKindSSHLease || spec.Coordinator != core.CoordinatorNever {
+			continue
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises direct %s; add an offline conformance config for it", name, core.FeatureTailscale)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.TailscaleMetadataBackend); !ok {
+			t.Fatalf("%s advertises direct %s but backend %T is not TailscaleMetadataBackend", name, core.FeatureTailscale, backend)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no direct SSH-lease providers advertised %s; conformance test is stale", core.FeatureTailscale)
+	}
+}
+
+func TestSSHFeatureRequiresSSHLoginBackend(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if !spec.Features.Has(core.FeatureSSH) {
+			continue
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises %s; add an offline conformance config for it", name, core.FeatureSSH)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.SSHLoginBackend); !ok {
+			t.Fatalf("%s advertises %s but backend %T is not SSHLoginBackend", name, core.FeatureSSH, backend)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureSSH)
+	}
+}
+
+func TestCrabboxSyncFeatureRequiresSSHLeaseBackend(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if !spec.Features.Has(core.FeatureCrabboxSync) {
+			continue
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises %s; add an offline conformance config for it", name, core.FeatureCrabboxSync)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.SSHLeaseBackend); !ok {
+			t.Fatalf("%s advertises %s but backend %T is not SSHLeaseBackend", name, core.FeatureCrabboxSync, backend)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureCrabboxSync)
+	}
+}
+
+func TestPauseResumeFeatureRequiresPausableBackend(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		if !provider.Spec().Features.Has(core.FeaturePauseResume) {
+			continue
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises %s; add an offline conformance config for it", name, core.FeaturePauseResume)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.PausableBackend); !ok {
+			t.Fatalf("%s advertises %s but backend %T is not PausableBackend", name, core.FeaturePauseResume, backend)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeaturePauseResume)
+	}
+}
+
+func TestHeartbeatFeatureRequiresLeaseHeartbeatBackend(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		if !provider.Spec().Features.Has(core.FeatureLeaseHeartbeat) {
+			continue
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises %s; add an offline conformance config for it", name, core.FeatureLeaseHeartbeat)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.LeaseHeartbeatBackend); !ok {
+			t.Fatalf("%s advertises %s but backend %T is not LeaseHeartbeatBackend", name, core.FeatureLeaseHeartbeat, backend)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureLeaseHeartbeat)
+	}
+}
+
+func TestWorkspaceFeaturesRequireNativeCheckpointProvider(t *testing.T) {
+	workspaceFeatures := []core.Feature{
+		core.FeatureCheckpoint,
+		core.FeatureFork,
+		core.FeatureRestore,
+		core.FeatureSnapshot,
+	}
+	counts := make(map[core.Feature]int, len(workspaceFeatures))
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if !hasAnyFeature(spec.Features, workspaceFeatures...) {
+			continue
+		}
+		if _, ok := provider.(core.NativeCheckpointProvider); !ok {
+			t.Fatalf("%s advertises workspace features %v but does not implement NativeCheckpointProvider", name, spec.Features)
+		}
+		if spec.Features.Has(core.FeatureFork) {
+			if _, ok := provider.(core.NativeCheckpointForkProvider); !ok {
+				t.Fatalf("%s advertises %s but does not implement NativeCheckpointForkProvider", name, core.FeatureFork)
+			}
+		}
+		for _, feature := range workspaceFeatures {
+			if spec.Features.Has(feature) {
+				counts[feature]++
+			}
+		}
+	}
+	for _, feature := range workspaceFeatures {
+		if counts[feature] == 0 {
+			t.Fatalf("no providers advertised %s; conformance test is stale", feature)
+		}
+	}
+}
+
+func TestRunDownloadFeatureRequiresDelegatedBackend(t *testing.T) {
+	downloadProviders := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if !spec.Features.Has(core.FeatureRunDownloads) {
+			continue
+		}
+		if spec.Kind != core.ProviderKindDelegatedRun {
+			t.Fatalf("%s advertises delegated run downloads but has kind=%s", name, spec.Kind)
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises delegated run downloads; add an offline conformance config for it", name)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.DelegatedRunDownloadBackend); !ok {
+			t.Fatalf("%s advertises %s but backend %T is not DelegatedRunDownloadBackend", name, core.FeatureRunDownloads, backend)
+		}
+		downloadProviders++
+	}
+	if downloadProviders == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureRunDownloads)
+	}
+}
+
+func TestRunEvidenceFeaturesGateDelegatedOptions(t *testing.T) {
+	artifactProviders := 0
+	downloadProviders := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		spec := provider.Spec()
+		if spec.Kind != core.ProviderKindDelegatedRun {
+			continue
+		}
+		artifactErr := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{
+			ArtifactGlobs: []string{"reports/**"},
+		})
+		if spec.Features.Has(core.FeatureRunArtifacts) {
+			if artifactErr != nil {
+				t.Fatalf("%s advertises %s but rejects --artifact-glob: %v", name, core.FeatureRunArtifacts, artifactErr)
+			}
+			artifactProviders++
+		} else if artifactErr == nil {
+			t.Fatalf("%s accepts --artifact-glob without %s", name, core.FeatureRunArtifacts)
+		}
+
+		downloadErr := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{
+			Downloads: []string{"reports/result.json=result.json"},
+		})
+		if spec.Features.Has(core.FeatureRunDownloads) {
+			if downloadErr != nil {
+				t.Fatalf("%s advertises %s but rejects --download: %v", name, core.FeatureRunDownloads, downloadErr)
+			}
+			downloadProviders++
+		} else if downloadErr == nil {
+			t.Fatalf("%s accepts --download without %s", name, core.FeatureRunDownloads)
+		}
+
+		requiredErr := core.RejectDelegatedSyncOptionsForSpec(spec, core.RunRequest{
+			RequiredArtifactGlobs: []string{"reports/result.json"},
+		})
+		if hasAnyFeature(spec.Features, core.FeatureRunArtifacts, core.FeatureRunDownloads) {
+			if requiredErr != nil {
+				t.Fatalf("%s advertises run evidence features %v but rejects --require-artifact: %v", name, spec.Features, requiredErr)
+			}
+		} else if requiredErr == nil {
+			t.Fatalf("%s accepts --require-artifact without run evidence features", name)
+		}
+	}
+	if artifactProviders == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureRunArtifacts)
+	}
+	if downloadProviders == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureRunDownloads)
+	}
+}
+
+func TestURLBridgeFeatureRequiresBridgeProvider(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		if !provider.Spec().Features.Has(core.FeatureURLBridge) {
+			continue
+		}
+		cfg, ok := offlineConformanceConfig(name)
+		if !ok {
+			t.Fatalf("%s advertises %s; add an offline conformance config for it", name, core.FeatureURLBridge)
+		}
+		backend, err := provider.Configure(cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			t.Fatalf("%s configure error: %v", name, err)
+		}
+		if _, ok := backend.(core.BridgeProvider); !ok {
+			t.Fatalf("%s advertises %s but backend %T is not BridgeProvider", name, core.FeatureURLBridge, backend)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureURLBridge)
+	}
+}
+
+func TestMCPFeatureRequiresCreateTimePassthrough(t *testing.T) {
+	checked := 0
+	for _, name := range allBuiltInProviderNames() {
+		provider := mustProvider(t, name)
+		if !provider.Spec().Features.Has(core.FeatureMCP) {
+			continue
+		}
+		if name != "docker-sandbox" {
+			t.Fatalf("%s advertises %s; add an offline conformance check for its MCP attachment contract", name, core.FeatureMCP)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatalf("no providers advertised %s; conformance test is stale", core.FeatureMCP)
+	}
+}
+
+func hasAnyFeature(features core.FeatureSet, wants ...core.Feature) bool {
+	for _, want := range wants {
+		if features.Has(want) {
+			return true
+		}
+	}
+	return false
+}
+
+func offlineConformanceConfig(provider string) (core.Config, bool) {
+	cfg := core.BaseConfig()
+	cfg.Provider = provider
+	switch provider {
+	case "agent-sandbox":
+		cfg.AgentSandbox.Context = "agent-context"
+		cfg.AgentSandbox.WarmPool = "linux-pool"
+		return cfg, true
+	case "aws-lambda-microvm":
+		cfg.AWSRegion = "eu-west-1"
+		cfg.AWSLambdaMicroVM.Image = "arn:aws:lambda:eu-west-1:123456789012:microvm-image:crabbox-runner"
+		return cfg, true
+	case "blacksmith-testbox":
+		return cfg, true
+	case "cloudflare-dynamic-workers":
+		cfg.CloudflareDynamicWorkers.LoaderURL = "https://loader.example.test"
+		cfg.CloudflareDynamicWorkers.Token = "test-token"
+		return cfg, true
+	case "cloudflare-sandbox":
+		cfg.CloudflareSandbox.BridgeURL = "https://bridge.example.test"
+		cfg.CloudflareSandbox.Token = "test-token"
+		return cfg, true
+	case "e2b":
+		return cfg, true
+	case "external":
+		cfg.External.Command = "external-provider"
+		return cfg, true
+	case "codesandbox":
+		return cfg, true
+	case "hyperv":
+		cfg.TargetOS = core.TargetWindows
+		return cfg, true
+	case "kubevirt":
+		cfg.KubeVirt.Context = "agent-context"
+		return cfg, true
+	case "mxc":
+		cfg.TargetOS = core.TargetWindows
+		return cfg, true
+	case "islo":
+		return cfg, true
+	case "railway":
+		return cfg, true
+	case "semaphore":
+		cfg.Semaphore.Host = "semaphore.example.test"
+		cfg.Semaphore.Token = "test-token"
+		return cfg, true
+	case "sealos-devbox":
+		cfg.SealosDevbox.Context = "sealos-context"
+		cfg.SealosDevbox.SSHGatewayHost = "ssh.sealos.example.test"
+		return cfg, true
+	case "sprites":
+		cfg.Sprites.Token = "test-token"
+		return cfg, true
+	case "windows-sandbox":
+		cfg.TargetOS = core.TargetWindows
+		cfg.WindowsMode = core.WindowsModeNormal
+		return cfg, true
+	default:
+		return cfg, true
+	}
+}
+
+func allBuiltInProviderNames() []string {
+	return []string{
 		"agent-sandbox",
 		"apple-container",
 		"apple-machine",
-		"apple-vz",
+		"apple-vm",
 		"ascii-box",
 		"aws",
+		"aws-lambda-microvm",
 		"azure",
 		"azure-dynamic-sessions",
+		"azure-sandbox",
+		"blaxel",
 		"blacksmith-testbox",
+		"boxd",
+		"cloud-run-sandbox",
 		"cloudflare",
 		"cloudflare-dynamic-workers",
+		"cloudflare-sandbox",
 		"codesandbox",
+		"coder",
+		"crownest",
+		"cua",
+		"cubesandbox",
 		"daytona",
+		"digitalocean",
 		"docker-sandbox",
 		"e2b",
 		"exe-dev",
 		"external",
+		"fastapi-cloud",
+		"firecracker",
 		"freestyle",
 		"gcp",
+		"github-codespaces",
 		"hetzner",
 		"hostinger",
+		"hyperv",
 		"incus",
 		"islo",
 		"kubevirt",
+		"lambda",
+		"linode",
 		"local-container",
+		"lume",
+		"machine0",
 		"modal",
+		"morph",
 		"multipass",
 		"mxc",
 		"namespace-devbox",
 		"namespace-instance",
+		"nebius",
+		"nomad",
 		"nvidia-brev",
 		"opencomputer",
 		"opensandbox",
+		"orgo",
 		"ovh",
 		"parallels",
+		"phala",
 		"proxmox",
 		"railway",
 		"runpod",
+		"scaleway",
 		"anthropic-sandbox-runtime",
 		"semaphore",
+		"sealos-devbox",
+		"serve",
 		"smolvm",
 		"sprites",
 		"ssh",
 		"superserve",
 		"tart",
+		"tencentcloud",
 		"tenki",
 		"tensorlake",
+		"unikraft-cloud",
 		"upstash-box",
+		"vast",
 		"vercel-sandbox",
+		"vultr",
 		"wandb",
 		"windows-sandbox",
 		"xcp-ng",
-	}
-	for _, name := range providers {
-		t.Run(name, func(t *testing.T) {
-			provider, err := core.ProviderFor(name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, ok := provider.(core.DoctorProvider); !ok {
-				t.Fatalf("%s does not implement DoctorProvider", name)
-			}
-		})
 	}
 }
 
@@ -336,4 +1600,94 @@ func mustProvider(t *testing.T, name string) core.Provider {
 		t.Fatal(err)
 	}
 	return provider
+}
+
+func TestClassSpecsReportCompleteShapesForEveryClass(t *testing.T) {
+	seen := 0
+	for _, providerName := range core.RegisteredProviderNames() {
+		provider, err := core.ProviderFor(providerName)
+		if err != nil {
+			t.Fatalf("ProviderFor(%q): %v", providerName, err)
+		}
+		specs, ok := provider.(core.ProviderClassSpecProvider)
+		if !ok {
+			continue
+		}
+		seen++
+		classes := specs.ClassSpecs()
+		classOrder := core.CanonicalProviderClasses()
+		if got, want := len(classes), len(classOrder); got != want {
+			t.Errorf("%s reports %d classes, want %d", providerName, got, want)
+			continue
+		}
+		for i, class := range classes {
+			if class.Class != classOrder[i] {
+				t.Errorf("%s class %d = %q, want %q", providerName, i, class.Class, classOrder[i])
+			}
+			if class.Type == "" {
+				t.Errorf("%s/%s has no type", providerName, class.Class)
+			}
+			// A class present in the type tables but absent from the provider's
+			// shape data would otherwise render with no CPU/RAM at all.
+			if class.VCPUs <= 0 || class.MemoryGB <= 0 {
+				t.Errorf("%s/%s (%s) reports incomplete shape vcpu=%d memoryGb=%d",
+					providerName, class.Class, class.Type, class.VCPUs, class.MemoryGB)
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("no providers implement ClassSpecs; test would be vacuous")
+	}
+}
+
+func TestManualBatchCProviderFlagInputLedger(t *testing.T) {
+	for _, owner := range []string{"parallels", "phala", "proxmox", "sprites", "ssh", "superserve", "tenki", "unikraft-cloud", "windows-sandbox", "xcp-ng"} {
+		t.Run(owner, func(t *testing.T) {
+			provider, err := core.ProviderFor(owner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seed := core.BaseConfig()
+			seed.Provider = "unselected-fixture"
+			inventory := flag.NewFlagSet("inventory", flag.ContinueOnError)
+			provider.RegisterFlags(inventory, seed)
+			check := func(t *testing.T, cfg core.Config, accepted bool) {
+				t.Helper()
+				ledger := reflect.ValueOf(cfg).FieldByName("inputProvenance")
+				wantLen := 0
+				if accepted {
+					wantLen = 1
+				}
+				if ledger.Len() != wantLen {
+					t.Fatalf("ledger owners=%d want=%d", ledger.Len(), wantLen)
+				}
+				if !accepted {
+					return
+				}
+				key := reflect.ValueOf(owner).Convert(ledger.Type().Key())
+				facts := ledger.MapIndex(key)
+				if !facts.IsValid() || facts.FieldByName("values").Uint() != 8 || facts.FieldByName("intents").Uint() != 0 || facts.FieldByName("complete").Bool() {
+					t.Fatal("flag attribution mismatch")
+				}
+			}
+			idle := seed
+			idleFlags := flag.NewFlagSet("idle", flag.ContinueOnError)
+			idleValues := provider.RegisterFlags(idleFlags, idle)
+			_ = provider.ApplyFlags(&idle, idleFlags, idleValues)
+			check(t, idle, false)
+			inventory.VisitAll(func(f *flag.Flag) {
+				t.Run(f.Name, func(t *testing.T) {
+					cfg := seed
+					fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+					values := provider.RegisterFlags(fs, cfg)
+					// Reapplying the registered value exercises equal-value acceptance at the actual assignment.
+					if err := fs.Set(f.Name, f.DefValue); err != nil {
+						t.Fatal(err)
+					}
+					_ = provider.ApplyFlags(&cfg, fs, values)
+					check(t, cfg, f.Name != "phala-skip-attestation")
+				})
+			})
+		})
+	}
 }

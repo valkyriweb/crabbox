@@ -7,16 +7,6 @@ import (
 	"strings"
 )
 
-const (
-	tightVNCMSIURL              = "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi"
-	gitForWindowsSetupURL       = "https://github.com/git-for-windows/git/releases/download/v2.52.0.windows.1/Git-2.52.0-64-bit.exe"
-	openSSHWin64ZipURL          = "https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.8.3.0p2-Preview/OpenSSH-Win64.zip"
-	ubuntuWSLRootFSURL          = "https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz"
-	defaultTailscaleVersion     = "1.98.4"
-	defaultTailscaleAMD64SHA256 = "e6c08a8ee7e63e69aaf1b62ecd12672b3883fbcd2a176bf6cfa42a15fdce0b6b"
-	defaultTailscaleARM64SHA256 = "3cb068eb1368b6bb218d0ef0aa0a7a679a7156b7c979e2279cc2c2321b5f05c7"
-)
-
 func awsUserData(cfg Config, publicKey string) string {
 	switch cfg.TargetOS {
 	case targetWindows:
@@ -24,11 +14,29 @@ func awsUserData(cfg Config, publicKey string) string {
 	case targetMacOS:
 		return macOSUserData(cfg, publicKey)
 	default:
-		return cloudInit(cfg, publicKey)
+		aptConfig := ""
+		if cfg.TargetOS == targetLinux && cfg.OSImage == "ubuntu:26.04" &&
+			cfg.AWSAMI == "" && cfg.AWSSnapshot == "" && effectiveArchitectureForConfig(cfg) == ArchitectureAMD64 {
+			// Only stock Canonical images use this policy; custom images own their sources.
+			// cloud-init copies primary into security unless security is explicit.
+			aptConfig = `apt:
+  primary:
+    - arches: [amd64]
+      uri: https://archive.ubuntu.com/ubuntu/
+  security:
+    - arches: [amd64]
+      uri: http://security.ubuntu.com/ubuntu/
+`
+		}
+		return cloudInitWithExtras(cfg, publicKey, aptConfig, "")
 	}
 }
 
 func cloudInit(cfg Config, publicKey string) string {
+	return cloudInitWithExtras(cfg, publicKey, "", "")
+}
+
+func cloudInitWithExtras(cfg Config, publicKey, additionalConfig, additionalBootstrap string) string {
 	portLines := ""
 	for _, port := range sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts) {
 		portLines += fmt.Sprintf("      Port %s\n", port)
@@ -36,20 +44,46 @@ func cloudInit(cfg Config, publicKey string) string {
 	readyChecks := cloudInitOptionalReadyChecks(cfg)
 	writeFiles := cloudInitOptionalWriteFiles(cfg)
 	bootstrap := cloudInitOptionalBootstrap(cfg)
+	if additionalBootstrap != "" {
+		if bootstrap != "" {
+			bootstrap += "\n"
+		}
+		bootstrap += additionalBootstrap
+	}
 	yamlSSHUser := yamlInlineString(cfg.SSHUser)
 	yamlPublicKey := yamlInlineString(publicKey)
 	shellSSHUser := shellQuote(cfg.SSHUser)
 	shellWorkRoot := shellQuote(cfg.WorkRoot)
+	// Optional services retain cloud-final ordering; the minimal path finishes early.
+	finish := "    retry /usr/local/lib/crabbox-ready-checks\n    touch /var/lib/crabbox/bootstrapped\n"
+	core := `    #!/bin/bash
+    exec > >(tee -a /var/log/cloud-init-output.log) 2>&1
+` + indentCloudInitRuncmd(sharedLinuxBootstrapPrelude()) + indentCloudInitRuncmd(sharedLinuxSSHRestart()) + indentCloudInitRuncmd(linuxMinimalReadinessBootstrap) + "\n" + fmt.Sprintf(`    mkdir -p %[1]s /var/cache/crabbox/pnpm /var/cache/crabbox/npm
+    chown -R %[2]s:%[2]s %[1]s /var/cache/crabbox
+    install -d /var/lib/crabbox
+`, shellWorkRoot, shellSSHUser) + indentCloudInitRuncmd(sharedLinuxSSHRestart()) + cloudInitEarlyBootstrap(cfg) + "\n"
+	final := "    systemctl start crabbox-bootstrap.service\n"
+	workspaceAfter := "crabbox-bootstrap.service cloud-config.service"
+	core += indentCloudInitRuncmd(sharedLinuxBootstrapActivate())
+	if bootstrap == "" {
+		core += finish
+	} else {
+		final += indentCloudInitRuncmd(sharedLinuxBootstrapPrelude()) + bootstrap + "\n" + finish
+		workspaceAfter += " cloud-final.service"
+	}
 	return fmt.Sprintf(`#cloud-config
 package_update: false
 package_upgrade: false
-users:
+%[11]susers:
   - name: %[1]s
     groups: sudo
     shell: /bin/bash
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
     ssh_authorized_keys:
       - %[2]s
+bootcmd:
+  - |
+%[10]s
 write_files:
   - path: /etc/ssh/sshd_config.d/99-crabbox-port.conf
     permissions: '0644'
@@ -59,47 +93,55 @@ write_files:
   - path: /usr/local/bin/crabbox-ready
     permissions: '0755'
     content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
+      #!/bin/sh
+      set -eu
+      test -f /var/lib/crabbox/bootstrapped
+      exec /usr/local/lib/crabbox-ready-checks
+  - path: /usr/local/lib/crabbox-ready-checks
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      set -eu
       git --version
       rsync --version >/dev/null
       curl --version >/dev/null
       jq --version >/dev/null
-      test -f /var/lib/crabbox/bootstrapped
+      tmux -V >/dev/null
+      flock --version >/dev/null
       test -w %[3]s
 %[5]s
+  - path: /etc/systemd/system/crabbox-workspace-ready.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Crabbox workspace per-boot readiness
+      After=%[12]s
+      ConditionPathExists=/var/lib/crabbox/bootstrapped
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/crabbox-ready
+      ExecStart=/usr/bin/install -d /run/crabbox
+      ExecStart=/usr/bin/touch /run/crabbox/workspace-ready
+
+      [Install]
+      WantedBy=cloud-init.target
 %[6]s
+  - path: /usr/local/lib/crabbox-bootstrap.sh
+    permissions: '0700'
+    content: |
+%[9]s
 runcmd:
   - |
     bash -euxo pipefail <<'BOOT'
-    export DEBIAN_FRONTEND=noninteractive
-    cat >/etc/apt/apt.conf.d/80-crabbox-retries <<'APT'
-    Acquire::Retries "8";
-    Acquire::http::Timeout "30";
-    Acquire::https::Timeout "30";
-    APT
-    retry() {
-      n=1
-      until "$@"; do
-        if [ "$n" -ge 8 ]; then
-          return 1
-        fi
-        sleep $((n * 5))
-        n=$((n + 1))
-      done
-    }
-    retry apt-get update
-    retry apt-get install -y --no-install-recommends openssh-server ca-certificates curl git rsync jq
-    mkdir -p %[3]s /var/cache/crabbox/pnpm /var/cache/crabbox/npm
-    chown -R %[7]s:%[7]s %[3]s /var/cache/crabbox
-    install -d /var/lib/crabbox
-    systemctl enable ssh || true
-    timeout 30s systemctl restart ssh || timeout 30s systemctl restart ssh.socket || true
 %[8]s
-    touch /var/lib/crabbox/bootstrapped
-    crabbox-ready
     BOOT
-`, yamlSSHUser, yamlPublicKey, shellWorkRoot, portLines, readyChecks, writeFiles, shellSSHUser, bootstrap)
+`, yamlSSHUser, yamlPublicKey, shellWorkRoot, portLines, readyChecks, writeFiles, shellSSHUser, final, indentCloudInitScriptFile(core), indentCloudInitRuncmd(sharedLinuxBootstrapStart()), additionalConfig, workspaceAfter)
+
+}
+
+func indentCloudInitScriptFile(script string) string {
+	return "  " + strings.ReplaceAll(strings.TrimRight(script, "\n"), "\n", "\n  ") + "\n"
 }
 
 func CloudInitUserData(cfg Config, publicKey string) string {
@@ -120,141 +162,25 @@ tasks:
 }
 
 func windowsBootstrapHeaderPowerShell(cfg Config, publicKey, workRoot string) string {
-	return `
-$ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-function Retry($ScriptBlock) {
-  for ($i = 1; $i -le 8; $i++) {
-    try { & $ScriptBlock; return }
-    catch {
-      if ($i -eq 8) { throw }
-      Start-Sleep -Seconds ($i * 5)
-    }
-  }
-}
-function New-CrabboxPassword {
-  $bytes = New-Object byte[] 18
-  $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-  try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-  return "Cb1!" + [Convert]::ToBase64String($bytes).Substring(0, 18)
-}
-$user = ` + psQuote(cfg.SSHUser) + `
-$publicKey = ` + psQuote(publicKey) + `
-$workRoot = ` + psQuote(workRoot) + `
-$sshPorts = ` + windowsSSHPortsPowerShell(cfg) + `
-$base = "C:\ProgramData\crabbox"
-$setupCompletePath = Join-Path $base "setup-complete"
-$openSSHZip = "$env:TEMP\OpenSSH-Win64.zip"
-$gitInstaller = "$env:TEMP\Git-2.52.0-64-bit.exe"
-New-Item -ItemType Directory -Force -Path $base, $workRoot | Out-Null
-New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Network\NewNetworkWindowOff" -Force | Out-Null
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\ServerManager" -Name DoNotOpenServerManagerAtLogon -Type DWord -Value 1 -ErrorAction SilentlyContinue
-`
+	script := sharedWindowsHeader(cfg.SSHUser, publicKey, workRoot, sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts))
+	// An omitted mode retains the native default; WSL2 owns a separate Linux runtime.
+	if cfg.WindowsMode != windowsModeWSL2 {
+		script += sharedWindowsRuntime() + sharedWindowsRuntimeGate() + sharedWindowsNodeInstall() + sharedWindowsDetachInstall()
+	}
+	return script
 }
 
-func windowsBootstrapCorePowerShell() string {
-	return `
-if (-not (Test-Path -LiteralPath $passwordPath)) {
-  New-CrabboxPassword | Set-Content -NoNewline -Encoding ASCII -Path $passwordPath
-}
-$userPassword = (Get-Content -Raw -Path $passwordPath).Trim()
-if ($userPassword.Length -lt 12 -or $userPassword -notmatch '[A-Z]' -or $userPassword -notmatch '[a-z]' -or $userPassword -notmatch '[0-9]' -or $userPassword -notmatch '[^A-Za-z0-9]') {
-  $userPassword = New-CrabboxPassword
-  Set-Content -NoNewline -Encoding ASCII -Path $passwordPath -Value $userPassword
-}
-$secure = ConvertTo-SecureString $userPassword -AsPlainText -Force
-if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
-  New-LocalUser -Name $user -Password $secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
-} else {
-  Set-LocalUser -Name $user -Password $secure -PasswordNeverExpires $true
-}
-Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
-Set-Content -NoNewline -Encoding ASCII -Path $usernamePath -Value $user
-$userSID = (Get-LocalUser -Name $user).SID.Value
-$credentialPaths = @($passwordPath)
-if ($passwordMirrorPath) {
-  Set-Content -NoNewline -Encoding ASCII -Path $passwordMirrorPath -Value $userPassword
-  $credentialPaths += $passwordMirrorPath
-}
-foreach ($credentialPath in $credentialPaths) {
-  icacls.exe $credentialPath /inheritance:r /grant "*${userSID}:F" /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
-}
-icacls.exe $workRoot /grant "*${userSID}:(OI)(CI)F" | Out-Null
-$userSSHDir = Join-Path (Join-Path "C:\Users" $user) ".ssh"
-$userAuthorizedKeys = Join-Path $userSSHDir "authorized_keys"
-New-Item -ItemType Directory -Force -Path $userSSHDir | Out-Null
-Set-Content -Encoding ASCII -Path $userAuthorizedKeys -Value $publicKey
-icacls.exe $userSSHDir /inheritance:r /grant "*${userSID}:F" /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
-icacls.exe $userAuthorizedKeys /inheritance:r /grant "*${userSID}:F" /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
-if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
-  Retry { Invoke-WebRequest -Uri ` + psQuote(openSSHWin64ZipURL) + ` -OutFile $openSSHZip -UseBasicParsing }
-  Remove-Item -Recurse -Force "C:\Program Files\OpenSSH" -ErrorAction SilentlyContinue
-  Expand-Archive -LiteralPath $openSSHZip -DestinationPath "C:\Program Files" -Force
-  if (Test-Path -LiteralPath "C:\Program Files\OpenSSH-Win64") {
-    Rename-Item -LiteralPath "C:\Program Files\OpenSSH-Win64" -NewName "OpenSSH" -Force
-  }
-  & "C:\Program Files\OpenSSH\install-sshd.ps1"
-}
-New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
-Set-Content -Encoding ASCII -Path "$env:ProgramData\ssh\administrators_authorized_keys" -Value $publicKey
-icacls.exe "$env:ProgramData\ssh\administrators_authorized_keys" /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
-$sshdConfigPath = "$env:ProgramData\ssh\sshd_config"
-$sshdConfig = ""
-if (Test-Path -LiteralPath $sshdConfigPath) {
-  $sshdConfig = Get-Content -Raw -LiteralPath $sshdConfigPath
-}
-$globalLines = @()
-$matchLines = @()
-$inMatch = $false
-foreach ($line in ($sshdConfig -split "\r?\n")) {
-  if ($line -match '^\s*Match\s+') { $inMatch = $true }
-  if (-not $inMatch -and $line -match '^\s*Port\s+\d+\s*$') { continue }
-  if ($enforceKeyAuth -and -not $inMatch -and $line -match '^\s*(PasswordAuthentication|PubkeyAuthentication)\s+') { continue }
-  if ($inMatch) { $matchLines += $line } else { $globalLines += $line }
-}
-foreach ($port in $sshPorts) { $globalLines += "Port $port" }
-if ($enforceKeyAuth) {
-  $globalLines += "PubkeyAuthentication yes"
-  $globalLines += "PasswordAuthentication no"
-}
-if (($matchLines -join [Environment]::NewLine) -notmatch '(?im)^\s*Match\s+Group\s+administrators\b') {
-  $matchLines += "Match Group administrators"
-  $matchLines += "       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys"
-}
-Set-Content -Encoding ASCII -LiteralPath $sshdConfigPath -Value (($globalLines + $matchLines) -join [Environment]::NewLine)
-foreach ($port in $sshPorts) {
-  $ruleName = "crabbox-sshd-$port"
-  if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name $ruleName -DisplayName "Crabbox OpenSSH $port" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort $port | Out-Null
-  }
-}
-Set-Service -Name sshd -StartupType Automatic
-Start-Service sshd
-if (-not (Test-Path -LiteralPath "C:\Program Files\Git\cmd\git.exe")) {
-  Retry { Invoke-WebRequest -Uri ` + psQuote(gitForWindowsSetupURL) + ` -OutFile $gitInstaller -UseBasicParsing }
-  Start-Process -FilePath $gitInstaller -ArgumentList "/VERYSILENT","/NORESTART","/NOCANCEL","/SP-" -Wait
-}
-$machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-foreach ($path in @("C:\Program Files\OpenSSH", "C:\Program Files\Git\cmd", "C:\Program Files\Git\usr\bin")) {
-  if ($machinePath -notlike "*$path*") { $machinePath = "$machinePath;$path" }
-  if ($env:Path -notlike "*$path*") { $env:Path = "$env:Path;$path" }
-}
-[Environment]::SetEnvironmentVariable("Path", $machinePath, "Machine")
-`
-}
-
-func windowsBootstrapPowerShell(cfg Config, publicKey string) string {
+func WindowsBootstrapPowerShell(cfg Config, publicKey string) string {
 	script := windowsBootstrapHeaderPowerShell(cfg, publicKey, windowsBootstrapWorkRoot(cfg)) +
 		windowsManagedCorePreludePowerShell(cfg) +
-		windowsBootstrapCorePowerShell()
+		sharedWindowsCore()
 	if cfg.WindowsMode == windowsModeWSL2 {
 		return script + windowsWSL2BootstrapPowerShell(cfg)
 	}
 	if cfg.Desktop {
 		return script + windowsDesktopBootstrapPowerShell()
 	}
-	return script + windowsCoreBootstrapFinalizePowerShell()
+	return script + sharedWindowsFinalize()
 }
 
 func windowsBootstrapWorkRoot(cfg Config) string {
@@ -276,32 +202,21 @@ func windowsWSLWorkRoot(cfg Config) string {
 
 func windowsManagedCorePreludePowerShell(cfg Config) string {
 	if cfg.WindowsMode == windowsModeNormal && cfg.Desktop {
-		return `
-	$vncPasswordPath = "C:\ProgramData\crabbox\vnc.password"
-	$windowsUsernamePath = "C:\ProgramData\crabbox\windows.username"
-	$windowsPasswordPath = "C:\ProgramData\crabbox\windows.password"
-	$passwordPath = $vncPasswordPath
-	$usernamePath = $windowsUsernamePath
-	$passwordMirrorPath = $windowsPasswordPath
-	$enforceKeyAuth = $false
-	$userVNCStartupPath = "C:\ProgramData\crabbox\start-user-vnc.ps1"
-	$userVNCStartupCommandPath = Join-Path (Join-Path (Join-Path "C:\Users" $user) "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup") "crabbox-user-vnc.cmd"
-	$tightVNCInstaller = "$env:TEMP\tightvnc-2.8.85-gpl-setup-64bit.msi"
-	`
+		return sharedWindowsDesktopPrelude()
 	}
-	return `
-	$windowsUsernamePath = "C:\ProgramData\crabbox\windows.username"
-	$windowsPasswordPath = "C:\ProgramData\crabbox\windows.password"
-	$passwordPath = $windowsPasswordPath
-	$usernamePath = $windowsUsernamePath
-	$passwordMirrorPath = $null
-	$enforceKeyAuth = $false
-	`
+	return sharedWindowsNativePrelude()
 }
 
 func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	workRoot := windowsWSLWorkRoot(cfg)
+	headless := ""
+	if !cfg.Desktop && !cfg.Browser {
+		// WSLg can stall headless distro launches from Windows service sessions.
+		headless = `$managedWSLConfig = Set-CrabboxWSLConfigValue $managedWSLConfig 'wsl2' 'guiApplications=false'`
+	}
 	return `
+	$wslConfigChanged = $false
+` + strings.ReplaceAll(windowsWSL2ConfigPowerShell, "@HEADLESS_CONFIG@", headless) + `
 	$wslDistro = "Crabbox"
 	$wslRoot = "C:\ProgramData\crabbox\wsl\Crabbox"
 	$wslRootfs = "C:\ProgramData\crabbox\wsl\ubuntu-noble-wsl-amd64.rootfs.tar.gz"
@@ -310,6 +225,7 @@ func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	$wslSetup = "C:\ProgramData\crabbox\wsl\linux-setup.sh"
 	$wslFeaturesMarker = "C:\ProgramData\crabbox\wsl-features-rebooted"
 	$wslKernelMarker = "C:\ProgramData\crabbox\wsl-kernel-rebooted"
+	Remove-Item -Force -LiteralPath $setupCompletePath -ErrorAction SilentlyContinue
 	function Restart-CrabboxBootstrap($MarkerPath) {
 	  Set-Content -NoNewline -Encoding ASCII -Path $MarkerPath -Value (Get-Date).ToString("o")
 	  Restart-Computer -Force
@@ -333,6 +249,10 @@ func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	  wsl.exe --update --web-download | Out-Host
 	  if ($LASTEXITCODE -ne 0) { throw "wsl --update --web-download failed with exit $LASTEXITCODE" }
 	  Restart-CrabboxBootstrap $wslKernelMarker
+	}
+	if ($wslConfigChanged) {
+	  wsl.exe --shutdown | Out-Host
+	  if ($LASTEXITCODE -ne 0) { throw "apply managed WSL configuration failed with exit $LASTEXITCODE" }
 	}
 	wsl.exe --set-default-version 2 | Out-Host
 	if ($LASTEXITCODE -ne 0) { throw "wsl --set-default-version 2 failed with exit $LASTEXITCODE" }
@@ -365,9 +285,11 @@ func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	      if ($expectedLength -gt 0 -and $actualLength -ne $expectedLength) {
 	        throw "downloaded WSL rootfs is incomplete: $actualLength of $expectedLength bytes"
 	      }
+	      Assert-CrabboxFileSHA256 $wslRootfsDownload ` + psQuote(ubuntuWSLRootFSSHA256) + `
 	    }
 	    Move-Item -Force -LiteralPath $wslRootfsDownload -Destination $wslRootfs
 	  }
+	  Assert-CrabboxFileSHA256 $wslRootfs ` + psQuote(ubuntuWSLRootFSSHA256) + `
 	  wsl.exe --import $wslDistro $wslRoot $wslRootfs --version 2 | Out-Host
 	  if ($LASTEXITCODE -ne 0) { throw "wsl --import failed with exit $LASTEXITCODE" }
 	  wsl.exe --set-default $wslDistro | Out-Host
@@ -376,6 +298,10 @@ func windowsWSL2BootstrapPowerShell(cfg Config) string {
 	$linuxSetup = @'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+mkdir -p /etc/cloud
+# Crabbox owns this distro's setup. WSL datasource discovery can block systemd
+# and root login while trying to invoke Windows tools from an SSH session.
+touch /etc/cloud/cloud-init.disabled
 mkdir -p ` + shellQuote(workRoot) + ` /var/cache/crabbox/pnpm /var/cache/crabbox/npm /var/lib/crabbox
 cat >/etc/apt/apt.conf.d/80-crabbox-retries <<'APT'
 Acquire::Retries "8";
@@ -384,120 +310,165 @@ Acquire::https::Timeout "30";
 APT
 rm -rf /var/lib/apt/lists/*
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git rsync jq
-if [ -d /proc/sys/fs/binfmt_misc ]; then
-  if [ ! -e /proc/sys/fs/binfmt_misc/register ]; then
-    mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
-  fi
-  if [ -e /proc/sys/fs/binfmt_misc/status ] && ! grep -qx enabled /proc/sys/fs/binfmt_misc/status; then
-    printf '1' >/proc/sys/fs/binfmt_misc/status 2>/dev/null || true
-  fi
-  if [ ! -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then
-    test -w /proc/sys/fs/binfmt_misc/register
-    printf '%s' ':WSLInterop:M::MZ::/init:PF' >/proc/sys/fs/binfmt_misc/register
-  fi
+apt-get install -y --no-install-recommends ca-certificates curl git jq python3 rsync sudo
+if ! id -u crabbox >/dev/null 2>&1; then
+  useradd --create-home --user-group --shell /bin/bash crabbox
 fi
-cat >/usr/local/bin/crabbox-ready <<'READY'
-#!/usr/bin/env bash
-set -euo pipefail
+groupadd -f docker
+usermod --append --groups sudo,docker --shell /bin/bash crabbox
+test "$(id -u crabbox)" -ne 0
+install -d -m 0755 /etc/sudoers.d
+printf '%s\n' 'crabbox ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/crabbox
+chmod 0440 /etc/sudoers.d/crabbox
+visudo -cf /etc/sudoers.d/crabbox
+chown -R crabbox:crabbox ` + shellQuote(workRoot) + ` /var/cache/crabbox
+# All WSL transports inherit this identity, including staged helpers and rsync.
+# Preserve the distro's boot, automount, networking, and interop settings.
+python3 - <<'WSL_USER'
+import configparser
+from pathlib import Path
+path = Path('/etc/wsl.conf')
+config = configparser.ConfigParser(interpolation=None)
+config.optionxform = str
+config.read(path)
+if not config.has_section('user'):
+    config.add_section('user')
+config.set('user', 'default', 'crabbox')
+with path.open('w') as output:
+    config.write(output, space_around_delimiters=False)
+WSL_USER
+` + sharedLinuxNodeInstall() + sharedWslTruffleHogInstall() + `cat >/usr/local/bin/crabbox-ready <<'READY'
+#!/bin/sh
+set -eu
+test "$(id -u)" -ne 0
+test "$(id -un)" = crabbox
+test "$HOME" = /home/crabbox
+test -w "$HOME"
+sudo -n true
+test -w /var/cache/crabbox/npm
+test -w /var/cache/crabbox/pnpm
 git --version >/dev/null
+python3 --version >/dev/null
 rsync --version >/dev/null
 curl --version >/dev/null
 jq --version >/dev/null
-test -e /proc/sys/fs/binfmt_misc/WSLInterop
+trufflehog --no-update --version >/dev/null
+node --version >/dev/null
+npm --version >/dev/null
+wslpath -w ` + shellQuote(workRoot) + ` >/dev/null
 test -w ` + shellQuote(workRoot) + `
 READY
 chmod 0755 /usr/local/bin/crabbox-ready
 touch /var/lib/crabbox/bootstrapped
-crabbox-ready
+sudo -H -u crabbox /usr/local/bin/crabbox-ready
 '@
 	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
 	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
 	wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh
 	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
+	wsl.exe --terminate $wslDistro | Out-Host
+	if ($LASTEXITCODE -ne 0) { throw "WSL restart failed with exit $LASTEXITCODE" }
+	wsl.exe -d $wslDistro --exec /usr/local/bin/crabbox-ready
+	if ($LASTEXITCODE -ne 0) { throw "WSL cold-start readiness failed with exit $LASTEXITCODE" }
 	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
 	Restart-Service sshd -Force
 	`
 }
 
-func windowsDesktopBootstrapPowerShell() string {
-	return `
-	if (-not (Test-Path -LiteralPath "C:\Program Files\TightVNC\tvnserver.exe")) {
-	  Retry { Invoke-WebRequest -Uri ` + psQuote(tightVNCMSIURL) + ` -OutFile $tightVNCInstaller -UseBasicParsing }
-	  $vncPassword = Get-Content -Raw -Path $vncPasswordPath
-	  Start-Process -FilePath msiexec.exe -ArgumentList @(
-    "/i", $tightVNCInstaller, "/quiet", "/norestart",
-    "ADDLOCAL=Server",
-    "SERVER_REGISTER_AS_SERVICE=1",
-    "SERVER_ADD_FIREWALL_EXCEPTION=0",
-    "SET_USEVNCAUTHENTICATION=1", "VALUE_OF_USEVNCAUTHENTICATION=1",
-    "SET_PASSWORD=1", "VALUE_OF_PASSWORD=$vncPassword",
-    "SET_USECONTROLAUTHENTICATION=1", "VALUE_OF_USECONTROLAUTHENTICATION=1",
-    "SET_CONTROLPASSWORD=1", "VALUE_OF_CONTROLPASSWORD=$vncPassword",
-    "SET_ALLOWLOOPBACK=1", "VALUE_OF_ALLOWLOOPBACK=1",
-    "SET_ACCEPTHTTPCONNECTIONS=1", "VALUE_OF_ACCEPTHTTPCONNECTIONS=0"
-  ) -Wait
-}
-$userVNCStartup = @'
-$ErrorActionPreference = "SilentlyContinue"
-$base = "C:\ProgramData\crabbox"
-$password = (Get-Content -Raw -LiteralPath (Join-Path $base "vnc.password")).Trim()
-$serverKey = "HKCU:\Software\TightVNC\Server"
-$serviceKey = "HKLM:\Software\TightVNC\Server"
-$serviceConfig = Get-ItemProperty -Path $serviceKey -ErrorAction SilentlyContinue
-function Set-TightVNCBinaryValue($Name) {
-  $hex = ""
-  if ($serviceConfig -and $serviceConfig.$Name) {
-    $bytes = [byte[]]$serviceConfig.$Name
-    if ($bytes -and $bytes.Length -gt 0) {
-      $hex = -join ($bytes | ForEach-Object { $_.ToString("X2") })
+// The lease owns distro lifetime: WSL's client-idle shutdown kills detached
+// daemons even while their Linux processes remain active. WSLg stays optional.
+const windowsWSL2ConfigPowerShell = `
+function Set-CrabboxWSLConfigValue([string]$Text, [string]$Section, [string]$Setting) {
+  $result = [Collections.Generic.List[string]]::new()
+  $inSection = $false
+  $hasSection = $false
+  $hasKey = $false
+  $keyPattern = '^\s*' + [Regex]::Escape(($Setting -split '=', 2)[0]) + '\s*='
+  if ($Text.Length -gt 0) {
+    foreach ($line in ($Text -split '\r?\n')) {
+      if ($line -match '^\s*\[([^\]]+)\]\s*(?:[;#].*)?$') {
+        if ($inSection -and -not $hasKey) { $result.Add($Setting) }
+        $inSection = $Matches[1].Trim() -eq $Section
+        $hasSection = $hasSection -or $inSection
+        $hasKey = $false
+      }
+      if ($inSection -and $line -match $keyPattern) {
+        $result.Add($Setting)
+        $hasKey = $true
+      } else { $result.Add($line) }
     }
   }
-  if ($hex) {
-    & reg.exe add "HKCU\Software\TightVNC\Server" /v $Name /t REG_BINARY /d $hex /f | Out-Null
-  }
+  if (-not $hasSection) { $result.Add('[' + $Section + ']'); $inSection = $true; $hasKey = $false }
+  if ($inSection -and -not $hasKey) { $result.Add($Setting) }
+  return $result -join [char]10
 }
-New-Item -Force -Path $serverKey | Out-Null
-New-ItemProperty -Force -Path $serverKey -Name UseVncAuthentication -PropertyType DWord -Value 1 | Out-Null
-Set-TightVNCBinaryValue "Password"
-New-ItemProperty -Force -Path $serverKey -Name UseControlAuthentication -PropertyType DWord -Value 1 | Out-Null
-Set-TightVNCBinaryValue "ControlPassword"
-New-ItemProperty -Force -Path $serverKey -Name AllowLoopback -PropertyType DWord -Value 1 | Out-Null
-New-ItemProperty -Force -Path $serverKey -Name AcceptHttpConnections -PropertyType DWord -Value 0 | Out-Null
-$exe = "C:\Program Files\TightVNC\tvnserver.exe"
-Get-Process tvnserver -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId } | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
-Start-Process -FilePath $exe -ArgumentList "-run" -WindowStyle Minimized
-'@
-Set-Content -Encoding UTF8 -LiteralPath $userVNCStartupPath -Value $userVNCStartup
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $userVNCStartupCommandPath) | Out-Null
-Set-Content -Encoding ASCII -LiteralPath $userVNCStartupCommandPath -Value ('@echo off' + [Environment]::NewLine + 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $userVNCStartupPath + '"' + [Environment]::NewLine)
-$startupTask = "CrabboxUserVNC"
-cmd.exe /c "schtasks.exe /Delete /TN $startupTask /F 2>NUL" | Out-Null
-schtasks.exe /Create /TN $startupTask /SC ONLOGON /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $userVNCStartupPath" /RU $user /IT /F | Out-Null
-Get-Service -Name tvnserver -ErrorAction SilentlyContinue | Set-Service -StartupType Disabled
-Stop-Service -Name tvnserver -Force -ErrorAction SilentlyContinue
-$winlogon = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-Set-ItemProperty -Path $winlogon -Name AutoAdminLogon -Value "1" -Type String
-Set-ItemProperty -Path $winlogon -Name ForceAutoLogon -Value "1" -Type String
-Set-ItemProperty -Path $winlogon -Name DefaultUserName -Value $user -Type String
-Set-ItemProperty -Path $winlogon -Name DefaultPassword -Value $userPassword -Type String
-if (-not (Test-Path -LiteralPath $setupCompletePath)) {
-  Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
-	  Restart-Computer -Force
-	  exit 0
-	}
-Restart-Service sshd
-	`
+$wslConfigPath = Join-Path $HOME '.wslconfig'
+$wslConfig = ''
+if (Test-Path -LiteralPath $wslConfigPath) { $wslConfig = [IO.File]::ReadAllText($wslConfigPath) }
+$managedWSLConfig = Set-CrabboxWSLConfigValue $wslConfig 'general' 'instanceIdleTimeout=-1'
+@HEADLESS_CONFIG@
+$wslConfigChanged = $managedWSLConfig -cne $wslConfig
+if ($wslConfigChanged) {
+  [IO.File]::WriteAllText($wslConfigPath, $managedWSLConfig, [Text.UTF8Encoding]::new($false))
+}
+`
+
+func windowsDesktopBootstrapPowerShell() string {
+	return windowsDesktopLauncherServicePowerShell() + sharedWindowsDesktop()
 }
 
-func windowsCoreBootstrapFinalizePowerShell() string {
+func azureWindowsSnapshotRehydratePowerShell(cfg Config, publicKey string) string {
+	workRoot := windowsBootstrapWorkRoot(cfg)
+	script := windowsBootstrapHeaderPowerShell(cfg, publicKey, workRoot) +
+		windowsManagedCorePreludePowerShell(cfg) +
+		azureWindowsSnapshotResetCredentialsPowerShell() +
+		sharedWindowsCore()
+	if cfg.Desktop {
+		return script + azureWindowsSnapshotRotateVNCPasswordPowerShell() + windowsDesktopBootstrapPowerShell()
+	}
+	return script + sharedWindowsFinalize()
+}
+
+func azureWindowsSnapshotRotateVNCPasswordPowerShell() string {
 	return `
-	git --version | Out-Null
-	tar --version | Out-Null
-	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
-	Restart-Service sshd -Force
-	`
+function ConvertTo-CrabboxVNCPassword([string]$Password) {
+  $plain = New-Object byte[] 8
+  $bytes = [Text.Encoding]::ASCII.GetBytes($Password)
+  [Array]::Copy($bytes, $plain, [Math]::Min($plain.Length, $bytes.Length))
+  # VNC's fixed DES key with each byte bit-reversed for the platform DES implementation.
+  $key = [byte[]](0xE8, 0x4A, 0xD6, 0x60, 0xC4, 0x72, 0x1A, 0xE0)
+  $des = [Security.Cryptography.DES]::Create()
+  try {
+    $des.Mode = [Security.Cryptography.CipherMode]::ECB
+    $des.Padding = [Security.Cryptography.PaddingMode]::None
+    $des.Key = $key
+    $encryptor = $des.CreateEncryptor()
+    try { return $encryptor.TransformFinalBlock($plain, 0, $plain.Length) }
+    finally { $encryptor.Dispose() }
+  } finally {
+    $des.Dispose()
+  }
+}
+$tightVNCServiceKey = "HKLM:\Software\TightVNC\Server"
+$vncPassword = (Get-Content -Raw -LiteralPath $vncPasswordPath).Trim()
+$encryptedVNCPassword = ConvertTo-CrabboxVNCPassword $vncPassword
+Stop-Service -Name tvnserver -Force -ErrorAction SilentlyContinue
+New-Item -Force -Path $tightVNCServiceKey | Out-Null
+New-ItemProperty -Force -Path $tightVNCServiceKey -Name UseVncAuthentication -PropertyType DWord -Value 1 | Out-Null
+New-ItemProperty -Force -Path $tightVNCServiceKey -Name Password -PropertyType Binary -Value $encryptedVNCPassword | Out-Null
+New-ItemProperty -Force -Path $tightVNCServiceKey -Name UseControlAuthentication -PropertyType DWord -Value 1 | Out-Null
+New-ItemProperty -Force -Path $tightVNCServiceKey -Name ControlPassword -PropertyType Binary -Value $encryptedVNCPassword | Out-Null
+New-ItemProperty -Force -Path $tightVNCServiceKey -Name AllowLoopback -PropertyType DWord -Value 1 | Out-Null
+New-ItemProperty -Force -Path $tightVNCServiceKey -Name AcceptHttpConnections -PropertyType DWord -Value 0 | Out-Null
+`
+}
+
+func azureWindowsSnapshotResetCredentialsPowerShell() string {
+	return `
+$vncPasswordPath = "C:\ProgramData\crabbox\vnc.password"
+Remove-Item -LiteralPath $vncPasswordPath, $windowsUsernamePath, $windowsPasswordPath -Force -ErrorAction SilentlyContinue
+Get-ChildItem -LiteralPath "$env:ProgramData\ssh" -Filter "ssh_host_*" -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+`
 }
 
 func azureWindowsBootstrapPowerShell(cfg Config, publicKey string) string {
@@ -510,8 +481,7 @@ func azureWindowsBootstrapPowerShell(cfg Config, publicKey string) string {
 $passwordPath = Join-Path $base "windows.password"
 $usernamePath = Join-Path $base "windows.username"
 $passwordMirrorPath = $null
-$enforceKeyAuth = $true
-` + windowsBootstrapCorePowerShell() + `
+` + sharedWindowsCore() + `
 git --version | Out-Null
 tar --version | Out-Null
 ` + setupComplete + `
@@ -519,105 +489,12 @@ Restart-Service sshd -Force
 `
 }
 
-func windowsSSHPortsPowerShell(cfg Config) string {
-	ports := sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts)
-	quoted := make([]string, 0, len(ports))
-	for _, port := range ports {
-		quoted = append(quoted, psQuote(port))
-	}
-	return "@(" + strings.Join(quoted, ", ") + ")"
-}
-
 func macOSUserData(cfg Config, publicKey string) string {
 	workRoot := cfg.WorkRoot
 	if workRoot == "" {
 		workRoot = defaultMacOSWorkRoot
 	}
-	quotedPorts := make([]string, 0, len(sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts)))
-	for _, port := range sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts) {
-		quotedPorts = append(quotedPorts, shellQuote(port))
-	}
-	sshPortsShell := strings.Join(quotedPorts, " ")
-	return `#!/bin/bash
-set -euxo pipefail
-crabbox_user=` + shellQuote(cfg.SSHUser) + `
-crabbox_work_root=` + shellQuote(workRoot) + `
-crabbox_public_key=` + shellQuote(publicKey) + `
-crabbox_ssh_ports=(` + sshPortsShell + `)
-id "$crabbox_user" >/dev/null
-install -d -m 0755 "$crabbox_work_root" /var/db/crabbox
-chown -R "$crabbox_user":staff "$crabbox_work_root"
-user_home="$(dscl . -read "/Users/$crabbox_user" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}')"
-if [ -z "$user_home" ]; then
-  user_home="/Users/$crabbox_user"
-fi
-install -d -m 0700 -o "$crabbox_user" -g staff "$user_home/.ssh"
-authorized_keys="$user_home/.ssh/authorized_keys"
-touch "$authorized_keys"
-if [ -n "$crabbox_public_key" ] && ! grep -qxF "$crabbox_public_key" "$authorized_keys"; then
-  printf '%s\n' "$crabbox_public_key" >>"$authorized_keys"
-fi
-chown "$crabbox_user":staff "$user_home/.ssh" "$authorized_keys"
-chmod 0700 "$user_home/.ssh"
-chmod 0600 "$authorized_keys"
-sshd_config=/etc/ssh/sshd_config
-touch "$sshd_config"
-tmp_config="$(mktemp)"
-awk '
-  /^# crabbox ssh ports begin$/ { skip=1; next }
-  /^# crabbox ssh ports end$/ { skip=0; next }
-  !skip { print }
-' "$sshd_config" >"$tmp_config"
-cat "$tmp_config" >"$sshd_config"
-rm -f "$tmp_config"
-{
-  printf '%s\n' '# crabbox ssh ports begin'
-  for port in "${crabbox_ssh_ports[@]}"; do
-    printf 'Port %s\n' "$port"
-  done
-  printf '%s\n' 'PubkeyAuthentication yes'
-  printf '%s\n' 'PasswordAuthentication no'
-  printf '%s\n' '# crabbox ssh ports end'
-} >>"$sshd_config"
-/usr/sbin/sshd -t -f "$sshd_config"
-systemsetup -setremotelogin on || true
-launchctl enable system/com.openssh.sshd || true
-launchctl load -w /System/Library/LaunchDaemons/ssh.plist || true
-launchctl kickstart -k system/com.openssh.sshd || true
-if [ ! -s /var/db/crabbox/vnc.password ]; then
-  set +o pipefail
-  pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
-  set -o pipefail
-  if [ "${#pw}" -ne 16 ]; then
-    echo "failed to generate vnc password" >&2
-    exit 1
-  fi
-  printf '%s\n' "$pw" >/var/db/crabbox/vnc.password
-  dscl . -passwd /Users/` + shellQuote(cfg.SSHUser) + ` "$pw"
-fi
-chmod 0600 /var/db/crabbox/vnc.password
-launchctl enable system/com.apple.screensharing || true
-launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
-launchctl kickstart -k system/com.apple.screensharing || true
-cat >/usr/local/bin/crabbox-ready <<'READY'
-#!/bin/bash
-set -euo pipefail
-rsync --version >/dev/null
-curl --version >/dev/null
-test -w ` + shellQuote(workRoot) + `
-ssh_ready=0
-for port in ` + sshPortsShell + `; do
-  if nc -z 127.0.0.1 "$port"; then
-    ssh_ready=1
-    break
-  fi
-done
-test "$ssh_ready" -eq 1
-nc -z 127.0.0.1 5900
-READY
-chmod 0755 /usr/local/bin/crabbox-ready
-/usr/local/bin/crabbox-ready
-`
+	return "#!/bin/bash\nset -euo pipefail\n(\n" + sharedMacOSSSHSession() + ")\n(\n" + sharedMacOSNodeInstall() + ")\n" + sharedMacOS(cfg.SSHUser, publicKey, workRoot, sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts))
 }
 
 func cloudInitOptionalReadyChecks(cfg Config) string {
@@ -633,10 +510,10 @@ func cloudInitOptionalReadyChecks(cfg Config) string {
 		} else {
 			b.WriteString("      systemctl is-active --quiet crabbox-xvfb.service\n")
 			b.WriteString("      systemctl is-active --quiet crabbox-desktop.service\n")
-			b.WriteString("      systemctl is-active --quiet crabbox-desktop-session.service\n")
-			b.WriteString("      systemctl is-active --quiet crabbox-x11vnc.service\n")
 		}
-		b.WriteString("      ss -ltn | grep -q '127.0.0.1:5900'\n")
+		// Check the producer separately: POSIX sh has no portable pipefail.
+		b.WriteString("      listening_sockets=$(ss -ltn)\n")
+		b.WriteString("      printf '%s\\n' \"$listening_sockets\" | grep -q '127.0.0.1:5900'\n")
 	}
 	if cfg.Browser {
 		b.WriteString("      test -s /var/lib/crabbox/browser.env\n")
@@ -653,8 +530,8 @@ func cloudInitOptionalReadyChecks(cfg Config) string {
 
 func cloudInitOptionalWriteFiles(cfg Config) string {
 	var parts []string
-	if cfg.Provider == "gcp" {
-		parts = append(parts, cloudInitGCPExpiryGuardFiles())
+	if files := cloudInitGuestExpiryGuardFiles(cfg); files != "" {
+		parts = append(parts, files)
 	}
 	if cfg.Desktop && isWaylandDesktopEnv(cfg.DesktopEnv) {
 		parts = append(parts, cloudInitWaylandDesktopWriteFiles(normalizedDesktopEnv(cfg.DesktopEnv)))
@@ -663,224 +540,24 @@ func cloudInitOptionalWriteFiles(cfg Config) string {
     permissions: '0644'
     content: |
       [Unit]
-      Description=Crabbox Xvfb display
+      Description=Crabbox resize-capable TigerVNC display
       After=network.target
 
       [Service]
       User=crabbox
-      ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -ac
+      ExecStart=/usr/bin/Xtigervnc :99 -geometry 1920x1080 -depth 24 -localhost yes -rfbport 5900 -SecurityTypes VncAuth -PasswordFile=/var/lib/crabbox/vnc.pass -AlwaysShared -AcceptSetDesktopSize -nolisten tcp -ac
       Restart=always
 
       [Install]
       WantedBy=multi-user.target
+  - path: /usr/local/lib/crabbox/xfce-session.sh
+    permissions: '0644'
+    content: |
+      `+strings.ReplaceAll(strings.TrimSuffix(sharedXfceSessionEnvironment(), "\n"), "\n", "\n      ")+`
   - path: /usr/local/bin/crabbox-configure-desktop-theme
     permissions: '0755'
     content: |
-      #!/bin/sh
-      set -eu
-      requested_mode="${1:-${CRABBOX_DESKTOP_THEME:-}}"
-      user="${CRABBOX_DESKTOP_USER:-crabbox}"
-      home_dir="$(getent passwd "$user" | cut -d: -f6)"
-      if [ -z "$home_dir" ]; then
-        home_dir="/home/$user"
-      fi
-      config_dir="$home_dir/.config"
-      mode="$requested_mode"
-      if [ -z "$mode" ] && [ -f "$config_dir/crabbox/desktop-theme" ]; then
-        mode="$(cat "$config_dir/crabbox/desktop-theme" 2>/dev/null || true)"
-      fi
-      case "$mode" in
-        light|dark) ;;
-        *) mode=dark ;;
-      esac
-      if [ "$mode" = "light" ]; then
-        gtk_theme=Adwaita
-        gtk_prefer_dark=false
-        gtk_prefer_dark_ini=0
-        gsettings_scheme=prefer-light
-        root_color="#f4f6f8"
-        terminal_fg="#1f2937"
-        terminal_bg="#f8fafc"
-        terminal_cursor="#111827"
-        panel_rgba="0.94 0.95 0.97 1"
-        panel_css_bg="#eef2f7"
-        panel_css_fg="#111827"
-        gtk_candidates="Arc Greybird Adwaita"
-        xfwm_candidates="Arc Greybird Daloa Default"
-      else
-        gtk_theme=Adwaita-dark
-        gtk_prefer_dark=true
-        gtk_prefer_dark_ini=1
-        gsettings_scheme=prefer-dark
-        root_color="#20242b"
-        terminal_fg="#e5e7eb"
-        terminal_bg="#111827"
-        terminal_cursor="#f3f4f6"
-        panel_rgba="0.12 0.13 0.15 1"
-        panel_css_bg="#20242b"
-        panel_css_fg="#e5e7eb"
-        gtk_candidates="Arc-Dark Greybird-dark Adwaita-dark Greybird"
-        xfwm_candidates="Arc-Dark Greybird-dark Daloa Default"
-      fi
-      for candidate in $gtk_candidates; do
-        if [ -d "/usr/share/themes/$candidate/gtk-3.0" ]; then
-          gtk_theme="$candidate"
-          break
-        fi
-      done
-      xfwm_theme=Default
-      for candidate in $xfwm_candidates; do
-        if [ -d "/usr/share/themes/$candidate/xfwm4" ]; then
-          xfwm_theme="$candidate"
-          break
-        fi
-      done
-      if [ "$(id -u)" -eq 0 ]; then
-        install -d -m 0700 -o "$user" "$config_dir/xfce4/xfconf/xfce-perchannel-xml" "$config_dir/xfce4/terminal" "$config_dir/gtk-3.0" "$config_dir/crabbox"
-      else
-        mkdir -p "$config_dir/xfce4/xfconf/xfce-perchannel-xml" "$config_dir/xfce4/terminal" "$config_dir/gtk-3.0" "$config_dir/crabbox"
-        chmod 0700 "$config_dir" "$config_dir/xfce4" "$config_dir/xfce4/xfconf" "$config_dir/xfce4/xfconf/xfce-perchannel-xml" "$config_dir/xfce4/terminal" "$config_dir/gtk-3.0" "$config_dir/crabbox"
-      fi
-      printf '%s\n' "$mode" > "$config_dir/crabbox/desktop-theme"
-      cat > "$config_dir/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" <<XML
-      <?xml version="1.0" encoding="UTF-8"?>
-      <channel name="xsettings" version="1.0">
-        <property name="Net" type="empty">
-          <property name="ThemeName" type="string" value="$gtk_theme"/>
-          <property name="IconThemeName" type="string" value="Adwaita"/>
-        </property>
-        <property name="Gtk" type="empty">
-          <property name="ApplicationPreferDarkTheme" type="bool" value="$gtk_prefer_dark"/>
-        </property>
-      </channel>
-      XML
-      if [ ! -s "$config_dir/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" ]; then
-        cat > "$config_dir/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<XML
-      <?xml version="1.0" encoding="UTF-8"?>
-      <channel name="xfwm4" version="1.0">
-        <property name="general" type="empty">
-          <property name="theme" type="string" value="$xfwm_theme"/>
-          <property name="box_move" type="bool" value="false"/>
-          <property name="box_resize" type="bool" value="false"/>
-          <property name="move_opacity" type="int" value="100"/>
-          <property name="resize_opacity" type="int" value="100"/>
-          <property name="snap_resist" type="bool" value="false"/>
-          <property name="snap_to_border" type="bool" value="false"/>
-          <property name="snap_to_windows" type="bool" value="false"/>
-          <property name="snap_width" type="int" value="0"/>
-          <property name="tile_on_move" type="bool" value="false"/>
-          <property name="use_compositing" type="bool" value="false"/>
-          <property name="wrap_windows" type="bool" value="false"/>
-        </property>
-      </channel>
-      XML
-      fi
-      cat > "$config_dir/xfce4/terminal/terminalrc" <<EOF
-      [Configuration]
-      ColorForeground=$terminal_fg
-      ColorBackground=$terminal_bg
-      ColorCursor=$terminal_cursor
-      MiscBell=FALSE
-      EOF
-      cat > "$config_dir/gtk-3.0/settings.ini" <<EOF
-      [Settings]
-      gtk-theme-name=$gtk_theme
-      gtk-icon-theme-name=Adwaita
-      gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-      EOF
-      cat > "$home_dir/.gtkrc-2.0" <<EOF
-      gtk-theme-name="$gtk_theme"
-      gtk-icon-theme-name="Adwaita"
-      gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-      EOF
-      css_file="$config_dir/gtk-3.0/gtk.css"
-      css_tmp="$(mktemp)"
-      if [ -f "$css_file" ]; then
-        sed '/^[/][*] crabbox desktop theme start [*][/]$/,/^[/][*] crabbox desktop theme end [*][/]$/d' "$css_file" > "$css_tmp" || true
-      fi
-      cat >> "$css_tmp" <<EOF
-      /* crabbox desktop theme start */
-      .xfce4-panel { background: $panel_css_bg; background-color: $panel_css_bg; color: $panel_css_fg; }
-      .xfce4-panel * { color: $panel_css_fg; text-shadow: none; -gtk-icon-shadow: none; }
-      .xfce4-panel button,
-      .xfce4-panel button.flat,
-      .xfce4-panel button:hover,
-      .xfce4-panel button:active,
-      .xfce4-panel button:checked,
-      .xfce4-panel button:focus,
-      .xfce4-panel button:backdrop,
-      .xfce4-panel .tasklist button,
-      .xfce4-panel .tasklist button:hover,
-      .xfce4-panel .tasklist button:active,
-      .xfce4-panel .tasklist button:checked,
-      .xfce4-panel .tasklist button:checked:hover,
-      .xfce4-panel .tasklist button:focus,
-      .xfce4-panel .tasklist button:backdrop,
-      .xfce4-panel .tasklist .toggle,
-      .xfce4-panel .tasklist .toggle:hover,
-      .xfce4-panel .tasklist .toggle:checked,
-      .xfce4-panel .tasklist .toggle:checked:hover,
-      .xfce4-panel .tasklist button:checked,
-      .xfce4-panel .tasklist button:active {
-        background: $panel_css_bg;
-        background-image: none;
-        background-color: $panel_css_bg;
-        border-image: none;
-        border-color: $panel_css_fg;
-        box-shadow: none;
-        color: $panel_css_fg;
-        outline-color: transparent;
-        text-shadow: none;
-        -gtk-icon-shadow: none;
-      }
-      .xfce4-panel .tasklist button label,
-      .xfce4-panel .tasklist .toggle label {
-        color: $panel_css_fg;
-        text-shadow: none;
-      }
-      /* crabbox desktop theme end */
-      EOF
-      mv "$css_tmp" "$css_file"
-      if [ "$(id -u)" -eq 0 ]; then
-        chown -R "$user" "$config_dir" "$home_dir/.gtkrc-2.0"
-      fi
-      if [ -n "${DISPLAY:-}" ] && command -v xfconf-query >/dev/null 2>&1; then
-        xfconf-query -c xsettings -p /Net/ThemeName -n -t string -s "$gtk_theme" >/dev/null 2>&1 || true
-        xfconf-query -c xsettings -p /Net/IconThemeName -n -t string -s Adwaita >/dev/null 2>&1 || true
-        xfconf-query -c xsettings -p /Gtk/ApplicationPreferDarkTheme -n -t bool -s "$gtk_prefer_dark" >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/theme -n -t string -s "$xfwm_theme" >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/box_move -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/box_resize -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/move_opacity -n -t int -s 100 >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/resize_opacity -n -t int -s 100 >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/snap_resist -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/snap_to_border -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/snap_to_windows -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/snap_width -n -t int -s 0 >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/tile_on_move -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/use_compositing -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfwm4 -p /general/wrap_windows -n -t bool -s false >/dev/null 2>&1 || true
-        xfconf-query -c xfce4-panel -p /panels/dark-mode -n -t bool -s "$gtk_prefer_dark" >/dev/null 2>&1 || true
-        set -- $panel_rgba
-        for panel_id in panel-1 panel-2; do
-          xfconf-query -c xfce4-panel -p "/panels/$panel_id/background-style" -n -t int -s 1 >/dev/null 2>&1 || true
-          xfconf-query -c xfce4-panel -p "/panels/$panel_id/background-rgba" -n -a -t double -s "$1" -t double -s "$2" -t double -s "$3" -t double -s "$4" >/dev/null 2>&1 || true
-        done
-        if [ "$(id -un)" = "$user" ]; then
-          pkill -TERM -x xfce4-panel >/dev/null 2>&1 || true
-          (sleep 0.4; xfce4-panel >"/tmp/crabbox-xfce4-panel-$user.log" 2>&1 &) >/dev/null 2>&1 &
-        else
-          pkill -USR1 -x xfce4-panel >/dev/null 2>&1 || true
-        fi
-        xfwm4 --replace --compositor=off >"/tmp/crabbox-xfwm4-replace-$user.log" 2>&1 &
-      fi
-      if [ -n "${DISPLAY:-}" ] && command -v xsetroot >/dev/null 2>&1; then
-        xsetroot -solid "$root_color" || true
-      fi
-      if command -v gsettings >/dev/null 2>&1; then
-        gsettings set org.gnome.desktop.interface color-scheme "$gsettings_scheme" >/dev/null 2>&1 || true
-        gsettings set org.gnome.desktop.interface gtk-theme "$gtk_theme" >/dev/null 2>&1 || true
-      fi
+      `+strings.ReplaceAll(strings.TrimSuffix(sharedXfceDesktopTheme("classic"), "\n"), "\n", "\n      ")+`
   - path: /etc/systemd/system/crabbox-desktop.service
     permissions: '0644'
     content: |
@@ -897,50 +574,20 @@ func cloudInitOptionalWriteFiles(cfg Config) string {
 
       [Install]
       WantedBy=multi-user.target
+      # Published CLI reset commands still request this legacy name.
+      Alias=crabbox-desktop-session.service
   - path: /usr/local/bin/crabbox-desktop-session
     permissions: '0755'
     content: |
-      #!/bin/sh
-      set -eu
-      export DISPLAY="${DISPLAY:-:99}"
-      CRABBOX_DESKTOP_USER="$(id -un)" /usr/local/bin/crabbox-configure-desktop-theme || true
-      if command -v xfce4-terminal >/dev/null 2>&1 && ! pgrep -u "$(id -u)" -f 'xfce4-terminal.*Crabbox Desktop' >/dev/null 2>&1; then
-        xfce4-terminal --title='Crabbox Desktop' --geometry=110x32+48+48 &
-      elif command -v xterm >/dev/null 2>&1 && ! pgrep -u "$(id -u)" -f 'xterm -title Crabbox Desktop' >/dev/null 2>&1; then
-        xterm -title 'Crabbox Desktop' -geometry 110x32+48+48 -bg '#111827' -fg '#e5e7eb' &
-      fi
-      tail -f /dev/null
-  - path: /etc/systemd/system/crabbox-desktop-session.service
+      `+strings.ReplaceAll(strings.TrimSuffix(sharedXfceDesktopSession(), "\n"), "\n", "\n      ")+`
+  - path: /etc/xdg/autostart/crabbox-desktop.desktop
     permissions: '0644'
     content: |
-      [Unit]
-      Description=Crabbox visible desktop helper
-      After=crabbox-desktop.service
-      Requires=crabbox-xvfb.service crabbox-desktop.service
-
-      [Service]
-      User=crabbox
-      Environment=DISPLAY=:99
-      ExecStart=/usr/local/bin/crabbox-desktop-session
-      Restart=always
-
-      [Install]
-      WantedBy=multi-user.target
-  - path: /etc/systemd/system/crabbox-x11vnc.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Crabbox loopback VNC server
-      After=crabbox-xvfb.service
-      Requires=crabbox-xvfb.service
-
-      [Service]
-      User=crabbox
-      ExecStart=/usr/bin/x11vnc -display :99 -localhost -rfbport 5900 -forever -shared -rfbauth /var/lib/crabbox/vnc.pass -wait 16 -defer 8 -nowait_bog
-      Restart=always
-
-      [Install]
-      WantedBy=multi-user.target
+      [Desktop Entry]
+      Type=Application
+      Name=Crabbox Desktop
+      Exec=/usr/local/bin/crabbox-desktop-session
+      OnlyShowIn=XFCE;
 `)
 	}
 	return strings.Join(parts, "\n")
@@ -1022,8 +669,15 @@ func cloudInitWaylandDesktopWriteFiles(desktopEnv string) string {
 `
 }
 
+func cloudInitEarlyBootstrap(cfg Config) string {
+	return cloudInitGuestExpiryGuardBootstrap(cfg)
+}
+
 func cloudInitOptionalBootstrap(cfg Config) string {
 	var parts []string
+	if cfg.Desktop || cfg.Browser {
+		parts = append(parts, indentCloudInitRuncmd(sharedLinuxOptionalPackages()))
+	}
 	if cfg.Tailscale.Enabled {
 		parts = append(parts, cloudInitTailscaleBootstrap(cfg))
 	}
@@ -1061,7 +715,15 @@ func cloudInitOptionalBootstrap(cfg Config) string {
     export MOZ_ENABLE_WAYLAND=0
     wallpaper_file="$HOME/.config/crabbox/desktop-background-$theme.svg"
     if command -v swaybg >/dev/null 2>&1; then
-      (swaybg -i "$wallpaper_file" -m fill >/tmp/crabbox-swaybg.log 2>&1 || swaybg -c "#0d1117" >/tmp/crabbox-swaybg.log 2>&1) &
+      (
+        if swaybg -i "$wallpaper_file" -m fill; then
+          exit 0
+        else
+          status=$?
+        fi
+        [ "$status" -lt 128 ] || exit "$status"
+        exec swaybg -c "#0d1117"
+      ) </dev/null >/tmp/crabbox-swaybg.log 2>&1 &
     fi
     gnome-panel >/tmp/crabbox-gnome-panel.log 2>&1 &
     gnome-terminal -- bash -l >/tmp/crabbox-gnome-terminal.log 2>&1 &
@@ -1069,203 +731,12 @@ func cloudInitOptionalBootstrap(cfg Config) string {
 `
 			desktopEnvExtra = "    DISPLAY=:0\n    GDK_BACKEND=x11\n    MOZ_ENABLE_WAYLAND=0\n"
 			themeBootstrap = indentCloudInitRuncmd(`cat >/usr/local/bin/crabbox-configure-desktop-theme <<'THEME'
-#!/bin/sh
-set -eu
-requested_mode="${1:-${CRABBOX_DESKTOP_THEME:-}}"
-user="${CRABBOX_DESKTOP_USER:-crabbox}"
-home_dir="$(getent passwd "$user" | cut -d: -f6)"
-if [ -z "$home_dir" ]; then
-  home_dir="/home/$user"
-fi
-config_dir="$home_dir/.config"
-mode="$requested_mode"
-if [ -z "$mode" ] && [ -f "$config_dir/crabbox/desktop-theme" ]; then
-  mode="$(cat "$config_dir/crabbox/desktop-theme" 2>/dev/null || true)"
-fi
-case "$mode" in
-  light|dark) ;;
-  *) mode=dark ;;
-esac
-if [ "$mode" = "light" ]; then
-  gtk_theme=Adwaita
-  gtk_prefer_dark_ini=0
-  gsettings_scheme=prefer-light
-  terminal_fg="#1f2937"
-  terminal_bg="#f8fafc"
-  labwc_title_bg="#f3f4f6"
-  labwc_title_fg="#111827"
-  labwc_inactive_title_bg="#e5e7eb"
-  labwc_inactive_title_fg="#374151"
-  labwc_border="#cbd5e1"
-  terminal_menu_bg="#f3f4f6"
-  terminal_menu_fg="#111827"
-  terminal_menu_hover_bg="#e5e7eb"
-  wallpaper_bg="#e7eef7"
-  wallpaper_panel="#d6e7f2"
-  wallpaper_accent="#0891b2"
-  wallpaper_grid="#b9c7d7"
-else
-  gtk_theme=Adwaita-dark
-  gtk_prefer_dark_ini=1
-  gsettings_scheme=prefer-dark
-  terminal_fg="#e5e7eb"
-  terminal_bg="#000000"
-  labwc_title_bg="#1f2329"
-  labwc_title_fg="#e5e7eb"
-  labwc_inactive_title_bg="#111827"
-  labwc_inactive_title_fg="#9ca3af"
-  labwc_border="#30363d"
-  terminal_menu_bg="#2b2f36"
-  terminal_menu_fg="#d1d5db"
-  terminal_menu_hover_bg="#374151"
-  wallpaper_bg="#0d1117"
-  wallpaper_panel="#111827"
-  wallpaper_accent="#22d3ee"
-  wallpaper_grid="#1f2937"
-fi
-if [ "$(id -u)" -eq 0 ]; then
-  install -d -m 0700 -o "$user" "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0"
-else
-  mkdir -p "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0" "$config_dir/labwc"
-  chmod 0700 "$config_dir" "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0" "$config_dir/labwc"
-fi
-printf '%s\n' "$mode" > "$config_dir/crabbox/desktop-theme"
-for gtk_dir in "$config_dir/gtk-3.0" "$config_dir/gtk-4.0"; do
-  cat > "$gtk_dir/settings.ini" <<EOF
-[Settings]
-gtk-theme-name=$gtk_theme
-gtk-icon-theme-name=Adwaita
-gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-EOF
-done
-cat > "$home_dir/.gtkrc-2.0" <<EOF
-gtk-theme-name="$gtk_theme"
-gtk-icon-theme-name="Adwaita"
-gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-EOF
-if [ "$(id -u)" -eq 0 ]; then
-  chown -R "$user" "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0" "$home_dir/.gtkrc-2.0"
-fi
-if [ -f /var/lib/crabbox/desktop.env ]; then
-  . /var/lib/crabbox/desktop.env
-fi
-display="${DISPLAY:-:0}"
-runtime="${XDG_RUNTIME_DIR:-/tmp/crabbox-runtime-$(id -u "$user")}"
-dbus_address="${DBUS_SESSION_BUS_ADDRESS:-}"
-if [ -z "$dbus_address" ]; then
-  labwc_pid="$(pgrep -u "$user" -n -x labwc 2>/dev/null || true)"
-  if [ -n "$labwc_pid" ] && [ -r "/proc/$labwc_pid/environ" ]; then
-    dbus_address="$(tr '\0' '\n' < "/proc/$labwc_pid/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n1)"
-  fi
-fi
-set_gnome_terminal_theme() {
-  profiles="$(gsettings get org.gnome.Terminal.ProfilesList list 2>/dev/null | tr -d "[],'" || true)"
-  default_profile="$(gsettings get org.gnome.Terminal.ProfilesList default 2>/dev/null | tr -d "'" || true)"
-  if [ -n "$default_profile" ] && ! printf ' %s ' "$profiles" | grep -q " $default_profile "; then
-    profiles="$profiles $default_profile"
-  fi
-  for profile in $profiles; do
-    [ -n "$profile" ] || continue
-    profile_path="/org/gnome/terminal/legacy/profiles:/:$profile/"
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" use-theme-colors false >/dev/null 2>&1 || true
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" foreground-color "$terminal_fg" >/dev/null 2>&1 || true
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" background-color "$terminal_bg" >/dev/null 2>&1 || true
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" use-transparent-background false >/dev/null 2>&1 || true
-  done
-}
-set_gtk_chrome_theme() {
-  cat > "$config_dir/gtk-3.0/gtk.css" <<EOF
-menubar, .menubar {
-  background-color: $terminal_menu_bg;
-  color: $terminal_menu_fg;
-}
-menubar menuitem, menubar menuitem label {
-  color: $terminal_menu_fg;
-}
-menubar menuitem:hover {
-  background-color: $terminal_menu_hover_bg;
-  color: $terminal_menu_fg;
-}
-EOF
-}
-set_labwc_theme() {
-  mkdir -p "$config_dir/labwc"
-  cat > "$config_dir/labwc/themerc-override" <<EOF
-window.active.title.bg.color: $labwc_title_bg
-window.active.label.text.color: $labwc_title_fg
-window.inactive.title.bg.color: $labwc_inactive_title_bg
-window.inactive.label.text.color: $labwc_inactive_title_fg
-window.active.border.color: $labwc_border
-window.inactive.border.color: $labwc_border
-window.active.button.unpressed.image.color: $labwc_title_fg
-window.inactive.button.unpressed.image.color: $labwc_inactive_title_fg
-window.active.button.hover.image.color: $labwc_title_fg
-window.inactive.button.hover.image.color: $labwc_inactive_title_fg
-window.active.button.pressed.image.color: $labwc_title_fg
-window.inactive.button.pressed.image.color: $labwc_inactive_title_fg
-EOF
-  if command -v labwc >/dev/null 2>&1; then
-    labwc_pid="$(pgrep -u "$user" -n -x labwc 2>/dev/null || true)"
-    if [ -n "$labwc_pid" ]; then
-      LABWC_PID="$labwc_pid" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" labwc --reconfigure >/dev/null 2>&1 || kill -HUP "$labwc_pid" >/dev/null 2>&1 || true
-    fi
-  fi
-}
-set_desktop_background() {
-  wallpaper_file="$config_dir/crabbox/desktop-background-$mode.svg"
-  cat > "$wallpaper_file" <<EOF
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080">
-  <rect width="1920" height="1080" fill="$wallpaper_bg"/>
-  <path d="M0 720 C360 620 520 760 860 650 C1210 540 1430 660 1920 520 L1920 1080 L0 1080 Z" fill="$wallpaper_panel"/>
-  <g stroke="$wallpaper_grid" stroke-width="1" opacity="0.45">
-    <path d="M0 180 H1920M0 360 H1920M0 540 H1920M0 720 H1920M0 900 H1920"/>
-    <path d="M240 0 V1080M480 0 V1080M720 0 V1080M960 0 V1080M1200 0 V1080M1440 0 V1080M1680 0 V1080"/>
-  </g>
-  <path d="M220 740 C520 520 790 910 1090 670 S1510 520 1710 700" fill="none" stroke="$wallpaper_accent" stroke-width="18" stroke-linecap="round" opacity="0.8"/>
-  <rect x="1320" y="180" width="360" height="170" rx="18" fill="$wallpaper_accent" opacity="0.12"/>
-</svg>
-EOF
-  if command -v swaybg >/dev/null 2>&1; then
-    pkill -u "$user" -x swaybg >/dev/null 2>&1 || true
-    (XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" swaybg -i "$wallpaper_file" -m fill >/tmp/crabbox-swaybg.log 2>&1 || XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" swaybg -c "$wallpaper_bg" >/tmp/crabbox-swaybg.log 2>&1) &
-  fi
-}
-target_uid="$(id -u "$user" 2>/dev/null || printf 0)"
-if [ "$(id -u)" -eq 0 ] && [ "$target_uid" -ne 0 ]; then
-  su "$user" -s /bin/sh -c "CRABBOX_DESKTOP_USER='$user' CRABBOX_DESKTOP_THEME='$mode' DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 /usr/local/bin/crabbox-configure-desktop-theme '$mode'" || true
-  exit 0
-fi
-if command -v gsettings >/dev/null 2>&1; then
-  if [ "$(id -u)" -eq 0 ]; then
-    su "$user" -s /bin/sh -c "DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface color-scheme '$gsettings_scheme' >/dev/null 2>&1 || true"
-    su "$user" -s /bin/sh -c "DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface gtk-theme '$gtk_theme' >/dev/null 2>&1 || true"
-  else
-    DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface color-scheme "$gsettings_scheme" >/dev/null 2>&1 || true
-    DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface gtk-theme "$gtk_theme" >/dev/null 2>&1 || true
-    DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 set_gnome_terminal_theme
-  fi
-fi
-set_gtk_chrome_theme
-set_labwc_theme
-set_desktop_background
-if [ "$(id -u)" -eq 0 ] && pgrep -u "$user" -x gnome-panel >/dev/null 2>&1; then
-  pkill -TERM -u "$user" -x gnome-panel >/dev/null 2>&1 || true
-  su "$user" -s /bin/sh -c "DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 GTK_THEME='$gtk_theme' nohup gnome-panel >/tmp/crabbox-gnome-panel.log 2>&1 &" >/dev/null 2>&1 || true
-elif [ "$(id -u)" -ne 0 ] && pgrep -x gnome-panel >/dev/null 2>&1; then
-  pkill -TERM -x gnome-panel >/dev/null 2>&1 || true
-  DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 GTK_THEME="$gtk_theme" nohup gnome-panel >/tmp/crabbox-gnome-panel.log 2>&1 &
-fi
-previous_terminal_theme="$(cat "$config_dir/crabbox/gnome-terminal-theme" 2>/dev/null || true)"
-printf '%s\n' "$mode" > "$config_dir/crabbox/gnome-terminal-theme"
-if [ "$(id -u)" -ne 0 ] && [ "$mode" = dark ] && command -v gnome-terminal >/dev/null 2>&1 && { [ "$previous_terminal_theme" != "$mode" ] || ! pgrep -u "$(id -u)" -f '/gnome-terminal-server' >/dev/null 2>&1; }; then
-  (sleep 0.4; DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 GTK_THEME="$gtk_theme" NO_AT_BRIDGE=1 gnome-terminal -- bash -l >/tmp/crabbox-gnome-terminal.log 2>&1 &) >/dev/null 2>&1 &
-fi
-THEME
+` + sharedGnomeDesktopTheme() + `THEME
 chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
 `)
 			themeConfigure = "    CRABBOX_DESKTOP_USER=crabbox /usr/local/bin/crabbox-configure-desktop-theme\n"
 		}
-		parts = append(parts, `    retry apt-get install -y --no-install-recommends `+packages+`
+		parts = append(parts, `    crabbox_install_packages `+packages+`
     install -d -m 0750 -o crabbox -g crabbox /var/lib/crabbox
     if [ ! -s /var/lib/crabbox/vnc.password ]; then
       (umask 077 && openssl rand -base64 18 > /var/lib/crabbox/vnc.password)
@@ -1298,39 +769,67 @@ chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
     systemctl enable crabbox-desktop.service crabbox-wayvnc.service
     systemctl restart crabbox-desktop.service crabbox-wayvnc.service`)
 	} else if cfg.Desktop {
-		parts = append(parts, `    retry apt-get install -y --no-install-recommends xvfb xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-terminal xfconf xfce4-settings x11vnc xauth dbus-x11 x11-xserver-utils xterm scrot ffmpeg xdotool wmctrl xclip xsel fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme util-linux novnc websockify
+		parts = append(parts, `    crabbox_install_packages tigervnc-standalone-server tigervnc-tools xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-terminal xfconf xfce4-settings xauth dbus-x11 x11-xserver-utils xterm scrot ffmpeg xdotool wmctrl xclip xsel fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme util-linux novnc websockify
     install -d -m 0750 -o crabbox -g crabbox /var/lib/crabbox
     if [ ! -s /var/lib/crabbox/vnc.password ]; then
       (umask 077 && openssl rand -base64 18 > /var/lib/crabbox/vnc.password)
     fi
-    { head -c 8 /var/lib/crabbox/vnc.password; printf '\n'; head -c 8 /var/lib/crabbox/vnc.password; printf '\n\n'; } | x11vnc -storepasswd /var/lib/crabbox/vnc.pass >/dev/null 2>&1
+    head -c 8 /var/lib/crabbox/vnc.password | tigervncpasswd -f > /var/lib/crabbox/vnc.pass
     chown crabbox:crabbox /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
     chmod 0600 /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
     printf 'CRABBOX_DESKTOP_ENV=xfce\nDISPLAY=:99\n' >/var/lib/crabbox/desktop.env
     chown crabbox:crabbox /var/lib/crabbox/desktop.env
     chmod 0644 /var/lib/crabbox/desktop.env
-    CRABBOX_DESKTOP_USER=crabbox /usr/local/bin/crabbox-configure-desktop-theme
+    systemctl disable --now crabbox-desktop-session.service 2>/dev/null || true
+    rm -f /etc/systemd/system/crabbox-desktop-session.service
+    systemctl stop crabbox-desktop.service 2>/dev/null || true
+    env -u DISPLAY CRABBOX_DESKTOP_USER=crabbox /usr/local/bin/crabbox-configure-desktop-theme
     systemctl daemon-reload
-    systemctl disable --now crabbox-wayvnc.service 2>/dev/null || true
-    systemctl enable crabbox-xvfb.service crabbox-desktop.service crabbox-desktop-session.service crabbox-x11vnc.service
-    systemctl restart crabbox-xvfb.service crabbox-desktop.service crabbox-desktop-session.service crabbox-x11vnc.service`)
-	}
-	if cfg.Provider == "gcp" {
-		parts = append(parts, cloudInitGCPExpiryGuardBootstrap())
+    systemctl disable --now crabbox-wayvnc.service crabbox-x11vnc.service 2>/dev/null || true
+    systemctl enable crabbox-xvfb.service crabbox-desktop.service
+    systemctl restart crabbox-xvfb.service crabbox-desktop.service`)
 	}
 	if cfg.Browser {
-		parts = append(parts, `    retry apt-get install -y --no-install-recommends gnupg build-essential python3
-    browser_path=""
-    if [ "$(dpkg --print-architecture)" = "amd64" ]; then
-      install -d -m 0755 /etc/apt/trusted.gpg.d
-      curl -fsSL https://dl.google.com/linux/linux_signing_key.pub > /etc/apt/trusted.gpg.d/google.asc
-      chmod 0644 /etc/apt/trusted.gpg.d/google.asc
-      echo "deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
-      if apt-get update && retry apt-get install -y --no-install-recommends google-chrome-stable; then
-        browser_path="$(command -v google-chrome || true)"
+		parts = append(parts, `    crabbox_install_packages gnupg build-essential python3
+    browser_path="$(crabbox_existing_browser || true)"
+    if [ -z "$browser_path" ] && [ "$(dpkg --print-architecture)" = "amd64" ]; then
+      install -d -m 0755 /etc/apt/keyrings
+      google_key_tmp="$(mktemp -d /etc/apt/keyrings/google-linux.gpg.tmp.XXXXXX)"
+      google_key_home="$google_key_tmp/gnupg"
+      install -d -m 0700 "$google_key_home"
+      google_key_ready=0
+      if curl -fsSL https://dl.google.com/linux/linux_signing_key.pub > "$google_key_tmp/google.asc" &&
+         GNUPGHOME="$google_key_home" gpg --batch --import "$google_key_tmp/google.asc" >/dev/null 2>&1; then
+        google_key_fingerprint="$(GNUPGHOME="$google_key_home" gpg --batch --with-colons --fingerprint `+googleLinuxSigningKeyFingerprint+` 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }' || true)"
+        if [ "$google_key_fingerprint" = "`+googleLinuxSigningKeyFingerprint+`" ] &&
+           GNUPGHOME="$google_key_home" gpg --batch --export `+googleLinuxSigningKeyFingerprint+` > "$google_key_tmp/google-linux.gpg" &&
+           [ -s "$google_key_tmp/google-linux.gpg" ]; then
+          chmod 0644 "$google_key_tmp/google-linux.gpg"
+          mv -f "$google_key_tmp/google-linux.gpg" /etc/apt/keyrings/google-linux.gpg
+          google_key_ready=1
+        fi
+      fi
+      rm -rf "$google_key_tmp"
+      if [ "$google_key_ready" = 1 ]; then
+        install -d -m 0755 /etc/default
+        google_defaults_tmp="$(mktemp /etc/default/google-chrome.tmp.XXXXXX)"
+        if [ -f /etc/default/google-chrome ]; then
+          awk '!/^[[:space:]]*repo_add_once=/ && !/^[[:space:]]*repo_reenable_on_distupgrade=/' /etc/default/google-chrome > "$google_defaults_tmp"
+        fi
+        printf '%s\n' 'repo_add_once="false"' 'repo_reenable_on_distupgrade="false"' >> "$google_defaults_tmp"
+        chmod 0644 "$google_defaults_tmp"
+        mv -f "$google_defaults_tmp" /etc/default/google-chrome
+        rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-linux.gpg] https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/crabbox-google-chrome.list
+        if apt-get update && retry apt-get install -y --no-install-recommends google-chrome-stable; then
+          rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          browser_path="$(command -v google-chrome || true)"
+        else
+          rm -f /etc/apt/sources.list.d/crabbox-google-chrome.list /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          retry apt-get update || true
+        fi
       else
-        rm -f /etc/apt/sources.list.d/google-chrome.list
-        retry apt-get update || true
+        echo "Google Linux signing key verification failed; trying Chromium fallback" >&2
       fi
     fi
     if [ -z "$browser_path" ]; then
@@ -1360,7 +859,7 @@ chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
 	}
 	if cfg.Code {
 		parts = append(parts, `    retry apt-get install -y --no-install-recommends libatomic1
-    retry env HOME=/root sh -c 'curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone --prefix=/usr/local'
+    `+sharedCodeServerInstall()+`
     /usr/local/bin/code-server --version >/dev/null`)
 	}
 	return strings.Join(parts, "\n")
@@ -1380,106 +879,11 @@ func indentCloudInitRuncmd(script string) string {
 	return strings.Join(lines, "")
 }
 
-func cloudInitGCPExpiryGuardFiles() string {
-	return `  - path: /usr/local/sbin/crabbox-gcp-expiry-guard
-    permissions: '0755'
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-      metadata() {
-        curl -fsS -H 'Metadata-Flavor: Google' "http://metadata.google.internal/computeMetadata/v1/$1"
-      }
-      project="$(metadata project/project-id 2>/dev/null || true)"
-      name="$(metadata instance/name 2>/dev/null || true)"
-      zone_path="$(metadata instance/zone 2>/dev/null || true)"
-      zone="${zone_path##*/}"
-      token_json="$(metadata instance/service-accounts/default/token 2>/dev/null || true)"
-      token="$(printf '%s' "$token_json" | jq -r '.access_token // empty' 2>/dev/null || true)"
-      if [ -z "$project" ] || [ -z "$name" ] || [ -z "$zone" ] || [ -z "$token" ]; then
-        exit 0
-      fi
-      instance="$(curl -fsS -H "Authorization: Bearer $token" "https://compute.googleapis.com/compute/v1/projects/$project/zones/$zone/instances/$name" 2>/dev/null || true)"
-      if [ -z "$instance" ]; then
-        exit 0
-      fi
-      label() {
-        printf '%s' "$instance" | jq -r --arg key "$1" '.labels[$key] // empty'
-      }
-      crabbox="$(label crabbox)"
-      provider="$(label provider)"
-      if [ "$crabbox" != "true" ] || { [ -n "$provider" ] && [ "$provider" != "gcp" ]; }; then
-        exit 0
-      fi
-      keep="$(label keep | tr '[:upper:]' '[:lower:]')"
-      if [ "$keep" = "true" ]; then
-        exit 0
-      fi
-      expires_at="$(label expires_at)"
-      state="$(label state | tr '[:upper:]' '[:lower:]')"
-      now="$(date -u +%s)"
-      delete=false
-      case "$state" in
-        failed|released|expired)
-          delete=true
-          ;;
-        running|provisioning)
-          if [[ "$expires_at" =~ ^[0-9]+$ ]] && [ "$now" -gt $((expires_at + 43200)) ]; then
-            delete=true
-          fi
-          ;;
-        leased|ready|active|"")
-          if [[ "$expires_at" =~ ^[0-9]+$ ]] && [ "$now" -gt "$expires_at" ]; then
-            delete=true
-          fi
-          ;;
-        *)
-          if [[ "$expires_at" =~ ^[0-9]+$ ]] && [ "$now" -gt "$expires_at" ]; then
-            delete=true
-          fi
-          ;;
-      esac
-      if [ "$delete" != "true" ]; then
-        exit 0
-      fi
-      logger -t crabbox-gcp-expiry-guard "deleting expired lease=$(label lease) state=${state:-unknown} expires_at=${expires_at:-missing}"
-      curl -fsS -X DELETE -H "Authorization: Bearer $token" "https://compute.googleapis.com/compute/v1/projects/$project/zones/$zone/instances/$name" >/dev/null || true
-  - path: /etc/systemd/system/crabbox-gcp-expiry-guard.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Crabbox GCP direct lease expiry guard
-      After=network-online.target
-      Wants=network-online.target
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/sbin/crabbox-gcp-expiry-guard
-  - path: /etc/systemd/system/crabbox-gcp-expiry-guard.timer
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Run Crabbox GCP direct lease expiry guard
-
-      [Timer]
-      OnBootSec=2min
-      OnUnitActiveSec=2min
-      RandomizedDelaySec=30s
-      Persistent=true
-
-      [Install]
-      WantedBy=timers.target`
-}
-
-func cloudInitGCPExpiryGuardBootstrap() string {
-	return `    systemctl daemon-reload
-    systemctl enable --now crabbox-gcp-expiry-guard.timer`
-}
-
 func cloudInitTailscaleBootstrap(cfg Config) string {
 	authKey := strings.TrimSpace(cfg.Tailscale.AuthKey)
 	hostname := strings.TrimSpace(cfg.Tailscale.Hostname)
 	if hostname == "" {
-		hostname = renderTailscaleHostname(cfg.Tailscale.HostnameTemplate, "", "lease", cfg.Provider)
+		hostname = RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, "", "lease", cfg.Provider)
 	}
 	sshUser := strings.TrimSpace(cfg.SSHUser)
 	if sshUser == "" {
@@ -1549,50 +953,20 @@ func cloudInitTailscaleBootstrap(cfg Config) string {
     fi
     chown ` + sshUserChown + ` /var/lib/crabbox/tailscale-* || true
     chmod 0640 /var/lib/crabbox/tailscale-* || true`
-	if pond := normalizePondName(cfg.Pond); pond != "" {
+	if pond := NormalizePondName(cfg.Pond); pond != "" {
 		tailscaleUpScript += "\n" + cloudInitPondHostsBootstrap(cfg.Pond)
 	}
 	return tailscaleUpScript
 }
 
 func cloudInitTailscaleInstallBootstrap() string {
-	if strings.TrimSpace(os.Getenv("CRABBOX_TAILSCALE_INSTALL_MODE")) != "pinned" {
-		return "retry sh -c 'curl -fsSL https://tailscale.com/install.sh | sh'"
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("CRABBOX_TAILSCALE_INSTALL_MODE")), "pinned") {
+		return sharedTailscalePackageInstall()
 	}
 	version := firstNonEmpty(strings.TrimSpace(os.Getenv("CRABBOX_TAILSCALE_VERSION")), defaultTailscaleVersion)
 	amd64SHA := firstNonEmpty(strings.TrimSpace(os.Getenv("CRABBOX_TAILSCALE_SHA256_AMD64")), defaultTailscaleAMD64SHA256)
 	arm64SHA := firstNonEmpty(strings.TrimSpace(os.Getenv("CRABBOX_TAILSCALE_SHA256_ARM64")), defaultTailscaleARM64SHA256)
-	return `TS_VERSION=` + shellQuote(version) + `
-    case "$(uname -m)" in
-      x86_64) TS_ARCH=amd64; TS_SHA256=` + shellQuote(amd64SHA) + ` ;;
-      aarch64|arm64) TS_ARCH=arm64; TS_SHA256=` + shellQuote(arm64SHA) + ` ;;
-      *) echo "unsupported Tailscale architecture: $(uname -m)" >&2; exit 3 ;;
-    esac
-    TS_INSTALL_DIR="$(mktemp -d)"
-    trap 'rm -rf "$TS_INSTALL_DIR"' EXIT
-    TS_ARCHIVE="$TS_INSTALL_DIR/tailscale.tgz"
-    retry sh -c "curl -fsSL -o \"$TS_ARCHIVE\" \"https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TS_ARCH}.tgz\""
-    printf '%s  %s\n' "$TS_SHA256" "$TS_ARCHIVE" | sha256sum -c -
-    tar -xzf "$TS_ARCHIVE" -C "$TS_INSTALL_DIR" --strip-components=1
-    install -m 0755 "$TS_INSTALL_DIR/tailscale" /usr/local/bin/tailscale
-    install -m 0755 "$TS_INSTALL_DIR/tailscaled" /usr/local/sbin/tailscaled
-    install -d -m 0755 /var/lib/tailscale /run/tailscale
-    {
-      printf '%s\n' '[Unit]'
-      printf '%s\n' 'Description=Tailscale node agent'
-      printf '%s\n' 'After=network-online.target'
-      printf '%s\n' 'Wants=network-online.target'
-      printf '%s\n' ''
-      printf '%s\n' '[Service]'
-      printf '%s\n' 'ExecStart=/usr/local/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock'
-      printf '%s\n' 'Restart=on-failure'
-      printf '%s\n' 'RuntimeDirectory=tailscale'
-      printf '%s\n' 'StateDirectory=tailscale'
-      printf '%s\n' ''
-      printf '%s\n' '[Install]'
-      printf '%s\n' 'WantedBy=multi-user.target'
-    } >/etc/systemd/system/tailscaled.service
-    systemctl daemon-reload || true`
+	return sharedTailscalePinnedInstall(version, amd64SHA, arm64SHA)
 }
 
 // cloudInitPondHostsBootstrap installs /usr/local/bin/crabbox-pond-hosts and a
@@ -1685,4 +1059,20 @@ PONDTIMER
     /usr/local/bin/crabbox-pond-hosts ` + tagLiteral + ` ` + hostsFile + ` ` + systemHostsFile + ` || true
     test -f ` + hostsFile + `
 `
+}
+
+func XfceDesktopThemeScript() string {
+	return sharedXfceDesktopTheme("classic")
+}
+
+func XfceSessionEnvironmentScript() string {
+	return sharedXfceSessionEnvironment()
+}
+
+func XfceDesktopSessionScript() string {
+	return sharedXfceDesktopSession()
+}
+
+func GnomeDesktopThemeScript() string {
+	return sharedGnomeDesktopTheme()
 }

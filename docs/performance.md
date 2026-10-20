@@ -7,15 +7,16 @@ Read this when you want to:
 - shrink or tune what gets synced;
 - get the most out of Actions hydration.
 
-Crabbox runs commands on a remote box but executes the data plane — SSH, rsync,
-and the command itself — directly from your machine to the runner. Performance
+For SSH leases, Crabbox syncs and streams commands directly between your machine
+and the runner; the command executes on the runner. Delegated providers own
+their transfer and execution transport. Performance
 comes from four levers: avoid repeated setup, keep the sync small, pick capacity
 that is actually available, and reuse project-defined hydration when it pays off.
 
 ## High-latency links
 
-There is no special slow-network mode. SSH stays the universal command
-transport, but the CLI enables SSH `ControlMaster` with a `ControlPersist`
+There is no special slow-network mode. On SSH leases the CLI enables
+`ControlMaster` with a `ControlPersist`
 window (10 minutes) so repeated readiness probes, sync helpers, and commands
 reuse one connection instead of paying a fresh handshake each time. Connection
 multiplexing is disabled only when a target requires an auth secret. Streaming
@@ -33,13 +34,14 @@ reconnects do not skip retained output.
 For repeated agent loops, lease a box once and reuse it:
 
 ```sh
-bin/crabbox warmup --class beast
+bin/crabbox warmup --class beast --slug swift-crab
 bin/crabbox run --id swift-crab -- pnpm test:changed:max
 ```
 
 A warm lease skips the wait for a fresh VM and preserves package caches that live
-outside the synced source tree. Warm leases release automatically after the idle
-timeout (default `30m`) if left untouched. End the loop explicitly with:
+outside the synced source tree. The coordinator schedules release after the idle
+timeout (default `30m`) if a brokered lease is left untouched. Direct providers
+have their own expiry enforcement. End the loop explicitly with:
 
 ```sh
 bin/crabbox stop swift-crab
@@ -47,6 +49,15 @@ bin/crabbox stop swift-crab
 
 You can pass the lease slug (for example `swift-crab`) or its canonical id
 (`cbx_…`) to `--id`.
+
+[`crabbox watch`](commands/watch.md) automates this loop: it holds one warm
+lease, re-runs the command on every qualifying local change, and exits after a
+quiet period (`--idle-exit`, capped at the lease idle timeout) so an abandoned
+watcher does not keep a box alive:
+
+```sh
+bin/crabbox watch --id swift-crab -- pnpm test:changed:max
+```
 
 ## Sync size
 
@@ -168,7 +179,9 @@ package-backed lane for release confidence.
 Pick the smallest class that keeps the target command CPU-bound without hitting
 queue or quota failures. Typical choices:
 
-- `standard` — cheap smoke checks and small repos.
+- `tiny` — minimal smoke checks.
+- `small` — small repositories and light CI lanes.
+- `standard` — typical CI lanes.
 - `fast` — general maintainer testing.
 - `large` — broad test shards or heavy builds.
 - `beast` — high-core changed-test runs.

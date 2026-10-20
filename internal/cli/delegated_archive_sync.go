@@ -4,15 +4,120 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 )
 
-type DelegatedArchiveSyncRequest struct {
+type DelegatedArchivePreparationRequest struct {
+	Config         Config
+	Repo           Repo
+	ForceSyncLarge bool
+	TempPattern    string
+	Stderr         io.Writer
+	Now            func() time.Time
+}
+
+type PreparedArchive struct {
+	File              *os.File
+	Size              int64
+	Manifest          SyncManifest
+	ManifestDuration  time.Duration
+	PreflightDuration time.Duration
+	ArchiveDuration   time.Duration
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// Close closes the prepared archive and removes its temporary file exactly once.
+func (archive *PreparedArchive) Close() error {
+	archive.closeOnce.Do(func() {
+		name := archive.File.Name()
+		archive.closeErr = errors.Join(archive.File.Close(), os.Remove(name))
+	})
+	return archive.closeErr
+}
+
+// PrepareDelegatedArchive builds and bounds a workspace archive before any
+// provider resource exists. The returned archive owns its temporary file;
+// Close removes it. Workspace changes after preparation are intentionally not
+// reflected in the uploaded pre-acquisition snapshot.
+func PrepareDelegatedArchive(ctx context.Context, req DelegatedArchivePreparationRequest) (*PreparedArchive, error) {
+	archive, _, cancel, err := prepareDelegatedArchive(ctx, req)
+	cancel()
+	return archive, err
+}
+
+func prepareDelegatedArchive(ctx context.Context, req DelegatedArchivePreparationRequest) (_ *PreparedArchive, archiveCtx context.Context, cancel context.CancelFunc, err error) {
+	archiveCtx, cancel = ctx, func() {}
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+	now := req.Now
+	if now == nil {
+		now = time.Now
+	}
+	stderr := req.Stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
+
+	excludes, err := syncExcludes(req.Repo.Root, req.Config)
+	if err != nil {
+		return nil, archiveCtx, cancel, err
+	}
+	manifestStart := now()
+	manifest, err := syncManifestFilteredRules(req.Repo.Root, excludes, req.Config.Sync.Includes)
+	if err != nil {
+		return nil, archiveCtx, cancel, Exit(6, "build sync file list: %v", err)
+	}
+	manifestDuration := now().Sub(manifestStart)
+
+	preflightStart := now()
+	archiveManifest := FullSyncGuardrailManifest(manifest)
+	if err := checkSyncPreflight(archiveManifest, req.Config, req.ForceSyncLarge, stderr); err != nil {
+		return nil, archiveCtx, cancel, err
+	}
+	preflightDuration := now().Sub(preflightStart)
+
+	if req.Config.Sync.Timeout > 0 {
+		archiveCtx, cancel = context.WithTimeout(ctx, req.Config.Sync.Timeout)
+	}
+
+	archiveStart := now()
+	file, err := CreateSyncArchive(archiveCtx, req.Repo, manifest, blank(req.TempPattern, "crabbox-delegated-sync-*.tgz"))
+	if err != nil {
+		return nil, archiveCtx, cancel, err
+	}
+	archiveDuration := now().Sub(archiveStart)
+	info, err := file.Stat()
+	if err != nil {
+		name := file.Name()
+		_ = file.Close()
+		_ = os.Remove(name)
+		return nil, archiveCtx, cancel, fmt.Errorf("stat sync archive: %w", err)
+	}
+	return &PreparedArchive{
+		File:              file,
+		Size:              info.Size(),
+		Manifest:          manifest,
+		ManifestDuration:  manifestDuration,
+		PreflightDuration: preflightDuration,
+		ArchiveDuration:   archiveDuration,
+	}, archiveCtx, cancel, nil
+}
+
+// ArchiveWorkspace binds local archive preparation and remote workspace transfer
+// to one configuration. Upload and Exec are invoked only after lease admission.
+type ArchiveWorkspace struct {
 	Config              Config
 	Repo                Repo
 	ForceSyncLarge      bool
@@ -29,9 +134,50 @@ type DelegatedArchiveSyncRequest struct {
 	Upload              func(context.Context, string, io.Reader) error
 	Exec                func(context.Context, string) error
 	Replace             func(context.Context, string, string) error
+	// Path admission belongs to remote operations; local preparation can precede it.
+	CleanWorkdir func(string) (string, error)
 }
 
-func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncRequest) ([]TimingPhase, time.Duration, error) {
+func NewArchiveWorkspace(cfg Config, rt Runtime, req RunRequest, provider, workdir string) ArchiveWorkspace {
+	return ArchiveWorkspace{
+		Config: cfg, Repo: req.Repo, ForceSyncLarge: req.ForceSyncLarge, Workdir: workdir,
+		Provider: provider, TempPattern: "crabbox-" + provider + "-sync-*.tgz",
+		PhaseName: strings.ReplaceAll(provider, "-", "_") + "_sync",
+		Stderr:    rt.Stderr, Now: func() time.Time { return ClockNow(rt.Clock) },
+	}
+}
+
+func (req ArchiveWorkspace) PrepareArchive(ctx context.Context) (*PreparedArchive, error) {
+	return PrepareDelegatedArchive(ctx, DelegatedArchivePreparationRequest{
+		Config: req.Config, Repo: req.Repo, ForceSyncLarge: req.ForceSyncLarge,
+		TempPattern: req.TempPattern, Stderr: req.Stderr, Now: req.Now,
+	})
+}
+
+func (req ArchiveWorkspace) Ensure(ctx context.Context) error {
+	var err error
+	if req, err = req.cleanWorkdir(); err != nil {
+		return err
+	}
+	if req.Exec == nil || strings.TrimSpace(req.Workdir) == "" {
+		return fmt.Errorf("delegated archive workspace requires workdir and exec callback")
+	}
+	return req.Exec(ctx, "mkdir -p "+ShellQuote(req.Workdir))
+}
+
+func (req ArchiveWorkspace) Sync(ctx context.Context, prepared ...*PreparedArchive) ([]TimingPhase, time.Duration, error) {
+	var workdirErr error
+	if req, workdirErr = req.cleanWorkdir(); workdirErr != nil {
+		return nil, 0, workdirErr
+	}
+	var preparedArchive *PreparedArchive
+	if len(prepared) > 0 {
+		preparedArchive = prepared[0]
+		if preparedArchive != nil {
+			defer preparedArchive.Close()
+		}
+	}
+	preparedExternally := preparedArchive != nil
 	if req.Upload == nil || req.Exec == nil {
 		return nil, 0, fmt.Errorf("delegated archive sync requires upload and exec callbacks")
 	}
@@ -52,7 +198,6 @@ func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncReques
 			return context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
 		}
 	}
-	tempPattern := blank(req.TempPattern, "crabbox-delegated-sync-*.tgz")
 	remoteDir := blank(req.RemoteArchiveDir, "/tmp")
 	remotePrefix := blank(req.RemoteArchivePrefix, "crabbox-sync-")
 	phaseName := blank(req.PhaseName, "delegated_archive_sync")
@@ -64,42 +209,36 @@ func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncReques
 
 	start := now()
 	syncCtx := ctx
-	cancel := func() {}
-	if req.Config.Sync.Timeout > 0 {
-		syncCtx, cancel = context.WithTimeout(ctx, req.Config.Sync.Timeout)
+	if preparedArchive == nil {
+		// Keep the live archive deadline through transfer; reporting durations
+		// must not restart the continuous budget of local preparation.
+		var cancel context.CancelFunc
+		var err error
+		preparedArchive, syncCtx, cancel, err = prepareDelegatedArchive(ctx, DelegatedArchivePreparationRequest{
+			Config: req.Config, Repo: req.Repo, ForceSyncLarge: req.ForceSyncLarge,
+			TempPattern: req.TempPattern, Stderr: stderr, Now: now,
+		})
+		defer cancel()
+		if err != nil {
+			return nil, 0, err
+		}
+		defer preparedArchive.Close()
 	}
-	defer cancel()
+	archive := preparedArchive.File
+	manifestDuration := preparedArchive.ManifestDuration
+	preflightDuration := preparedArchive.PreflightDuration
+	archiveDuration := preparedArchive.ArchiveDuration
 
-	excludes, err := syncExcludes(req.Repo.Root, req.Config)
-	if err != nil {
-		return nil, 0, err
+	// A prepared archive has already consumed part of the original sync budget.
+	if preparedExternally && req.Config.Sync.Timeout > 0 {
+		remaining := req.Config.Sync.Timeout - archiveDuration
+		if remaining < 0 {
+			remaining = 0
+		}
+		transferCtx, cancel := context.WithTimeout(ctx, remaining)
+		defer cancel()
+		syncCtx = transferCtx
 	}
-	manifestStart := now()
-	manifest, err := syncManifestFiltered(req.Repo.Root, excludes, req.Config.Sync.Includes)
-	if err != nil {
-		return nil, 0, exit(6, "build sync file list: %v", err)
-	}
-	manifestDuration := now().Sub(manifestStart)
-
-	preflightStart := now()
-	archiveManifest := manifest
-	archiveManifest.Changed = nil
-	archiveManifest.ChangedBytes = 0
-	if err := checkSyncPreflight(archiveManifest, req.Config, req.ForceSyncLarge, stderr); err != nil {
-		return nil, 0, err
-	}
-	preflightDuration := now().Sub(preflightStart)
-
-	archiveStart := now()
-	archive, err := CreateSyncArchive(syncCtx, req.Repo, manifest, tempPattern)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func() {
-		_ = archive.Close()
-		_ = os.Remove(archive.Name())
-	}()
-	archiveDuration := now().Sub(archiveStart)
 
 	remoteArchive := path.Join(remoteDir, remotePrefix+suffix()+".tgz")
 	extractDir := req.Workdir
@@ -111,11 +250,14 @@ func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncReques
 	cleanupRemote := func() {
 		cleanupCtx, cleanupCancel := cleanupContext(ctx)
 		defer cleanupCancel()
-		command := "rm -f " + ShellQuote(remoteArchive) + " 2>/dev/null || true"
+		command := "rm -f " + ShellQuote(remoteArchive) + " && crabbox_cleanup_status=0 || crabbox_cleanup_status=$?"
 		if stagingDir != "" {
-			command += "; rm -rf " + ShellQuote(stagingDir) + " 2>/dev/null || true"
+			command += "; rm -rf " + ShellQuote(stagingDir) + " || crabbox_cleanup_status=$?"
 		}
-		_ = req.Exec(cleanupCtx, command)
+		command += "; exit \"$crabbox_cleanup_status\""
+		if err := req.Exec(cleanupCtx, command); err != nil {
+			fmt.Fprintf(stderr, "warning: %s sync cleanup failed: %v\n", provider, err)
+		}
 	}
 	cleanupPending := true
 	defer func() {
@@ -126,7 +268,7 @@ func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncReques
 
 	uploadStart := now()
 	if _, err := archive.Seek(0, io.SeekStart); err != nil {
-		return nil, 0, exit(6, "rewind sync archive: %v", err)
+		return nil, 0, Exit(6, "rewind sync archive: %v", err)
 	}
 	if err := req.Upload(syncCtx, remoteArchive, archive); err != nil {
 		return nil, 0, err
@@ -134,6 +276,7 @@ func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncReques
 	uploadDuration := now().Sub(uploadStart)
 
 	prepareStart := now()
+	var err error
 	if stagingDir == "" {
 		err = req.Exec(syncCtx, "mkdir -p "+ShellQuote(req.Workdir))
 	} else {
@@ -171,6 +314,9 @@ func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncReques
 	cleanupDuration := now().Sub(cleanupStart)
 
 	total := now().Sub(start)
+	if preparedExternally {
+		total += manifestDuration + preflightDuration + archiveDuration
+	}
 	phases := []TimingPhase{
 		{Name: "manifest", Ms: manifestDuration.Milliseconds()},
 		{Name: "preflight", Ms: preflightDuration.Milliseconds()},
@@ -185,6 +331,14 @@ func RunDelegatedArchiveSync(ctx context.Context, req DelegatedArchiveSyncReques
 	phases = append(phases, TimingPhase{Name: "cleanup", Ms: cleanupDuration.Milliseconds()})
 	phases = append(phases, TimingPhase{Name: phaseName, Ms: total.Milliseconds()})
 	return phases, total, nil
+}
+
+func (req ArchiveWorkspace) cleanWorkdir() (ArchiveWorkspace, error) {
+	var err error
+	if req.CleanWorkdir != nil {
+		req.Workdir, err = req.CleanWorkdir(req.Workdir)
+	}
+	return req, err
 }
 
 func replaceDelegatedArchiveWorkspace(ctx context.Context, exec func(context.Context, string) error, stagingDir, workdir, provider string, stderr io.Writer) error {

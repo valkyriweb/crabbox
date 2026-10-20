@@ -1,7 +1,16 @@
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { WebSocket as NodeWebSocket } from "ws";
+
+import { AsyncMutex } from "../src/async-mutex";
+import { routeCoordinatorRequest } from "../src/coordinator-entry";
+import type { CoordinatorStorageView } from "../src/coordinator-runtime";
+import { FleetCoordinator } from "../src/fleet";
+import type { Env } from "../src/types";
+import { ProvisioningTestStorage } from "./provisioning-fixtures";
 
 type OperationRunner = <T>(callback: () => Promise<T>) => Promise<T>;
 
@@ -25,8 +34,17 @@ const mocks = vi.hoisted(() => {
     deleteQueuedJobs: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
   };
   const storage = {
+    transaction:
+      vi.fn<
+        (callback: (transaction: CoordinatorStorageView) => Promise<unknown>) => Promise<unknown>
+      >(),
+    list: vi.fn<(...args: unknown[]) => Promise<Map<string, unknown>>>(),
     initialize: vi.fn<() => Promise<void>>(async () => {}),
     close: vi.fn<() => Promise<void>>(async () => {}),
+    get: vi.fn<(key: string) => Promise<unknown>>(async () => undefined),
+    put: vi.fn<(key: string, value: unknown) => Promise<void>>(async () => {}),
+    delete: vi.fn<(key: string) => Promise<void>>(async () => {}),
+    take: vi.fn<(key: string) => Promise<unknown>>(async () => undefined),
   };
   return { boss, storage };
 });
@@ -44,10 +62,97 @@ vi.mock("../node/postgres-storage", () => ({
 }));
 
 import { NodeCoordinatorRuntime } from "../node/node-runtime";
+import { fleetRequestQueue } from "../node/server-support";
 
 describe("NodeCoordinatorRuntime", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    const storage = new ProvisioningTestStorage();
+    mocks.storage.get.mockImplementation((key) => storage.get(key));
+    mocks.storage.put.mockImplementation((key, value) => storage.put(key, value));
+    mocks.storage.delete.mockImplementation((key) => storage.delete(key));
+    mocks.storage.transaction.mockImplementation((callback) => storage.transaction(callback));
+    mocks.storage.list.mockImplementation((options) =>
+      storage.list(options as Parameters<CoordinatorStorageView["list"]>[0]),
+    );
+  });
+
+  it("accepts control traffic during unrelated lifecycle work without holding its grant checks", async () => {
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    const mutex = new AsyncMutex();
+    runtime.setOperationRunner((callback) => mutex.run(callback));
+    const env = {
+      CRABBOX_SHARED_TOKEN: "synthetic-control-token",
+      CRABBOX_SHARED_OWNER: "alice@example.com",
+      CRABBOX_DEFAULT_ORG: "example-org",
+    } as Env;
+    const fleet = new FleetCoordinator(runtime, env);
+    const server = createServer();
+    const upgrades: Promise<unknown>[] = [];
+    server.on("upgrade", (request, socket, head) => {
+      const headers = new Headers();
+      for (let index = 0; index < request.rawHeaders.length; index += 2) {
+        headers.append(request.rawHeaders[index]!, request.rawHeaders[index + 1]!);
+      }
+      const context = { request, socket, head, upgraded: false };
+      upgrades.push(
+        runtime.runWithUpgrade(context, () =>
+          routeCoordinatorRequest(
+            new Request(`http://localhost${request.url}`, { headers }),
+            env,
+            (prepared) =>
+              fleetRequestQueue(prepared) === "direct"
+                ? fleet.fetch(prepared)
+                : mutex.run(() => fleet.fetch(prepared)),
+          ),
+        ),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing fixture listener");
+    const release = deferred<void>();
+    const entered = deferred<void>();
+    const lifecycle = runtime.runExclusive(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const client = new NodeWebSocket(`ws://127.0.0.1:${address.port}/v1/control`, {
+      headers: { authorization: "Bearer synthetic-control-token" },
+    });
+    const opened = new Promise<void>((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    const messages: unknown[] = [];
+    client.on("message", (data) => messages.push(JSON.parse(data.toString())));
+    try {
+      await vi.waitFor(() =>
+        expect(messages).toEqual([expect.objectContaining({ type: "hello" })]),
+      );
+      client.send(JSON.stringify({ type: "ping" }));
+      const transportPong = new Promise<void>((resolve) => client.once("pong", resolve));
+      client.ping();
+      await transportPong;
+      await vi.waitFor(() => expect(messages.at(-1)).toEqual({ type: "pong" }));
+      release.resolve();
+      await lifecycle;
+      await vi.waitFor(() => expect(messages.at(-1)).toEqual({ type: "pong" }));
+      const closed = new Promise<number>((resolve) => client.once("close", resolve));
+      env.CRABBOX_SHARED_TOKEN = "synthetic-rotated-token";
+      client.send(JSON.stringify({ type: "heartbeat", leaseID: "cbx_abcdef012345" }));
+      expect(await closed).toBe(1008);
+      expect(messages).not.toContainEqual(expect.objectContaining({ type: "heartbeat" }));
+    } finally {
+      release.resolve();
+      await lifecycle;
+      await Promise.all(upgrades);
+      await opened;
+      client.terminate();
+      await runtime.stop();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   it("allows an active alarm to enqueue one successor", async () => {
@@ -59,6 +164,71 @@ describe("NodeCoordinatorRuntime", () => {
       "coordinator-alarm",
       expect.objectContaining({ policy: "short" }),
     );
+  });
+
+  it("persists the scheduled alarm time across Node coordinator restarts", async () => {
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    mocks.storage.get.mockResolvedValueOnce(1234);
+
+    await expect(runtime.getAlarm()).resolves.toBe(1234);
+    await runtime.scheduleAlarm(5678);
+    await expect(runtime.getAlarm()).resolves.toBe(5678);
+    await runtime.clearAlarm();
+
+    await expect(runtime.getAlarm()).resolves.toBeUndefined();
+    expect(mocks.storage.transaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("repairs a committed due marker with no queued job at startup and during slow maintenance", async () => {
+    vi.useFakeTimers();
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    const at = Date.now();
+    const due = `provisioning-due:${at.toString().padStart(16, "0")}:lease`;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    mocks.boss.send.mockRejectedValueOnce(new Error("lost queue notification"));
+    await runtime.commitAndWake(async (transaction) => {
+      await transaction.put(due, { operationID: "lease", at });
+    });
+    await runtime.stop();
+    const restarted = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    const ticks = vi.fn<() => Promise<void>>(async () => {
+      await restarted.storage.delete(due);
+    });
+    restarted.registerProvisioningTick(ticks);
+    await restarted.start(async () => {});
+    expect(ticks).toHaveBeenCalledTimes(1);
+    const maintenance = deferred<void>();
+    restarted.ownMaintenance(maintenance.promise);
+    await restarted.storage.put(due, { operationID: "lease", at: Date.now() });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ticks).toHaveBeenCalledTimes(2);
+    maintenance.resolve();
+    await restarted.stop();
+    log.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("keeps scanning due work when the queue hint is stalled", async () => {
+    vi.useFakeTimers();
+    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+    const ticks = vi.fn<() => Promise<void>>(async () => {});
+    runtime.registerProvisioningTick(ticks);
+    await runtime.start(async () => {});
+    const stalled = deferred<void>();
+    mocks.boss.deleteQueuedJobs.mockImplementationOnce(() => stalled.promise);
+    const at = Date.now();
+    const committed = runtime.commitAndWake(async (transaction) => {
+      await transaction.put(`provisioning-due:${at.toString().padStart(16, "0")}:lease`, {
+        operationID: "lease",
+        at,
+      });
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    await committed;
+    expect(ticks).toHaveBeenCalled();
+    stalled.resolve();
+    await runtime.stop();
+    vi.useRealTimers();
   });
 
   it("contains WebSocket message handler failures to the offending socket", async () => {
@@ -144,6 +314,9 @@ describe("NodeCoordinatorRuntime", () => {
     const start = source.indexOf("private async connectWorkspaceTerminal");
     const end = source.indexOf("private trackWorkspaceTerminal", start);
     const terminal = source.slice(start, end);
+    const sshStart = source.indexOf("async function connectWorkspaceSSH");
+    const sshEnd = source.indexOf("async function readWorkspaceVNCPassword", sshStart);
+    const ssh = source.slice(sshStart, sshEnd);
 
     expect(terminal).toContain("workspaceTerminalMaxBufferedFrames");
     expect(source).toContain("workspaceTerminalTransportMemoryBudgetBytes");
@@ -151,41 +324,44 @@ describe("NodeCoordinatorRuntime", () => {
     expect(terminal).toContain("pending.length + queuedInputFrames");
     expect(terminal).toContain("queuedInputFrames -= 1");
     expect(terminal).toContain("if (length === 0) return");
-    expect(terminal).toContain("lastObservedHostKey = fingerprint");
-    expect(terminal).toContain("return expectedHostKey === fingerprint");
-    expect(terminal).toContain('cipher: ["aes128-ctr", "aes192-ctr", "aes256-ctr"]');
-    expect(terminal).toContain('"hmac-sha2-256-etm@openssh.com"');
-    expect(terminal).toContain('"hmac-sha2-512"');
-    expect(terminal).toContain("workspaceTerminalSSHReadyTimeoutMs");
-    expect(terminal).toContain("for (const port of terminalPorts)");
-    expect(terminal).toContain("await new Promise<void>((resolve) => setTimeout(resolve, 2_000))");
+    expect(ssh).toContain("observedHostKey = fingerprint");
+    expect(ssh).toContain("return expectedHostKey === fingerprint");
+    expect(ssh).toContain('cipher: ["aes128-ctr", "aes192-ctr", "aes256-ctr"]');
+    expect(ssh).toContain('"hmac-sha2-256-etm@openssh.com"');
+    expect(ssh).toContain('"hmac-sha2-512"');
+    expect(ssh).toContain("workspaceTerminalSSHReadyTimeoutMs");
+    expect(ssh).toContain("for (const port of ports)");
+    expect(ssh).toContain("await new Promise<void>((resolve) => setTimeout(resolve, 2_000))");
     expect(terminal).not.toContain("!workspace.sshHostKeySha256");
   });
 
-  it("lets code-agent replies bypass the lifecycle queue", async () => {
-    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
-    const socket = Object.assign(new EventEmitter(), {
-      close: vi.fn<(code?: number, reason?: string) => void>(),
-      terminate: vi.fn<() => void>(),
-    });
-    const operationRunner = vi.fn<OperationRunner>(
-      async <T>(_callback: () => Promise<T>): Promise<T> => await new Promise<T>(() => {}),
-    );
-    const message = vi.fn<() => Promise<void>>(async () => {});
-    runtime.setOperationRunner(operationRunner);
+  it.each(["code-agent", "serve-relay"])(
+    "lets %s replies bypass the lifecycle queue",
+    async (kind) => {
+      const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+      const socket = Object.assign(new EventEmitter(), {
+        close: vi.fn<(code?: number, reason?: string) => void>(),
+        terminate: vi.fn<() => void>(),
+      });
+      const operationRunner = vi.fn<OperationRunner>(
+        async <T>(_callback: () => Promise<T>): Promise<T> => await new Promise<T>(() => {}),
+      );
+      const message = vi.fn<() => Promise<void>>(async () => {});
+      runtime.setOperationRunner(operationRunner);
 
-    runtime.acceptWebSocket(socket as unknown as WebSocket, { kind: "code-agent" }, [], {
-      message,
-      close: vi.fn<(code: number, reason: string) => void>(),
-      error: vi.fn<() => void>(),
-    });
-    socket.emit("message", Buffer.from("{}"), false);
+      runtime.acceptWebSocket(socket as unknown as WebSocket, { kind }, [], {
+        message,
+        close: vi.fn<(code: number, reason: string) => void>(),
+        error: vi.fn<() => void>(),
+      });
+      socket.emit("message", Buffer.from("{}"), false);
 
-    await vi.waitFor(() => {
-      expect(message).toHaveBeenCalledOnce();
-    });
-    expect(operationRunner).not.toHaveBeenCalled();
-  });
+      await vi.waitFor(() => {
+        expect(message).toHaveBeenCalledOnce();
+      });
+      expect(operationRunner).not.toHaveBeenCalled();
+    },
+  );
 
   it("lets runtime-adapter replies bypass the lifecycle queue", async () => {
     const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
@@ -212,103 +388,145 @@ describe("NodeCoordinatorRuntime", () => {
     expect(operationRunner).not.toHaveBeenCalled();
   });
 
-  it("serializes control messages with lifecycle operations", async () => {
-    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
-    const socket = Object.assign(new EventEmitter(), {
-      close: vi.fn<(code?: number, reason?: string) => void>(),
-      terminate: vi.fn<() => void>(),
-    });
-    const operationRunner = vi.fn<OperationRunner>(
-      async <T>(callback: () => Promise<T>): Promise<T> => callback(),
-    );
-    const message = vi.fn<() => Promise<void>>(async () => {});
-    runtime.setOperationRunner(operationRunner);
+  it.each([
+    { kind: "control", payload: "{}", isBinary: false },
+    { kind: "control", payload: '{"type":"subscribe"}', isBinary: false },
+    { kind: "control", payload: '{"type":"heartbeat"', isBinary: false },
+    { kind: "control", payload: '{"type":"heartbeat"}', isBinary: true },
+    { kind: "unknown", payload: '{"type":"heartbeat"}', isBinary: false },
+  ])(
+    "dispatches $kind messages ($payload, binary=$isBinary) with the proper lifecycle boundary",
+    async ({ kind, payload, isBinary }) => {
+      const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+      const socket = Object.assign(new EventEmitter(), {
+        close: vi.fn<(code?: number, reason?: string) => void>(),
+        terminate: vi.fn<() => void>(),
+      });
+      const mutex = new AsyncMutex();
+      const operationRunner = vi.fn<OperationRunner>((callback) => mutex.run(callback));
+      runtime.setOperationRunner(operationRunner);
+      const lifecycleDone = deferred<void>();
+      const lifecycle = runtime.runExclusive(async () => lifecycleDone.promise);
+      const message = vi.fn<() => Promise<void>>(async () => {});
 
-    runtime.acceptWebSocket(socket as unknown as WebSocket, { kind: "control" }, [], {
-      message,
-      close: vi.fn<(code: number, reason: string) => void>(),
-      error: vi.fn<() => void>(),
-    });
-    socket.emit("message", Buffer.from("{}"), false);
+      runtime.acceptWebSocket(socket as unknown as WebSocket, { kind }, [], {
+        message,
+        close: vi.fn<(code: number, reason: string) => void>(),
+        error: vi.fn<() => void>(),
+      });
+      socket.emit("message", Buffer.from(payload), isBinary);
 
-    await vi.waitFor(() => {
-      expect(message).toHaveBeenCalledOnce();
-    });
-    expect(operationRunner).toHaveBeenCalledOnce();
-  });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(message.mock.calls).toHaveLength(kind === "control" ? 1 : 0);
+      lifecycleDone.resolve();
+      await lifecycle;
 
-  it("keeps data-plane close callbacks behind earlier messages", async () => {
-    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
-    const socket = Object.assign(new EventEmitter(), {
-      close: vi.fn<(code?: number, reason?: string) => void>(),
-      terminate: vi.fn<() => void>(),
-    });
-    const order: string[] = [];
-    const messageDone = deferred<void>();
+      await vi.waitFor(() => {
+        expect(message).toHaveBeenCalledWith(
+          isBinary ? Uint8Array.from(Buffer.from(payload)).buffer : payload,
+        );
+      });
+      expect(operationRunner).toHaveBeenCalledTimes(kind === "control" ? 1 : 2);
+    },
+  );
 
-    runtime.acceptWebSocket(socket as unknown as WebSocket, { kind: "code-agent" }, [], {
-      message: async () => {
-        order.push("message");
+  it.each(["code-agent", "runtime-adapter-agent", "serve-relay"])(
+    "keeps %s data-plane close callbacks behind earlier messages",
+    async (kind) => {
+      const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+      const socket = Object.assign(new EventEmitter(), {
+        close: vi.fn<(code?: number, reason?: string) => void>(),
+        terminate: vi.fn<() => void>(),
+      });
+      const order: string[] = [];
+      const messageDone = deferred<void>();
+
+      runtime.acceptWebSocket(socket as unknown as WebSocket, { kind }, [], {
+        message: async () => {
+          order.push("message");
+          await messageDone.promise;
+        },
+        close: () => {
+          order.push("close");
+        },
+        error: vi.fn<() => void>(),
+      });
+      socket.emit("message", Buffer.from('{"type":"heartbeat"}'), false);
+      socket.emit("message", Buffer.from("{}"), false);
+      socket.emit("close", 1000, Buffer.from("done"));
+
+      await vi.waitFor(() => {
+        expect(order).toEqual(["message"]);
+      });
+      messageDone.resolve();
+      await vi.waitFor(() => {
+        expect(order).toEqual(["message", "message", "close"]);
+      });
+    },
+  );
+
+  it.each(["code-agent", "runtime-adapter-agent", "control"])(
+    "drains %s socket operations that own lifecycle transactions before stopping jobs and closing storage",
+    async (kind) => {
+      const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
+      const mutex = new AsyncMutex();
+      runtime.setOperationRunner((callback) => mutex.run(callback));
+      const messageDone = deferred<void>();
+      const socket = new EventEmitter();
+      const close = vi.fn<() => void>(() => {
+        queueMicrotask(() => socket.emit("close", 1000, Buffer.from("shutdown")));
+      });
+      Object.assign(socket, {
+        close,
+        terminate: vi.fn<() => void>(),
+        readyState: 1,
+      });
+      let heartbeatCompleted = false;
+      const message = vi.fn<() => Promise<void>>(async () => {
+        await runtime.runExclusive(async () => {
+          await runtime.scheduleAlarm(Date.now() + 60_000);
+        });
+        heartbeatCompleted = true;
         await messageDone.promise;
-      },
-      close: () => {
-        order.push("close");
-      },
-      error: vi.fn<() => void>(),
-    });
-    socket.emit("message", Buffer.from("{}"), false);
-    socket.emit("close", 1000, Buffer.from("done"));
+      });
 
-    await vi.waitFor(() => {
-      expect(order).toEqual(["message"]);
-    });
-    messageDone.resolve();
-    await vi.waitFor(() => {
-      expect(order).toEqual(["message", "close"]);
-    });
-  });
+      runtime.acceptWebSocket(socket as unknown as WebSocket, { kind }, [], {
+        message,
+        close: vi.fn<(code: number, reason: string) => void>(),
+        error: vi.fn<() => void>(),
+      });
+      socket.emit("message", Buffer.from('{"type":"heartbeat"}'), false);
+      await vi.waitFor(() => expect(heartbeatCompleted).toBe(true));
+      const followingLifecycle = vi.fn<() => Promise<void>>(async () => {});
+      await runtime.runExclusive(followingLifecycle);
+      await mutex.drain();
+      expect(followingLifecycle).toHaveBeenCalledOnce();
 
-  it("drains socket operations before stopping jobs and closing storage", async () => {
-    const runtime = new NodeCoordinatorRuntime("postgresql://example.invalid/test");
-    const messageDone = deferred<void>();
-    const socket = new EventEmitter();
-    const close = vi.fn<() => void>(() => {
-      queueMicrotask(() => socket.emit("close", 1000, Buffer.from("shutdown")));
-    });
-    Object.assign(socket, {
-      close,
-      terminate: vi.fn<() => void>(),
-      readyState: 1,
-    });
-    const message = vi.fn<() => Promise<void>>(async () => {
-      await messageDone.promise;
-      await runtime.scheduleAlarm(Date.now() + 60_000);
-    });
+      runtime.beginShutdown();
+      expect(close).toHaveBeenCalledOnce();
+      const maintenanceDone = deferred<void>();
+      runtime.ownMaintenance(maintenanceDone.promise);
+      const stopped = runtime.stop();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(mocks.boss.stop).not.toHaveBeenCalled();
+      expect(mocks.storage.close).not.toHaveBeenCalled();
+      messageDone.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(mocks.boss.stop).not.toHaveBeenCalled();
+      expect(mocks.storage.close).not.toHaveBeenCalled();
+      maintenanceDone.resolve();
+      await stopped;
+      await mutex.drain();
 
-    runtime.acceptWebSocket(socket as unknown as WebSocket, { kind: "code-agent" }, [], {
-      message,
-      close: vi.fn<(code: number, reason: string) => void>(),
-      error: vi.fn<() => void>(),
-    });
-    socket.emit("message", Buffer.from("{}"), false);
-    await vi.waitFor(() => expect(message).toHaveBeenCalledOnce());
-
-    runtime.beginShutdown();
-    expect(close).toHaveBeenCalledOnce();
-    const stopped = runtime.stop();
-    expect(mocks.boss.stop).not.toHaveBeenCalled();
-    expect(mocks.storage.close).not.toHaveBeenCalled();
-    messageDone.resolve();
-    await stopped;
-
-    expect(mocks.boss.send).toHaveBeenCalledWith(
-      "coordinator-alarm",
-      null,
-      expect.objectContaining({ singletonKey: "fleet" }),
-    );
-    expect(mocks.boss.send.mock.invocationCallOrder.at(-1)).toBeLessThan(
-      mocks.boss.stop.mock.invocationCallOrder.at(-1) ?? 0,
-    );
-    expect(mocks.storage.close).toHaveBeenCalledOnce();
-  });
+      expect(mocks.boss.send).toHaveBeenCalledWith(
+        "coordinator-alarm",
+        null,
+        expect.objectContaining({ singletonKey: "fleet" }),
+      );
+      expect(mocks.boss.send.mock.invocationCallOrder.at(-1)).toBeLessThan(
+        mocks.boss.stop.mock.invocationCallOrder.at(-1) ?? 0,
+      );
+      expect(mocks.storage.close).toHaveBeenCalledOnce();
+    },
+  );
 });

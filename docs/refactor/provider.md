@@ -104,7 +104,7 @@ The provider seam has shipped for the full provider set.
 
 For the up-to-date provider/capability matrix, run `crabbox providers` or
 `crabbox providers --json`; the user-facing inventory lives in
-[Providers](../features/providers.md).
+[Providers](../providers/README.md).
 
 ## Non-Goals
 
@@ -123,8 +123,6 @@ For the up-to-date provider/capability matrix, run `crabbox providers` or
 
 ```go
 type Provider interface {
-	Name() string
-	Aliases() []string
 	Spec() ProviderSpec
 
 	RegisterFlags(fs *flag.FlagSet, defaults Config) any
@@ -182,6 +180,15 @@ rendering when a normalized view can describe the result. If a provider has a
 lossy or native-only status shape, keep that loss inside its backend and return
 the closest `StatusView` instead of printing directly from command code.
 
+Delegated providers should also return normalized run outcome metadata in
+`RunResult`: `Status` uses `succeeded`, `failed`, `timed-out`, or `canceled`;
+`ErrorKind` uses `command-exit`, `timeout`, `canceled`, or `provider-error`.
+Call `FinalizeRunResult(result, err)` before returning once the provider knows
+the command exit code and provider error. `--timing-json` emits the same
+normalized outcome fields, deriving them from `exitCode` when the provider did
+not set a more specific status. That keeps future recommendation and proof
+surfaces provider-neutral instead of parsing provider-specific stderr.
+
 ### Optional Backend Interfaces
 
 Several capabilities are opt-in: a provider implements an extra interface only
@@ -211,11 +218,87 @@ type JSONListBackend interface {
 }
 ```
 
+For Doctor aggregates, use `core.DoctorChecksStatus(checks)`: after trimming and
+lowercasing statuses, literal `failed` or `missing` yields `failed`; otherwise
+`warning` yields `warning`, and all other values (including empty, unknown, and
+`skip`) are nonfailures. Nil or empty checks yield `ok`. The helper preserves
+the input checks and their detail maps. Map severity to provider-local vocabulary
+locally, as Sealos Devbox does with `failed` → `blocked` and everything else →
+`ready`, using that same mapped status in its summary. The CLI continues to
+render and classify nonempty `Checks` in preference to aggregate `Status` and
+`Message`; consolidating internal aggregates does not change that precedence.
+
+`FeatureRunSession` is also an explicit capability contract. Delegated
+providers return their handle in `RunResult`; opted-in SSH providers such as AWS
+and `local-container` rely on core to write the handle after exact claim and
+coordinator run recording. Do not add provider-specific handle construction.
+
 Provider-native checkpoints/images are also expressed through optional hooks
 (`NativeCheckpointProvider`, `NativeCheckpointForkProvider`) rather than core
 provider-name checks, and config routing/server-type defaults through
 `ProviderRouter` and `ProviderServerTypeProvider`. New providers implement only
 the interfaces they need.
+
+### Generated command routing and claim scope
+
+`ProviderCommandRouter.CommandRouting` owns the provider's non-secret follow-up
+selectors. Its request carries the purpose, lease ID, and resolved SSH target;
+static-host fallback stays in the SSH adapter. It returns `CommandRouting{Args, Env}`; environment assignments are
+never argv. Core adds canonical provider names, target/Windows mode, network and
+lease selectors, renders shell commands, and passes the environment separately
+when starting a WebVNC daemon. In-process desktop-to-WebVNC calls retain the
+environment in which their config was resolved. Endpoint credentials stay out
+of generated commands: core's shared URL sanitizer removes userinfo, credential query parameters,
+and fragments while retaining harmless endpoint parameters, scheme spelling,
+and empty query markers used by legacy claim scopes. Adapters apply it only to
+URL-valued fields, including endpoints without a scheme. Opaque paths and other
+selectors are never guessed to be URLs. Credential contents must never be
+returned by the hook.
+
+The purpose is explicit because release and recovery have different contracts:
+
+- `reconnect` is used by WebVNC daemons and native VNC guidance. KubeVirt pins
+  its resolved SSH settings and release policy, including false.
+- `rescue` is used by printed desktop/WebVNC repair commands and the in-process
+  desktop launch handoff. It has reconnect semantics, but External may use its
+  restricted simple-command flag fallback when no routing file exists.
+- `retry` supplies failed-run retry and SSH guidance. Like `stop`, it carries
+  only explicit release-policy overrides for providers that otherwise recover
+  the policy from resource metadata. KubeVirt must not turn an ambient default
+  into a cleanup override here. Coder retains its existing always-explicit
+  delete-on-release selector.
+- `stop` supplies generated cleanup commands. External reconnect, retry, and
+  stop prefer the configured routing file or canonical per-lease path and bind
+  the child to its digest; missing/unreadable state produces an invalid empty
+  digest, not an unbound load.
+
+KubeVirt and Sealos preserve inherited multi-file `KUBECONFIG` in `Env` when no
+provider kubeconfig is set. Their explicit kubeconfig flag suppresses that
+environment override. Azure account/resource-group/location, GCP project/zone,
+and AWS region use the existing public environment selectors where no matching
+CLI flags exist. Stop/retry retain the same endpoint and SSH route fields as
+reconnect; they do not need a second provider-name switch in core.
+
+`ProviderClaimScoper.ClaimScope` owns config-derived local claim identity. Core
+treats the returned string as opaque, including its historical whitespace and
+endpoint normalization. Azure, GCP, E2B/CubeSandbox, Namespace Instance, Phala,
+Proxmox, and Railway no longer depend on a core fallback switch. Do not replace
+their differing endpoint formats with a new universal normalizer: existing
+claims must keep matching, including schemes, ports, query handling, and legacy
+incomplete-route behavior. E2B and CubeSandbox share their existing compatible
+normalizer. Runtime-discovered scope remains the backend/client's responsibility;
+for example the Azure API client supplies its resolved account scope.
+
+Some legacy endpoint scopes contain bytes that generated commands cannot safely
+repeat: Railway retains fragments and credential query fields, E2B/CubeSandbox
+and Proxmox retain opaque schemeless forms, Namespace Instance has legacy opaque
+endpoint forms, and Morph can retain URL userinfo.
+These adapters omit an endpoint override when sanitization would change that
+identity. Follow-ups then require the original private endpoint configuration,
+as they require authentication configuration; they never print the sensitive
+endpoint or migrate its claim key. Other endpoint scopes still cannot match the
+original claim. Self-contained replay of these legacy forms would require a
+separate private routing-state contract, outside this interface refactor.
 
 ## Runtime
 
@@ -319,8 +402,18 @@ const (
 	FeatureRunProof    Feature = "run-proof"
 	FeatureRunSession  Feature = "run-session"
 	FeatureRunArtifacts Feature = "run-artifacts"
+	FeatureRunDownloads Feature = "run-downloads"
+	FeatureModuleRun    Feature = "module-run"
+	FeaturePauseResume  Feature = "pause-resume"
+	FeatureMCP          Feature = "mcp-attachments"
 )
 ```
+
+`FeatureRunSession` is provider-neutral and explicitly opt-in. A delegated
+backend may return a validated handle in `RunResult`; an SSH-lease provider may
+instead have core emit the handle after exact claim recording only when its
+spec also advertises `FeatureSSH` and `FeatureCleanup`. AWS and
+`local-container` currently opt into that SSH-lease contract.
 
 Actions-runner hydration is **not** modeled as a provider feature. That workflow
 is core-over-SSH after a Linux or Windows lease exists, so `--actions-runner`
@@ -333,11 +426,12 @@ representative slice:
 ```text
 provider                kind           coordinator  features
 hetzner                 ssh-lease      supported    ssh, crabbox-sync, cleanup, desktop, browser, code, tailscale
-aws                     ssh-lease      supported    ssh, crabbox-sync, cleanup, desktop, browser, code
+aws                     ssh-lease      supported    ssh, crabbox-sync, cleanup, desktop, browser, code, run-session
 azure                   ssh-lease      supported    ssh, crabbox-sync, cleanup, desktop, browser, code, tailscale
 gcp                     ssh-lease      supported    ssh, crabbox-sync, cleanup, tailscale
 ssh                     ssh-lease      never        ssh, crabbox-sync, desktop, browser, code
-daytona                 ssh-lease      never        ssh, crabbox-sync
+local-container         ssh-lease      never        ssh, crabbox-sync, cleanup, run-session
+daytona                 ssh-lease      supported    ssh, crabbox-sync, archive-sync
 blacksmith-testbox      delegated-run  never        run-proof, run-session
 islo                    delegated-run  never        url-bridge
 ```
@@ -363,7 +457,8 @@ Built-in providers register at init time:
 var providerRegistry = map[string]Provider{}
 
 func RegisterProvider(provider Provider) {
-	names := append([]string{provider.Name()}, provider.Aliases()...)
+	spec := provider.Spec()
+	names := append([]string{spec.Name}, spec.Aliases...)
 	for _, name := range names {
 		key := normalizeProviderName(name)
 		if key == "" {
@@ -388,7 +483,7 @@ func ProviderFor(name string) (Provider, error) {
 Each provider package registers itself in its `init`, and
 `internal/providers/all` blank-imports every package so a single import of `all`
 wires the whole registry. Canonical names and compatibility aliases come from
-`Name()`/`Aliases()`, for example:
+`ProviderSpec.Name`/`ProviderSpec.Aliases`, for example:
 
 ```text
 ssh                 # aliases: static, static-ssh
@@ -474,12 +569,12 @@ func loadBackend(cfg Config, rt Runtime) (Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.Provider = provider.Name()
+	cfg.Provider = provider.Spec().Name
 	backend, err := provider.Configure(cfg, rt)
 	if err != nil {
 		return nil, err
 	}
-	if ssh, ok := backend.(SSHLeaseBackend); ok && shouldUseCoordinator(cfg, provider.Spec()) {
+	if ssh, ok := backend.(SSHLeaseBackend); ok && ShouldUseCoordinator(cfg, provider.Spec()) {
 		coord, _, err := newCoordinatorClient(cfg)
 		if err != nil {
 			return nil, err
@@ -504,8 +599,9 @@ Coordinator (broker) routing is a wrapper around `SSHLeaseBackend`, not a specia
 provider path inside every command.
 
 ```go
-func shouldUseCoordinator(cfg Config, spec ProviderSpec) bool {
-	return spec.Coordinator == CoordinatorSupported && strings.TrimSpace(cfg.Coordinator) != ""
+func ShouldUseCoordinator(cfg Config, spec ProviderSpec) bool {
+	return cfg.BrokerMode != BrokerModeRegistered &&
+		spec.Coordinator == CoordinatorSupported && strings.TrimSpace(cfg.Coordinator) != ""
 }
 ```
 
@@ -527,9 +623,9 @@ provider spec and the non-brokered implementation. Brokered list/pool still
 enforces the existing admin-token requirement; the wrapper must not silently
 downgrade brokered pool/list to a direct provider listing.
 
-Only `hetzner`, `aws`, `azure`, and `gcp` declare `Coordinator: supported`; every
+Only `hetzner`, `aws`, `azure`, `daytona`, and `gcp` declare `Coordinator: supported`; every
 other adapter is `Coordinator: never` and always runs direct-from-CLI. Even the
-four brokerable providers run direct unless a broker URL is configured
+five brokerable providers run direct unless a broker URL is configured
 (`CRABBOX_COORDINATOR` / `config set-broker`). Adding broker support to another
 provider means changing its spec and implementing Worker-side support.
 
@@ -586,9 +682,10 @@ type ReleaseLeaseRequest struct {
 }
 
 type TouchRequest struct {
-	Lease       LeaseTarget
-	State       string
-	IdleTimeout time.Duration
+	Lease               LeaseTarget
+	State               string
+	IdleTimeout         time.Duration
+	IdleTimeoutOverride *time.Duration
 }
 ```
 
@@ -854,13 +951,14 @@ release. No provider cleanup, no coordinator.
 > command. This is functionally the "hybrid" model from the original plan,
 > expressed as one backend implementing both shapes' relevant methods.
 
-Coordinator never, Linux only, features ssh/crabbox-sync. Owns the Daytona
-generated Go API client (auth + organization header), the SDK/toolbox, sandbox
-lifecycle, labels and last-activity touch, SSH-access token minting, toolbox
-archive upload and command execution for `run`, sandbox-to-`Server` mapping, and
-secret SSH-user metadata. Reuses sync guardrails, claims, status rendering, and
-explicit release/stop. Constraints: Linux only, no coordinator, no Tailscale, no
-desktop/VNC/browser/code portal, no Actions-runner hydration, snapshot mode only.
+Coordinator supported, Linux only, features ssh/crabbox-sync/archive-sync. Owns
+the Daytona generated Go API client (auth + organization header), the SDK/toolbox,
+sandbox lifecycle, labels and last-activity touch, SSH-access token minting,
+toolbox archive upload and command execution for `run`, sandbox-to-`Server`
+mapping, and secret SSH-user metadata. Reuses sync guardrails, claims, status
+rendering, and explicit release/stop. Constraints: Linux only, no Tailscale, no
+desktop/VNC/browser/code portal, no Actions-runner hydration, snapshot mode only;
+brokered workspaces and ready pools remain disabled because SSH credentials rotate.
 
 ### Blacksmith Testbox — `DelegatedRunBackend`
 
@@ -885,8 +983,9 @@ defaults to `https://api.islo.dev`). No Crabbox rsync, `--sync-only`, `--checksu
 desktop/browser, Actions runner, or coordinator.
 
 The remaining sandbox/proof adapters (Modal, E2B, Tensorlake, Upstash, Cloudflare,
-Azure dynamic sessions, W&B) follow the Islo pattern: delegated-run, Linux-only,
-with a feature subset of archive-sync/url-bridge as appropriate.
+Cloudflare Sandbox, Azure dynamic sessions, W&B) follow the Islo pattern:
+delegated-run, Linux-only, with a feature subset of archive-sync/url-bridge as
+appropriate.
 
 ## Migration Ledger
 
@@ -939,7 +1038,7 @@ Representative coverage that any provider change should preserve:
   mapping; SSE parser handles stdout/stderr/exit events; run streams output and
   propagates exit code; status wait polls and times out; stop removes the local
   claim.
-- **Docs** — provider docs link from [Providers](../features/providers.md);
+- **Docs** — provider docs link from [Providers](../providers/README.md);
   [`docs/source-map.md`](../source-map.md) lists provider implementation files.
 
 ## Acceptance Criteria

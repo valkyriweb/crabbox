@@ -12,17 +12,24 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return spritesProvider }
-func (Provider) Aliases() []string { return nil }
+func (Provider) ClaimScope(cfg core.Config) string {
+	endpoint, _, err := validateSpritesAPIURL(core.Blank(cfg.Sprites.APIURL, "https://api.sprites.dev"))
+	if err != nil {
+		return ""
+	}
+	return "endpoint:" + endpoint
+}
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        spritesProvider,
-		Family:      "sprites",
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync},
-		Coordinator: core.CoordinatorNever,
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIToken),
+		Name:             spritesProvider,
+		Family:           "sprites",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -36,16 +43,4 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewSpritesBackend(p.Spec(), cfg, rt)
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "sprites doctor backend unavailable")
-	}
-	return doctor, nil
 }

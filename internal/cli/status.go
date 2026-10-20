@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"time"
@@ -13,7 +14,7 @@ import (
 func (a App) status(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("status", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpAll())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	id := fs.String("id", "", "lease id or slug")
 	wait := fs.Bool("wait", false, "wait until ready")
 	waitTimeout := fs.Duration("wait-timeout", 5*time.Minute, "maximum wait duration")
@@ -32,12 +33,17 @@ func (a App) status(ctx context.Context, args []string) error {
 	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
 		return err
 	}
-	if err := requireLeaseID(*id, "crabbox status --id <lease-id-or-slug>", cfg); err != nil {
-		return err
-	}
 	backend, err := loadBackend(cfg, runtimeForApp(a))
 	if err != nil {
 		return err
+	}
+	// Service-control providers may resolve status from configured application
+	// context instead of a lease ID. Let the provider own that contract and its
+	// missing-context diagnostic.
+	if backend.Spec().Kind != ProviderKindServiceControl {
+		if err := requireLeaseID(*id, "crabbox status --id <lease-id-or-slug>", cfg); err != nil {
+			return err
+		}
 	}
 	statusBackend, isStatus := backend.(interface {
 		Status(context.Context, StatusRequest) (statusView, error)
@@ -59,13 +65,19 @@ func (a App) status(ctx context.Context, args []string) error {
 			state, err = delegated.Status(statusCtx, StatusRequest{Options: leaseOptionsFromConfig(cfg), ID: *id, Wait: *wait, WaitTimeout: *waitTimeout})
 		} else if isSSH {
 			var lease LeaseTarget
-			lease, err = sshBackend.Resolve(statusCtx, ResolveRequest{Options: leaseOptionsFromConfig(cfg), ID: *id, StatusOnly: true, ReadyProbe: *wait})
+			lease, err = sshBackend.Resolve(statusCtx, ResolveRequest{Options: leaseOptionsFromConfig(cfg), ID: *id, StatusOnly: true, ReadyProbe: *wait, NoLocalStateMutations: true, IncludeDiagnostics: *jsonOut && !*wait})
 			if err == nil {
 				state, err = statusViewFromLeaseTarget(statusCtx, cfg, lease)
-				if err == nil && *wait {
-					_, touchErr := sshBackend.Touch(statusCtx, TouchRequest{Lease: lease, State: state.State, IdleTimeout: cfg.IdleTimeout})
-					if touchErr != nil {
-						fmt.Fprintf(a.Stderr, "warning: touch failed for %s: %v\n", lease.LeaseID, touchErr)
+				if err == nil && *wait && !statusTerminalState(state.State) {
+					claim, claimed, claimErr := statusLeaseExactClaim(statusCtx, backend, lease, backend.Spec().Name, leaseOptionsFromConfig(cfg).ProviderScope)
+					if claimErr != nil {
+						fmt.Fprintf(a.Stderr, "warning: touch skipped for %s: %v\n", lease.LeaseID, claimErr)
+					} else if claimed {
+						SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
+						_, touchErr := touchLeaseWithGuestExpiry(statusCtx, sshBackend, cfg, TouchRequest{Lease: lease, State: state.State, IdleTimeout: cfg.IdleTimeout})
+						if touchErr != nil {
+							fmt.Fprintf(a.Stderr, "warning: touch failed for %s: %v\n", lease.LeaseID, touchErr)
+						}
 					}
 				}
 			}
@@ -74,7 +86,7 @@ func (a App) status(ctx context.Context, args []string) error {
 		}
 		if err != nil {
 			if *wait && errors.Is(statusCtx.Err(), context.DeadlineExceeded) {
-				timeoutErr := exit(5, "timed out waiting for %s to become ready", *id)
+				timeoutErr := Exit(5, "timed out waiting for %s to become ready", *id)
 				if err != statusCtx.Err() {
 					return errors.Join(timeoutErr, err)
 				}
@@ -82,6 +94,7 @@ func (a App) status(ctx context.Context, args []string) error {
 			}
 			return err
 		}
+		addStatusLifetime(&state, cfg)
 		if *jsonOut {
 			if !*wait || statusWaitDone(state) {
 				if err := json.NewEncoder(a.Stdout).Encode(state); err != nil {
@@ -101,6 +114,11 @@ func (a App) status(ctx context.Context, args []string) error {
 			if telemetry != "" {
 				telemetry = " " + telemetry
 			}
+			if state.ProvisioningPhase != "" {
+				telemetry += fmt.Sprintf(" provisioning_phase=%q", state.ProvisioningPhase)
+			}
+			telemetry += lifetimePolicySummary(state.LifetimePolicy)
+			printStatusLifetime(a.Stdout, state)
 			fmt.Fprintf(a.Stdout, "%s slug=%s provider=%s target=%s windows_mode=%s state=%s type=%s host=%s pond=%s network=%s%s ready=%t has_host=%t idle_for=%s idle_timeout=%s expires=%s%s\n", state.ID, blank(state.Slug, "-"), state.Provider, state.TargetOS, blank(state.WindowsMode, "-"), state.State, state.ServerType, state.Host, blank(state.Pond, "-"), state.Network, tailscale, state.Ready, state.HasHost, blank(state.IdleFor, "-"), blank(state.IdleTimeout, "-"), blank(state.ExpiresAt, "-"), telemetry)
 		}
 		if *wait {
@@ -114,7 +132,7 @@ func (a App) status(ctx context.Context, args []string) error {
 		select {
 		case <-statusCtx.Done():
 			if errors.Is(statusCtx.Err(), context.DeadlineExceeded) {
-				return exit(5, "timed out waiting for %s to become ready", *id)
+				return Exit(5, "timed out waiting for %s to become ready", *id)
 			}
 			return statusCtx.Err()
 		case <-time.After(5 * time.Second):
@@ -126,25 +144,78 @@ func statusWaitDone(state statusView) bool {
 	return state.Ready || statusTerminalState(state.State)
 }
 
+func statusLeaseExactClaim(ctx context.Context, backend Backend, lease LeaseTarget, fallbackProvider, providerScope string) (leaseClaim, bool, error) {
+	provider := canonicalClaimProvider(blank(lease.Server.Provider, fallbackProvider))
+	if lease.LeaseID == "" || provider == "" {
+		return leaseClaim{}, false, nil
+	}
+	// The status wait budget may already be spent; this exact-ID read is O(1)
+	// and must still observe the claim that authorizes the touch.
+	claim, claimed, exact, err := ResolveLeaseClaimForProviderWithExact(lease.LeaseID, provider)
+	if err != nil {
+		return leaseClaim{}, false, fmt.Errorf("read exact %s lease claim: %w", provider, err)
+	}
+	if observed, observedExists, set := ServerLeaseClaimSnapshot(lease.Server); set {
+		if err := unchangedLeaseClaimGuard(lease.LeaseID, observed, observedExists)(claim, claimed && exact); err != nil {
+			return leaseClaim{}, false, err
+		}
+	}
+	if !claimed || !exact {
+		return leaseClaim{}, false, nil
+	}
+	if authorizer, ok := backend.(StatusTouchClaimAuthorizer); ok {
+		if err := authorizer.AuthorizeStatusTouchClaim(ctx, lease, claim); err != nil {
+			return leaseClaim{}, false, err
+		}
+		return claim, true, nil
+	}
+	resourceID := strings.TrimSpace(lease.Server.CloudID)
+	matched := claim.ProviderScope == providerScope &&
+		resourceID != "" && claim.CloudID == resourceID
+	if !matched {
+		return leaseClaim{}, false, nil
+	}
+	if validator, ok := backend.(StatusTouchClaimValidator); ok && !validator.StatusTouchClaimMatches(lease, claim) {
+		return leaseClaim{}, false, nil
+	}
+	return claim, true, nil
+}
+
 func statusWaitTerminalError(id string, state statusView) error {
 	if state.Ready || !statusTerminalState(state.State) {
 		return nil
 	}
-	return exit(5, "lease %s reached terminal state %s before ready", id, state.State)
+	return Exit(5, "lease %s reached terminal state %s before ready", id, state.State)
 }
 
 func statusTerminalState(state string) bool {
 	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "deleting", "expired", "failed", "missing", "released", "stopped", "stopped_with_code", "terminated":
+	case "dead", "deleting", "exited", "expired", "failed", "missing", "released", "shutting-down", "stopped", "stopped_with_code", "terminated":
 		return true
 	default:
 		return false
 	}
 }
 
+func statusSSHReadinessTimeout(target SSHTarget) time.Duration {
+	if isWindowsWSL2Target(target) {
+		// WSL startup, SFTP negotiation, and the Linux ready check share this
+		// budget; a healthy managed guest can exceed the ordinary four seconds.
+		return 30 * time.Second
+	}
+	return 4 * time.Second
+}
+
 func statusViewFromLeaseTarget(ctx context.Context, cfg Config, lease LeaseTarget) (statusView, error) {
 	server := lease.Server
 	target := lease.SSH
+	if err := validateResolvedLeasePlatform(cfg, server); err != nil {
+		return statusView{}, err
+	}
+	// Recorded lease labels decide the platform. Resolve them before the
+	// readiness probe so a lease found under configuration defaults is probed
+	// with its own platform's readiness command rather than the default one.
+	applyResolvedLeaseConfig(&cfg, server, &target)
 	hasHost := server.PublicNet.IPv4.IP != ""
 	if target.NetworkKind == NetworkPublic && target.Host != "" {
 		hasHost = true
@@ -158,38 +229,64 @@ func statusViewFromLeaseTarget(ctx context.Context, cfg Config, lease LeaseTarge
 	}
 	target = resolved.Target
 	state := blank(server.Labels["state"], server.Status)
-	ready := hasHost && leaseStatusStateCanBeReady(lease, state) && probeSSHReady(ctx, &target, 4*time.Second)
+	ready := hasHost && leaseStatusStateCanBeReady(lease, state) && ProbeSSHReady(ctx, &target, statusSSHReadinessTimeout(target))
 	meta := serverTailscaleMetadata(server)
 	var tailscale *TailscaleMetadata
 	if meta.Enabled {
 		tailscale = &meta
 	}
+	provider := blank(server.Provider, cfg.Provider)
+	serverID := ""
+	if server.CloudID != "" || server.ID != 0 {
+		serverID = server.DisplayID()
+	}
 	return statusView{
+		LifetimePolicy:   server.LifetimePolicy,
 		ID:               lease.LeaseID,
-		Slug:             serverSlug(server),
-		Provider:         blank(server.Provider, cfg.Provider),
+		Slug:             ServerSlug(server),
+		Provider:         provider,
 		TargetOS:         blank(server.Labels["target"], cfg.TargetOS),
+		WorkRoot:         statusWorkRoot(cfg, server, target),
 		WindowsMode:      blank(server.Labels["windows_mode"], cfg.WindowsMode),
 		State:            state,
-		ServerID:         server.DisplayID(),
+		ServerID:         serverID,
 		ServerType:       server.ServerType.Name,
 		Host:             server.PublicNet.IPv4.IP,
 		Pond:             blank(server.Labels[pondLabelKey], cfg.Pond),
 		Network:          resolved.Network,
 		Tailscale:        tailscale,
 		SSHHost:          target.Host,
+		SSHHostKey:       target.SSHHostKey,
 		SSHUser:          redactedSSHUser(cfg, server, target),
 		SSHPort:          target.Port,
 		SSHFallbackPorts: target.FallbackPorts,
 		SSHKey:           target.Key,
-		LastTouchedAt:    blank(leaseLabelTimeDisplay(server.Labels["last_touched_at"]), server.Labels["last_touched_at"]),
+		LastTouchedAt:    blank(LeaseLabelTimeDisplay(server.Labels["last_touched_at"]), server.Labels["last_touched_at"]),
 		IdleFor:          idleForString(server.Labels["last_touched_at"], time.Now()),
-		IdleTimeout:      leaseLabelDurationDisplay(server.Labels["idle_timeout_secs"], server.Labels["idle_timeout"]),
-		ExpiresAt:        blank(leaseLabelTimeDisplay(server.Labels["expires_at"]), server.Labels["expires_at"]),
+		IdleTimeout:      LeaseLabelDurationDisplay(server.Labels["idle_timeout_secs"], server.Labels["idle_timeout"]),
+		ExpiresAt:        blank(LeaseLabelTimeDisplay(server.Labels["expires_at"]), server.Labels["expires_at"]),
 		Labels:           server.Labels,
+		ProviderMetadata: inspectProviderMetadata(provider, server.ProviderMetadata),
+		ImageEvidence:    CloneImageEvidence(server.ImageEvidence),
 		HasHost:          hasHost,
 		Ready:            ready,
 	}, nil
+}
+
+func statusWorkRoot(cfg Config, server Server, target SSHTarget) string {
+	applyResolvedLeaseConfig(&cfg, server, &target)
+	return cfg.WorkRoot
+}
+
+func inspectProviderMetadata(provider string, metadata map[string]any) map[string]any {
+	if provider != "aws" {
+		return nil
+	}
+	attached, ok := metadata["instanceProfileAttached"].(bool)
+	if !ok {
+		return nil
+	}
+	return map[string]any{"instanceProfileAttached": attached}
 }
 
 func leaseStatusStateCanBeReady(lease LeaseTarget, state string) bool {
@@ -200,37 +297,71 @@ func leaseStatusStateCanBeReady(lease LeaseTarget, state string) bool {
 }
 
 type StatusView struct {
-	ID               string             `json:"id"`
-	Slug             string             `json:"slug,omitempty"`
-	Provider         string             `json:"provider"`
-	TargetOS         string             `json:"target"`
-	WindowsMode      string             `json:"windowsMode,omitempty"`
-	State            string             `json:"state"`
-	ServerID         string             `json:"serverId"`
-	ServerType       string             `json:"serverType"`
-	Host             string             `json:"host"`
-	Pond             string             `json:"pond,omitempty"`
-	Network          NetworkMode        `json:"network"`
-	Tailscale        *TailscaleMetadata `json:"tailscale,omitempty"`
-	SSHHost          string             `json:"sshHost"`
-	SSHUser          string             `json:"sshUser"`
-	SSHPort          string             `json:"sshPort"`
-	SSHFallbackPorts []string           `json:"sshFallbackPorts,omitempty"`
-	SSHKey           string             `json:"sshKey"`
-	LastTouchedAt    string             `json:"lastTouchedAt,omitempty"`
-	IdleFor          string             `json:"idleFor,omitempty"`
-	IdleTimeout      string             `json:"idleTimeout,omitempty"`
-	ExpiresAt        string             `json:"expiresAt,omitempty"`
-	Labels           map[string]string  `json:"labels,omitempty"`
-	HasHost          bool               `json:"hasHost"`
-	Ready            bool               `json:"ready"`
-	Telemetry        *LeaseTelemetry    `json:"telemetry,omitempty"`
-	TelemetryHistory []*LeaseTelemetry  `json:"telemetryHistory,omitempty"`
+	LeasePolicy       *CoordinatorLeasePolicy `json:"leasePolicy,omitempty"`
+	RemainingLifetime string                  `json:"remainingLifetime,omitempty"`
+	MaxLifetime       string                  `json:"maxLifetime,omitempty"`
+	LifetimePolicy    *LeaseLifetimePolicy    `json:"lifetimePolicy,omitempty"`
+	ID                string                  `json:"id"`
+	Slug              string                  `json:"slug,omitempty"`
+	Provider          string                  `json:"provider"`
+	TargetOS          string                  `json:"target"`
+	WorkRoot          string                  `json:"workroot,omitempty"`
+	WindowsMode       string                  `json:"windowsMode,omitempty"`
+	State             string                  `json:"state"`
+	ServerID          string                  `json:"serverId"`
+	ServerType        string                  `json:"serverType"`
+	ImageEvidence     *ImageEvidence          `json:"imageEvidence,omitempty"`
+	// ProviderResourceID optionally exposes an immutable provider resource ID.
+	// ServerID keeps each provider's existing identity semantics; for Islo it
+	// is the sandbox name rather than the immutable sandbox ID.
+	ProviderResourceID           string                   `json:"providerResourceId,omitempty"`
+	Host                         string                   `json:"host"`
+	Pond                         string                   `json:"pond,omitempty"`
+	Network                      NetworkMode              `json:"network"`
+	NetworkDiagnostics           *LeaseNetworkDiagnostics `json:"networkDiagnostics,omitempty"`
+	Tailscale                    *TailscaleMetadata       `json:"tailscale,omitempty"`
+	SSHHost                      string                   `json:"sshHost"`
+	SSHHostKey                   string                   `json:"sshHostKey,omitempty"`
+	ProviderAccessExpiresAt      string                   `json:"providerAccessExpiresAt,omitempty"`
+	SSHUser                      string                   `json:"sshUser"`
+	SSHPort                      string                   `json:"sshPort"`
+	SSHFallbackPorts             []string                 `json:"sshFallbackPorts,omitempty"`
+	SSHKey                       string                   `json:"sshKey"`
+	LastTouchedAt                string                   `json:"lastTouchedAt,omitempty"`
+	IdleFor                      string                   `json:"idleFor,omitempty"`
+	IdleTimeout                  string                   `json:"idleTimeout,omitempty"`
+	ExpiresAt                    string                   `json:"expiresAt,omitempty"`
+	CleanupStatus                string                   `json:"cleanupStatus,omitempty"`
+	ProviderCleanup              *ProviderCleanupEvidence `json:"providerCleanup,omitempty"`
+	CleanupStartedAt             string                   `json:"cleanupStartedAt,omitempty"`
+	CleanupCompletedAt           string                   `json:"cleanupCompletedAt,omitempty"`
+	CleanupError                 string                   `json:"cleanupError,omitempty"`
+	CleanupRetryAt               string                   `json:"cleanupRetryAt,omitempty"`
+	ReleaseDeletesServer         *bool                    `json:"releaseDeletesServer,omitempty"`
+	FailureError                 string                   `json:"failureError,omitempty"`
+	ProvisioningPhase            string                   `json:"provisioningPhase,omitempty"`
+	ProvisioningResourceMayExist *bool                    `json:"provisioningResourceMayExist,omitempty"`
+	ProvisioningFailureRetryable *bool                    `json:"provisioningFailureRetryable,omitempty"`
+	Labels                       map[string]string        `json:"labels,omitempty"`
+	ProviderMetadata             map[string]any           `json:"providerMetadata,omitempty"`
+	HasHost                      bool                     `json:"hasHost"`
+	Ready                        bool                     `json:"ready"`
+	Telemetry                    *LeaseTelemetry          `json:"telemetry,omitempty"`
+	TelemetryHistory             []*LeaseTelemetry        `json:"telemetryHistory,omitempty"`
 }
 
 type statusView = StatusView
 
 func (a App) leaseStatus(ctx context.Context, cfg Config, id string) (statusView, error) {
+	return a.leaseStatusWithRequest(ctx, cfg, StatusRequest{Options: leaseOptionsFromConfig(cfg), ID: id}, false)
+}
+
+func (a App) leaseStatusWithRequest(
+	ctx context.Context,
+	cfg Config,
+	req StatusRequest,
+	includeDiagnostics bool,
+) (statusView, error) {
 	backend, err := loadBackend(cfg, runtimeForApp(a))
 	if err != nil {
 		return statusView{}, err
@@ -238,16 +369,16 @@ func (a App) leaseStatus(ctx context.Context, cfg Config, id string) (statusView
 	if statusBackend, ok := backend.(interface {
 		Status(context.Context, StatusRequest) (statusView, error)
 	}); ok {
-		return statusBackend.Status(ctx, StatusRequest{Options: leaseOptionsFromConfig(cfg), ID: id})
+		return statusBackend.Status(ctx, req)
 	}
 	if delegated, ok := backend.(DelegatedRunBackend); ok {
-		return delegated.Status(ctx, StatusRequest{Options: leaseOptionsFromConfig(cfg), ID: id})
+		return delegated.Status(ctx, req)
 	}
 	sshBackend, ok := backend.(SSHLeaseBackend)
 	if !ok {
-		return statusView{}, exit(2, "provider=%s does not support status", backend.Spec().Name)
+		return statusView{}, Exit(2, "provider=%s does not support status", backend.Spec().Name)
 	}
-	lease, err := sshBackend.Resolve(ctx, ResolveRequest{Options: leaseOptionsFromConfig(cfg), ID: id, StatusOnly: true})
+	lease, err := sshBackend.Resolve(ctx, ResolveRequest{Options: req.Options, ID: req.ID, StatusOnly: true, NoLocalStateMutations: true, IncludeDiagnostics: includeDiagnostics})
 	if err != nil {
 		return statusView{}, err
 	}
@@ -280,7 +411,7 @@ func (a App) resolveSSHTargetWithRequestConfig(ctx context.Context, cfg *Config,
 
 func (a App) resolveSSHLeaseWithRequestConfig(ctx context.Context, cfg *Config, req ResolveRequest, allowLoginOnly bool) (LeaseTarget, error) {
 	if cfg == nil {
-		return LeaseTarget{}, exit(2, "lease target config is required")
+		return LeaseTarget{}, Exit(2, "lease target config is required")
 	}
 	if err := autoRouteExternalLeaseForConfig(cfg, req.ID); err != nil {
 		return LeaseTarget{}, err
@@ -291,11 +422,11 @@ func (a App) resolveSSHLeaseWithRequestConfig(ctx context.Context, cfg *Config, 
 	}
 	sshBackend, ok := backend.(SSHLoginBackend)
 	if !ok {
-		return LeaseTarget{}, exit(2, "provider=%s does not expose an SSH target", backend.Spec().Name)
+		return LeaseTarget{}, Exit(2, "provider=%s does not expose an SSH target", backend.Spec().Name)
 	}
 	if !allowLoginOnly {
 		if _, ok := backend.(SSHLeaseBackend); !ok {
-			return LeaseTarget{}, exit(2, "provider=%s exposes SSH login only, not a Crabbox-managed SSH lease", backend.Spec().Name)
+			return LeaseTarget{}, Exit(2, "provider=%s exposes SSH login only, not a Crabbox-managed SSH lease", backend.Spec().Name)
 		}
 	}
 	req.Options = leaseOptionsFromConfig(*cfg)
@@ -312,12 +443,15 @@ func (a App) resolveSSHLeaseWithRequestConfig(ctx context.Context, cfg *Config, 
 	if err != nil {
 		return LeaseTarget{}, err
 	}
+	if err := validateResolvedLeasePlatform(*cfg, lease.Server); err != nil {
+		return LeaseTarget{}, err
+	}
 	applyResolvedLeaseConfig(cfg, lease.Server, &lease.SSH)
 	return lease, nil
 }
 
 func resolveSSHLeaseTarget(ctx context.Context, backend SSHLoginBackend, req ResolveRequest) (LeaseTarget, error) {
-	claimsBefore, err := snapshotLeaseClaims()
+	claimsBefore, err := snapshotLeaseClaimsContext(ctx)
 	if err != nil {
 		return LeaseTarget{}, err
 	}
@@ -342,17 +476,20 @@ func resolveSSHLeaseTarget(ctx context.Context, backend SSHLoginBackend, req Res
 		expectedRepoRoot = strings.TrimSpace(claimBefore.RepoRoot)
 	}
 	if claimExistedBefore {
+		if !resolvedLeaseClaimIdentityCompatible(claimBefore, lease.Server) {
+			return LeaseTarget{}, Exit(2, "lease %s has an incompatible provider identity; refusing to rebind resolved access", claimBefore.LeaseID)
+		}
 		leaseIDChanged := lease.LeaseID != claimBefore.LeaseID
 		var discardedClaim leaseClaim
 		discardedClaimExists := false
 		if leaseIDChanged && !resolvedClaimExistedBefore && validLeaseClaimID(resolvedLeaseID) {
-			resolvedClaim, resolvedClaimExists, err := readLeaseClaimWithPresence(resolvedLeaseID)
+			resolvedClaim, resolvedClaimExists, err := ReadLeaseClaimWithPresence(resolvedLeaseID)
 			if err != nil {
 				return LeaseTarget{}, err
 			}
 			if resolvedClaimExists {
 				if !resolvedLeaseClaimAttestsResult(resolvedClaim, lease.Server, expectedRepoRoot, req.Options.ProviderScope) {
-					return LeaseTarget{}, exit(2, "lease %s claim changed during resolve; retry", resolvedLeaseID)
+					return LeaseTarget{}, Exit(2, "lease %s claim changed during resolve; retry", resolvedLeaseID)
 				}
 				discardedClaim = resolvedClaim
 				discardedClaimExists = true
@@ -367,27 +504,27 @@ func resolveSSHLeaseTarget(ctx context.Context, backend SSHLoginBackend, req Res
 		if claimBefore.Slug != "" {
 			lease.Server.Labels["slug"] = claimBefore.Slug
 		}
-		if rebinder, ok := backend.(ResolvedLeaseTargetRebinder); ok && leaseIDChanged {
+		if rebinder, ok := backend.(ResolvedLeaseTargetRebinder); ok && leaseIDChanged && !req.ReleaseOnly {
 			if err := rebinder.RebindResolvedLeaseTarget(&lease, claimBefore.LeaseID); err != nil {
 				return LeaseTarget{}, err
 			}
 		}
 		if leaseIDChanged && !resolvedClaimExistedBefore && validLeaseClaimID(resolvedLeaseID) {
-			if aliasKeyPath, err := testboxKeyPath(resolvedLeaseID); err == nil && lease.SSH.Key == aliasKeyPath {
-				return LeaseTarget{}, exit(2, "lease %s resolved to %s but the canonical stored SSH key is unavailable", resolvedLeaseID, claimBefore.LeaseID)
+			if aliasKeyPath, err := TestboxKeyPath(resolvedLeaseID); !req.ReleaseOnly && err == nil && lease.SSH.Key == aliasKeyPath {
+				return LeaseTarget{}, Exit(2, "lease %s resolved to %s but the canonical stored SSH key is unavailable", resolvedLeaseID, claimBefore.LeaseID)
 			}
 			if discardedClaimExists {
-				if err := removeLeaseClaimIfUnchanged(resolvedLeaseID, discardedClaim); err != nil {
+				if err := RemoveLeaseClaimIfUnchanged(resolvedLeaseID, discardedClaim); err != nil {
 					return LeaseTarget{}, err
 				}
+				RemoveStoredTestboxKey(resolvedLeaseID)
 			}
-			removeStoredTestboxKey(resolvedLeaseID)
 		}
 	}
 	var claimAfter leaseClaim
 	claimExistsAfter := false
 	if lease.LeaseID != "" {
-		if claimAfter, claimExistsAfter, err = readLeaseClaimWithPresence(lease.LeaseID); err != nil {
+		if claimAfter, claimExistsAfter, err = ReadLeaseClaimWithPresence(lease.LeaseID); err != nil {
 			return LeaseTarget{}, err
 		}
 	}
@@ -432,7 +569,7 @@ func resolvedLeaseClaimBefore(snapshot leaseClaimsSnapshot, provider, providerSc
 				continue
 			}
 			if found.LeaseID != "" && found.LeaseID != claim.LeaseID {
-				return leaseClaim{}, false, exit(2, "multiple provider=%s claims match resolved lease %s", provider, firstNonBlank(lease.LeaseID, identifier))
+				return leaseClaim{}, false, Exit(2, "multiple provider=%s claims match resolved lease %s", provider, firstNonBlank(lease.LeaseID, identifier))
 			}
 			found = cloneLeaseClaim(claim)
 		}
@@ -449,13 +586,20 @@ func resolvedLeaseClaimBefore(snapshot leaseClaimsSnapshot, provider, providerSc
 		if candidate.LeaseID == identifier {
 			return strings.TrimSpace(candidate.ProviderScope) == "" || providerScope == "" || scopeMatches(candidate)
 		}
-		slug := normalizeLeaseSlug(identifier)
-		if slug != "" && normalizeLeaseSlug(candidate.Slug) == slug {
+		slug := NormalizeLeaseSlug(identifier)
+		if slug != "" && NormalizeLeaseSlug(candidate.Slug) == slug {
 			return scopeMatches(candidate) &&
 				(candidate.CloudID == "" || lease.Server.CloudID == "" || candidate.CloudID == lease.Server.CloudID)
 		}
 		return canonicalClaimProvider(candidate.Provider) == provider && scopeMatches(candidate) && candidate.CloudID == identifier
 	})
+}
+
+func resolvedLeaseClaimIdentityCompatible(claim leaseClaim, server Server) bool {
+	// Missing identities remain unknown; compatibility alone does not attest ownership.
+	return (claim.CloudID == "" || server.CloudID == "" || claim.CloudID == server.CloudID) &&
+		(claim.CloudImmutableID == "" || server.ImmutableID == "" || claim.CloudImmutableID == server.ImmutableID) &&
+		(claim.CloudNumericID == 0 || server.ID == 0 || claim.CloudNumericID == server.ID)
 }
 
 func resolvedLeaseClaimAttestsResult(claim leaseClaim, server Server, expectedRepoRoot, expectedProviderScope string) bool {
@@ -465,7 +609,7 @@ func resolvedLeaseClaimAttestsResult(claim leaseClaim, server Server, expectedRe
 	serverState := strings.ToLower(strings.TrimSpace(firstNonBlank(server.Labels["state"], server.Status)))
 	return (claimProvider == "" || serverProvider == "" || claimProvider == serverProvider) &&
 		(strings.TrimSpace(expectedProviderScope) == "" || strings.TrimSpace(claim.ProviderScope) == strings.TrimSpace(expectedProviderScope)) &&
-		(claim.CloudID == "" || server.CloudID == "" || claim.CloudID == server.CloudID) &&
+		resolvedLeaseClaimIdentityCompatible(claim, server) &&
 		resolvedLeaseClaimStateAttests(claimState, serverState) &&
 		strings.TrimSpace(claim.RepoRoot) == expectedRepoRoot
 }
@@ -522,4 +666,27 @@ func formatSecondsDuration(seconds int) string {
 		return ""
 	}
 	return (time.Duration(seconds) * time.Second).String()
+}
+
+func addStatusLifetime(state *StatusView, cfg Config) {
+	if deadline, err := time.Parse(time.RFC3339, state.ExpiresAt); err == nil {
+		state.RemainingLifetime = max(time.Duration(0), time.Until(deadline)).Round(time.Second).String()
+	}
+	if state.LeasePolicy != nil {
+		state.MaxLifetime = formatSecondsDuration(state.LeasePolicy.MaxTTLSeconds)
+	} else if state.ExpiresAt != "" {
+		if provider, err := ProviderFor(state.Provider); err == nil && !ShouldUseCoordinator(cfg, provider.Spec()) {
+			state.MaxLifetime = EffectiveMaxTTL(cfg).String()
+		}
+	}
+}
+
+func printStatusLifetime(out io.Writer, state StatusView) {
+	if state.RemainingLifetime != "" {
+		fmt.Fprintf(out, "remaining_lifetime=%s max_lifetime=%s", state.RemainingLifetime, blank(state.MaxLifetime, "-"))
+		if state.LeasePolicy != nil {
+			fmt.Fprintf(out, " runtime_extension=%t", state.LeasePolicy.RuntimeExtension)
+		}
+		fmt.Fprintln(out)
+	}
 }

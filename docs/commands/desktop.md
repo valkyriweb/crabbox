@@ -39,8 +39,13 @@ connectivity.
 ## desktop launch
 
 `crabbox desktop launch` starts an app inside the desktop session without
-attaching a VNC viewer first. It waits for the loopback VNC service, then starts
-the process detached from the SSH session.
+attaching a VNC viewer first. It waits for the loopback VNC service, starts the
+process detached from the SSH session, and verifies that the process remains
+alive through startup. A short-lived Linux/X11 wrapper can also succeed by
+creating a new visible window or focusing a different existing visible window.
+Linux browser launches additionally require a visible browser window or browser
+process. macOS `open` launches wait on the opened app so an immediately failed
+launch is not reported as successful.
 
 With `--browser`, Crabbox probes the target browser the same way
 `run --browser` does and launches the resolved `BROWSER` when no explicit
@@ -62,11 +67,12 @@ egress bridge first; the flag currently requires `--browser`. Override the proxy
 address with `--egress-proxy host:port` if egress is listening elsewhere. See
 [egress](egress.md) for the full bridge model.
 
-On Linux and macOS the process is detached with `setsid` or `nohup`. On native
-Windows, an SSH session cannot directly own the visible console desktop, so
-Crabbox writes a one-shot PowerShell launcher under `C:\ProgramData\crabbox` and
-runs it as an interactive scheduled task for the logged-in `crabbox` user. The
-launcher starts the app in a normal window and brings it to the foreground.
+On Linux and macOS the process is detached with `setsid` or `nohup`. Native
+Windows desktop bootstrap installs a restricted LocalSystem launch broker. It
+uses the active WTS session token to create the app directly on
+`winsta0\default`; it does not create a scheduled task or read the stored
+desktop password. The command waits for a new or changed visible window, brings
+it to the foreground, and reports the owning PID, session ID, and title.
 
 ```text
 desktop launch --id <lease-id-or-slug>
@@ -84,7 +90,13 @@ desktop launch --id <lease-id-or-slug>
 `gnome-terminal` on Wayland/GNOME desktop envs). On native Windows it launches
 Git-for-Windows `mintty`, which is present after bootstrap and can render Sixel
 inline images when `--sixel` is set. On macOS it launches Ghostty via
-`open -na Ghostty.app`.
+`open -W -na Ghostty.app`.
+
+POSIX launches must remain alive through startup. X11 terminals also receive a
+per-lease title and must create a new visible window before `launched terminal:`
+or any capture output is printed. Verification follows the stable X11 window ID,
+so commands may change the window title. This rejects commands that make the
+terminal exit immediately.
 
 Add `--screenshot <path>` or `--record <path>` to capture proof after launch;
 `--wait-visible <duration>` controls the settle delay before capture (defaults
@@ -139,9 +151,10 @@ Defaults: `--duration 10s`, `--fps 15`, `--contact-sheet-frames 5`,
 ## desktop proof
 
 `crabbox desktop proof` is the one-shot visual QA command for terminal smokes.
-It launches the terminal command, waits for the UI to settle (`--wait-visible`,
-default 2s), and writes a bundle into `--output` (default
-`artifacts/<slug>-proof`):
+It launches and verifies the terminal command, waits for the UI to settle
+(`--wait-visible`, default 2s), and writes a bundle into `--output` (default
+`artifacts/<slug>-proof`). A failed launch returns before metadata, screenshot,
+diagnostics, video, contact-sheet, or final `proof:` output is written:
 
 - `metadata.json`
 - `screenshot.png`
@@ -185,8 +198,8 @@ service, and interactive user state on Windows; `DISPLAY`, remote `ffmpeg`,
 
 `crabbox desktop doctor` checks the selected lease without syncing the repo. For
 Linux desktop leases it reports VM/session health separately from portal health:
-`DISPLAY`, Xvfb/window manager/panel (or Wayland session for Wayland envs), VNC
-listener, `xdotool`/`wtype`, clipboard tool, browser binary, `ffmpeg`, screen
+`DISPLAY`, TigerVNC/window manager/panel (or Wayland session for Wayland envs),
+VNC listener, `xdotool`/`wtype`, clipboard tool, browser binary, `ffmpeg`, screen
 size, and screenshot capture. On coordinator-backed leases it also reports the
 WebVNC bridge/viewer state. Failures carry a one-line repair suggestion so you
 can tell a session bug apart from a WebVNC/browser-portal bug. Non-Linux targets
@@ -207,11 +220,19 @@ them instead of hand-written input snippets.
   through `xdotool type` (or `wtype` on Wayland); text containing emails,
   passwords, symbols such as `@` or `+`, URLs, whitespace, or longer payloads is
   routed through the clipboard/paste path so keyboard layouts cannot corrupt
-  special characters. Linux only.
+  special characters. On macOS, see the VNC typing behavior below.
 - `desktop paste` pastes text from `--text` or stdin via the remote clipboard.
-  Linux only.
+  On Linux, Crabbox verifies clipboard ownership before Ctrl+V and propagates
+  supported helper delivery failures; helper failure makes the command fail
+  without printing `pasted:`.
 - `desktop key` sends an `xdotool` key sequence (or a single modifier+key
   combination on Wayland). Linux only.
+
+On macOS, both `desktop type` and `desktop paste` send key events through the
+SSH-tunneled Screen Sharing connection. Cancellation or timeout allows up to
+two extra seconds for best-effort key release and a confirming framebuffer
+reply. The original error is preserved; failed cleanup is reported with it.
+A broken connection or a forcibly killed client cannot guarantee key release.
 
 `desktop key` accepts either `--id <lease> <keys>` or the positional lease form
 `<lease> <keys>`; the key sequence is parsed after lease flags, so

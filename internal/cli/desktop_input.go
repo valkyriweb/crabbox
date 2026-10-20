@@ -19,7 +19,7 @@ func (a App) desktopDoctor(ctx context.Context, args []string) error {
 	fmt.Fprintf(a.Stdout, "lease: %s provider=%s target=%s\n", leaseID, cfg.Provider, target.TargetOS)
 	out, err := runSSHOutput(ctx, target, desktopDoctorRemoteCommand(target))
 	if err != nil {
-		return exit(5, "desktop doctor failed: %v", err)
+		return Exit(5, "desktop doctor failed: %v", err)
 	}
 	fmt.Fprintln(a.Stdout, out)
 	if isBlacksmithProvider(cfg.Provider) || isStaticProvider(cfg.Provider) {
@@ -52,14 +52,21 @@ func (a App) desktopClick(ctx context.Context, args []string) error {
 	x, xOK := intFlagValue(args, "x")
 	y, yOK := intFlagValue(args, "y")
 	if !xOK || !yOK || x < 0 || y < 0 {
-		return exit(2, "usage: crabbox desktop click --id <lease-id-or-slug> --x <n> --y <n>")
+		return Exit(2, "usage: crabbox desktop click --id <lease-id-or-slug> --x <n> --y <n>")
 	}
 	if !desktopClickSupportsTarget(target) {
-		return exit(2, "desktop click supports target=linux, target=macos, or target=windows with windowsMode=normal")
+		return Exit(2, "desktop click supports target=linux, target=macos, or target=windows with windowsMode=normal")
+	}
+	if target.TargetOS == targetMacOS {
+		if err := clickRemoteMacVNC(ctx, cfg, target, x, y); err != nil {
+			return Exit(5, "desktop click failed for %s: %v", leaseID, err)
+		}
+		fmt.Fprintf(a.Stdout, "clicked: lease=%s x=%d y=%d method=vnc\n", leaseID, x, y)
+		return nil
 	}
 	if out, err := runSSHCombinedOutput(ctx, target, desktopClickRemoteCommand(target, x, y)); err != nil {
 		a.printDesktopInputRescue(classifyDesktopFailure(out), out, cfg, target, leaseID)
-		return exit(5, "desktop click failed for %s: %v", leaseID, err)
+		return Exit(5, "desktop click failed for %s: %v", leaseID, err)
 	}
 	fmt.Fprintf(a.Stdout, "clicked: lease=%s x=%d y=%d\n", leaseID, x, y)
 	return nil
@@ -70,47 +77,101 @@ func desktopClickSupportsTarget(target SSHTarget) bool {
 }
 
 func (a App) desktopPaste(ctx context.Context, args []string) error {
-	target, cfg, leaseID, err := a.desktopCommandTarget(ctx, "desktop paste", args, true)
+	target, cfg, leaseID, err := a.desktopCommandTarget(ctx, "desktop paste", args, false)
 	if err != nil {
 		return err
+	}
+	if !desktopTextSupportsTarget(target) {
+		return Exit(2, "desktop paste supports target=linux or target=macos")
 	}
 	text, err := desktopTextArgOrStdin(a.Stderr, args, "desktop paste")
 	if err != nil {
 		return err
 	}
+	if target.TargetOS == targetMacOS {
+		if err := typeRemoteMacVNC(ctx, cfg, target, text); err != nil {
+			return Exit(5, "desktop paste failed for %s: %v", leaseID, err)
+		}
+		fmt.Fprintf(a.Stdout, "pasted: lease=%s bytes=%d method=vnc-key\n", leaseID, len(text))
+		return nil
+	}
 	var stdout, stderr strings.Builder
 	if err := runSSHInput(ctx, target, desktopPasteRemoteCommand(), strings.NewReader(text), &stdout, &stderr); err != nil {
 		a.printDesktopInputRescue(classifyDesktopFailure(stderr.String()+"\n"+stdout.String()), stderr.String()+"\n"+stdout.String(), cfg, target, leaseID)
-		return exit(5, "desktop paste failed for %s: %v", leaseID, err)
+		return Exit(5, "desktop paste failed for %s: %v", leaseID, err)
 	}
 	fmt.Fprintf(a.Stdout, "pasted: lease=%s bytes=%d\n", leaseID, len(text))
 	return nil
 }
 
 func (a App) desktopType(ctx context.Context, args []string) error {
-	target, cfg, leaseID, err := a.desktopCommandTarget(ctx, "desktop type", args, true)
+	target, cfg, leaseID, err := a.desktopCommandTarget(ctx, "desktop type", args, false)
 	if err != nil {
 		return err
+	}
+	if !desktopTextSupportsTarget(target) {
+		return Exit(2, "desktop type supports target=linux or target=macos")
 	}
 	text, err := desktopTextArgOrStdin(a.Stderr, args, "desktop type")
 	if err != nil {
 		return err
 	}
+	if target.TargetOS == targetMacOS {
+		if err := typeRemoteMacVNC(ctx, cfg, target, text); err != nil {
+			return Exit(5, "desktop type failed for %s: %v", leaseID, err)
+		}
+		fmt.Fprintf(a.Stdout, "typed: lease=%s bytes=%d method=vnc-key\n", leaseID, len(text))
+		return nil
+	}
 	if desktopShouldPasteForType(text) {
 		var stdout, stderr strings.Builder
 		if err := runSSHInput(ctx, target, desktopPasteRemoteCommand(), strings.NewReader(text), &stdout, &stderr); err != nil {
-			a.printDesktopInputRescue(classifyDesktopFailure(stderr.String()+"\n"+stdout.String()), stderr.String()+"\n"+stdout.String(), cfg, target, leaseID)
-			return exit(5, "desktop type paste fallback failed for %s: %v", leaseID, err)
+			pasteDetail := stderr.String() + "\n" + stdout.String()
+			if !desktopPasteFailureSafeToRetry(pasteDetail) {
+				a.printDesktopInputRescue(classifyDesktopFailure(pasteDetail), pasteDetail, cfg, target, leaseID)
+				return Exit(5, "desktop type paste failed for %s: %v", leaseID, err)
+			}
+			if out, typeErr := runSSHCombinedOutput(ctx, target, desktopTypeRemoteCommand(text)); typeErr == nil {
+				fmt.Fprintf(a.Stdout, "typed: lease=%s method=key-fallback bytes=%d\n", leaseID, len(text))
+				return nil
+			} else {
+				detail := pasteDetail + "\nkey fallback:\n" + out
+				a.printDesktopInputRescue(classifyDesktopFailure(detail), detail, cfg, target, leaseID)
+				return Exit(5, "desktop type paste and key fallback failed for %s: %v", leaseID, typeErr)
+			}
 		}
 		fmt.Fprintf(a.Stdout, "typed: lease=%s method=paste bytes=%d\n", leaseID, len(text))
 		return nil
 	}
 	if out, err := runSSHCombinedOutput(ctx, target, desktopTypeRemoteCommand(text)); err != nil {
 		a.printDesktopInputRescue(classifyDesktopFailure(out), out, cfg, target, leaseID)
-		return exit(5, "desktop type failed for %s: %v", leaseID, err)
+		return Exit(5, "desktop type failed for %s: %v", leaseID, err)
 	}
 	fmt.Fprintf(a.Stdout, "typed: lease=%s method=xdotool bytes=%d\n", leaseID, len(text))
 	return nil
+}
+
+func desktopTextSupportsTarget(target SSHTarget) bool {
+	return target.TargetOS == targetLinux || target.TargetOS == targetMacOS
+}
+
+// desktopPasteFailureSafeToRetry only permits a key-by-key retry when the
+// remote paste helper failed before it could send input to the active window.
+// Retrying after a post-paste clipboard-owner failure would duplicate text.
+func desktopPasteFailureSafeToRetry(detail string) bool {
+	for _, marker := range []string{
+		"missing clipboard tool",
+		"missing or unavailable xdotool",
+		"missing xdotool",
+		"missing wtype",
+		"clipboard helper exited before paste",
+		"clipboard helper failed to provide requested contents",
+	} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a App) desktopKey(ctx context.Context, args []string) error {
@@ -123,11 +184,11 @@ func (a App) desktopKey(ctx context.Context, args []string) error {
 		return err
 	}
 	if strings.TrimSpace(keys) == "" {
-		return exit(2, "usage: crabbox desktop key --id <lease-id-or-slug> <keys>")
+		return Exit(2, "usage: crabbox desktop key --id <lease-id-or-slug> <keys>")
 	}
 	if out, err := runSSHCombinedOutput(ctx, target, desktopKeyRemoteCommand(keys)); err != nil {
 		a.printDesktopInputRescue(classifyDesktopFailure(out), out, cfg, target, leaseID)
-		return exit(5, "desktop key failed for %s: %v", leaseID, err)
+		return Exit(5, "desktop key failed for %s: %v", leaseID, err)
 	}
 	fmt.Fprintf(a.Stdout, "key: lease=%s keys=%s\n", leaseID, strings.TrimSpace(keys))
 	return nil
@@ -141,8 +202,9 @@ func (a App) printDesktopInputRescue(problem, output string, cfg Config, target 
 func (a App) desktopCommandTarget(ctx context.Context, name string, args []string, requireLinux bool) (SSHTarget, Config, string, error) {
 	defaults := defaultConfig()
 	fs := newFlagSet(name, a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpSSH())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	id := fs.String("id", "", "lease id or slug")
+	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
 	networkFlags := registerNetworkModeFlag(fs, defaults)
 	if strings.HasSuffix(name, "click") {
@@ -174,8 +236,11 @@ func (a App) desktopCommandTarget(ctx context.Context, name string, args []strin
 	if err != nil {
 		return SSHTarget{}, Config{}, "", err
 	}
+	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
+		return SSHTarget{}, Config{}, "", err
+	}
 	if isBlacksmithProvider(cfg.Provider) {
-		return SSHTarget{}, Config{}, "", exit(2, "desktop helpers are not supported for provider=%s; Blacksmith owns machine connectivity", cfg.Provider)
+		return SSHTarget{}, Config{}, "", Exit(2, "desktop helpers are not supported for provider=%s; Blacksmith owns machine connectivity", cfg.Provider)
 	}
 	if err := requireLeaseID(*id, "crabbox "+name+" --id <lease-id-or-slug>", cfg); err != nil {
 		return SSHTarget{}, Config{}, "", err
@@ -188,7 +253,7 @@ func (a App) desktopCommandTarget(ctx context.Context, name string, args []strin
 		return SSHTarget{}, Config{}, "", err
 	}
 	if requireLinux && target.TargetOS != targetLinux {
-		return SSHTarget{}, Config{}, "", exit(2, "desktop input helpers currently require target=linux with xdotool")
+		return SSHTarget{}, Config{}, "", Exit(2, "desktop input helpers currently require target=linux with xdotool")
 	}
 	a.touchLeaseTargetBestEffort(ctx, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, "")
 	return target, cfg, leaseID, nil
@@ -197,8 +262,9 @@ func (a App) desktopCommandTarget(ctx context.Context, name string, args []strin
 func desktopKeySequenceArg(args []string) (string, error) {
 	defaults := defaultConfig()
 	fs := newFlagSet("desktop key", io.Discard)
-	fs.String("provider", defaults.Provider, providerHelpSSH())
+	registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	id := fs.String("id", "", "lease id or slug")
+	registerProviderFlags(fs, defaults)
 	registerTargetFlags(fs, defaults)
 	registerNetworkModeFlag(fs, defaults)
 	keys := fs.String("keys", "", "xdotool key sequence")
@@ -225,11 +291,11 @@ func desktopTextArgOrStdin(stderr io.Writer, args []string, name string) (string
 	}
 	info, err := os.Stdin.Stat()
 	if err == nil && info.Mode()&os.ModeCharDevice != 0 {
-		return "", exit(2, "usage: crabbox %s --id <lease-id-or-slug> --text <text>", name)
+		return "", Exit(2, "usage: crabbox %s --id <lease-id-or-slug> --text <text>", name)
 	}
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		return "", exit(2, "read stdin: %v", err)
+		return "", Exit(2, "read stdin: %v", err)
 	}
 	return string(data), nil
 }
@@ -412,12 +478,15 @@ exit 127`, x, y, x, y)
 	}
 	return fmt.Sprintf(`set -eu
 if [ -f /var/lib/crabbox/desktop.env ]; then . /var/lib/crabbox/desktop.env; fi
-if [ "${CRABBOX_DESKTOP_ENV:-xfce}" != "xfce" ]; then
+export DISPLAY="${DISPLAY:-:99}"
+if ! command -v xdotool >/dev/null 2>&1 || ! xdotool getactivewindow >/dev/null 2>&1; then
+  if [ "${CRABBOX_DESKTOP_ENV:-xfce}" = "xfce" ]; then
+    echo "missing or unavailable xdotool; warm a new --desktop lease or install xdotool" >&2
+    exit 127
+  fi
   echo "desktop click is not supported on Wayland desktop envs yet; use WebVNC pointer input" >&2
   exit 2
 fi
-export DISPLAY="${DISPLAY:-:99}"
-command -v xdotool >/dev/null 2>&1 || { echo "missing xdotool; warm a new --desktop lease or install xdotool" >&2; exit 127; }
 xdotool mousemove %d %d click 1`, x, y)
 }
 
@@ -433,11 +502,13 @@ func desktopKeyRemoteCommand(keys string) string {
 	}
 	return `set -eu
 if [ -f /var/lib/crabbox/desktop.env ]; then . /var/lib/crabbox/desktop.env; fi
-if [ "${CRABBOX_DESKTOP_ENV:-xfce}" != "xfce" ]; then
+export DISPLAY="${DISPLAY:-:99}"
+x11_input=0
+if command -v xdotool >/dev/null 2>&1 && xdotool getactivewindow >/dev/null 2>&1; then x11_input=1; fi
+if [ "${CRABBOX_DESKTOP_ENV:-xfce}" != "xfce" ] && [ "$x11_input" -ne 1 ]; then
   export XDG_RUNTIME_DIR WAYLAND_DISPLAY
   command -v wtype >/dev/null 2>&1 || { echo "missing wtype; warm a new Wayland desktop lease or install wtype" >&2; exit 127; }
   ` + wayland.String() + `fi
-export DISPLAY="${DISPLAY:-:99}"
 command -v xdotool >/dev/null 2>&1 || { echo "missing xdotool; warm a new --desktop lease or install xdotool" >&2; exit 127; }
 xdotool key --clearmodifiers ` + shellQuote(strings.TrimSpace(keys))
 }
@@ -445,12 +516,14 @@ xdotool key --clearmodifiers ` + shellQuote(strings.TrimSpace(keys))
 func desktopTypeRemoteCommand(text string) string {
 	return `set -eu
 if [ -f /var/lib/crabbox/desktop.env ]; then . /var/lib/crabbox/desktop.env; fi
-if [ "${CRABBOX_DESKTOP_ENV:-xfce}" != "xfce" ]; then
+export DISPLAY="${DISPLAY:-:99}"
+x11_input=0
+if command -v xdotool >/dev/null 2>&1 && xdotool getactivewindow >/dev/null 2>&1; then x11_input=1; fi
+if [ "${CRABBOX_DESKTOP_ENV:-xfce}" != "xfce" ] && [ "$x11_input" -ne 1 ]; then
   export XDG_RUNTIME_DIR WAYLAND_DISPLAY
   command -v wtype >/dev/null 2>&1 || { echo "missing wtype; warm a new Wayland desktop lease or install wtype" >&2; exit 127; }
   exec wtype -d 1 -- ` + shellQuote(text) + `
 fi
-export DISPLAY="${DISPLAY:-:99}"
 command -v xdotool >/dev/null 2>&1 || { echo "missing xdotool; warm a new --desktop lease or install xdotool" >&2; exit 127; }
 xdotool type --clearmodifiers --delay 1 -- ` + shellQuote(text)
 }
@@ -458,16 +531,20 @@ xdotool type --clearmodifiers --delay 1 -- ` + shellQuote(text)
 func desktopPasteRemoteCommand() string {
 	return `set -eu
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+clip_pid=""
+clip_backend=""
+trap 'if [ -n "$clip_pid" ]; then kill "$clip_pid" 2>/dev/null || true; wait "$clip_pid" 2>/dev/null || true; fi; rm -f "$tmp"' EXIT
 cat > "$tmp"
 if [ -f /var/lib/crabbox/desktop.env ]; then . /var/lib/crabbox/desktop.env; fi
-if [ "${CRABBOX_DESKTOP_ENV:-xfce}" != "xfce" ]; then
+export DISPLAY="${DISPLAY:-:99}"
+x11_input=0
+if command -v xdotool >/dev/null 2>&1 && xdotool getactivewindow >/dev/null 2>&1; then x11_input=1; fi
+if [ "${CRABBOX_DESKTOP_ENV:-xfce}" != "xfce" ] && [ "$x11_input" -ne 1 ]; then
   export XDG_RUNTIME_DIR WAYLAND_DISPLAY
   command -v wtype >/dev/null 2>&1 || { echo "missing wtype; warm a new Wayland desktop lease or install wtype" >&2; exit 127; }
   wtype -d 1 - < "$tmp"
   exit 0
 fi
-export DISPLAY="${DISPLAY:-:99}"
 command -v xdotool >/dev/null 2>&1 || { echo "missing xdotool; warm a new --desktop lease or install xdotool" >&2; exit 127; }
 active_class="$(xdotool getactivewindow getwindowclassname 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
 active_name="$(xdotool getactivewindow getwindowname 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
@@ -482,22 +559,79 @@ case "$active_class $active_name $active_proc" in
     exit 0
     ;;
 esac
+# Keep foreground-capable clipboard servers supervised; xsel is verified by
+# exact readback because it has no paste-once mode.
 if command -v xclip >/dev/null 2>&1; then
-  timeout 5s xclip -selection clipboard -loops 1 "$tmp" &
+  timeout 5s xclip -quiet -selection clipboard -loops 1 "$tmp" &
   clip_pid=$!
+  clip_backend=xclip
 elif command -v xsel >/dev/null 2>&1; then
-  timeout 5s xsel --clipboard --input < "$tmp" &
+  xsel --nodetach --selectionTimeout 5000 --clipboard --input < "$tmp" &
   clip_pid=$!
+  clip_verified=0
+  clip_attempt=0
+  while [ "$clip_attempt" -lt 10 ]; do
+    if ! kill -0 "$clip_pid" >/dev/null 2>&1; then
+      set +e
+      wait "$clip_pid"
+      clip_status=$?
+      set -e
+      [ "$clip_status" -ne 0 ] || clip_status=1
+      clip_pid=""
+      echo "clipboard helper exited before paste (xsel status=$clip_status)" >&2
+      exit "$clip_status"
+    fi
+    if timeout 1s xsel --clipboard --output | cmp -s - "$tmp"; then
+      clip_verified=1
+      break
+    fi
+    clip_attempt=$((clip_attempt + 1))
+    sleep 0.05
+  done
+  if [ "$clip_verified" -ne 1 ]; then
+    echo "clipboard helper failed to provide requested contents (xsel)" >&2
+    exit 1
+  fi
+  xdotool key --clearmodifiers ctrl+v
+  # xsel has no paste-once mode. Give the target time to request the selection,
+  # then stop the supervised owner so pasted contents do not remain exposed.
+  sleep 0.2
+  kill "$clip_pid" 2>/dev/null || true
+  wait "$clip_pid" 2>/dev/null || true
+  clip_pid=""
+  exit 0
 elif command -v wl-copy >/dev/null 2>&1; then
-  wl-copy --paste-once < "$tmp" &
+  wl-copy --foreground --paste-once < "$tmp" &
   clip_pid=$!
+  clip_backend=wl-copy
 else
   echo "missing clipboard tool; warm a new --desktop lease or install xclip/xsel" >&2
   exit 127
 fi
 sleep 0.2
+if ! kill -0 "$clip_pid" >/dev/null 2>&1; then
+  set +e
+  wait "$clip_pid"
+  clip_status=$?
+  set -e
+  if [ "$clip_status" -eq 0 ] && [ "$clip_backend" = xclip ] && timeout 1s xclip -selection clipboard -o | cmp -s - "$tmp"; then
+    clip_pid=""
+    xdotool key --clearmodifiers ctrl+v
+    exit 0
+  fi
+  [ "$clip_status" -ne 0 ] || clip_status=1
+  echo "clipboard helper exited before paste (status=$clip_status)" >&2
+  exit "$clip_status"
+fi
 xdotool key --clearmodifiers ctrl+v
-wait "$clip_pid" || true`
+set +e
+wait "$clip_pid"
+clip_status=$?
+set -e
+if [ "$clip_status" -ne 0 ]; then
+  echo "clipboard helper failed while serving paste (status=$clip_status)" >&2
+  exit "$clip_status"
+fi`
 }
 
 func desktopWaylandWtypeKeyArgs(keys string) ([]string, bool) {
@@ -582,10 +716,10 @@ check() {
   fi
 }
 CRABBOX_REPAIR="ensure DISPLAY=:99 is exported"; [ -n "$DISPLAY" ] && echo "session ok DISPLAY=$DISPLAY" || echo "session failed DISPLAY repair=export DISPLAY=:99"
-CRABBOX_REPAIR="restart crabbox-xvfb.service"; check session xvfb pgrep -f "Xvfb :99"
+CRABBOX_REPAIR="restart crabbox-xvfb.service"; check session display sh -c 'pgrep -f "Xtigervnc :99" >/dev/null || pgrep -f "Xvfb :99" >/dev/null'
 CRABBOX_REPAIR="restart crabbox-desktop.service"; check session xfwm4 pgrep -x xfwm4
 CRABBOX_REPAIR="restart crabbox-desktop.service"; check session panel pgrep -x xfce4-panel
-CRABBOX_REPAIR="restart crabbox-x11vnc.service"; check vm vnc ss -ltn sport = :5900
+CRABBOX_REPAIR="restart crabbox-xvfb.service"; check vm vnc ss -ltn sport = :5900
 CRABBOX_REPAIR="warm a new --desktop lease or install xdotool"; check input xdotool command -v xdotool
 CRABBOX_REPAIR="warm a new --desktop lease or install xclip"; if command -v xclip >/dev/null 2>&1 || command -v xsel >/dev/null 2>&1 || command -v wl-copy >/dev/null 2>&1; then echo "input ok clipboard"; else echo "input failed clipboard repair=$CRABBOX_REPAIR"; fi
 CRABBOX_REPAIR="warm with --browser or install Chrome/Chromium"; if [ -f /var/lib/crabbox/browser.env ]; then . /var/lib/crabbox/browser.env; fi; if [ -n "${BROWSER:-}" ] && [ -x "$BROWSER" ]; then echo "session ok browser=$BROWSER"; elif command -v google-chrome >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1; then echo "session ok browser"; else echo "session failed browser repair=$CRABBOX_REPAIR"; fi

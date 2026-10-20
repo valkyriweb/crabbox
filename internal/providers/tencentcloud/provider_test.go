@@ -1,0 +1,1155 @@
+package tencentcloud
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+func TestProviderFlagsApply(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	provider := Provider{}
+	values := provider.RegisterFlags(fs, core.Config{})
+	args := []string{
+		"--tencentcloud-region", "ap-guangzhou",
+		"--tencentcloud-zone", "ap-guangzhou-7",
+		"--tencentcloud-image", "img-test",
+		"--tencentcloud-type", "S5.SMALL2",
+		"--tencentcloud-vpc-id", "vpc-test",
+		"--tencentcloud-subnet-id", "subnet-test",
+		"--tencentcloud-security-group-id", "sg-test",
+		"--tencentcloud-root-gb", "80",
+		"--tencentcloud-internet-charge-type", "BANDWIDTH_POSTPAID_BY_HOUR",
+		"--tencentcloud-internet-max-bandwidth-out", "10",
+		"--tencentcloud-api-endpoint", "cvm.intl.tencentcloudapi.com",
+	}
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	cfg := core.Config{}
+	if err := provider.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TencentCloud.Region != "ap-guangzhou" || !core.TencentCloudRegionWasExplicit(cfg) {
+		t.Fatalf("region=%q explicit=%v", cfg.TencentCloud.Region, core.TencentCloudRegionWasExplicit(cfg))
+	}
+	if cfg.TencentCloud.Zone != "ap-guangzhou-7" || !core.TencentCloudZoneWasExplicit(cfg) {
+		t.Fatalf("zone=%q explicit=%v", cfg.TencentCloud.Zone, core.TencentCloudZoneWasExplicit(cfg))
+	}
+	if cfg.TencentCloud.Image != "img-test" || !core.TencentCloudImageWasExplicit(cfg) {
+		t.Fatalf("image=%q explicit=%v", cfg.TencentCloud.Image, core.TencentCloudImageWasExplicit(cfg))
+	}
+	if cfg.TencentCloud.Type != "S5.SMALL2" || !core.TencentCloudTypeWasExplicit(cfg) {
+		t.Fatalf("type=%q explicit=%v", cfg.TencentCloud.Type, core.TencentCloudTypeWasExplicit(cfg))
+	}
+	if cfg.TencentCloud.VPCID != "vpc-test" || cfg.TencentCloud.SubnetID != "subnet-test" || cfg.TencentCloud.SecurityGroupID != "sg-test" {
+		t.Fatalf("network config=%+v", cfg.TencentCloud)
+	}
+	if cfg.TencentCloud.RootGB != 80 || cfg.TencentCloud.InternetChargeType != "BANDWIDTH_POSTPAID_BY_HOUR" || cfg.TencentCloud.InternetMaxBandwidthOut != 10 {
+		t.Fatalf("capacity config=%+v", cfg.TencentCloud)
+	}
+	if cfg.TencentCloud.APIEndpoint != "cvm.intl.tencentcloudapi.com" {
+		t.Fatalf("api endpoint=%q", cfg.TencentCloud.APIEndpoint)
+	}
+}
+
+func TestServerTypeForConfigHonorsClassAndTypeProvenance(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		cfg  core.Config
+		want string
+	}{
+		{name: "unsupported target", cfg: core.Config{Class: "fast", TargetOS: core.TargetMacOS}},
+		{name: "unsupported architecture", cfg: core.Config{Class: "fast", TargetOS: core.TargetLinux, Architecture: core.ArchitectureARM64}},
+		{name: "legacy normalized fallback", cfg: core.Config{Class: " FAST ", TargetOS: core.TargetMacOS}, want: "SA5.LARGE8"},
+		{name: "unknown legacy fallback", cfg: core.Config{Class: "custom-shape"}, want: defaultType},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core.MarkClassExplicit(&test.cfg)
+			if got := (Provider{}).ServerTypeForConfig(test.cfg); got != test.want {
+				t.Fatalf("type=%q want=%q", got, test.want)
+			}
+		})
+	}
+	provider := Provider{}
+	defaults := core.BaseConfig()
+	defaults.Provider = providerName
+	defaults.TencentCloud.Type = ""
+	if got := provider.ServerTypeForConfig(defaults); got != defaultType {
+		t.Fatalf("inherited class server type=%q want provider default %q", got, defaultType)
+	}
+
+	providerDefault := defaults
+	providerDefault.TencentCloud.Type = "S5.SMALL2"
+	if got := provider.ServerTypeForConfig(providerDefault); got != "S5.SMALL2" {
+		t.Fatalf("non-explicit provider default=%q", got)
+	}
+
+	explicitClass := defaults
+	explicitClass.Class = "fast"
+	core.MarkClassExplicit(&explicitClass)
+	if got := provider.ServerTypeForConfig(explicitClass); got != "SA5.LARGE8" {
+		t.Fatalf("explicit class server type=%q", got)
+	}
+
+	explicitProviderType := explicitClass
+	explicitProviderType.TencentCloud.Type = " S5.SMALL2 "
+	core.SetTencentCloudTypeExplicit(&explicitProviderType)
+	if got := provider.ServerTypeForConfig(explicitProviderType); got != "S5.SMALL2" {
+		t.Fatalf("explicit provider type=%q", got)
+	}
+
+	explicitGenericType := explicitProviderType
+	explicitGenericType.ServerType = " S6.MEDIUM4 "
+	explicitGenericType.ServerTypeExplicit = true
+	if got := provider.ServerTypeForConfig(explicitGenericType); got != "S6.MEDIUM4" {
+		t.Fatalf("explicit generic type=%q", got)
+	}
+}
+
+func TestServerTypeForConfigUsesExplicitCLIClass(t *testing.T) {
+	provider := Provider{}
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	cfg.TencentCloud.Type = ""
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	class := fs.String("class", cfg.Class, "machine class")
+	values := provider.RegisterFlags(fs, cfg)
+	if err := fs.Parse([]string{"--class", "fast"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Class = *class
+	core.MarkClassExplicit(&cfg)
+	if err := provider.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.ServerTypeForConfig(cfg); got != "SA5.LARGE8" {
+		t.Fatalf("server type=%q want SA5.LARGE8", got)
+	}
+}
+
+func TestCfgForRunPreservesLoadedMachineTypePrecedence(t *testing.T) {
+	fastType, ok := providerClassType("fast")
+	if !ok {
+		t.Fatal("fast class profile is missing")
+	}
+	tests := []struct {
+		name            string
+		content         string
+		classEnv        string
+		wantClass       string
+		wantType        string
+		wantClassIntent bool
+	}{
+		{name: "inherited default", content: "provider: tencentcloud\n", wantClass: "beast", wantType: defaultType},
+		{name: "YAML class", content: "provider: tencentcloud\nclass: fast\n", wantClass: "fast", wantType: fastType, wantClassIntent: true},
+		{name: "environment class", content: "provider: tencentcloud\n", classEnv: "fast", wantClass: "fast", wantType: fastType, wantClassIntent: true},
+		{name: "explicit Tencent type", content: "provider: tencentcloud\nclass: fast\ntencentcloud:\n  type: S5.SMALL2\n", wantClass: "fast", wantType: "S5.SMALL2", wantClassIntent: true},
+		{name: "explicit generic type", content: "provider: tencentcloud\nclass: fast\nserverType: S6.MEDIUM4\n", wantClass: "fast", wantType: "S6.MEDIUM4", wantClassIntent: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(test.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CRABBOX_CONFIG", configPath)
+			t.Setenv("CRABBOX_DEFAULT_CLASS", test.classEnv)
+			cfg, err := core.LoadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Class != test.wantClass || core.ClassWasExplicit(cfg) != test.wantClassIntent {
+				t.Fatalf("loaded class=%q explicit=%v", cfg.Class, core.ClassWasExplicit(cfg))
+			}
+			if cfg.TencentCloud.Type == "" {
+				t.Fatal("LoadConfig did not populate TencentCloud.Type")
+			}
+			runtime := cfgForRun(cfg)
+			if runtime.TencentCloud.Type != test.wantType || runtime.ServerType != test.wantType {
+				t.Fatalf("runtime type=%q serverType=%q want %q", runtime.TencentCloud.Type, runtime.ServerType, test.wantType)
+			}
+		})
+	}
+}
+
+func TestBuildRunInstanceRequest(t *testing.T) {
+	cfg := cfgForRun(core.Config{
+		TargetOS: core.TargetLinux,
+		Class:    "standard",
+		Capacity: core.CapacityConfig{Market: "on-demand"},
+		TencentCloud: core.TencentCloudConfig{
+			Region:                  "ap-shanghai",
+			Zone:                    "ap-shanghai-2",
+			Image:                   "img-test",
+			Type:                    "S5.SMALL2",
+			VPCID:                   "vpc-test",
+			SubnetID:                "subnet-test",
+			SecurityGroupID:         "sg-test",
+			RootGB:                  80,
+			InternetChargeType:      "TRAFFIC_POSTPAID_BY_HOUR",
+			InternetMaxBandwidthOut: 10,
+		},
+	})
+	cfg.ProviderKey = core.ProviderKeyForLease("cbx_abcdef123456")
+	cfg.ServerType = serverTypeForConfig(cfg)
+	tags := leaseTags(cfg, "cbx_abcdef123456", "my-app", "provisioning", false, time.Unix(1700000000, 0))
+	req, err := buildRunInstanceRequest(cfg, "cbx_abcdef123456", "my-app", "ssh-ed25519 AAAATEST", tags)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if req.InstanceChargeType != "POSTPAID_BY_HOUR" || req.Placement.Zone != "ap-shanghai-2" || req.ImageID != "img-test" || req.InstanceType != "S5.SMALL2" {
+		t.Fatalf("basic request=%+v", req)
+	}
+	if req.InstanceName != core.LeaseProviderName("cbx_abcdef123456", "my-app") {
+		t.Fatalf("instance name=%q", req.InstanceName)
+	}
+	if req.VirtualPrivateCloud == nil || req.VirtualPrivateCloud.VPCID != "vpc-test" || req.VirtualPrivateCloud.SubnetID != "subnet-test" {
+		t.Fatalf("vpc=%+v", req.VirtualPrivateCloud)
+	}
+	if len(req.SecurityGroupIDs) != 1 || req.SecurityGroupIDs[0] != "sg-test" {
+		t.Fatalf("security groups=%v", req.SecurityGroupIDs)
+	}
+	if req.SystemDisk == nil || req.SystemDisk.DiskSize != 80 {
+		t.Fatalf("system disk=%+v", req.SystemDisk)
+	}
+	if req.InternetAccessible == nil || !req.InternetAccessible.PublicIPAssigned || req.InternetAccessible.InternetMaxBandwidthOut != 10 {
+		t.Fatalf("internet=%+v", req.InternetAccessible)
+	}
+	userData, err := base64.StdEncoding.DecodeString(req.UserData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(userData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	userData, err = io.ReadAll(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(userData), "ssh-ed25519 AAAATEST") {
+		t.Fatalf("user data does not contain public key")
+	}
+	if len(req.TagSpecification) != 1 || req.TagSpecification[0].ResourceType != "instance" {
+		t.Fatalf("tag spec=%+v", req.TagSpecification)
+	}
+}
+
+func TestTencentCloudMarketReachesRunInstanceRequest(t *testing.T) {
+	for _, test := range []struct {
+		market string
+		want   string
+		ok     bool
+	}{
+		{market: "spot", want: "SPOTPAID", ok: true},
+		{market: "on-demand", want: "POSTPAID_BY_HOUR", ok: true},
+		{market: "unknown", ok: false},
+	} {
+		t.Run(test.market, func(t *testing.T) {
+			cfg := cfgForRun(core.Config{
+				TargetOS: core.TargetLinux,
+				Capacity: core.CapacityConfig{Market: test.market},
+				TencentCloud: core.TencentCloudConfig{
+					Zone:  "ap-singapore-1",
+					Image: "img-test",
+					Type:  "S5.SMALL2",
+				},
+			})
+			core.MarkCapacityMarketExplicit(&cfg)
+			req, err := buildRunInstanceRequest(cfg, "cbx_abcdef123456", "my-app", "ssh-ed25519 AAAATEST", nil)
+			if (err == nil) != test.ok {
+				t.Fatalf("buildRunInstanceRequest market=%q error=%v, want success=%v", test.market, err, test.ok)
+			}
+			if req.InstanceChargeType != test.want {
+				t.Fatalf("buildRunInstanceRequest market=%q chargeType=%q, want %q", test.market, req.InstanceChargeType, test.want)
+			}
+		})
+	}
+}
+
+func TestTencentCloudUnconfiguredMarketPreservesOnDemand(t *testing.T) {
+	cfg := cfgForRun(core.Config{
+		TargetOS: core.TargetLinux,
+		Capacity: core.CapacityConfig{Market: "spot"},
+		TencentCloud: core.TencentCloudConfig{
+			Zone:  "ap-singapore-1",
+			Image: "img-test",
+			Type:  "S5.SMALL2",
+		},
+	})
+	req, err := buildRunInstanceRequest(cfg, "cbx_abcdef123456", "my-app", "ssh-ed25519 AAAATEST", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.InstanceChargeType != "POSTPAID_BY_HOUR" {
+		t.Fatalf("unconfigured chargeType=%q, want POSTPAID_BY_HOUR", req.InstanceChargeType)
+	}
+}
+
+func TestInvalidExplicitMarketRejectsBeforeClientOrKey(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := core.BaseConfig()
+	cfg.TencentCloud.Image = "img-test"
+	cfg.Capacity.Market = "reserved"
+	core.MarkCapacityMarketExplicit(&cfg)
+	b := &Backend{
+		DirectSSHBackend: shared.DirectSSHBackend{Cfg: cfg},
+		clientFactory: func(core.Config, core.Runtime) (tencentCloudAPI, error) {
+			t.Fatal("invalid market reached provider client")
+			return nil, nil
+		},
+	}
+	_, err := b.acquireOnce(t.Context(), core.AcquireRequest{})
+	var configurationError core.ExitError
+	if !core.AsExitError(err, &configurationError) || configurationError.Code != 2 || !strings.Contains(err.Error(), "capacity market") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			t.Errorf("invalid market wrote file %s", path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newAcquireTestBackend(t *testing.T, api *fakeTencentCloudAPI, stderr io.Writer) *Backend {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	cfg := core.BaseConfig()
+	cfg.TencentCloud.Image = "img-test"
+	b := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: stderr}).(*Backend)
+	b.clientFactory = func(core.Config, core.Runtime) (tencentCloudAPI, error) { return api, nil }
+	return b
+}
+
+func TestAcquireCleanupErrorPreservesCausesAndVetoesRetry(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		for _, tc := range []struct {
+			name             string
+			primary, cleanup error
+			wantCode         int
+		}{
+			{name: "bootstrap timeout", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: errors.New("terminate unavailable"), wantCode: 5},
+			{name: "cancellation", primary: context.Canceled, cleanup: errors.New("terminate unavailable"), wantCode: 1},
+			{name: "primary exit wins", primary: core.Exit(5, "timed out waiting for SSH"), cleanup: core.Exit(9, "terminate unavailable"), wantCode: 5},
+			{name: "cleanup timeout cannot trigger retry", primary: context.Canceled, cleanup: core.Exit(5, "timed out waiting for SSH during cleanup"), wantCode: 5},
+		} {
+			t.Run(tc.name+"/keep="+strconv.FormatBool(keep), func(t *testing.T) {
+				api := &fakeTencentCloudAPI{item: instance{InstanceID: "ins-test", PublicIPAddresses: []string{"203.0.113.25"}}, terminateErr: tc.cleanup}
+				var stderr bytes.Buffer
+				b := newAcquireTestBackend(t, api, &stderr)
+				b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error { return tc.primary }
+				_, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "cause-retained", Keep: keep})
+				if !errors.Is(err, tc.primary) || !errors.Is(err, tc.cleanup) || core.ExitCodeForError(err, 1) != tc.wantCode {
+					t.Errorf("err=%v code=%d wantCode=%d", err, core.ExitCodeForError(err, 1), tc.wantCode)
+				}
+				if api.runCalls != 1 || len(api.terminated) != 1 || api.terminated[0] != "ins-test" || api.replaceCalls != 0 {
+					t.Errorf("creates=%d terminated=%v tagUpdates=%d", api.runCalls, api.terminated, api.replaceCalls)
+				}
+				if !strings.Contains(stderr.String(), "tencentcloud cleanup failed:") || !strings.Contains(stderr.String(), tc.cleanup.Error()) || !strings.Contains(stderr.String(), "refusing a fresh lease retry") || strings.Contains(stderr.String(), "retrying with fresh lease") {
+					t.Errorf("cleanup warning=%q", stderr.String())
+				}
+			})
+		}
+	}
+}
+
+func TestAcquireStillRetriesAfterSuccessfulRollback(t *testing.T) {
+	api := &fakeTencentCloudAPI{item: instance{InstanceID: "ins-test", PublicIPAddresses: []string{"203.0.113.25"}}}
+	var stderr bytes.Buffer
+	b := newAcquireTestBackend(t, api, &stderr)
+	waits := 0
+	b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		waits++
+		if waits == 1 {
+			return core.Exit(5, "timed out waiting for SSH")
+		}
+		return nil
+	}
+	lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "safe-retry"})
+	if err != nil || lease.Server.CloudID != "ins-test" || waits != 2 || api.runCalls != 2 || len(api.terminated) != 1 || api.replaceCalls != 1 {
+		t.Fatalf("err=%v lease=%#v waits=%d creates=%d terminated=%v tagUpdates=%d", err, lease, waits, api.runCalls, api.terminated, api.replaceCalls)
+	}
+	if !strings.Contains(stderr.String(), "retrying with fresh lease") || strings.Contains(stderr.String(), "refusing a fresh lease retry") {
+		t.Fatalf("retry warning=%q", stderr.String())
+	}
+}
+
+func TestAcquireReadinessCancellationSurvivesCleanupFailure(t *testing.T) {
+	cause := errors.New("private cancellation detail")
+	cleanup := core.Exit(5, "timed out waiting for SSH during cleanup")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	api := &fakeTencentCloudAPI{terminateErr: cleanup, getFn: func(ctx context.Context, _ string) (instance, error) {
+		cancel(cause)
+		return instance{}, ctx.Err()
+	}}
+	var stderr bytes.Buffer
+	b := newAcquireTestBackend(t, api, &stderr)
+	b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error {
+		t.Fatal("canceled IP readiness reached SSH")
+		return nil
+	}
+	_, err := b.Acquire(ctx, core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "readiness-canceled"})
+	if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || !errors.Is(err, cleanup) || core.ExitCodeForError(err, 1) != 1 || api.runCalls != 1 || len(api.terminated) != 1 {
+		t.Fatalf("err=%v code=%d creates=%d terminated=%v", err, core.ExitCodeForError(err, 1), api.runCalls, api.terminated)
+	}
+	if !strings.Contains(stderr.String(), "refusing a fresh lease retry") || strings.Contains(stderr.String(), "retrying with fresh lease") || strings.Contains(stderr.String(), cause.Error()) {
+		t.Fatalf("cleanup warning=%q", stderr.String())
+	}
+}
+
+func TestWaitForInstanceIPPreservesCallerCause(t *testing.T) {
+	for _, phase := range []string{"before read", "read", "after no-IP response"} {
+		t.Run(phase, func(t *testing.T) {
+			cause := errors.New("private caller cause")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			api := &fakeTencentCloudAPI{getFn: func(ctx context.Context, _ string) (instance, error) {
+				cancel(cause)
+				if phase == "read" {
+					return instance{}, ctx.Err()
+				}
+				return instance{}, nil
+			}}
+			if phase == "before read" {
+				cancel(cause)
+			}
+			_, err := new(Backend).waitForInstanceIP(ctx, api, "ins-test")
+			wantCalls := 1
+			if phase == "before read" {
+				wantCalls = 0
+			}
+			if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || err.Error() != context.Canceled.Error() || api.getCalls != wantCalls {
+				t.Fatalf("err=%v calls=%d wantCalls=%d", err, api.getCalls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestWaitForInstanceIPBoundsReadsAndSleeps(t *testing.T) {
+	for _, phase := range []string{"read", "sleep"} {
+		t.Run(phase, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				api := &fakeTencentCloudAPI{getFn: func(ctx context.Context, _ string) (instance, error) {
+					if phase == "read" {
+						select {
+						case <-ctx.Done():
+							return instance{}, ctx.Err()
+						case <-time.After(6 * time.Minute):
+							return instance{}, errors.New("unbounded read completed too late")
+						}
+					}
+					return instance{}, nil
+				}}
+				_, err := new(Backend).waitForInstanceIP(t.Context(), api, "ins-test")
+				if !errors.Is(err, context.DeadlineExceeded) || core.ExitCodeForError(err, 1) != 5 || err.Error() != "timed out waiting for Tencent Cloud instance IP" || time.Since(start) != 5*time.Minute || t.Context().Err() != nil {
+					t.Fatalf("err=%v code=%d elapsed=%v parent=%v", err, core.ExitCodeForError(err, 1), time.Since(start), t.Context().Err())
+				}
+			})
+		})
+	}
+}
+
+func TestWaitForInstanceIPRetainsObservationPolicy(t *testing.T) {
+	t.Run("public IP without running state after interval", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			start := time.Now()
+			reads := 0
+			api := &fakeTencentCloudAPI{getFn: func(context.Context, string) (instance, error) {
+				reads++
+				if reads == 1 {
+					return instance{PrivateIPAddresses: []string{"10.0.0.2"}}, nil
+				}
+				return instance{InstanceID: "ins-test", InstanceState: "STOPPED", PublicIPAddresses: []string{"203.0.113.25"}}, nil
+			}}
+			got, err := new(Backend).waitForInstanceIP(t.Context(), api, "ins-test")
+			if err != nil || got.InstanceID != "ins-test" || api.getCalls != 2 || time.Since(start) != 3*time.Second {
+				t.Fatalf("got=%#v err=%v calls=%d elapsed=%v", got, err, api.getCalls, time.Since(start))
+			}
+		})
+	})
+	for _, ready := range []bool{false, true} {
+		t.Run("completed response wins cancellation/ready="+strconv.FormatBool(ready), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			responseErr := errors.Join(&apiError{Code: "ResourceNotFound.Instance"}, context.Canceled)
+			api := &fakeTencentCloudAPI{getFn: func(context.Context, string) (instance, error) {
+				cancel()
+				if ready {
+					return instance{InstanceID: "ins-test", PublicIPAddresses: []string{"203.0.113.25"}}, nil
+				}
+				return instance{}, responseErr
+			}}
+			got, err := new(Backend).waitForInstanceIP(ctx, api, "ins-test")
+			if ready && (err != nil || got.InstanceID != "ins-test") || !ready && err != responseErr || api.getCalls != 1 {
+				t.Fatalf("got=%#v err=%v calls=%d", got, err, api.getCalls)
+			}
+		})
+	}
+	t.Run("independent client deadline stays unchanged", func(t *testing.T) {
+		api := &fakeTencentCloudAPI{getFn: func(context.Context, string) (instance, error) { return instance{}, context.DeadlineExceeded }}
+		_, err := new(Backend).waitForInstanceIP(t.Context(), api, "ins-test")
+		if err != context.DeadlineExceeded || api.getCalls != 1 {
+			t.Fatalf("err=%v calls=%d", err, api.getCalls)
+		}
+	})
+}
+
+func TestSignTencentCloudRequest(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://cvm.tencentcloudapi.com", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	signTencentCloudRequest(req, signInput{
+		SecretID:  "secret-id",
+		SecretKey: "secret-key",
+		Service:   cvmService,
+		Action:    "DescribeInstances",
+		Version:   cvmVersion,
+		Region:    "ap-shanghai",
+		Timestamp: 1700000000,
+		Payload:   []byte("{}"),
+	})
+	if req.Header.Get("X-TC-Action") != "DescribeInstances" || req.Header.Get("X-TC-Version") != cvmVersion || req.Header.Get("X-TC-Region") != "ap-shanghai" {
+		t.Fatalf("headers=%v", req.Header)
+	}
+	auth := req.Header.Get("Authorization")
+	for _, want := range []string{"TC3-HMAC-SHA256", "Credential=secret-id/2023-11-14/cvm/tc3_request", "SignedHeaders=content-type;host;x-tc-action", "Signature="} {
+		if !strings.Contains(auth, want) {
+			t.Fatalf("authorization %q missing %q", auth, want)
+		}
+	}
+}
+
+func TestResourceName(t *testing.T) {
+	got := resourceName("ap-shanghai", "100000000001", "ins-abc")
+	want := "qcs::cvm:ap-shanghai:uin/100000000001:instance/ins-abc"
+	if got != want {
+		t.Fatalf("resourceName=%q, want %q", got, want)
+	}
+}
+
+func TestTagUpdateSetUsesTagAPIFieldNames(t *testing.T) {
+	got := tagUpdateSet([]tag{{Key: "state", Value: "ready"}, {Key: "", Value: "skip"}})
+	if len(got) != 1 {
+		t.Fatalf("tag updates=%+v", got)
+	}
+	if got[0].TagKey != "state" || got[0].TagValue != "ready" {
+		t.Fatalf("tag update=%+v", got[0])
+	}
+}
+
+func TestTagDeleteSetDeletesObsoleteManagedTagsOnly(t *testing.T) {
+	got := tagDeleteSet(
+		[]tag{
+			{Key: "crabbox", Value: "true"},
+			{Key: "provider", Value: providerName},
+			{Key: "state", Value: "ready"},
+			{Key: "tailscale_error", Value: "old failure"},
+			{Key: "owner", Value: "external"},
+		},
+		[]tag{
+			{Key: "crabbox", Value: "true"},
+			{Key: "provider", Value: providerName},
+			{Key: "state", Value: "ready"},
+		},
+	)
+	if len(got) != 1 || got[0].TagKey != "tailscale_error" {
+		t.Fatalf("tag deletes=%+v", got)
+	}
+}
+
+func TestReplaceInstanceTagsSendsDeleteTagsForObsoleteManagedTags(t *testing.T) {
+	var payload struct {
+		Resource    string      `json:"Resource"`
+		ReplaceTags []tagUpdate `json:"ReplaceTags"`
+		DeleteTags  []tagDelete `json:"DeleteTags"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-TC-Action") != "ModifyResourceTags" {
+			t.Fatalf("X-TC-Action=%q", r.Header.Get("X-TC-Action"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"Response":{"RequestId":"req-test"}}`))
+	}))
+	defer server.Close()
+
+	client := &client{
+		secretID:     "secret-id",
+		secretKey:    "secret-key",
+		httpClient:   server.Client(),
+		region:       "ap-shanghai",
+		tagEndpoint:  server.URL,
+		accountID:    "100000000001",
+		accountReady: true,
+	}
+	err := client.ReplaceInstanceTags(
+		context.Background(),
+		"ins-test",
+		[]tag{
+			{Key: "crabbox", Value: "true"},
+			{Key: "provider", Value: providerName},
+			{Key: "tailscale_error", Value: "old failure"},
+			{Key: "owner", Value: "external"},
+		},
+		[]tag{
+			{Key: "crabbox", Value: "true"},
+			{Key: "provider", Value: providerName},
+			{Key: "state", Value: "ready"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.Resource != "qcs::cvm:ap-shanghai:uin/100000000001:instance/ins-test" {
+		t.Fatalf("resource=%q", payload.Resource)
+	}
+	if len(payload.DeleteTags) != 1 || payload.DeleteTags[0].TagKey != "tailscale_error" {
+		t.Fatalf("delete tags=%+v", payload.DeleteTags)
+	}
+	for _, item := range payload.DeleteTags {
+		if item.TagKey == "owner" {
+			t.Fatalf("external tag was deleted: %+v", payload.DeleteTags)
+		}
+	}
+	if len(payload.ReplaceTags) == 0 || payload.ReplaceTags[0].TagKey == "" {
+		t.Fatalf("replace tags=%+v", payload.ReplaceTags)
+	}
+}
+
+func TestInstanceDecodesTencentCloudTags(t *testing.T) {
+	var got instance
+	if err := json.Unmarshal([]byte(`{"InstanceId":"ins-test","Tags":[{"Key":"crabbox","Value":"true"}]}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	labels := labelsFromTags(got.Tags)
+	if labels["crabbox"] != "true" {
+		t.Fatalf("labels=%v", labels)
+	}
+}
+
+func TestUpdateTailscaleMetadataPassesCurrentAndDesiredTags(t *testing.T) {
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	cfg.TargetOS = core.TargetLinux
+	cfg.ServerType = "SA5.MEDIUM2"
+	cfg.ProviderKey = core.ProviderKeyForLease("cbx_abcdef123456")
+	tags := leaseTags(cfg, "cbx_abcdef123456", "tailnet", "ready", false, time.Unix(1700000000, 0))
+	tags = append(tags, tag{Key: "tailscale_error", Value: "old failure"})
+	item := instance{
+		InstanceID:    "ins-test",
+		InstanceName:  core.LeaseProviderName("cbx_abcdef123456", "tailnet"),
+		InstanceState: "RUNNING",
+		Tags:          tags,
+	}
+	api := &fakeTencentCloudAPI{item: item}
+	backend := &Backend{
+		DirectSSHBackend: shared.DirectSSHBackend{Cfg: cfg},
+		clientFactory: func(core.Config, core.Runtime) (tencentCloudAPI, error) {
+			return api, nil
+		},
+	}
+	server := serverFromInstance(item, cfg)
+	updated, err := backend.UpdateTailscaleMetadata(context.Background(), core.LeaseTarget{Server: server, LeaseID: "cbx_abcdef123456"}, core.TailscaleMetadata{
+		Enabled: true,
+		State:   "ready",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := updated.Labels["tailscale_error"]; ok {
+		t.Fatalf("updated labels still include tailscale_error: %v", updated.Labels)
+	}
+	if !hasTag(api.replacedCurrent, "tailscale_error") {
+		t.Fatalf("current tags did not include stale error: %+v", api.replacedCurrent)
+	}
+	if hasTag(api.replacedDesired, "tailscale_error") {
+		t.Fatalf("desired tags still include stale error: %+v", api.replacedDesired)
+	}
+}
+
+func TestTencentCloudReleaseRequiresExactClaimedInstance(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		seedClaim bool
+		staleID   bool
+	}{
+		{name: "missing claim"},
+		{name: "stale instance claim", seedClaim: true, staleID: true},
+		{name: "exact claim", seedClaim: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			leaseID := "cbx_abcdef123456"
+			cfg := core.BaseConfig()
+			cfg.Provider = providerName
+			cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
+			tags := leaseTags(cfg, leaseID, "owned", "ready", false, time.Now().UTC())
+			tags = append(tags, tag{Key: accountLabel, Value: "100000000001"})
+			item := instance{InstanceID: "ins-owned", InstanceName: core.LeaseProviderName(leaseID, "owned"), InstanceState: "RUNNING", Tags: tags}
+			api := &fakeTencentCloudAPI{item: item}
+			backend := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*Backend)
+			backend.clientFactory = func(core.Config, core.Runtime) (tencentCloudAPI, error) { return api, nil }
+			server := serverFromInstance(item, backend.Cfg)
+			if test.seedClaim {
+				claimed := server
+				if test.staleID {
+					claimed.CloudID = "ins-stale"
+				}
+				if err := core.ClaimLeaseTargetForRepoConfig(leaseID, "owned", backend.Cfg, claimed, core.SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: leaseID, Server: server}})
+			if test.seedClaim && !test.staleID {
+				if err != nil || strings.Join(api.terminated, ",") != item.InstanceID {
+					t.Fatalf("exact release err=%v terminated=%v", err, api.terminated)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "exact local ownership claim") {
+				t.Fatalf("unowned release err=%v", err)
+			}
+			if len(api.terminated) != 0 {
+				t.Fatalf("unowned instance was terminated: %v", api.terminated)
+			}
+		})
+	}
+}
+
+func TestTencentCloudCleanupSkipsNameMatchedUnclaimedInstance(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	leaseID := "cbx_abcdef123457"
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
+	tags := leaseTags(cfg, leaseID, "unclaimed", "ready", false, time.Now().Add(-24*time.Hour))
+	tags = append(tags, tag{Key: accountLabel, Value: "100000000001"})
+	api := &fakeTencentCloudAPI{item: instance{InstanceID: "ins-unclaimed", InstanceName: core.LeaseProviderName(leaseID, "unclaimed"), InstanceState: "RUNNING", Tags: tags}}
+	var stderr strings.Builder
+	backend := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: &stderr}).(*Backend)
+	backend.clientFactory = func(core.Config, core.Runtime) (tencentCloudAPI, error) { return api, nil }
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.terminated) != 0 || !strings.Contains(stderr.String(), "no-exact-local-claim") {
+		t.Fatalf("terminated=%v stderr=%q", api.terminated, stderr.String())
+	}
+}
+
+func TestTencentCloudTerminationFencesConcurrentClaimMutation(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	leaseID := "cbx_abcdef123458"
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
+	tags := leaseTags(cfg, leaseID, "fenced", "ready", false, time.Now().UTC())
+	tags = append(tags, tag{Key: accountLabel, Value: "100000000001"})
+	item := instance{InstanceID: "ins-fenced", InstanceName: core.LeaseProviderName(leaseID, "fenced"), InstanceState: "RUNNING", Tags: tags}
+	api := &fakeTencentCloudAPI{item: item}
+	backend := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*Backend)
+	backend.clientFactory = func(core.Config, core.Runtime) (tencentCloudAPI, error) { return api, nil }
+	server := serverFromInstance(item, backend.Cfg)
+	if err := core.ClaimLeaseTargetForRepoConfig(leaseID, "fenced", backend.Cfg, server, core.SSHTarget{}, t.TempDir(), time.Hour, false); err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	updated := make(chan error, 1)
+	api.terminateFn = func() {
+		go func() {
+			close(started)
+			labels := shared.CloneLabels(claim.Labels)
+			labels["state"] = "renewed"
+			_, updateErr := core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, claim, labels)
+			updated <- updateErr
+		}()
+		<-started
+		select {
+		case err := <-updated:
+			t.Errorf("claim mutation escaped termination fence: %v", err)
+		default:
+		}
+	}
+	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: leaseID, Server: server}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-updated; err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("claim mutation after termination err=%v", err)
+	}
+}
+
+type fakeTencentCloudAPI struct {
+	runCalls        int
+	terminateErr    error
+	getCalls        int
+	getFn           func(context.Context, string) (instance, error)
+	item            instance
+	replacedCurrent []tag
+	replacedDesired []tag
+	replaceCalls    int
+	replaceErr      error
+	terminated      []string
+	terminateFn     func()
+}
+
+func (f *fakeTencentCloudAPI) AccountID(context.Context) (string, error) {
+	return "100000000001", nil
+}
+
+func (f *fakeTencentCloudAPI) ListInstances(context.Context) ([]instance, error) {
+	return []instance{f.item}, nil
+}
+
+func (f *fakeTencentCloudAPI) GetInstance(ctx context.Context, id string) (instance, error) {
+	f.getCalls++
+	if f.getFn != nil {
+		return f.getFn(ctx, id)
+	}
+	return f.item, nil
+}
+
+func (f *fakeTencentCloudAPI) RunInstance(context.Context, runInstanceRequest) (string, error) {
+	f.runCalls++
+	return "ins-test", nil
+}
+
+func (f *fakeTencentCloudAPI) TerminateInstance(_ context.Context, id string) error {
+	f.terminated = append(f.terminated, id)
+	if f.terminateFn != nil {
+		f.terminateFn()
+	}
+	return f.terminateErr
+}
+
+func (f *fakeTencentCloudAPI) ReplaceInstanceTags(_ context.Context, _ string, current, desired []tag) error {
+	f.replaceCalls++
+	f.replacedCurrent = append([]tag(nil), current...)
+	f.replacedDesired = append([]tag(nil), desired...)
+	if f.replaceErr != nil {
+		return f.replaceErr
+	}
+	f.item.Tags = append([]tag(nil), desired...)
+	return nil
+}
+
+func hasTag(tags []tag, key string) bool {
+	for _, item := range tags {
+		if item.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func TestTencentBindingFlagContract(t *testing.T) {
+	p := Provider{}
+	cfg := core.BaseConfig()
+	cfg.TencentCloud.SSHCIDRs = []string{"prior"}
+	fs := flag.NewFlagSet("contract", flag.ContinueOnError)
+	values := p.RegisterFlags(fs, cfg)
+	count := 0
+	fs.VisitAll(func(*flag.Flag) { count++ })
+	if count != 12 || fs.Lookup("tencentcloud-region").DefValue != "" || fs.Lookup("tencentcloud-root-gb").DefValue != "0" || fs.Lookup("tencentcloud-ssh-cidrs").DefValue != "" {
+		t.Fatal("raw flag defaults changed")
+	}
+	if _, ok := fs.Lookup("tencentcloud-root-gb").Value.(flag.Getter).Get().(int64); !ok {
+		t.Fatal("root flag is not int64")
+	}
+	if _, ok := fs.Lookup("tencentcloud-internet-max-bandwidth-out").Value.(flag.Getter).Get().(int64); !ok {
+		t.Fatal("bandwidth flag is not int64")
+	}
+	cfg.TencentCloud.Region = "layered-region"
+	before := cfg.TencentCloud
+	if err := p.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.TencentCloud, before) || core.TencentCloudRegionWasExplicit(cfg) {
+		t.Fatal("unvisited changed config")
+	}
+	args := []string{"--tencentcloud-region=ap-guangzhou", "--tencentcloud-zone=ap-guangzhou-7", "--tencentcloud-image=img-fixture", "--tencentcloud-type=S5.SMALL2", "--tencentcloud-vpc-id=vpc-fixture", "--tencentcloud-subnet-id=subnet-fixture", "--tencentcloud-security-group-id=sg-fixture", "--tencentcloud-ssh-cidrs=203.0.113.0/24, 2001:db8::/64,203.0.113.0/24", "--tencentcloud-root-gb=8589934592", "--tencentcloud-internet-charge-type=TRAFFIC_POSTPAID_BY_HOUR", "--tencentcloud-internet-max-bandwidth-out=8589934593", "--tencentcloud-api-endpoint=https://endpoint.example.test"}
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := fmt.Sprintf("%#v", cfg)
+	if err := p.ApplyFlags(&cfg, fs, struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprintf("%#v", cfg) != snapshot {
+		t.Fatal("wrong type changed config")
+	}
+	if err := p.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	want := core.TencentCloudConfig{Region: "ap-guangzhou", Zone: "ap-guangzhou-7", Image: "img-fixture", Type: "S5.SMALL2", VPCID: "vpc-fixture", SubnetID: "subnet-fixture", SecurityGroupID: "sg-fixture", SSHCIDRs: []string{"203.0.113.0/24", "2001:db8::/64", "203.0.113.0/24"}, RootGB: 8589934592, InternetChargeType: "TRAFFIC_POSTPAID_BY_HOUR", InternetMaxBandwidthOut: 8589934593, APIEndpoint: "https://endpoint.example.test"}
+	if !reflect.DeepEqual(cfg.TencentCloud, want) || !core.TencentCloudRegionWasExplicit(cfg) || !core.TencentCloudZoneWasExplicit(cfg) || !core.TencentCloudImageWasExplicit(cfg) || !core.TencentCloudTypeWasExplicit(cfg) {
+		t.Fatal("complete flag values/markers changed")
+	}
+	for _, raw := range []string{"0", "-2", "-9223372036854775808", "9223372036854775807"} {
+		cfg := core.BaseConfig()
+		fs := flag.NewFlagSet("contract", flag.ContinueOnError)
+		values := p.RegisterFlags(fs, cfg)
+		if err := fs.Parse([]string{"--tencentcloud-root-gb=" + raw, "--tencentcloud-internet-max-bandwidth-out=" + raw}); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.ApplyFlags(&cfg, fs, values); err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(cfg.TencentCloud.RootGB) != raw || fmt.Sprint(cfg.TencentCloud.InternetMaxBandwidthOut) != raw {
+			t.Fatalf("flag int64=%s got=%d/%d", raw, cfg.TencentCloud.RootGB, cfg.TencentCloud.InternetMaxBandwidthOut)
+		}
+	}
+	for _, name := range []string{"region", "zone", "image", "type"} {
+		for _, raw := range []string{"", "  ", "equal-value"} {
+			cfg := core.BaseConfig()
+			cfg.TencentCloud.Region = "equal-value"
+			cfg.TencentCloud.Zone = "equal-value"
+			cfg.TencentCloud.Image = "equal-value"
+			cfg.TencentCloud.Type = "equal-value"
+			fs := flag.NewFlagSet("contract", flag.ContinueOnError)
+			values := p.RegisterFlags(fs, cfg)
+			if err := fs.Parse([]string{"--tencentcloud-" + name + "=" + raw}); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.ApplyFlags(&cfg, fs, values); err != nil {
+				t.Fatal(err)
+			}
+			for field, got := range map[string]bool{"region": core.TencentCloudRegionWasExplicit(cfg), "zone": core.TencentCloudZoneWasExplicit(cfg), "image": core.TencentCloudImageWasExplicit(cfg), "type": core.TencentCloudTypeWasExplicit(cfg)} {
+				if got != (field == name) {
+					t.Fatalf("flag=%s marker=%s", name, field)
+				}
+			}
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		want []string
+	}{{[]string{"--tencentcloud-ssh-cidrs="}, nil}, {[]string{"--tencentcloud-ssh-cidrs= , , "}, nil}, {[]string{"--tencentcloud-ssh-cidrs=none"}, []string{"none"}}, {[]string{"--tencentcloud-ssh-cidrs=203.0.113.0/24", "--tencentcloud-ssh-cidrs=198.51.100.0/24,198.51.100.0/24"}, []string{"198.51.100.0/24", "198.51.100.0/24"}}} {
+		cfg := core.BaseConfig()
+		cfg.TencentCloud.SSHCIDRs = []string{"prior"}
+		fs := flag.NewFlagSet("contract", flag.ContinueOnError)
+		values := p.RegisterFlags(fs, cfg)
+		if err := fs.Parse(tc.args); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.ApplyFlags(&cfg, fs, values); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(cfg.TencentCloud.SSHCIDRs, tc.want) {
+			t.Fatalf("list=%#v want=%#v", cfg.TencentCloud.SSHCIDRs, tc.want)
+		}
+	}
+}
+
+func TestTencentBindingRuntimeAndClassContract(t *testing.T) {
+	for _, n := range []int64{0, -2, 8589934592} {
+		cfg := core.Config{TencentCloud: core.TencentCloudConfig{RootGB: n, InternetMaxBandwidthOut: n}, SSHUser: "fixture-user", SSHPort: "1234", WorkRoot: "/fixture/root"}
+		got := cfgForRun(cfg)
+		root, bandwidth := n, n
+		if n == 0 {
+			root = 50
+			bandwidth = 5
+		}
+		if got.TencentCloud.Region != "ap-shanghai" || got.TencentCloud.Zone != "ap-shanghai-2" || got.TencentCloud.Type != "SA5.MEDIUM2" || got.TencentCloud.RootGB != root || got.TencentCloud.InternetMaxBandwidthOut != bandwidth || got.TencentCloud.InternetChargeType != "TRAFFIC_POSTPAID_BY_HOUR" || got.TencentCloud.Image != "" || got.TencentCloud.APIEndpoint != "" || got.SSHUser != "fixture-user" || got.SSHPort != "1234" || got.WorkRoot != "/fixture/root" || cfg.TencentCloud.Region != "" {
+			t.Fatalf("runtime n=%d got=%#v", n, got.TencentCloud)
+		}
+	}
+	for _, raw := range []string{"", "  "} {
+		cfg := core.Config{TencentCloud: core.TencentCloudConfig{Region: raw, Zone: raw, APIEndpoint: raw}}
+		if regionForConfig(cfg) != "ap-shanghai" || zoneForConfig(cfg) != "ap-shanghai-2" || cvmEndpointForConfig(cfg) != "https://cvm.tencentcloudapi.com" {
+			t.Fatal("trimmed helper defaults changed")
+		}
+	}
+	cfg := core.Config{TencentCloud: core.TencentCloudConfig{Region: "  ", Zone: "  ", InternetChargeType: "  ", APIEndpoint: " cvm.intl.tencentcloudapi.com "}}
+	got := cfgForRun(cfg)
+	if got.TencentCloud.Region != "  " || got.TencentCloud.Zone != "  " || got.TencentCloud.InternetChargeType != "  " || cvmEndpointForConfig(cfg) != "https://cvm.intl.tencentcloudapi.com" {
+		t.Fatal("raw versus trimmed fallback predicate changed")
+	}
+	cfg = core.BaseConfig()
+	cfg.Provider = "tencentcloud"
+	if serverTypeForConfig(cfg) != "SA5.MEDIUM2" {
+		t.Fatal("inherited class changed provider fallback")
+	}
+	cfg.TencentCloud.Type = "S5.SMALL2"
+	if serverTypeForConfig(cfg) != "S5.SMALL2" {
+		t.Fatal("configured type lost")
+	}
+	cfg.Class = "fast"
+	core.MarkClassExplicit(&cfg)
+	if serverTypeForConfig(cfg) != "SA5.LARGE8" {
+		t.Fatal("explicit class lost")
+	}
+	core.SetTencentCloudTypeExplicit(&cfg)
+	if serverTypeForConfig(cfg) != "S5.SMALL2" {
+		t.Fatal("explicit provider type lost")
+	}
+	cfg.ServerType = "S6.MEDIUM4"
+	cfg.ServerTypeExplicit = true
+	if serverTypeForConfig(cfg) != "S6.MEDIUM4" || cfgForRun(cfg).TencentCloud.Type != "S6.MEDIUM4" {
+		t.Fatal("generic type priority lost")
+	}
+	for _, tc := range []struct {
+		architecture, class, want string
+	}{
+		{core.ArchitectureAMD64, "fast", "SA5.LARGE8"},
+		{core.ArchitectureARM64, "standard", ""},
+	} {
+		cfg := core.Config{Provider: providerName, TargetOS: core.TargetLinux, Architecture: tc.architecture, Class: tc.class}
+		core.MarkClassExplicit(&cfg)
+		core.SetTencentCloudTypeExplicit(&cfg)
+		got := cfgForRun(cfg)
+		if got.TencentCloud.Type != tc.want || got.ServerType != tc.want {
+			t.Fatalf("explicit-empty native type with class=%s architecture=%s resolved=%q/%q want=%q", tc.class, tc.architecture, got.TencentCloud.Type, got.ServerType, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		market   string
+		explicit bool
+		want     string
+	}{{"spot", false, "POSTPAID_BY_HOUR"}, {"spot", true, "SPOTPAID"}, {"on-demand", true, "POSTPAID_BY_HOUR"}} {
+		cfg := core.BaseConfig()
+		cfg.Capacity.Market = tc.market
+		if tc.explicit {
+			core.MarkCapacityMarketExplicit(&cfg)
+		}
+		got, err := tencentCloudChargeType(cfg)
+		if err != nil || got != tc.want {
+			t.Fatalf("market=%s explicit=%t got=%s err=%v", tc.market, tc.explicit, got, err)
+		}
+	}
+}
+
+func TestTouchIdleTimeoutIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		storedKey                  string
+		stored, fallback, explicit time.Duration
+		want                       time.Duration
+		writeFails                 bool
+	}{
+		{name: "stored policy beats effective fallback", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, fallback: 90 * time.Minute, want: 30 * time.Minute},
+		{name: "legacy stored spelling", storedKey: "idle_timeout", stored: 30 * time.Minute, fallback: 90 * time.Minute, want: 30 * time.Minute},
+		{name: "explicit pointer beats fallback within TTL", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, fallback: time.Minute, explicit: 90 * time.Minute, want: time.Hour},
+		{name: "explicit without fallback", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, explicit: 90 * time.Minute, want: time.Hour},
+		{name: "missing policy uses fallback", fallback: 45 * time.Minute, want: 45 * time.Minute},
+		{name: "refreshes live policy within TTL", storedKey: "idle_timeout_secs", stored: 90 * time.Minute, fallback: time.Minute, want: time.Hour},
+		{name: "remote update failure", storedKey: "idle_timeout_secs", stored: 30 * time.Minute, explicit: 90 * time.Minute, want: 90 * time.Minute, writeFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const leaseID = "cbx_abcdef123456"
+			cfg := core.BaseConfig()
+			cfg.Provider = providerName
+			cfg.TargetOS = core.TargetLinux
+			cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
+			cfg.IdleTimeout = 5 * time.Minute
+			cfg.TTL = time.Hour
+			created := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+			now := created.Add(20 * time.Minute)
+			labels := labelsFromTags(leaseTags(cfg, leaseID, "touch", "ready", false, created))
+			delete(labels, "idle_timeout")
+			delete(labels, "idle_timeout_secs")
+			if tc.storedKey != "" {
+				labels[tc.storedKey] = strconv.FormatInt(int64(tc.stored/time.Second), 10)
+			}
+			item := instance{InstanceID: "ins-touch", InstanceName: core.LeaseProviderName(leaseID, "touch"), InstanceState: "RUNNING", Tags: tagsFromLabels(labels)}
+			api := &fakeTencentCloudAPI{item: item}
+			failure := errors.New("synthetic tag update failure")
+			if tc.writeFails {
+				api.replaceErr = failure
+			}
+			b := NewBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard}).(*Backend)
+			b.clientFactory = func(core.Config, core.Runtime) (tencentCloudAPI, error) { return api, nil }
+			b.now = func() time.Time { return now }
+			server := serverFromInstance(item, cfg)
+			server.Labels["idle_timeout_secs"] = "10" // A cached projection is not authoritative.
+			server.Labels[accountLabel] = "100000000001"
+			before := shared.CloneLabels(server.Labels)
+			req := core.TouchRequest{Lease: core.LeaseTarget{LeaseID: leaseID, Server: server}, State: "running", IdleTimeout: tc.fallback}
+			if tc.explicit > 0 {
+				req.IdleTimeoutOverride = &tc.explicit
+			}
+			got, err := b.Touch(t.Context(), req)
+			if tc.writeFails {
+				if !errors.Is(err, failure) || got.CloudID != "" || !reflect.DeepEqual(api.item.Tags, item.Tags) {
+					t.Fatal("failed update was reported as committed")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := strconv.FormatInt(int64(tc.want/time.Second), 10)
+			if got.Labels["idle_timeout_secs"] != want || got.Labels["idle_timeout"] != want {
+				t.Fatalf("timeout=%s want=%s", got.Labels["idle_timeout_secs"], want)
+			}
+			expires := now.Add(tc.want)
+			if expires.After(created.Add(time.Hour)) {
+				expires = created.Add(time.Hour)
+			}
+			if got.Labels["expires_at"] != core.LeaseLabelTime(expires) || got.Labels["last_touched_at"] != core.LeaseLabelTime(now) {
+				t.Fatal("touch timestamp or original TTL cap lost")
+			}
+			for _, key := range []string{"lease", "slug", "provider", "provider_key", "created_at", "ttl_secs"} {
+				if got.Labels[key] != labels[key] {
+					t.Fatalf("lost %s", key)
+				}
+			}
+			if got.Labels[accountLabel] != "100000000001" || api.replaceCalls != 1 || !reflect.DeepEqual(api.replacedCurrent, item.Tags) {
+				t.Fatal("remote replacement lost account or live current tags")
+			}
+			fresh, err := api.GetInstance(t.Context(), item.InstanceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(serverFromInstance(fresh, cfg).Labels, got.Labels) {
+				t.Fatal("returned labels differ from committed remote policy")
+			}
+			if !reflect.DeepEqual(server.Labels, before) {
+				t.Fatal("touch mutated its input projection")
+			}
+		})
+	}
+}

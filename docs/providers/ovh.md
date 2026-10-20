@@ -87,6 +87,12 @@ Do not pass OVH credentials as command-line arguments. Keep them in the
 environment or in a local secret manager. Crabbox config stores only non-secret
 OVH settings.
 
+These five non-secret settings use the shared typed configuration bindings.
+Empty YAML or environment strings preserve the previous value; nonempty strings
+retain whitespace, and explicitly empty flags still assign. Image explicitness
+records accepted input even when it equals the default. Regional endpoint aliases,
+machine-class mapping, and native credential handling remain provider-owned.
+
 ## Credential Scope
 
 The provider signs requests with OVH application credentials and operates only
@@ -135,12 +141,42 @@ permissions inside scripts.
    resources with complete Crabbox OVH ownership metadata and a matching local
    claim.
 
+Public-IP readiness uses a five-minute elapsed-time context budget for API
+lookups and retry sleeps, independently of the clock used for lease timestamps.
+Caller cancellation retains its cause. A completed ready result or permanent
+API error keeps precedence; a client timeout while the wait context is active
+remains a client error. When the readiness budget expires, the timeout diagnostic
+includes the latest completed transient error unless a later successful lookup
+without an address cleared it.
+
 If instance creation returns an indeterminate error after a key or instance may
 exist, Crabbox records a recovery claim so `crabbox stop --provider ovh
 <lease-or-slug>` can retry cleanup instead of leaving a billed resource without
 its SSH key.
 
 ## Ownership And Cleanup
+
+Heartbeat policy is stored in the local lease claim, not reconstructed from OVH
+instance labels or the current configuration. Ordinary touches preserve the
+recorded idle timeout; `heartbeat --idle-timeout` explicitly replaces it while
+the original creation-based TTL still caps expiry. Activity timestamps and
+timeout changes are committed together, so a fresh process observes the same
+policy after reuse.
+
+Older versions persisted successful heartbeat overrides only in timeout labels,
+which can disagree with the claim's structured timeout field. Those recorded
+label values remain authoritative on upgrade: reads preserve them without a
+write, and the next authorized heartbeat or repository reuse atomically aligns
+both representations. A new explicit timeout override still takes precedence.
+
+Plain status and list reads do not renew the claim. A ready probe also resolves
+without modifying local state, although `status --wait` can subsequently touch
+the lease while waiting. If another operation changes the claim during a touch,
+retry the command to resolve its current revision; the stale update is refused.
+Plain status includes the available public SSH address, configured user/port,
+and stored lease key for core's readiness probe. Without a public address it
+remains a metadata-only observation. Status resolution never admits a repository
+or renews its claim, even when a repository root is supplied.
 
 Crabbox-owned OVH leases use a local claim with ownership metadata such as:
 
@@ -177,14 +213,16 @@ crabbox cleanup --provider ovh
 The repeatable live check is opt-in:
 
 ```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=ovh scripts/live-smoke.sh
 CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=ovh scripts/live-ovh-smoke.sh
 ```
 
-The script builds `bin/crabbox`, reads OVH credentials and project settings from
-the environment, requires an empty Crabbox-owned OVH inventory, creates a small
-`b3-8` instance by default, waits for ready status, runs `echo ok`, verifies
-`list --json`, stops the lease, runs dry-run cleanup, and verifies the
-Crabbox-owned inventory is empty afterward.
+The top-level script dispatches to the provider-specific script. The
+provider-specific script builds `bin/crabbox` unless `CRABBOX_BIN` is set, reads
+OVH credentials and project settings from the environment, requires an empty
+Crabbox-owned OVH inventory, creates a small `b3-8` instance by default, waits
+for ready status, runs `echo ok`, verifies `list --json`, stops the lease, runs
+dry-run cleanup, and verifies the Crabbox-owned inventory is empty afterward.
 
 Optional smoke overrides:
 
@@ -233,5 +271,4 @@ instance in `crabbox list --provider ovh --json` or the OVHcloud console.
 
 - [Provider reference](README.md)
 - [Provider backends](../provider-backends.md)
-- [Provider feature overview](../features/providers.md)
 - [Operations](../operations.md)

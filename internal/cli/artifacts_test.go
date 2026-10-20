@@ -5,16 +5,35 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func uploadArtifactGrant(ctx context.Context, path string, grant CoordinatorArtifactUploadGrant) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return Exit(2, "open artifact %s: %v", grant.Name, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return Exit(2, "stat artifact %s: %v", grant.Name, err)
+	}
+	return uploadArtifactGrantReader(ctx, file, info.Size(), grant)
+}
 
 func TestParseArtifactPublishOptionsNormalizesStorage(t *testing.T) {
 	opts, err := parseArtifactPublishOptions([]string{
@@ -191,6 +210,81 @@ func TestArtifactCollectNeedsDesktop(t *testing.T) {
 	}
 }
 
+func TestWriteArtifactRunLogsUsesRoutedCoordinatorAndScrubsDesktopCredentials(t *testing.T) {
+	t.Setenv("CRABBOX_ARTIFACT_RUN_TOKEN_HELPER", "1")
+	t.Setenv("ARTIFACT_CURRENT_DESKTOP_PASSWORD", "current-secret")
+	t.Setenv("ARTIFACT_ROUTED_DESKTOP_PASSWORD", "routed-secret")
+	t.Setenv("CRABBOX_TEST_KEEP", "preserved")
+
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		if got := r.Header.Get("Authorization"); got != "Bearer artifact-token" {
+			t.Errorf("Authorization=%q", got)
+		}
+		switch r.URL.Path {
+		case "/v1/runs/run_routed/logs":
+			_, _ = io.WriteString(w, "routed logs")
+		case "/v1/runs/run_routed":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"run":{"id":"run_routed","state":"passed"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := Config{
+		Coordinator:       server.URL,
+		CoordTokenCommand: synchronousTestHelperCommand("TestArtifactRunLogCoordinatorTokenHelper"),
+		Provider:          "external",
+		TargetOS:          targetMacOS,
+	}
+	cfg.External.Connection.Desktop.PasswordEnv = "ARTIFACT_ROUTED_DESKTOP_PASSWORD"
+	// A base-config reload would ignore the routed coordinator above.
+	t.Setenv("CRABBOX_COORDINATOR", "http://127.0.0.1:1")
+
+	dir := t.TempDir()
+	logPath, runPath, err := writeArtifactRunLogs(
+		context.Background(),
+		cfg,
+		[]string{"ARTIFACT_CURRENT_DESKTOP_PASSWORD"},
+		"run_routed",
+		dir,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 2 {
+		t.Fatalf("requests=%d", got)
+	}
+	if data, err := os.ReadFile(logPath); err != nil || string(data) != "routed logs" {
+		t.Fatalf("logs=%q err=%v", data, err)
+	}
+	var run CoordinatorRun
+	if data, err := os.ReadFile(runPath); err != nil {
+		t.Fatal(err)
+	} else if err := json.Unmarshal(data, &run); err != nil || run.ID != "run_routed" {
+		t.Fatalf("run=%#v err=%v", run, err)
+	}
+}
+
+func TestArtifactRunLogCoordinatorTokenHelper(t *testing.T) {
+	if os.Getenv("CRABBOX_ARTIFACT_RUN_TOKEN_HELPER") != "1" {
+		return
+	}
+	for _, name := range []string{"ARTIFACT_CURRENT_DESKTOP_PASSWORD", "ARTIFACT_ROUTED_DESKTOP_PASSWORD"} {
+		if _, ok := os.LookupEnv(name); ok {
+			os.Exit(89)
+		}
+	}
+	if os.Getenv("CRABBOX_TEST_KEEP") != "preserved" {
+		os.Exit(90)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "artifact-token")
+	os.Exit(0)
+}
+
 func TestArtifactCloudflareEnvUsesGenericCredentials(t *testing.T) {
 	t.Setenv("CLOUDFLARE_API_TOKEN", "generic-token")
 	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "generic-account")
@@ -220,6 +314,234 @@ func TestArtifactCloudflareEnvArtifactCredentialsWin(t *testing.T) {
 		if !strings.Contains(env, want) {
 			t.Fatalf("env missing %q in %s", want, env)
 		}
+	}
+}
+
+func TestArtifactPublisherCommandsScrubTargetEnvironmentAndPreserveToolAuth(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell publisher fixtures")
+	}
+	for _, tc := range []struct {
+		name      string
+		command   string
+		authSetup func(*testing.T)
+		authCheck string
+		publish   func(*testing.T, context.Context, artifactPublishOptions, string) error
+	}{
+		{
+			name:    "aws",
+			command: "aws",
+			authSetup: func(t *testing.T) {
+				t.Setenv("AWS_ACCESS_KEY_ID", "publisher-access")
+				t.Setenv("AWS_SECRET_ACCESS_KEY", "publisher-secret")
+			},
+			authCheck: "[ \"$AWS_ACCESS_KEY_ID\" = publisher-access ] && [ \"$AWS_SECRET_ACCESS_KEY\" = publisher-secret ] || exit 91\n",
+			publish: func(t *testing.T, ctx context.Context, opts artifactPublishOptions, dir string) error {
+				opts.Bucket = "qa"
+				file, cleanup := artifactPublisherTestFile(t, dir)
+				defer cleanup()
+				_, err := uploadArtifactS3(ctx, opts, file, "proof.png", "image/png")
+				return err
+			},
+		},
+		{
+			name:    "wrangler",
+			command: "wrangler",
+			authSetup: func(t *testing.T) {
+				t.Setenv("CRABBOX_ARTIFACTS_CLOUDFLARE_API_TOKEN", "")
+				t.Setenv("CRABBOX_ARTIFACTS_CLOUDFLARE_ACCOUNT_ID", "")
+				t.Setenv("CLOUDFLARE_API_TOKEN", "publisher-token")
+				t.Setenv("CLOUDFLARE_ACCOUNT_ID", "publisher-account")
+			},
+			authCheck: "[ \"$CLOUDFLARE_API_TOKEN\" = publisher-token ] && [ \"$CLOUDFLARE_ACCOUNT_ID\" = publisher-account ] || exit 92\n",
+			publish: func(t *testing.T, ctx context.Context, opts artifactPublishOptions, dir string) error {
+				opts.Bucket = "qa"
+				opts.BaseURL = "https://assets.example.test"
+				file, cleanup := artifactPublisherTestFile(t, dir)
+				defer cleanup()
+				_, err := uploadArtifactCloudflare(ctx, opts, file, "proof.png", "image/png")
+				return err
+			},
+		},
+		{
+			name:    "gh",
+			command: "gh",
+			authSetup: func(t *testing.T) {
+				t.Setenv("GH_TOKEN", "publisher-token")
+				t.Setenv("GH_CONFIG_DIR", t.TempDir())
+			},
+			authCheck: "[ \"$GH_TOKEN\" = publisher-token ] && [ -n \"$GH_CONFIG_DIR\" ] || exit 93\n",
+			publish: func(_ *testing.T, ctx context.Context, opts artifactPublishOptions, _ string) error {
+				opts.PR = 42
+				opts.Repo = "example-org/my-app"
+				return postGitHubPRComment(ctx, opts, []byte("proof"))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := "#!/bin/sh\n" +
+				"if [ \"${TEST_ARD_PASSWORD+x}\" = x ]; then exit 89; fi\n" +
+				"[ \"$CRABBOX_TEST_KEEP\" = preserved ] || exit 90\n" +
+				tc.authCheck +
+				"printf ok\n"
+			if err := os.WriteFile(filepath.Join(dir, tc.command), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("TEST_ARD_PASSWORD", "must-not-reach-publisher")
+			t.Setenv("CRABBOX_TEST_KEEP", "preserved")
+			tc.authSetup(t)
+			opts := artifactPublishOptions{ChildEnvDenylist: []string{"test_ard_password"}}
+			if err := tc.publish(t, context.Background(), opts, dir); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func artifactPublisherTestFile(t *testing.T, dir string) (artifactFile, func()) {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, cleanup, err := snapshotArtifactData(root, artifactFile{
+		Kind: artifactKindForPath("proof.png"),
+		Name: "proof.png",
+		Path: filepath.Join(dir, "proof.png"),
+	}, []byte("proof"))
+	if err != nil {
+		_ = root.Close()
+		t.Fatal(err)
+	}
+	return files[0], func() {
+		cleanup()
+		_ = root.Close()
+	}
+}
+
+func TestArtifactsPublishScrubsConfiguredExternalDesktopPasswordEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell publisher fixtures")
+	}
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	config := `provider: external
+target: macos
+external:
+  connection:
+    desktop:
+      username: screen-user
+      passwordEnv: TEST_ARTIFACTS_DESKTOP_PASSWORD
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(root, "publisher.log")
+	script := "#!/bin/sh\n" +
+		"if [ \"${TEST_ARTIFACTS_DESKTOP_PASSWORD+x}\" = x ]; then exit 89; fi\n" +
+		"[ \"$CRABBOX_TEST_KEEP\" = preserved ] || exit 90\n" +
+		"printf '%s\\n' \"${0##*/}\" >> \"$CRABBOX_TEST_ARTIFACT_PUBLISH_LOG\"\n"
+	for _, name := range []string{"aws", "gh"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bundleDir := filepath.Join(root, "bundle")
+	if err := os.Mkdir(bundleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(bundleDir, "proof.png"), "png")
+
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("CRABBOX_PROVIDER", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_USERNAME", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_PASSWORD_ENV", "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TEST_ARTIFACTS_DESKTOP_PASSWORD", "must-not-reach-publisher")
+	t.Setenv("CRABBOX_TEST_KEEP", "preserved")
+	t.Setenv("CRABBOX_TEST_ARTIFACT_PUBLISH_LOG", logPath)
+
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+		"--dir", bundleDir,
+		"--storage", "s3",
+		"--bucket", "qa",
+		"--skip-manifest",
+		"--pr", "42",
+		"--repo", "example-org/my-app",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logData)
+	for _, name := range []string{"aws\n", "gh\n"} {
+		if !strings.Contains(logText, name) {
+			t.Fatalf("publisher log missing %q: %q", name, logText)
+		}
+	}
+}
+
+func TestArtifactsPublishRejectsInvalidExternalDesktopPasswordEnvironmentBeforePublisher(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell publisher fixture")
+	}
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	config := `provider: external
+target: macos
+external:
+  command: provider-adapter
+  connection:
+    desktop:
+      username: screen-user
+      passwordEnv: PATH
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	invokedPath := filepath.Join(root, "publisher-invoked")
+	script := "#!/bin/sh\nprintf invoked > \"$CRABBOX_TEST_ARTIFACT_PUBLISH_INVOKED\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(root, "bundle")
+	if err := os.Mkdir(bundleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(bundleDir, "proof.png"), "png")
+
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("CRABBOX_PROVIDER", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_USERNAME", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_PASSWORD_ENV", "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_TEST_ARTIFACT_PUBLISH_INVOKED", invokedPath)
+
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+		"--dir", bundleDir,
+		"--storage", "s3",
+		"--bucket", "qa",
+		"--skip-manifest",
+		"--no-comment",
+	})
+	if err == nil || !strings.Contains(err.Error(), "passwordEnv PATH is reserved") {
+		t.Fatalf("error=%v", err)
+	}
+	if _, statErr := os.Stat(invokedPath); !os.IsNotExist(statErr) {
+		t.Fatalf("publisher invoked before config rejection: %v", statErr)
 	}
 }
 
@@ -319,13 +641,42 @@ func TestWindowsDesktopVideoRemoteCommandCapturesInteractiveFrames(t *testing.T)
 	}
 }
 
+func TestWindowsDesktopVideoEncoderScrubsTargetChildEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ffmpeg fixture")
+	}
+	dir := t.TempDir()
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	script := "#!/bin/sh\nif [ \"${TEST_ARD_PASSWORD+x}\" = x ]; then echo leaked >&2; exit 89; fi\nif [ \"$CRABBOX_TEST_KEEP\" != preserved ]; then echo missing >&2; exit 90; fi\nprintf encoded\n"
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TEST_ARD_PASSWORD", "must-not-reach-ffmpeg")
+	t.Setenv("CRABBOX_TEST_KEEP", "preserved")
+	target := SSHTarget{ChildEnvDenylist: []string{"TEST_ARD_PASSWORD"}}
+	out, err := windowsDesktopVideoEncoderCommand(context.Background(), target, "-version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("fake ffmpeg: %v: %s", err, out)
+	}
+	if string(out) != "encoded" {
+		t.Fatalf("fake ffmpeg output=%q", out)
+	}
+}
+
 func TestListArtifactBundleFilesSkipsPublishedMarkdown(t *testing.T) {
 	dir := t.TempDir()
 	mustWriteFile(t, filepath.Join(dir, "screenshot.png"), "png")
 	mustWriteFile(t, filepath.Join(dir, "published-artifacts.md"), "old")
 	mustWriteFile(t, filepath.Join(dir, artifactManifestFilename), "{}")
 	mustWriteFile(t, filepath.Join(dir, "nested", "logs.txt"), "logs")
-	files, err := listArtifactBundleFiles(dir)
+	mustWriteFile(t, filepath.Join(dir, "nested", "published-artifacts.md", "child.txt"), "child")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,8 +685,1093 @@ func TestListArtifactBundleFilesSkipsPublishedMarkdown(t *testing.T) {
 		names = append(names, file.Name)
 	}
 	got := strings.Join(names, ",")
-	if got != "nested/logs.txt,screenshot.png" {
+	if got != "nested/logs.txt,nested/published-artifacts.md/child.txt,screenshot.png" {
 		t.Fatalf("files=%s", got)
+	}
+}
+
+func TestArtifactsPublishRejectsSymlinksBeforeSideEffects(t *testing.T) {
+	for _, linkName := range []string{"screenshot.png", artifactManifestFilename, "published-artifacts.md"} {
+		t.Run(linkName, func(t *testing.T) {
+			dir := t.TempDir()
+			outside := filepath.Join(t.TempDir(), "outside-secret.txt")
+			mustWriteFile(t, outside, "outside-secret")
+			mustWriteFile(t, filepath.Join(dir, "safe.txt"), "safe")
+			if err := os.Symlink(outside, filepath.Join(dir, linkName)); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+
+			var stdout bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+				"--dir", dir,
+				"--storage", "local",
+			})
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+				t.Fatalf("error=%v, want exit 2", err)
+			}
+			if !strings.Contains(exitErr.Message, "symlink") || !strings.Contains(exitErr.Message, linkName) {
+				t.Fatalf("message=%q", exitErr.Message)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout=%q, want no publish output", stdout.String())
+			}
+			if got, readErr := os.ReadFile(outside); readErr != nil || string(got) != "outside-secret" {
+				t.Fatalf("outside file changed: data=%q err=%v", got, readErr)
+			}
+		})
+	}
+}
+
+func TestSnapshotArtifactFilesRejectsSymlinkSwapAfterValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "screenshot.png")
+	mustWriteFile(t, path, "safe-bytes")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside-secret.txt")
+	mustWriteFile(t, outside, "outside-secret")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	_, cleanup, err := prepareArtifactFiles(root, files, true)
+	defer cleanup()
+	if err == nil || !strings.Contains(err.Error(), "screenshot.png") {
+		t.Fatalf("error=%v, want changed artifact rejection", err)
+	}
+	if got, readErr := os.ReadFile(outside); readErr != nil || string(got) != "outside-secret" {
+		t.Fatalf("outside file changed: data=%q err=%v", got, readErr)
+	}
+}
+
+func TestValidateArtifactBundleRootRejectsParentSwap(t *testing.T) {
+	base := t.TempDir()
+	bundle := filepath.Join(base, "bundle")
+	replacement := filepath.Join(base, "replacement")
+	mustWriteFile(t, filepath.Join(bundle, "safe.txt"), "safe")
+	mustWriteFile(t, filepath.Join(replacement, "outside-secret.txt"), "outside-secret")
+	root, err := os.OpenRoot(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	original := filepath.Join(base, "bundle-original")
+	if err := os.Rename(bundle, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, bundle); err != nil {
+		t.Fatal(err)
+	}
+	absBundle, err := filepath.Abs(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := validateArtifactBundleRoot(root, absBundle); err == nil || !strings.Contains(err.Error(), "artifact directory changed") {
+		t.Fatalf("error=%v, want root identity mismatch", err)
+	}
+	file, err := root.Open("safe.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil || string(data) != "safe" {
+		t.Fatalf("anchored root data=%q err=%v", data, err)
+	}
+}
+
+func TestSnapshotArtifactFilesRejectsNestedDirectorySwap(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "nested")
+	mustWriteFile(t, filepath.Join(nested, "safe.txt"), "safe-bytes")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(outsideDir, "safe.txt"), "outside-secret")
+	if err := os.Rename(nested, nested+"-original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, nested); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	_, cleanup, err := prepareArtifactFiles(root, files, true)
+	defer cleanup()
+	if err == nil || !strings.Contains(err.Error(), "nested/safe.txt") {
+		t.Fatalf("error=%v, want nested swap rejection", err)
+	}
+}
+
+func TestSnapshotArtifactFilesSupportsMaximumLengthComponent(t *testing.T) {
+	dir := t.TempDir()
+	name := "a." + strings.Repeat("x", 252)
+	mustWriteFile(t, filepath.Join(dir, name), "safe-bytes")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cleanup, err := prepareArtifactFiles(root, files, true)
+	defer cleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindArtifactSummaryFileAllowsExternalSymlink(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside-secret.md")
+	mustWriteFile(t, outside, "external-summary")
+	path := filepath.Join(dir, "summary.md")
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	binding, err := bindArtifactSummaryFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	data, err := io.ReadAll(binding.file)
+	if err != nil || string(data) != "external-summary" {
+		t.Fatalf("summary=%q err=%v", data, err)
+	}
+}
+
+func TestArtifactsPublishAllowsExternalParentRelativeSummarySymlink(t *testing.T) {
+	bundle := t.TempDir()
+	mustWriteFile(t, filepath.Join(bundle, "result.txt"), "safe-result")
+	external := t.TempDir()
+	mustWriteFile(t, filepath.Join(external, "notes.md"), "external-summary")
+	summaryDir := filepath.Join(external, "sub")
+	if err := os.MkdirAll(summaryDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	summaryPath := filepath.Join(summaryDir, "summary.md")
+	if err := os.Symlink(filepath.Join("..", "notes.md"), summaryPath); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := (App{Stdout: io.Discard, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+		"--dir", bundle,
+		"--storage", "local",
+		"--summary-file", summaryPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(bundle, "published-artifacts.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "external-summary") {
+		t.Fatalf("published markdown omitted external summary:\n%s", body)
+	}
+}
+
+func TestArtifactPublishSummaryRejectsExternalAliasToSwappedBundleFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "summary.md")
+	mustWriteFile(t, path, "safe-summary")
+	alias := filepath.Join(t.TempDir(), "summary-alias.md")
+	if err := os.Symlink(path, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	original := path + ".original"
+	if err := os.Rename(path, original); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside-secret.md")
+	mustWriteFile(t, outside, "outside-secret")
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	binding, err := bindArtifactSummaryFile(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(original, path); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside := artifactSummaryInsideBundle(dir, dir, mustArtifactRootInfo(t, root), binding, files)
+	if !inside {
+		t.Fatal("external alias target inside the bundle was not classified as bundle input")
+	}
+	_, err = artifactPublishSummaryText("", binding, inside, root, files)
+	if err == nil || !strings.Contains(err.Error(), "summary file changed") {
+		t.Fatalf("error=%v, want outside identity rejection", err)
+	}
+}
+
+func TestArtifactPublishSummaryRejectsSymlinkDotDotSwap(t *testing.T) {
+	bundle := t.TempDir()
+	nested := filepath.Join(bundle, "nested")
+	mustWriteFile(t, filepath.Join(bundle, "summary.md"), "safe-summary")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	aliasBase := t.TempDir()
+	bridge := filepath.Join(aliasBase, "bridge")
+	if err := os.MkdirAll(bridge, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(nested, filepath.Join(bridge, "nested-link")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	alias := filepath.Join(aliasBase, "summary-alias.md")
+	aliasTarget := "bridge" + string(filepath.Separator) + "nested-link" + string(filepath.Separator) + ".." + string(filepath.Separator) + "summary.md"
+	if err := os.Symlink(aliasTarget, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	originalNested := nested + ".original"
+	if err := os.Rename(nested, originalNested); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(outside, "summary.md"), "outside-secret")
+	if err := os.Symlink(filepath.Join(outside, "child"), nested); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	binding, err := bindArtifactSummaryFile(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	if err := os.Remove(nested); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(originalNested, nested); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside := artifactSummaryInsideBundle(bundle, bundle, mustArtifactRootInfo(t, root), binding, files)
+	if !inside {
+		t.Fatal("component-wise symlink target inside bundle was classified as external")
+	}
+	_, err = artifactPublishSummaryText("", binding, inside, root, files)
+	if err == nil || !strings.Contains(err.Error(), "summary file changed") {
+		t.Fatalf("error=%v, want outside identity rejection", err)
+	}
+}
+
+func TestArtifactPublishSummaryClassifiesNestedDirectoryIdentity(t *testing.T) {
+	bundle := t.TempDir()
+	nested := filepath.Join(bundle, "nested")
+	mustWriteFile(t, filepath.Join(nested, "safe.txt"), "safe")
+	root, err := os.OpenRoot(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nestedInfo, err := os.Stat(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	mustWriteFile(t, outside, "outside-secret")
+	outsideInfo, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := &artifactSummaryBinding{
+		path:           outside,
+		resolvedPath:   outside,
+		fileInfo:       outsideInfo,
+		directoryInfos: []os.FileInfo{nestedInfo},
+	}
+	if !artifactSummaryInsideBundle(bundle, bundle, mustArtifactRootInfo(t, root), binding, files) {
+		t.Fatal("nested bundle directory identity was classified as external")
+	}
+}
+
+func TestArtifactPublishSummaryRejectsCaseAliasToSwappedBundleDirectory(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "BundleCase")
+	nested := filepath.Join(dir, "nested")
+	path := filepath.Join(nested, "summary.md")
+	mustWriteFile(t, path, "safe-summary")
+	caseAliasDir := filepath.Join(base, "bundlecase")
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasInfo, err := os.Stat(caseAliasDir)
+	if err != nil || !os.SameFile(dirInfo, aliasInfo) {
+		t.Skip("test requires a case-insensitive filesystem")
+	}
+	alias := filepath.Join(t.TempDir(), "summary-alias.md")
+	if err := os.Symlink(filepath.Join(caseAliasDir, "nested", "summary.md"), alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	originalNested := nested + ".original"
+	if err := os.Rename(nested, originalNested); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	mustWriteFile(t, filepath.Join(outside, "summary.md"), "outside-secret")
+	if err := os.Symlink(outside, nested); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	binding, err := bindArtifactSummaryFile(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	if err := os.Remove(nested); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(originalNested, nested); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside := artifactSummaryInsideBundle(dir, dir, mustArtifactRootInfo(t, root), binding, files)
+	if !inside {
+		t.Fatal("case-equivalent alias target inside the bundle was not classified as bundle input")
+	}
+	_, err = artifactPublishSummaryText("", binding, inside, root, files)
+	if err == nil || !strings.Contains(err.Error(), "summary file changed") {
+		t.Fatalf("error=%v, want outside identity rejection", err)
+	}
+}
+
+func TestArtifactPathWithinPreservesCaseSensitiveSiblings(t *testing.T) {
+	base := t.TempDir()
+	upper := filepath.Join(base, "BundleCase")
+	lower := filepath.Join(base, "bundlecase")
+	if err := os.Mkdir(upper, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(lower, 0o755); err != nil {
+		t.Skip("test requires a case-sensitive filesystem")
+	}
+	upperInfo, err := os.Stat(upper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowerInfo, err := os.Stat(lower)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(upperInfo, lowerInfo) {
+		t.Skip("test requires distinct case-sensitive siblings")
+	}
+	if artifactPathWithin(upper, filepath.Join(lower, "summary.md")) {
+		t.Fatal("case-sensitive sibling was classified inside bundle")
+	}
+}
+
+func TestBindArtifactSummaryFileAllowsExternalRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "summary.md")
+	mustWriteFile(t, path, "external-summary")
+	binding, err := bindArtifactSummaryFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	data, err := io.ReadAll(binding.file)
+	if err != nil || string(data) != "external-summary" {
+		t.Fatalf("summary=%q err=%v", data, err)
+	}
+}
+
+func TestArtifactPublishSummaryUsesValidatedSnapshotThroughDirectoryAlias(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "summary.md")
+	mustWriteFile(t, path, "safe-summary")
+	alias := filepath.Join(t.TempDir(), "bundle-alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	binding, err := bindArtifactSummaryFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	root, err := os.OpenRoot(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots, cleanupSnapshots, err := prepareArtifactFiles(root, files, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupSnapshots()
+	outside := filepath.Join(t.TempDir(), "outside-secret.md")
+	mustWriteFile(t, outside, "outside-secret")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	resolvedAlias, err := filepath.EvalSymlinks(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside := artifactSummaryInsideBundle(alias, resolvedAlias, mustArtifactRootInfo(t, root), binding, files)
+	if !inside {
+		t.Fatal("canonical summary path should match symlinked bundle root")
+	}
+	got, err := artifactPublishSummaryText("prefix", binding, inside, root, snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "prefix\n\nsafe-summary" {
+		t.Fatalf("summary=%q, want validated snapshot", got)
+	}
+}
+
+func TestArtifactsPublishAllowsGeneratedOutputSummaryFile(t *testing.T) {
+	for _, name := range []string{
+		"published-artifacts.md",
+		filepath.Join("nested", artifactManifestFilename),
+	} {
+		t.Run(filepath.ToSlash(name), func(t *testing.T) {
+			dir := t.TempDir()
+			mustWriteFile(t, filepath.Join(dir, "result.txt"), "safe-result")
+			summaryPath := filepath.Join(dir, name)
+			mustWriteFile(t, summaryPath, "existing-summary")
+			if err := (App{Stdout: io.Discard, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+				"--dir", dir,
+				"--storage", "local",
+				"--summary-file", summaryPath,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(filepath.Join(dir, "published-artifacts.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(body), "existing-summary") {
+				t.Fatalf("published markdown omitted generated-file summary:\n%s", body)
+			}
+		})
+	}
+}
+
+func TestArtifactsPublishAllowsGeneratedOutputSummaryCaseAlias(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "BundleCase")
+	mustWriteFile(t, filepath.Join(dir, "result.txt"), "safe-result")
+	mustWriteFile(t, filepath.Join(dir, "published-artifacts.md"), "existing-summary")
+	alias := filepath.Join(base, "bundlecase")
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasInfo, err := os.Stat(alias)
+	if err != nil || !os.SameFile(dirInfo, aliasInfo) {
+		t.Skip("test requires a case-insensitive filesystem")
+	}
+	if err := (App{Stdout: io.Discard, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+		"--dir", dir,
+		"--storage", "local",
+		"--summary-file", filepath.Join(alias, "published-artifacts.md"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "published-artifacts.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "existing-summary") {
+		t.Fatalf("published markdown omitted case-aliased summary:\n%s", body)
+	}
+}
+
+func TestArtifactPublishSummaryRejectsIdentityChangeBeforeValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "summary.md")
+	mustWriteFile(t, path, "safe-summary")
+	binding, err := bindArtifactSummaryFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, path, "replacement-summary")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inside := artifactSummaryInsideBundle(dir, dir, mustArtifactRootInfo(t, root), binding, files)
+	if !inside {
+		t.Fatal("summary path should remain classified inside the bundle")
+	}
+	_, err = artifactPublishSummaryText("", binding, inside, root, files)
+	if err == nil || !strings.Contains(err.Error(), "summary file changed") {
+		t.Fatalf("error=%v, want identity change rejection", err)
+	}
+}
+
+func TestArtifactPublishSummaryRejectsCanonicalNestedParentReswap(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "nested")
+	path := filepath.Join(nested, "summary.md")
+	mustWriteFile(t, path, "safe-summary")
+	alias := filepath.Join(t.TempDir(), "bundle-alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	root, err := os.OpenRoot(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalNested := nested + "-original"
+	if err := os.Rename(nested, originalNested); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	mustWriteFile(t, filepath.Join(outside, "summary.md"), "outside-secret")
+	if err := os.Symlink(outside, nested); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	binding, err := bindArtifactSummaryFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer binding.file.Close()
+	inside := artifactSummaryInsideBundle(alias, dir, mustArtifactRootInfo(t, root), binding, files)
+	if !inside {
+		t.Fatal("canonical nested summary should remain classified inside aliased bundle")
+	}
+	_, err = artifactPublishSummaryText("", binding, inside, root, files)
+	if err == nil || !strings.Contains(err.Error(), "summary file changed") {
+		t.Fatalf("error=%v, want outside identity rejection", err)
+	}
+}
+
+func TestWriteArtifactManifestUsesValidatedHandleForLocalStorage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "result.txt")
+	mustWriteFile(t, path, "safe-bytes")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validated, cleanup, err := prepareArtifactFiles(root, files, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if validated[0].snapshotFile != nil {
+		t.Fatal("local manifest unexpectedly copied file to a snapshot")
+	}
+	outside := filepath.Join(t.TempDir(), "outside-secret.txt")
+	mustWriteFile(t, outside, "outside-secret")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	_, data, err := writeArtifactManifest(root, artifactPublishOptions{
+		Directory: dir,
+		Storage:   "local",
+	}, validated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest artifactManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Files) != 1 {
+		t.Fatalf("files=%#v", manifest.Files)
+	}
+	wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte("safe-bytes")))
+	if got := manifest.Files[0]; got.SHA256 != wantHash || got.Size == nil || *got.Size != int64(len("safe-bytes")) {
+		t.Fatalf("manifest file=%#v, want safe snapshot hash=%s", got, wantHash)
+	}
+	if got, readErr := os.ReadFile(outside); readErr != nil || string(got) != "outside-secret" {
+		t.Fatalf("outside file changed: data=%q err=%v", got, readErr)
+	}
+}
+
+func TestSnapshotArtifactDataUsesGeneratedBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, artifactManifestFilename)
+	mustWriteFile(t, path, "path-bytes")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, cleanup, err := snapshotArtifactData(root, artifactFile{
+		Kind: "manifest",
+		Name: artifactManifestFilename,
+		Path: path,
+	}, []byte("generated-bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if len(files) != 1 {
+		t.Fatalf("files=%#v", files)
+	}
+	got, err := io.ReadAll(io.NewSectionReader(files[0].snapshotFile, files[0].snapshotOffset, files[0].snapshotSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "generated-bytes" {
+		t.Fatalf("snapshot=%q, want generated bytes", got)
+	}
+	wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte("generated-bytes")))
+	if files[0].snapshotHash != wantHash || files[0].snapshotSize != int64(len("generated-bytes")) {
+		t.Fatalf("snapshot metadata=%#v, want hash=%s", files[0], wantHash)
+	}
+}
+
+func TestPublishArtifactFilesBrokerUsesValidatedSnapshotAfterPathSwap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "screenshot.png")
+	mustWriteFile(t, path, "safe-bytes")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots, cleanup, err := prepareArtifactFiles(root, files, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	outside := filepath.Join(t.TempDir(), "outside-secret.txt")
+	mustWriteFile(t, outside, "leak-bytes")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte("safe-bytes")))
+	var uploaded string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/artifacts/uploads":
+			var req CoordinatorArtifactUploadRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode upload request: %v", err)
+			}
+			if len(req.Files) != 1 || req.Files[0].SHA256 != wantHash || req.Files[0].Size != int64(len("safe-bytes")) {
+				t.Fatalf("request=%#v", req)
+			}
+			w.Header().Set("content-type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"files":[{"name":"screenshot.png","key":"runs/abc/screenshot.png","upload":{"method":"PUT","url":%q,"headers":{"content-length":"10"}},"url":"https://artifacts.example.com/screenshot.png"}]}`, server.URL+"/upload")
+		case "/upload":
+			data, _ := io.ReadAll(r.Body)
+			uploaded = string(data)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err = publishArtifactFilesBroker(context.Background(), &CoordinatorClient{
+		BaseURL: server.URL,
+		Token:   "token",
+		Client:  server.Client(),
+	}, artifactPublishOptions{Storage: "broker", Prefix: "runs/abc"}, snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploaded != "safe-bytes" {
+		t.Fatalf("uploaded=%q, want validated snapshot", uploaded)
+	}
+}
+
+func TestWriteArtifactBundleFileDoesNotFollowReservedOutputSymlink(t *testing.T) {
+	for _, name := range []string{artifactManifestFilename, "published-artifacts.md"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			outside := filepath.Join(t.TempDir(), "outside-secret.txt")
+			mustWriteFile(t, outside, "outside-secret")
+			if err := os.Symlink(outside, filepath.Join(dir, name)); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+
+			err = writeArtifactBundleFile(root, name, []byte("generated-output"), 0o644)
+			if got, readErr := os.ReadFile(outside); readErr != nil || string(got) != "outside-secret" {
+				t.Fatalf("outside file changed: data=%q err=%v writeErr=%v", got, readErr, err)
+			}
+			if err != nil {
+				return
+			}
+			info, statErr := os.Lstat(filepath.Join(dir, name))
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if !info.Mode().IsRegular() {
+				t.Fatalf("generated output mode=%v, want regular file", info.Mode())
+			}
+			got, readErr := os.ReadFile(filepath.Join(dir, name))
+			if readErr != nil || string(got) != "generated-output" {
+				t.Fatalf("generated output=%q err=%v", got, readErr)
+			}
+		})
+	}
+}
+
+func TestWriteArtifactBundleFilePreservesExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, artifactManifestFilename)
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initialInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMode := initialInfo.Mode().Perm()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := writeArtifactBundleFile(root, artifactManifestFilename, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != wantMode {
+		t.Fatalf("mode=%#o, want preserved %#o", got, wantMode)
+	}
+}
+
+// The manifest carries presigned upload/read URLs, which are bearer capabilities, so it
+// must stay owner-only even when --output selects a non-private directory and even when
+// an earlier bundle left a world-readable manifest in place.
+//
+// published-artifacts.md is the sibling instance: artifactTemplateMarkdown embeds the same
+// URLs, so both bundle files that can carry a presigned URL are covered here.
+//
+// The summary's mode is conditional — see TestPublishedArtifactsSummaryModeFollowsURLKind.
+func TestWriteArtifactBundleCredentialFilesKeepOwnerOnlyMode(t *testing.T) {
+	for _, name := range []string{artifactManifestFilename, "published-artifacts.md"} {
+		for _, existing := range []os.FileMode{0, 0o644, 0o600} {
+			t.Run(fmt.Sprintf("%s/%#o", name, existing), func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, name)
+				if existing != 0 {
+					if err := os.WriteFile(path, []byte("old"), existing); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chmod(path, existing); err != nil {
+						t.Fatal(err)
+					}
+				}
+				root, err := os.OpenRoot(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer root.Close()
+
+				if err := writePrivateArtifactBundleFile(root, name, []byte("body")); err != nil {
+					t.Fatal(err)
+				}
+
+				if runtime.GOOS == "windows" {
+					return
+				}
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := info.Mode().Perm(); got&0o077 != 0 {
+					t.Fatalf("%s mode=%#o, want no group or other access", name, got)
+				}
+			})
+		}
+	}
+}
+
+// The summary is meant to be shared (it is the PR comment body), so it may only be
+// restricted when it actually embeds a presigned URL. A public or local bundle keeps the
+// readable mode it has always had.
+func TestPublishedArtifactsSummaryModeFollowsURLKind(t *testing.T) {
+	signed := "https://bucket.s3.amazonaws.com/proof.txt?X-Amz-Signature=deadbeef&X-Amz-Expires=900"
+	for _, item := range []struct {
+		name    string
+		files   []artifactFile
+		private bool
+	}{
+		{name: "signed", files: []artifactFile{{Kind: "proof", Name: "proof.txt", URL: signed}}, private: true},
+		{name: "public", files: []artifactFile{{Kind: "proof", Name: "proof.txt", URL: "https://artifacts.example.com/proof.txt"}}, private: false},
+		{name: "local", files: []artifactFile{{Kind: "proof", Name: "proof.txt", Path: "proof.txt"}}, private: false},
+		{name: "mixed", files: []artifactFile{{Kind: "a", Name: "a.txt", URL: "https://artifacts.example.com/a.txt"}, {Kind: "b", Name: "b.txt", URL: signed}}, private: true},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			if got := artifactFilesContainSignedURL(item.files); got != item.private {
+				t.Fatalf("artifactFilesContainSignedURL=%t, want %t", got, item.private)
+			}
+			dir := t.TempDir()
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			if item.private {
+				err = writePrivateArtifactBundleFile(root, "published-artifacts.md", []byte("body"))
+			} else {
+				err = writeArtifactBundleFile(root, "published-artifacts.md", []byte("body"), 0o644)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.GOOS == "windows" {
+				return
+			}
+			info, err := os.Stat(filepath.Join(dir, "published-artifacts.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			restricted := info.Mode().Perm()&0o077 == 0
+			if restricted != item.private {
+				t.Fatalf("summary mode=%#o restricted=%t, want restricted=%t", info.Mode().Perm(), restricted, item.private)
+			}
+		})
+	}
+}
+
+func TestWriteSensitiveArtifactManifestKeepsOwnerOnlyMode(t *testing.T) {
+	signedFile := artifactFile{
+		Kind:          "proof",
+		Name:          "proof.txt",
+		URL:           "https://bucket.s3.amazonaws.com/proof.txt?X-Amz-Signature=deadbeef&X-Amz-Expires=900",
+		snapshotValid: true,
+		snapshotHash:  strings.Repeat("a", 64),
+		snapshotSize:  1,
+	}
+	for _, existing := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "fresh", mode: 0},
+		{name: "world-readable", mode: 0o644},
+		{name: "already-private", mode: 0o600},
+	} {
+		t.Run(existing.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, artifactManifestFilename)
+			if existing.mode != 0 {
+				if err := os.WriteFile(path, []byte("old"), existing.mode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, existing.mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+
+			if _, _, err := writeArtifactManifest(root, artifactPublishOptions{
+				Directory: dir,
+				Storage:   "broker",
+			}, []artifactFile{signedFile}); err != nil {
+				t.Fatal(err)
+			}
+
+			if runtime.GOOS == "windows" {
+				return
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got&0o077 != 0 {
+				t.Fatalf("manifest mode=%#o, want no group or other access", got)
+			}
+		})
+	}
+}
+
+func TestPublicAndLocalArtifactManifestPreserveSharedModes(t *testing.T) {
+	for _, item := range []struct {
+		name     string
+		url      string
+		existing os.FileMode
+		want     os.FileMode
+	}{
+		{name: "public fresh", url: "https://artifacts.example.com/proof.txt", want: 0o644},
+		{name: "local fresh", want: 0o644},
+		{name: "public narrowed", url: "https://artifacts.example.com/proof.txt", existing: 0o640, want: 0o640},
+		{name: "public writable capped", url: "https://artifacts.example.com/proof.txt", existing: 0o666, want: 0o644},
+		{name: "local private", existing: 0o600, want: 0o600},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, artifactManifestFilename)
+			if item.existing != 0 {
+				if err := os.WriteFile(path, []byte("old"), item.existing); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, item.existing); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			file := artifactFile{
+				Kind:          "proof",
+				Name:          "proof.txt",
+				Path:          "proof.txt",
+				URL:           item.url,
+				snapshotValid: true,
+				snapshotHash:  strings.Repeat("b", 64),
+				snapshotSize:  1,
+			}
+			if _, _, err := writeArtifactManifest(root, artifactPublishOptions{
+				Directory: dir,
+				Storage:   "local",
+			}, []artifactFile{file}); err != nil {
+				t.Fatal(err)
+			}
+			if runtime.GOOS == "windows" {
+				return
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != item.want {
+				t.Fatalf("manifest mode=%#o, want %#o", got, item.want)
+			}
+		})
+	}
+}
+
+func TestArtifactsPublishRejectsReservedOutputDirectoriesBeforeSideEffects(t *testing.T) {
+	for _, reservedName := range []string{
+		artifactManifestFilename,
+		"published-artifacts.md",
+	} {
+		t.Run(reservedName, func(t *testing.T) {
+			dir := t.TempDir()
+			mustWriteFile(t, filepath.Join(dir, "safe.txt"), "safe")
+			mustWriteFile(t, filepath.Join(dir, reservedName, "nested.txt"), "nested")
+
+			var stdout bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+				"--dir", dir,
+				"--storage", "local",
+			})
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+				t.Fatalf("error=%v, want exit 2", err)
+			}
+			if !strings.Contains(exitErr.Message, "reserved output path") || !strings.Contains(exitErr.Message, reservedName) {
+				t.Fatalf("message=%q", exitErr.Message)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout=%q, want no publish output", stdout.String())
+			}
+		})
 	}
 }
 
@@ -365,7 +1801,7 @@ func TestArtifactsPublishWritesManifestByDefault(t *testing.T) {
 		t.Fatalf("manifest=%#v", manifest)
 	}
 	file := manifest.Files[0]
-	if file.Name != "screenshot.png" || file.ContentType != "image/png" || file.Size != int64(len(data)) || file.SHA256 == "" {
+	if file.Name != "screenshot.png" || file.ContentType != "image/png" || file.Size == nil || *file.Size != int64(len(data)) || file.SHA256 == "" {
 		t.Fatalf("file=%#v", file)
 	}
 	if file.URL != "https://artifacts.example.com/proof/screenshot.png" {
@@ -390,6 +1826,36 @@ func TestArtifactsPublishSkipManifest(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, artifactManifestFilename)); !os.IsNotExist(err) {
 		t.Fatalf("manifest should not exist, stat err=%v", err)
+	}
+}
+
+func TestArtifactsPublishSkipManifestDoesNotReadUnusedFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "local", args: []string{"--storage", "local"}},
+		{name: "hosted-dry-run", args: []string{"--storage", "s3", "--bucket", "qa", "--dry-run"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "already-hosted.bin")
+			mustWriteFile(t, path, "bytes-not-needed")
+			if err := os.Chmod(path, 0); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Chmod(path, 0o600)
+			if file, err := os.Open(path); err == nil {
+				_ = file.Close()
+				t.Skip("filesystem does not enforce unreadable mode")
+			}
+
+			args := append([]string{"--dir", dir, "--skip-manifest", "--no-comment"}, tc.args...)
+			err := (App{Stdout: io.Discard, Stderr: io.Discard}).artifactsPublish(context.Background(), args)
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -437,7 +1903,22 @@ func TestPublishArtifactFilesBrokerUploadsViaGrantedURL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "screenshot.png")
 	mustWriteFile(t, path, "png-data")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	files, err := listArtifactBundleRoot(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots, cleanup, err := prepareArtifactFiles(root, files, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
 	wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte("png-data")))
+	wantChecksumHeader := "cGluLWRhdGEtY2hlY2tzdW0="
 	var uploaded string
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -459,10 +1940,10 @@ func TestPublishArtifactFilesBrokerUploadsViaGrantedURL(t *testing.T) {
 				"files":[{
 					"name":"screenshot.png",
 					"key":"runs/abc/screenshot.png",
-					"upload":{"method":"PUT","url":%q,"headers":{"content-type":"image/png","content-length":"8"},"expiresAt":"2026-05-08T00:00:00Z"},
+					"upload":{"method":"PUT","url":%q,"headers":{"content-type":"image/png","content-length":"8","x-amz-checksum-sha256":%q},"expiresAt":"2026-05-08T00:00:00Z"},
 					"url":"https://artifacts.example.com/runs/abc/screenshot.png"
 				}]
-			}`, server.URL+"/upload/screenshot.png")
+			}`, server.URL+"/upload/screenshot.png", wantChecksumHeader)
 		case "/upload/screenshot.png":
 			if r.Method != http.MethodPut {
 				t.Fatalf("method=%s", r.Method)
@@ -472,6 +1953,9 @@ func TestPublishArtifactFilesBrokerUploadsViaGrantedURL(t *testing.T) {
 			}
 			if len(r.TransferEncoding) > 0 {
 				t.Fatalf("transfer encoding=%v", r.TransferEncoding)
+			}
+			if got := r.Header.Get("x-amz-checksum-sha256"); got != wantChecksumHeader {
+				t.Fatalf("checksum header=%q, want %q", got, wantChecksumHeader)
 			}
 			data, _ := io.ReadAll(r.Body)
 			uploaded = string(data)
@@ -486,9 +1970,7 @@ func TestPublishArtifactFilesBrokerUploadsViaGrantedURL(t *testing.T) {
 		BaseURL: server.URL,
 		Token:   "token",
 		Client:  server.Client(),
-	}, artifactPublishOptions{Storage: "broker", Prefix: "runs/abc"}, []artifactFile{
-		{Kind: "screenshot", Name: "screenshot.png", Path: path},
-	})
+	}, artifactPublishOptions{Storage: "broker", Prefix: "runs/abc"}, snapshots)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,6 +1982,63 @@ func TestPublishArtifactFilesBrokerUploadsViaGrantedURL(t *testing.T) {
 	}
 	if published[0].Key != "runs/abc/screenshot.png" {
 		t.Fatalf("key=%q", published[0].Key)
+	}
+}
+
+func TestArtifactsPublishBrokerDryRunDoesNotRequireTemporaryStorage(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "result.txt"), "safe-bytes")
+	configPath := filepath.Join(t.TempDir(), "missing.yaml")
+	unusableTemp := filepath.Join(t.TempDir(), "missing-temp")
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/artifacts/uploads" {
+			http.NotFound(w, r)
+			return
+		}
+		requests++
+		var input CoordinatorArtifactUploadRequest
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		response := CoordinatorArtifactUploadResponse{Backend: "r2", Prefix: input.Prefix}
+		for _, file := range input.Files {
+			grant := CoordinatorArtifactUploadGrant{
+				Name: file.Name,
+				Key:  input.Prefix + "/" + file.Name,
+				URL:  "https://artifacts.example.test/" + file.Name,
+			}
+			grant.Upload.Method = http.MethodPut
+			grant.Upload.URL = "https://upload.example.test/" + file.Name
+			grant.Upload.Headers = map[string]string{"content-length": strconv.FormatInt(file.Size, 10)}
+			response.Files = append(response.Files, grant)
+		}
+		w.Header().Set("content-type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configPath))
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "token")
+	t.Setenv("TMPDIR", unusableTemp)
+	t.Setenv("TMP", unusableTemp)
+	t.Setenv("TEMP", unusableTemp)
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).artifactsPublish(context.Background(), []string{
+		"--dir", dir,
+		"--storage", "broker",
+		"--dry-run",
+		"--skip-manifest",
+		"--no-comment",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("upload grant requests=%d, want 1", requests)
 	}
 }
 
@@ -526,7 +2065,7 @@ func TestArtifactsPullDownloadsAndVerifiesManifest(t *testing.T) {
 			Name:        "nested/screenshot.png",
 			URL:         server.URL + "/screenshot.png",
 			ContentType: "image/png",
-			Size:        int64(len(payload)),
+			Size:        new(int64(len(payload))),
 			SHA256:      hash,
 		}},
 	}
@@ -581,7 +2120,7 @@ func TestDownloadArtifactURLRejectsContentLengthAboveLimit(t *testing.T) {
 	_, _, _, err := downloadArtifactURL(context.Background(), artifactManifestFile{
 		Name: "artifact.bin",
 		URL:  server.URL,
-		Size: 4,
+		Size: new(int64(4)),
 	}, outPath)
 	if err == nil || !strings.Contains(err.Error(), "content-length 1024 exceeds limit 4") {
 		t.Fatalf("err=%v", err)
@@ -608,7 +2147,7 @@ func TestDownloadArtifactURLStopsStreamingAboveDeclaredSize(t *testing.T) {
 	_, _, _, err := downloadArtifactURL(context.Background(), artifactManifestFile{
 		Name: "artifact.bin",
 		URL:  server.URL,
-		Size: 4,
+		Size: new(int64(4)),
 	}, outPath)
 	if err == nil || !strings.Contains(err.Error(), "response exceeds limit 4") {
 		t.Fatalf("err=%v", err)
@@ -622,6 +2161,220 @@ func TestDownloadArtifactURLStopsStreamingAboveDeclaredSize(t *testing.T) {
 	}
 }
 
+func TestArtifactHTTPFlowsRejectCrossOriginRedirects(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetRequests.Add(1)
+	}))
+	defer target.Close()
+
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/collect", http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+
+	signedURL := redirect.URL + "/artifact?X-Amz-Signature=secret-signature"
+	for _, test := range artifactHTTPFailureFlows(t, signedURL) {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.run()
+			if err == nil || !strings.Contains(err.Error(), errArtifactCrossOriginRedirect.Error()) {
+				t.Fatalf("error=%v, want cross-origin redirect rejection", err)
+			}
+			if strings.Contains(err.Error(), "secret-signature") {
+				t.Fatalf("error leaked signed URL: %v", err)
+			}
+		})
+	}
+	if got := targetRequests.Load(); got != 0 {
+		t.Fatalf("cross-origin target received %d requests", got)
+	}
+}
+
+func TestArtifactHTTPFlowsRedactRequestErrorURLs(t *testing.T) {
+	const signedQuery = "?X-Amz-Credential=synthetic-credential&X-Amz-Signature=synthetic-signature&X-Amz-Security-Token=synthetic-token"
+	cause := errors.New("synthetic connection failure")
+	requests := 0
+	originalClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = originalClient })
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, &net.OpError{Op: "write", Net: "tcp", Err: cause}
+	})}
+	for _, failure := range []struct {
+		name         string
+		url          string
+		wantCause    string
+		wantRequests int
+	}{
+		{name: "transport", url: "https://artifacts.invalid/private-capability/object" + signedQuery, wantCause: cause.Error(), wantRequests: 1},
+		{name: "malformed URL", url: "https://artifacts.invalid/private-capability/%zz" + signedQuery, wantCause: "invalid URL escape", wantRequests: 0},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			for _, flow := range artifactHTTPFailureFlows(t, failure.url) {
+				t.Run(flow.name, func(t *testing.T) {
+					before := requests
+					err := flow.run()
+					if err == nil || !strings.Contains(err.Error(), failure.wantCause) {
+						t.Fatalf("error=%v, want useful cause %q", err, failure.wantCause)
+					}
+					if got := requests - before; got != failure.wantRequests {
+						t.Fatalf("transport requests=%d, want %d", got, failure.wantRequests)
+					}
+					for _, sensitive := range []string{"artifacts.invalid", "private-capability", "X-Amz-", "synthetic-credential", "synthetic-signature", "synthetic-token"} {
+						if strings.Contains(err.Error(), sensitive) {
+							t.Fatalf("request error exposed signed URL component %q: %v", sensitive, err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestArtifactRequestErrorPreservesTransportCause(t *testing.T) {
+	const signedURL = "https://artifacts.invalid/private-capability?X-Amz-Signature=synthetic-signature"
+	cause := errors.New("synthetic connection failure")
+	transportErr := &net.OpError{Op: "write", Net: "tcp", Err: cause}
+	for _, nested := range []bool{false, true} {
+		t.Run(fmt.Sprintf("nested=%t", nested), func(t *testing.T) {
+			var inner error = transportErr
+			if nested {
+				inner = &url.Error{Op: "connect", URL: signedURL, Err: transportErr}
+			}
+			original := &url.Error{Op: "Put", URL: signedURL, Err: inner}
+			originalText := original.Error()
+			redacted := artifactRequestError(original)
+			if !errors.Is(redacted, cause) {
+				t.Fatalf("redaction lost underlying cause: %v", redacted)
+			}
+			var gotTransport *net.OpError
+			if !errors.As(redacted, &gotTransport) || gotTransport != transportErr {
+				t.Fatalf("redaction lost transport error type: %v", redacted)
+			}
+			var gotURL *url.Error
+			if !errors.As(redacted, &gotURL) || gotURL.Op != original.Op {
+				t.Fatalf("redaction lost request operation: %v", redacted)
+			}
+			if strings.Contains(redacted.Error(), "artifacts.invalid") || strings.Contains(redacted.Error(), "synthetic-signature") {
+				t.Fatalf("redacted error retained a signed URL: %v", redacted)
+			}
+			if original.Error() != originalText || original.URL != signedURL || original.Err != inner {
+				t.Fatalf("redaction mutated the original request error: %v", original)
+			}
+		})
+	}
+}
+
+func artifactHTTPFailureFlows(t *testing.T, signedURL string) []struct {
+	name string
+	run  func() error
+} {
+	t.Helper()
+	dir := t.TempDir()
+	uploadPath := filepath.Join(dir, "upload.txt")
+	mustWriteFile(t, uploadPath, "private artifact")
+	return []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "manifest",
+			run: func() error {
+				_, _, err := readArtifactManifestRef(context.Background(), signedURL)
+				return err
+			},
+		},
+		{
+			name: "download",
+			run: func() error {
+				_, _, _, err := downloadArtifactURL(context.Background(), artifactManifestFile{
+					Name: "artifact.txt",
+					URL:  signedURL,
+					Size: new(int64(64)),
+				}, filepath.Join(dir, "download.txt"))
+				return err
+			},
+		},
+		{
+			name: "upload",
+			run: func() error {
+				return uploadArtifactGrant(context.Background(), uploadPath, CoordinatorArtifactUploadGrant{
+					Name: "artifact.txt",
+					Upload: struct {
+						Method    string            `json:"method"`
+						URL       string            `json:"url"`
+						Headers   map[string]string `json:"headers"`
+						ExpiresAt string            `json:"expiresAt"`
+					}{Method: http.MethodPut, URL: signedURL},
+				})
+			},
+		},
+	}
+}
+
+func TestArtifactHTTPFlowsAllowSameOriginRedirects(t *testing.T) {
+	manifest := `{"schemaVersion":1,"generatedAt":"2026-07-05T00:00:00Z","storage":{"backend":"broker"},"files":[]}`
+	payload := "private artifact"
+	var uploadedMethod, uploadedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manifest-start":
+			http.Redirect(w, r, "/manifest", http.StatusFound)
+		case "/manifest":
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, manifest)
+		case "/download-start":
+			http.Redirect(w, r, "/download", http.StatusFound)
+		case "/download":
+			_, _ = io.WriteString(w, payload)
+		case "/upload-start":
+			http.Redirect(w, r, "/upload", http.StatusTemporaryRedirect)
+		case "/upload":
+			uploadedMethod = r.Method
+			body, _ := io.ReadAll(r.Body)
+			uploadedBody = string(body)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	listed, _, err := readArtifactManifestRef(context.Background(), server.URL+"/manifest-start")
+	if err != nil || listed.SchemaVersion != 1 {
+		t.Fatalf("manifest=%#v err=%v", listed, err)
+	}
+	dir := t.TempDir()
+	_, size, _, err := downloadArtifactURL(context.Background(), artifactManifestFile{
+		Name: "artifact.txt",
+		URL:  server.URL + "/download-start",
+		Size: new(int64(len(payload))),
+	}, filepath.Join(dir, "download.txt"))
+	if err != nil || size != int64(len(payload)) {
+		t.Fatalf("download size=%d err=%v", size, err)
+	}
+	uploadPath := filepath.Join(dir, "upload.txt")
+	mustWriteFile(t, uploadPath, payload)
+	err = uploadArtifactGrant(context.Background(), uploadPath, CoordinatorArtifactUploadGrant{
+		Name: "artifact.txt",
+		Upload: struct {
+			Method    string            `json:"method"`
+			URL       string            `json:"url"`
+			Headers   map[string]string `json:"headers"`
+			ExpiresAt string            `json:"expiresAt"`
+		}{Method: http.MethodPut, URL: server.URL + "/upload-start"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploadedMethod != http.MethodPut || uploadedBody != payload {
+		t.Fatalf("redirected upload method=%q body=%q", uploadedMethod, uploadedBody)
+	}
+}
+
 func TestArtifactsPullRejectsNegativeManifestSize(t *testing.T) {
 	dir := t.TempDir()
 	manifest := artifactManifest{
@@ -631,7 +2384,7 @@ func TestArtifactsPullRejectsNegativeManifestSize(t *testing.T) {
 		Files: []artifactManifestFile{{
 			Name: "screenshot.png",
 			Path: "screenshot.png",
-			Size: -1,
+			Size: new(int64(-1)),
 		}},
 	}
 	data, err := json.Marshal(manifest)
@@ -645,6 +2398,188 @@ func TestArtifactsPullRejectsNegativeManifestSize(t *testing.T) {
 	_, err = pullArtifactManifest(context.Background(), manifestPath, filepath.Join(dir, "pull"), false)
 	if err == nil || !strings.Contains(err.Error(), "artifact size for screenshot.png is invalid: -1") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestArtifactsPullDistinguishesZeroFromOmittedManifestSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		payload   string
+		sizeField string
+		wantError string
+	}{
+		{
+			name:      "declared zero accepts empty artifact",
+			sizeField: `,"size":0`,
+		},
+		{
+			name:      "declared zero rejects non-empty artifact",
+			payload:   "not empty",
+			sizeField: `,"size":0`,
+			wantError: "artifact size mismatch for artifact.txt: got 9, want 0",
+		},
+		{
+			name:    "omitted size remains optional",
+			payload: "legacy artifact",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mustWriteFile(t, filepath.Join(dir, "artifact.txt"), test.payload)
+			manifest := fmt.Sprintf(`{"schemaVersion":1,"generatedAt":"2026-07-17T00:00:00Z","storage":{"backend":"local"},"files":[{"name":"artifact.txt","path":"artifact.txt"%s}]}`, test.sizeField)
+			manifestPath := filepath.Join(dir, artifactManifestFilename)
+			if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			output := filepath.Join(dir, "pull")
+			_, err := pullArtifactManifest(context.Background(), manifestPath, output, false)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("err=%v, want %q", err, test.wantError)
+				}
+				if _, statErr := os.Stat(filepath.Join(output, "artifact.txt")); !os.IsNotExist(statErr) {
+					t.Fatalf("mismatched artifact was installed: %v", statErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(output, "artifact.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != test.payload {
+				t.Fatalf("payload=%q, want %q", got, test.payload)
+			}
+		})
+	}
+}
+
+func TestArtifactsListJSONPreservesManifestSizePresence(t *testing.T) {
+	tests := []struct {
+		name          string
+		sizeField     string
+		wantSize      bool
+		wantSizeValue float64
+		wantPullError string
+	}{
+		{
+			name: "omitted",
+		},
+		{
+			name:          "explicit zero",
+			sizeField:     `,"size":0`,
+			wantSize:      true,
+			wantPullError: "artifact size mismatch for artifact.txt: got 15, want 0",
+		},
+		{
+			name:          "positive",
+			sizeField:     `,"size":15`,
+			wantSize:      true,
+			wantSizeValue: 15,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mustWriteFile(t, filepath.Join(dir, "artifact.txt"), "legacy artifact")
+			manifest := fmt.Sprintf(`{"schemaVersion":1,"generatedAt":"2026-07-17T00:00:00Z","storage":{"backend":"local"},"files":[{"name":"artifact.txt","path":"artifact.txt"%s}]}`, test.sizeField)
+			manifestPath := filepath.Join(dir, artifactManifestFilename)
+			if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var normalized bytes.Buffer
+			app := App{Stdout: &normalized, Stderr: io.Discard}
+			if err := app.artifactsList(context.Background(), []string{"--json", manifestPath}); err != nil {
+				t.Fatal(err)
+			}
+			var encoded struct {
+				Files []map[string]any `json:"files"`
+			}
+			if err := json.Unmarshal(normalized.Bytes(), &encoded); err != nil {
+				t.Fatal(err)
+			}
+			if len(encoded.Files) != 1 {
+				t.Fatalf("files=%#v, want one entry", encoded.Files)
+			}
+			gotSize, hasSize := encoded.Files[0]["size"]
+			if hasSize != test.wantSize {
+				t.Fatalf("normalized size presence=%t value=%v, want presence=%t\n%s", hasSize, gotSize, test.wantSize, normalized.String())
+			}
+			if hasSize && gotSize != test.wantSizeValue {
+				t.Fatalf("normalized size=%v, want %v", gotSize, test.wantSizeValue)
+			}
+
+			normalizedPath := filepath.Join(dir, "normalized.json")
+			if err := os.WriteFile(normalizedPath, normalized.Bytes(), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(dir, "pull")
+			_, err := pullArtifactManifest(context.Background(), normalizedPath, output, false)
+			if test.wantPullError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantPullError) {
+					t.Fatalf("err=%v, want %q", err, test.wantPullError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(output, "artifact.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "legacy artifact" {
+				t.Fatalf("payload=%q, want legacy artifact", got)
+			}
+		})
+	}
+}
+
+func TestDownloadArtifactURLHonorsDeclaredZeroSize(t *testing.T) {
+	for _, flushHeaders := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flushHeaders=%t", flushHeaders), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if flushHeaders {
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+				}
+				_, _ = io.WriteString(w, "unexpected")
+			}))
+			defer server.Close()
+
+			data, err := json.Marshal(map[string]any{
+				"schemaVersion": 1,
+				"files": []map[string]any{{
+					"name": "artifact.txt",
+					"url":  server.URL,
+					"size": 0,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := decodeArtifactManifest(data, "test manifest")
+			if err != nil {
+				t.Fatal(err)
+			}
+			outPath := filepath.Join(t.TempDir(), "artifact.txt")
+			_, _, _, err = downloadArtifactURL(context.Background(), manifest.Files[0], outPath)
+			if err == nil || !strings.Contains(err.Error(), "exceeds limit 0") {
+				t.Fatalf("err=%v, want zero-size limit rejection", err)
+			}
+			if info, statErr := os.Stat(outPath); statErr == nil && info.Size() != 0 {
+				t.Fatalf("downloaded artifact size=%d, want no bytes", info.Size())
+			} else if statErr != nil && !os.IsNotExist(statErr) {
+				t.Fatal(statErr)
+			}
+		})
 	}
 }
 
@@ -664,7 +2599,7 @@ func TestArtifactsPullAllowsOutputAfterManifestRef(t *testing.T) {
 			Name:        "screenshot.png",
 			Path:        "screenshot.png",
 			ContentType: "image/png",
-			Size:        int64(len(payload)),
+			Size:        new(int64(len(payload))),
 			SHA256:      hash,
 		}},
 	}
@@ -711,7 +2646,7 @@ func TestArtifactsPullUsesLocalPathForR2ManifestURL(t *testing.T) {
 			Path:        "screenshot.png",
 			URL:         "r2://qa-artifacts/runs/abc/screenshot.png",
 			ContentType: "image/png",
-			Size:        int64(len(payload)),
+			Size:        new(int64(len(payload))),
 			SHA256:      hash,
 		}},
 	}
@@ -753,6 +2688,7 @@ func TestArtifactsPullRejectsHashMismatch(t *testing.T) {
 		Files: []artifactManifestFile{{
 			Name:   "screenshot.png",
 			URL:    server.URL,
+			Size:   new(int64(len("changed"))),
 			SHA256: strings.Repeat("0", 64),
 		}},
 	}
@@ -895,7 +2831,7 @@ func TestArtifactsPullRejectsSymlinkedOutputParent(t *testing.T) {
 					Kind:   "screenshot",
 					Name:   "link/owned.txt",
 					URL:    "http://" + r.Host + "/owned.txt",
-					Size:   int64(len(payload)),
+					Size:   new(int64(len(payload))),
 					SHA256: hash,
 				}},
 			}
@@ -1005,7 +2941,7 @@ func TestArtifactCollectFailureJSONIsParseable(t *testing.T) {
 		Metadata:  artifactBundleMetadata{LeaseID: "cbx_123"},
 		Files:     []artifactFile{{Kind: "metadata", Name: "metadata.json", Path: "/tmp/bundle/metadata.json"}},
 	}
-	err := app.finishArtifactCollectFailure(&result, true, exit(5, "capture screenshot: boom"), artifactWarning{
+	err := app.finishArtifactCollectFailure(&result, true, Exit(5, "capture screenshot: boom"), artifactWarning{
 		Problem: rescueScreenshotCaptureBroken,
 		Detail:  "capture screenshot: boom",
 		Rescue:  []string{"crabbox desktop doctor --id cbx_123"},
@@ -1038,7 +2974,7 @@ func TestContactSheetWarningJSONIsParseable(t *testing.T) {
 		Metadata:  artifactBundleMetadata{LeaseID: "cbx_123"},
 		Files:     []artifactFile{{Kind: "video", Name: "screen.mp4", Path: "/tmp/bundle/screen.mp4"}},
 	}
-	appendContactSheetWarning(&result.Warnings, exit(2, "ffprobe is required"))
+	appendContactSheetWarning(&result.Warnings, Exit(2, "ffprobe is required"))
 	if err := json.NewEncoder(&stdout).Encode(result); err != nil {
 		t.Fatal(err)
 	}
@@ -1118,4 +3054,13 @@ func mustWriteFile(t *testing.T, path, data string) {
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func mustArtifactRootInfo(t *testing.T, root *os.Root) os.FileInfo {
+	t.Helper()
+	info, err := root.Stat(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
 }

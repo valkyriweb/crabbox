@@ -12,18 +12,21 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return "daytona" }
-func (Provider) Aliases() []string {
-	return nil
-}
+func (Provider) BackendCapabilities() core.Backend { return &daytonaLeaseBackend{} }
+
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        "daytona",
-		Family:      "daytona",
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync},
-		Coordinator: core.CoordinatorNever,
+		Authentication: core.ProviderAuthentication{
+			{Route: "direct", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationAPIKey, core.ProviderAuthenticationAPIToken}, Description: "Direct API-key or JWT/OAuth access-token credentials may also come from a saved Daytona profile."},
+			{Route: "brokered", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationCoordinator}, Description: "The client authenticates to the coordinator; Daytona credentials remain server-side."},
+		},
+		Name:             "daytona",
+		Family:           "daytona",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureSSHScriptRun, core.FeatureClaimExec, core.FeatureFixedCurrentRepoStop, core.FeatureCrabboxSync, core.FeatureArchiveSync, core.FeatureCheckpoint, core.FeatureFork, core.FeatureSnapshot},
+		Coordinator:      core.CoordinatorSupported,
+		ClassDisposition: core.ProviderClassDispositionMapped,
 	}
 }
 func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
@@ -34,16 +37,4 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 }
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewDaytonaLeaseBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "daytona doctor backend unavailable")
-	}
-	return doctor, nil
 }

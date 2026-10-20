@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	shared "github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 // inspectContainer mirrors the JSON returned by `container inspect <id>` and
@@ -62,7 +64,10 @@ type inspectConfiguration struct {
 // inspectImage tolerates both an object ({"reference":"..."}) and a bare
 // string image form, since the documented surface does not pin this down.
 type inspectImage struct {
-	Reference string `json:"reference,omitempty"`
+	Reference  string `json:"reference,omitempty"`
+	Descriptor struct {
+		Digest string `json:"digest"`
+	} `json:"descriptor"`
 }
 
 func (i *inspectImage) UnmarshalJSON(data []byte) error {
@@ -157,7 +162,7 @@ func (c inspectContainer) ip() string {
 
 func firstNetworkAddress(networks []inspectNetwork) string {
 	for _, n := range networks {
-		addr := firstNonBlank(n.Address, n.IPv4Address)
+		addr := shared.FirstNonBlank(n.Address, n.IPv4Address)
 		if addr == "" {
 			continue
 		}

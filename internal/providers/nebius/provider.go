@@ -1,0 +1,78 @@
+package nebius
+
+import (
+	"flag"
+	"strings"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func init() {
+	core.RegisterProvider(Provider{})
+}
+
+type Provider struct{}
+
+func (Provider) Spec() core.ProviderSpec {
+	return core.ProviderSpec{
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationCLI),
+		Name:             providerName,
+		Family:           providerName,
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+	}
+}
+
+func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return RegisterNebiusProviderFlags(fs, defaults)
+}
+
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	return ApplyNebiusProviderFlags(cfg, fs, values)
+}
+
+func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
+		return nil, core.Exit(2, "provider=%s supports target=linux only", providerName)
+	}
+	if cfg.Tailscale.Enabled || string(cfg.Network) == "tailscale" {
+		return nil, core.Exit(2, "--tailscale is not supported for provider=%s in the Nebius provider foundation", providerName)
+	}
+	if err := p.ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
+	return NewBackend(p.Spec(), cfg, rt), nil
+}
+
+func (Provider) ValidateConfig(cfg core.Config) error {
+	neb := cfg.Nebius
+	if strings.TrimSpace(neb.CLI) == "" {
+		return core.Exit(2, "nebius.cli is required")
+	}
+	if err := validateNebiusUser(neb.User); err != nil {
+		return err
+	}
+	if neb.DiskSizeGiB <= 0 {
+		return core.Exit(2, "nebius.diskSizeGiB must be positive")
+	}
+	switch strings.ToLower(strings.TrimSpace(neb.PublicIP)) {
+	case "", "dynamic", "none":
+	default:
+		return core.Exit(2, "nebius.publicIP must be dynamic or none")
+	}
+	switch strings.ToLower(strings.TrimSpace(neb.RecoveryPolicy)) {
+	case "", "fail":
+	default:
+		return core.Exit(2, "nebius.recoveryPolicy must be fail")
+	}
+	return nil
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	cfg.Nebius = cfg.Nebius.WithRuntimeDefaults()
+	core.ApplyLinuxConnectionDefaults(cfg, cfg.Nebius.User, core.BaseConfig().SSHPort)
+	return nil
+}

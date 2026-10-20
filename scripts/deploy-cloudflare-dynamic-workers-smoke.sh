@@ -126,7 +126,7 @@ missing_env_names() {
       missing+=("$name")
     fi
   done
-  (IFS=,; printf '%s' "${missing[*]}")
+  (IFS=,; printf '%s' "${missing[*]-}")
 }
 
 redact_file() {

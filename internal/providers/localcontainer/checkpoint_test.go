@@ -1,15 +1,197 @@
 package localcontainer
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
+
+func TestCheckpointIdentityProbeDiagnostics(t *testing.T) {
+	for _, probe := range []struct {
+		name, runtime, operation, empty string
+		read                            func(context.Context, checkpointScope) (string, error)
+	}{
+		{"docker identity", "docker", "resolve Docker daemon identity", "id", checkpointDaemonID},
+		{"podman identity", "podman", "resolve Podman runtime identity", "identity", checkpointDaemonID},
+		{"docker endpoint", "docker", "resolve Docker context proof endpoint", "endpoint", checkpointContextEndpoint},
+		{"docker context", "docker", "resolve Docker context", "context", func(ctx context.Context, scope checkpointScope) (string, error) {
+			cfg := core.Config{LocalContainer: core.LocalContainerConfig{Runtime: scope.Runtime}}
+			resolved, err := checkpointScopeForServer(ctx, cfg, core.Server{})
+			return resolved.Context, err
+		}},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			dir := t.TempDir()
+			runtimePath := filepath.Join(dir, probe.runtime)
+			script := "#!/bin/sh\nprintf '%s' \"$CRABBOX_PROBE_STDOUT\"\nprintf '%s' \"$CRABBOX_PROBE_STDERR\" >&2\nexit \"$CRABBOX_PROBE_EXIT\"\n"
+			if err := os.WriteFile(runtimePath, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("DOCKER_CONTEXT", "")
+			t.Setenv("DOCKER_HOST", "")
+			t.Setenv("DOCKER_CONFIG", dir)
+			for _, tc := range []struct{ name, stdout, stderr, code, want string }{
+				{"diagnostic", "\n", "daemon unavailable\n", "0", probe.operation + ": command returned an empty " + probe.empty + ": daemon unavailable"},
+				{"silent", "", "", "0", probe.operation + ": command returned an empty " + probe.empty},
+				{"whitespace", "\t\n", " \t\n", "0", probe.operation + ": command returned an empty " + probe.empty},
+				{"bounded", "", strings.Repeat("x", 700), "0", probe.operation + ": command returned an empty " + probe.empty + ": " + strings.Repeat("x", 500) + "..."},
+				{"failure", "ignored-output", "daemon unavailable\n", "3", probe.operation + ": exit status 3: daemon unavailable"},
+				{"success with warning", "identity-ok\n", "warning\n", "0", ""},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Setenv("CRABBOX_PROBE_STDOUT", tc.stdout)
+					t.Setenv("CRABBOX_PROBE_STDERR", tc.stderr)
+					t.Setenv("CRABBOX_PROBE_EXIT", tc.code)
+					value, err := probe.read(context.Background(), checkpointScope{Runtime: runtimePath, Context: "proof"})
+					if tc.want == "" {
+						if err != nil || value == "" || strings.Contains(value, "warning") {
+							t.Fatalf("value=%q error=%v", value, err)
+						}
+						return
+					}
+					var exitErr core.ExitError
+					if !errors.As(err, &exitErr) || exitErr.Code != 7 || err.Error() != tc.want || value != "" {
+						t.Fatalf("value=%q error=%v want exit 7: %s", value, err, tc.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestLocalContainerCheckpointCLIConfigDependency(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		missingRuntime bool
+		validConfig    bool
+		wantError      string
+	}{
+		{name: "recorded_runtime"},
+		{name: "missing_runtime_invalid_config", missingRuntime: true, wantError: "parse config"},
+		{name: "missing_runtime_configured_fallback", missingRuntime: true, validConfig: true},
+		{name: "changed_daemon", wantError: "Docker daemon changed"},
+		{name: "changed_endpoint", wantError: "endpoint changed"},
+		{name: "changed_image", wantError: "tag now points to"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Chdir(root)
+			t.Setenv("XDG_STATE_HOME", root)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+			t.Setenv("DOCKER_CONTEXT", "ambient-invalid")
+			t.Setenv("DOCKER_HOST", "tcp://ambient.invalid:2376")
+			configPath := filepath.Join(root, "config.yaml")
+			t.Setenv("CRABBOX_CONFIG", configPath)
+			runtimePath, callsPath := filepath.Join(root, "docker"), filepath.Join(root, "calls")
+			write := func(path, value string, mode os.FileMode) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(value), mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			config := "machine0: [\n"
+			if tc.validConfig {
+				config = fmt.Sprintf("provider: local-container\nlocalContainer:\n  runtime: %q\n", runtimePath)
+			}
+			write(configPath, config, 0o600)
+			write(callsPath, "", 0o600)
+			metadata := checkpointScopeMetadata(checkpointScope{Runtime: runtimePath, Context: "recorded", Config: filepath.Join(root, "docker-config"), Endpoint: "unix:///recorded.sock", DaemonID: "daemon-owned"})
+			if tc.missingRuntime {
+				delete(metadata, checkpointMetadataRuntime)
+			}
+			imageID := "sha256:" + strings.Repeat("a", 64)
+			endpoint, daemon, digest := metadata[checkpointMetadataEndpoint], metadata[checkpointMetadataDaemonID], imageID
+			switch tc.name {
+			case "changed_daemon":
+				daemon = "daemon-other"
+			case "changed_endpoint":
+				endpoint = "unix:///other.sock"
+			case "changed_image":
+				digest = "sha256:" + strings.Repeat("b", 64)
+			}
+			// The fixture rejects ambient Docker routing before any simulated operation.
+			write(runtimePath, fmt.Sprintf(`#!/bin/sh
+[ "$DOCKER_CONFIG" = %q ] && [ -z "$DOCKER_HOST" ] && [ -z "$DOCKER_CONTEXT" ] || exit 90
+[ "$1 $2" = '--context recorded' ] || exit 91
+shift 2
+printf '%%s\n' "$1" >> %q
+case "$*" in
+  'context inspect recorded --format '*) printf '%%s\n' %q ;;
+  'info --format {{.ID}}') printf '%%s\n' %q ;;
+  'image inspect crabbox-checkpoint-fixture --format {{.Id}}') printf '%%s\n' %q ;;
+  'rmi -f crabbox-checkpoint-fixture') exit 0 ;;
+  *) exit 92 ;;
+esac
+`, metadata[checkpointMetadataConfig], callsPath, endpoint, daemon, digest), 0o700)
+			metaPath := filepath.Join(root, "crabbox", "checkpoints", "chk_config", "checkpoint.json")
+			if err := os.MkdirAll(filepath.Dir(metaPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			before, err := json.Marshal(map[string]any{
+				"id": "chk_config", "kind": core.CheckpointKindDockerCommit, "provider": providerName,
+				"createdAt": time.Now().UTC().Format(time.RFC3339),
+				"native":    map[string]any{"provider": providerName, "imageId": imageID, "name": "crabbox-checkpoint-fixture", "direct": true, "metadata": metadata},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			write(metaPath, string(before), 0o600)
+			var stdout bytes.Buffer
+			app := core.App{Stdout: &stdout, Stderr: io.Discard}
+			if err := app.Run(t.Context(), []string{"checkpoint", "inspect", "chk_config", "--verify", "--json"}); err != nil {
+				t.Fatal(err)
+			}
+			wantState := "available"
+			if tc.wantError != "" {
+				wantState = "unknown"
+				if tc.name == "changed_image" {
+					wantState = "conflict"
+				}
+			}
+			if !strings.Contains(stdout.String(), `"providerState":"`+wantState+`"`) {
+				t.Errorf("verify: %s, want %s", &stdout, wantState)
+			}
+			err = app.Run(t.Context(), []string{"checkpoint", "delete", "chk_config"})
+			if tc.wantError == "" {
+				if err != nil {
+					t.Errorf("cleanup: %v", err)
+				}
+				if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
+					t.Errorf("local record retained: %v", err)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Errorf("cleanup: %v, want %q", err, tc.wantError)
+				}
+				after, readErr := os.ReadFile(metaPath)
+				if readErr != nil || !bytes.Equal(before, after) {
+					t.Errorf("failed cleanup changed record: %v", readErr)
+				}
+			}
+			calls, err := os.ReadFile(callsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(calls), "rmi\n"); (tc.wantError == "" && got != 1) || (tc.wantError != "" && got != 0) {
+				t.Errorf("unsafe or missing image deletion: %s", calls)
+			}
+			if tc.missingRuntime && !tc.validConfig && len(calls) != 0 {
+				t.Errorf("runtime used despite invalid config: %s", calls)
+			}
+		})
+	}
+}
 
 func TestNativeCheckpointWorkdirUsesResolvedLeaseRoot(t *testing.T) {
 	cfg := core.Config{Provider: providerName, WorkRoot: "/stale"}
@@ -21,6 +203,46 @@ func TestNativeCheckpointWorkdirUsesResolvedLeaseRoot(t *testing.T) {
 	})
 	if got != "/resolved/cbx_123/my-app" {
 		t.Fatalf("workdir=%q", got)
+	}
+}
+
+func TestPodmanScopeCapturesConnectionAndRuntimeIdentity(t *testing.T) {
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "podman")
+	script := `#!/bin/sh
+case "$*" in
+  "system connection list --format json")
+    printf '[{"Name":"team","URI":"%s","Default":true}]\n' "${PODMAN_TEST_URI:-ssh://runner@example.invalid/run/podman.sock}"
+    ;;
+  "--connection team info --format "*)
+    printf '%s\n' 'host-a|/var/lib/containers|/run/containers|/run/podman.sock|true'
+    ;;
+  *)
+    printf 'unexpected args: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(runtimePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONTAINER_CONNECTION", "team")
+	t.Setenv("CONTAINER_HOST", "")
+	t.Setenv("DOCKER_HOST", "tcp://unrelated-docker.invalid:2376")
+	cfg := core.Config{LocalContainer: core.LocalContainerConfig{Runtime: runtimePath}}
+	scope, err := podmanScopeForConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Runtime != runtimePath || scope.Context != "team" || scope.Endpoint != "ssh://runner@example.invalid/run/podman.sock" || !strings.HasPrefix(scope.DaemonID, "podman-") {
+		t.Fatalf("scope=%#v", scope)
+	}
+	if err := validateCheckpointScope(context.Background(), scope); err != nil {
+		t.Fatalf("validate matching scope: %v", err)
+	}
+	t.Setenv("PODMAN_TEST_URI", "ssh://runner@other.invalid/run/podman.sock")
+	if err := validateCheckpointScope(context.Background(), scope); err == nil {
+		t.Fatal("repointed Podman connection validated")
 	}
 }
 
@@ -77,7 +299,7 @@ func TestParseCheckpointImageIDIgnoresNonDigestOutput(t *testing.T) {
 
 func TestCheckpointResetLeaseLabelsClearsOwnershipSelectors(t *testing.T) {
 	change := checkpointResetLeaseLabelsChange()
-	for _, key := range []string{"crabbox", "provider", "lease", "slug", "keep", "expires_at"} {
+	for _, key := range []string{"crabbox", "provider", "lease", "slug", "keep", "expires_at", "fixed_intent_sha256"} {
 		if !strings.Contains(change, ` `+key+`=""`) {
 			t.Fatalf("label reset missing %s", key)
 		}
@@ -241,6 +463,48 @@ func TestCheckpointScopeForServerUsesPersistedLabels(t *testing.T) {
 	labels[checkpointMetadataDaemonID] = "another-daemon"
 	if _, err := checkpointScopeForServer(context.Background(), core.Config{}, core.Server{Labels: labels}); err == nil {
 		t.Fatal("expected changed persisted daemon identity to fail")
+	}
+}
+
+func TestCheckpointScopeForServerUsesExactClaimSnapshot(t *testing.T) {
+	binDir := writeCheckpointScopeDocker(t, "unix:///claim/docker.sock", "daemon-123")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_CONTEXT", "ambient-invalid")
+	t.Setenv("DOCKER_HOST", "tcp://ambient.invalid:2376")
+	server := core.Server{Labels: map[string]string{
+		checkpointMetadataRuntime:  "docker",
+		checkpointMetadataContext:  "remote-context",
+		checkpointMetadataDaemonID: "daemon-123",
+	}}
+	claimLabels := shared.CloneLabels(server.Labels)
+	claimLabels[checkpointMetadataConfig] = "/claim/docker-config"
+	claimLabels[checkpointMetadataEndpoint] = "unix:///claim/docker.sock"
+	core.SetServerLeaseClaimSnapshot(&server, core.LeaseClaim{Labels: claimLabels}, true)
+	scope, err := checkpointScopeForServer(context.Background(), core.Config{}, server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Context != "remote-context" || scope.Config != "/claim/docker-config" || scope.Endpoint != "unix:///claim/docker.sock" || scope.DaemonID != "daemon-123" {
+		t.Fatalf("claim scope=%#v", scope)
+	}
+}
+
+func TestCheckpointScopeForServerCompletesPrivateRoutingOmittedFromLabels(t *testing.T) {
+	binDir := writeCheckpointScopeDocker(t, "unix:///tmp/docker.sock", "daemon-123")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_CONTEXT", "ambient-invalid")
+	t.Setenv("DOCKER_HOST", "tcp://ambient.invalid:2376")
+	labels := map[string]string{
+		checkpointMetadataRuntime:  "docker",
+		checkpointMetadataContext:  "remote-context",
+		checkpointMetadataDaemonID: "daemon-123",
+	}
+	scope, err := checkpointScopeForServer(context.Background(), core.Config{}, core.Server{Labels: labels})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Context != "remote-context" || scope.Endpoint != "unix:///tmp/docker.sock" || scope.Config == "" || scope.DaemonID != "daemon-123" {
+		t.Fatalf("completed scope=%#v", scope)
 	}
 }
 

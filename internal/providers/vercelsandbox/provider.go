@@ -12,20 +12,18 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
-
 func (Provider) ServerTypeForConfig(core.Config) string { return "" }
-func (Provider) ServerTypeForClass(string) string       { return "" }
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      providerFamily,
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureArchiveSync, core.FeatureCleanup},
-		Coordinator: core.CoordinatorNever,
+		Authentication:             core.DirectProviderAuthentication(core.ProviderAuthenticationSDKCredentials),
+		SyncGuardrailFullCandidate: true,
+		Name:                       providerName,
+		Family:                     providerFamily,
+		Kind:                       core.ProviderKindDelegatedRun,
+		Targets:                    []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:                   core.FeatureSet{core.FeatureArchiveSync, core.FeatureCleanup, core.FeatureRunSession},
+		Coordinator:                core.CoordinatorNever,
+		ClassDisposition:           core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -49,34 +47,22 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return NewBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "vercel-sandbox doctor backend unavailable")
-	}
-	return doctor, nil
-}
-
-func NewBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func NewBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	cfg.Provider = providerName
 	return &backend{spec: spec, cfg: cfg, rt: rt, newClient: newBridgeClient}
 }
 
 type backend struct {
-	spec            ProviderSpec
-	cfg             Config
-	rt              Runtime
+	spec            core.ProviderSpec
+	cfg             core.Config
+	rt              core.Runtime
 	resolvedProject string
 	resolvedTeam    string
 	legacyScopeBase string
-	newClient       func(Config, Runtime) (vercelSandboxClient, error)
+	newClient       func(core.Config, core.Runtime) (vercelSandboxClient, error)
 }
 
-func (b *backend) Spec() ProviderSpec { return b.spec }
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
 func (b *backend) client() (vercelSandboxClient, error) {
 	if b.newClient != nil {

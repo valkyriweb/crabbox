@@ -1,0 +1,169 @@
+name: Verify Homebrew Release
+run-name: Verify Homebrew ${{ inputs.tag }} from public release ${{ inputs.release_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Signed stable release tag
+        required: true
+        type: string
+      tag_object:
+        description: Signed annotated tag object SHA
+        required: true
+        type: string
+      source_commit:
+        description: Peeled release source commit SHA
+        required: true
+        type: string
+      verifier_commit:
+        description: Protected release verifier commit SHA
+        required: true
+        type: string
+      release_id:
+        description: Published GitHub release ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard-protected-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out protected Homebrew workflow tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Guard protected default-branch workflow
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RUN_SHA: ${{ github.sha }}
+          VERIFIER_COMMIT: ${{ inputs.verifier_commit }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || exit 1
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$VERIFIER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          [[ "$GITHUB_REPOSITORY" == openclaw/crabbox ]] || exit 1
+          expected_ref="refs/heads/$DEFAULT_BRANCH"
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/verify-homebrew.yml@$expected_ref"
+          [[ "$REF_PROTECTED" == true ]] || exit 1
+          [[ "$GITHUB_REF" == "$expected_ref" ]] || exit 1
+          [[ "$GITHUB_WORKFLOW_REF" == "$expected_workflow_ref" ]] || exit 1
+          [[ "$WORKFLOW_SHA" == "$RUN_SHA" ]] || exit 1
+
+          test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "$VERIFIER_COMMIT"
+          git merge-base --is-ancestor "$VERIFIER_COMMIT" "$WORKFLOW_SHA"
+
+  verify:
+    name: verify-${{ matrix.arch }}
+    needs: guard
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: xcode-27
+            arch: arm64
+          - runner: xcode-27
+            arch: x86_64
+    steps:
+
+      - name: Check out protected Homebrew tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up macOS verification architecture
+        env:
+          VERIFY_ARCH: ${{ matrix.arch }}
+        run: bash scripts/setup-release-macos-architecture.sh "$VERIFY_ARCH" homebrew
+
+      - name: Set up Go for build-info inspection
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node for protected release tooling
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Download frozen public release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$WORKFLOW_COMMIT"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || exit 1
+          version=${RELEASE_TAG#v}
+          assets=(
+            checksums.txt
+            provenance.json
+            "crabbox_${version}_darwin_amd64.tar.gz"
+            "crabbox_${version}_darwin_arm64.tar.gz"
+            "crabbox_${version}_linux_amd64.tar.gz"
+            "crabbox_${version}_linux_arm64.tar.gz"
+            "crabbox_${version}_windows_amd64.zip"
+            "crabbox_${version}_windows_arm64.zip"
+          )
+          assets_dir="$RUNNER_TEMP/release-assets"
+          mkdir -m 700 "$assets_dir"
+          for asset in "${assets[@]}"; do
+            curl --disable --fail --location --retry 3 --retry-all-errors --silent --show-error \
+              --output "$assets_dir/$asset" \
+              "https://github.com/openclaw/crabbox/releases/download/$RELEASE_TAG/$asset"
+          done
+
+      - name: Read public release metadata with read-only token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          gh api --method GET "repos/openclaw/crabbox/releases/$RELEASE_ID" \
+            >"$RUNNER_TEMP/public-release.json"
+
+      - name: Verify public Homebrew install without credentials
+        shell: bash
+        env:
+          RELEASE_ID: ${{ inputs.release_id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          TAG_OBJECT: ${{ inputs.tag_object }}
+          VERIFIER_COMMIT: ${{ inputs.verifier_commit }}
+          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+          VERIFY_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_RUNTIME_TOKEN GH_TOKEN GITHUB_TOKEN
+          unset HOMEBREW_GITHUB_API_TOKEN HOMEBREW_TAP_GITHUB_TOKEN
+          CRABBOX_VERIFY_TOOLING_COMMIT="$WORKFLOW_COMMIT" \
+            CRABBOX_HOMEBREW_RELEASE_METADATA="$RUNNER_TEMP/public-release.json" \
+            /usr/bin/arch "-$VERIFY_ARCH" /bin/bash scripts/verify-homebrew-release.sh \
+            "$RELEASE_TAG" "$RUNNER_TEMP/release-assets" \
+            "$TAG_OBJECT" "$SOURCE_COMMIT" "$VERIFIER_COMMIT" \
+            "$RELEASE_ID"

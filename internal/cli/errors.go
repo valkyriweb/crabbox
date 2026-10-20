@@ -2,6 +2,16 @@ package cli
 
 import "errors"
 
+// MissingLeaseClaimError preserves the resolver's error contract while letting
+// CLI stop explain a missing claim without claiming proof of a previous stop.
+type MissingLeaseClaimError struct {
+	LeaseID string
+	Err     error
+}
+
+func (e *MissingLeaseClaimError) Error() string { return e.Err.Error() }
+func (e *MissingLeaseClaimError) Unwrap() error { return e.Err }
+
 type ExitError struct {
 	Code    int
 	Message string
@@ -15,6 +25,16 @@ func AsExitError(err error, target *ExitError) bool {
 	return errors.As(err, target)
 }
 
-func exit(code int, format string, args ...any) ExitError {
+// ExitCodeForError returns the first matched ExitError's nonzero code, or fallback.
+// Nil errors and matched zero codes use fallback; signed codes are preserved.
+func ExitCodeForError(err error, fallback int) int {
+	var exitErr ExitError
+	if AsExitError(err, &exitErr) && exitErr.Code != 0 {
+		return exitErr.Code
+	}
+	return fallback
+}
+
+func Exit(code int, format string, args ...any) ExitError {
 	return ExitError{Code: code, Message: sprintf(format, args...)}
 }

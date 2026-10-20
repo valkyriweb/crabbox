@@ -4,21 +4,85 @@ import (
 	"bytes"
 	"context"
 	"crypto/aes"
+	"crypto/des"
 	"crypto/md5"
 	"encoding/binary"
+	"errors"
 	"flag"
+	"fmt"
 	"image/color"
 	"io"
 	"math/big"
+	"math/bits"
 	"net"
+	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type desktopCredentialTestProvider struct{}
 
-func (desktopCredentialTestProvider) Name() string      { return "desktop-credential-test" }
-func (desktopCredentialTestProvider) Aliases() []string { return nil }
+func serveTestARDHandshakeUntilSecurityResult(conn net.Conn, username, password string) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("RFB 003.889\n")); err != nil {
+		return err
+	}
+	clientVersion := make([]byte, 12)
+	if _, err := io.ReadFull(conn, clientVersion); err != nil {
+		return err
+	}
+	if !bytes.Equal(clientVersion, []byte("RFB 003.008\n")) {
+		return fmt.Errorf("client version=%q", clientVersion)
+	}
+	if _, err := conn.Write([]byte{1, rfbSecurityARD}); err != nil {
+		return err
+	}
+	security := []byte{0}
+	if _, err := io.ReadFull(conn, security); err != nil {
+		return err
+	}
+	if security[0] != rfbSecurityARD {
+		return fmt.Errorf("security type=%d", security[0])
+	}
+
+	keyLength := 8
+	g := big.NewInt(5)
+	p := big.NewInt(23)
+	serverPrivate := big.NewInt(6)
+	serverPublic := new(big.Int).Exp(g, serverPrivate, p)
+	params := make([]byte, 4+keyLength*2)
+	binary.BigEndian.PutUint16(params[0:2], uint16(g.Uint64()))
+	binary.BigEndian.PutUint16(params[2:4], uint16(keyLength))
+	copy(params[4:4+keyLength], leftPadBigInt(p, keyLength))
+	copy(params[4+keyLength:], leftPadBigInt(serverPublic, keyLength))
+	if _, err := conn.Write(params); err != nil {
+		return err
+	}
+
+	response := make([]byte, 128+keyLength)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return err
+	}
+	clientPublic := new(big.Int).SetBytes(response[128:])
+	shared := new(big.Int).Exp(clientPublic, serverPrivate, p)
+	key := md5.Sum(leftPadBigInt(shared, keyLength))
+	credentials, err := aesECBDecryptForTest(key[:], response[:128])
+	if err != nil {
+		return err
+	}
+	if got := string(credentials[:bytes.IndexByte(credentials[:64], 0)]); got != username {
+		return fmt.Errorf("username=%q", got)
+	}
+	if got := string(credentials[64 : 64+bytes.IndexByte(credentials[64:], 0)]); got != password {
+		return fmt.Errorf("password mismatch")
+	}
+	_, err = conn.Write([]byte{0, 0, 0, 0})
+	return err
+}
+
 func (desktopCredentialTestProvider) Spec() ProviderSpec {
 	return ProviderSpec{Name: "desktop-credential-test"}
 }
@@ -32,11 +96,14 @@ func (desktopCredentialTestProvider) DesktopCredentials(Config, SSHTarget) (Desk
 }
 
 func TestDesktopCredentialsFromProvider(t *testing.T) {
-	got, ok := desktopCredentialsFromProvider(
+	got, ok, err := desktopCredentialsFromProvider(
 		desktopCredentialTestProvider{},
 		Config{},
 		SSHTarget{User: "lease-user"},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("provider desktop credentials should be available")
 	}
@@ -58,7 +125,7 @@ func TestCaptureRFBFrameSupportsAppleRemoteDesktopAuth(t *testing.T) {
 	img, err := captureRFBFrameFromConn(context.Background(), client, rfbCredentials{
 		Username: "ec2-user",
 		Password: "example-pass",
-	})
+	}, localWebVNCAuthARD)
 	if err != nil {
 		t.Fatalf("capture RFB frame: %v", err)
 	}
@@ -73,6 +140,219 @@ func TestCaptureRFBFrameSupportsAppleRemoteDesktopAuth(t *testing.T) {
 	}
 }
 
+func TestPreflightRFBAuthenticationSupportsAppleRemoteDesktopAuth(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestARDHandshakeUntilSecurityResult(server, "ec2-user", "example-pass")
+	}()
+
+	if err := preflightRFBAuthenticationFromConn(context.Background(), client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}); err != nil {
+		t.Fatalf("preflight RFB authentication: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB server: %v", err)
+	}
+}
+
+func TestNegotiateRFBSecurityTypeHonorsAuthenticationMode(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode localWebVNCAuthenticationMode
+		want byte
+	}{
+		{name: "ARD", mode: localWebVNCAuthARD, want: rfbSecurityARD},
+		{name: "VNC", mode: localWebVNCAuthVNC, want: rfbSecurityVNC},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			serverErr := make(chan error, 1)
+			go func() {
+				if _, err := server.Write([]byte{2, rfbSecurityARD, rfbSecurityVNC}); err != nil {
+					serverErr <- err
+					return
+				}
+				selected := []byte{0}
+				_, err := io.ReadFull(server, selected)
+				if err == nil && selected[0] != test.want {
+					err = fmt.Errorf("selected security type=%d, want %d", selected[0], test.want)
+				}
+				serverErr <- err
+			}()
+			got, err := negotiateRFBSecurityTypeForMode(client, rfbCredentials{Username: "user", Password: "secret"}, test.mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("security type=%d, want %d", got, test.want)
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPreflightRFBAuthenticationRejectsNoAuth(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if _, err := server.Write([]byte("RFB 003.008\n")); err != nil {
+			serverErr <- err
+			return
+		}
+		version := make([]byte, 12)
+		if _, err := io.ReadFull(server, version); err != nil {
+			serverErr <- err
+			return
+		}
+		if _, err := server.Write([]byte{1, rfbSecurityNone}); err != nil {
+			serverErr <- err
+			return
+		}
+		selected := []byte{0}
+		_, err := io.ReadFull(server, selected)
+		serverErr <- err
+	}()
+
+	err := preflightRFBAuthenticationFromConn(context.Background(), client, rfbCredentials{
+		Username: "screen-user",
+		Password: "screen-secret",
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not require credential authentication") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreflightRFBAuthenticationSupportsRFB33VNC(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	const password = "example-pass"
+	serverErr := make(chan error, 1)
+	go func() {
+		if _, err := server.Write([]byte("RFB 003.003\n")); err != nil {
+			serverErr <- err
+			return
+		}
+		version := make([]byte, 12)
+		if _, err := io.ReadFull(server, version); err != nil {
+			serverErr <- err
+			return
+		}
+		if string(version) != "RFB 003.003\n" {
+			serverErr <- fmt.Errorf("client version=%q", version)
+			return
+		}
+		security := make([]byte, 4)
+		binary.BigEndian.PutUint32(security, uint32(rfbSecurityVNC))
+		if _, err := server.Write(security); err != nil {
+			serverErr <- err
+			return
+		}
+		challenge := []byte("0123456789abcdef")
+		if _, err := server.Write(challenge); err != nil {
+			serverErr <- err
+			return
+		}
+		response := make([]byte, len(challenge))
+		if _, err := io.ReadFull(server, response); err != nil {
+			serverErr <- err
+			return
+		}
+		expected, err := directSSHWebVNCChallengeResponse(password, challenge)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if !bytes.Equal(response, expected) {
+			serverErr <- fmt.Errorf("unexpected VNC challenge response")
+			return
+		}
+		_, err = server.Write([]byte{0, 0, 0, 0})
+		serverErr <- err
+	}()
+
+	if err := preflightRFBAuthenticationFromConn(context.Background(), client, rfbCredentials{Password: password}); err != nil {
+		t.Fatalf("preflight RFB 3.3 authentication: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreflightRFBAuthenticationSupportsAliasBanner(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	const password = "example-pass"
+	serverErr := make(chan error, 1)
+	go func() {
+		if _, err := server.Write([]byte("RFB 004.000\n")); err != nil {
+			serverErr <- err
+			return
+		}
+		version := make([]byte, 12)
+		if _, err := io.ReadFull(server, version); err != nil {
+			serverErr <- err
+			return
+		}
+		if string(version) != "RFB 003.008\n" {
+			serverErr <- fmt.Errorf("client version=%q", version)
+			return
+		}
+		if _, err := server.Write([]byte{1, rfbSecurityVNC}); err != nil {
+			serverErr <- err
+			return
+		}
+		selected := []byte{0}
+		if _, err := io.ReadFull(server, selected); err != nil {
+			serverErr <- err
+			return
+		}
+		challenge := []byte("0123456789abcdef")
+		if _, err := server.Write(challenge); err != nil {
+			serverErr <- err
+			return
+		}
+		response := make([]byte, len(challenge))
+		if _, err := io.ReadFull(server, response); err != nil {
+			serverErr <- err
+			return
+		}
+		expected, err := directSSHWebVNCChallengeResponse(password, challenge)
+		if err != nil || !bytes.Equal(response, expected) {
+			serverErr <- fmt.Errorf("unexpected VNC challenge response: %v", err)
+			return
+		}
+		_, err = server.Write([]byte{0, 0, 0, 0})
+		serverErr <- err
+	}()
+
+	if err := preflightRFBAuthenticationFromConn(context.Background(), client, rfbCredentials{Password: password}); err != nil {
+		t.Fatalf("preflight alias-banner authentication: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptureRFBFrameReadsNoneAuthSecurityResult(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
@@ -83,7 +363,7 @@ func TestCaptureRFBFrameReadsNoneAuthSecurityResult(t *testing.T) {
 		serverErr <- serveTestNoneRFB(server)
 	}()
 
-	img, err := captureRFBFrameFromConn(context.Background(), client, rfbCredentials{})
+	img, err := captureRFBFrameFromConn(context.Background(), client, rfbCredentials{}, localWebVNCAuthAuto)
 	if err != nil {
 		t.Fatalf("capture RFB frame: %v", err)
 	}
@@ -93,6 +373,1284 @@ func TestCaptureRFBFrameReadsNoneAuthSecurityResult(t *testing.T) {
 	if got := color.RGBAModel.Convert(img.At(0, 0)); got != (color.RGBA{B: 255, A: 255}) {
 		t.Fatalf("pixel=%v", got)
 	}
+}
+
+func TestClickRFBPointerSendsPressAndRelease(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestPointerRFB(server, 12, 34)
+	}()
+
+	if err := clickRFBPointerFromConn(context.Background(), client, rfbCredentials{}, localWebVNCAuthAuto, 12, 34); err != nil {
+		t.Fatalf("click RFB pointer: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB server: %v", err)
+	}
+}
+
+func TestClickRFBPointerHonorsVNCModeWhenServerOffersARD(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestVNCAuthPointerRFB(server, 12, 34)
+	}()
+
+	credentials := rfbCredentials{Username: "parallels-user", Password: "password"}
+	if err := clickRFBPointerFromConn(context.Background(), client, credentials, localWebVNCAuthVNC, 12, 34); err != nil {
+		t.Fatalf("click RFB pointer with VNC mode: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake dual-offer RFB server: %v", err)
+	}
+}
+
+func TestClickRFBPointerSupportsRFB33VNC(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestLegacyVNCAuthPointer(server, "RFB 003.003\n", "password", 12, 34)
+	}()
+
+	credentials := rfbCredentials{Password: "password"}
+	if err := clickRFBPointerFromConn(context.Background(), client, credentials, localWebVNCAuthVNC, 12, 34); err != nil {
+		t.Fatalf("click RFB 3.3 pointer: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB 3.3 server: %v", err)
+	}
+}
+
+func TestClickRFBPointerFallsBackToRFB33ForUnknownServerVersion(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestLegacyVNCAuthPointer(server, "RFB 003.009\n", "password", 12, 34)
+	}()
+
+	credentials := rfbCredentials{Password: "password"}
+	if err := clickRFBPointerFromConn(context.Background(), client, credentials, localWebVNCAuthVNC, 12, 34); err != nil {
+		t.Fatalf("click unknown-version RFB pointer: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake unknown-version RFB server: %v", err)
+	}
+}
+
+func TestClickRFBPointerSupportsRFB37NoneAuth(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestRFB37NoneAuthPointer(server, 12, 34)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := clickRFBPointerFromConn(ctx, client, rfbCredentials{}, localWebVNCAuthAuto, 12, 34); err != nil {
+		t.Fatalf("click RFB 3.7 pointer: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB 3.7 server: %v", err)
+	}
+}
+
+func TestWriteRFBPointerEventRejectsProtocolOverflow(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	for _, point := range [][2]int{{-1, 0}, {0, -1}, {1 << 16, 0}, {0, 1 << 16}} {
+		if err := writeRFBPointerEvent(client, 0, point[0], point[1]); err == nil {
+			t.Errorf("pointer coordinates %d,%d should be rejected", point[0], point[1])
+		}
+	}
+}
+
+func useRFBInputReadySettle(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := rfbInputReadySettle
+	rfbInputReadySettle = d
+	t.Cleanup(func() { rfbInputReadySettle = prev })
+}
+
+func TestRFBInputReadySettleIsDocumentedDelay(t *testing.T) {
+	if defaultRFBInputReadySettle != 2*time.Second {
+		t.Fatalf("default RFB input-ready settle=%s, want 2s documented delay", defaultRFBInputReadySettle)
+	}
+	if rfbInputReadySettle != defaultRFBInputReadySettle {
+		t.Fatalf("rfbInputReadySettle=%s, want default %s", rfbInputReadySettle, defaultRFBInputReadySettle)
+	}
+}
+
+func TestTypeRFBTextSendsExactKeyEventsAfterReadyAndDrain(t *testing.T) {
+	useRFBInputReadySettle(t, 0)
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	const text = "_CRABBOX_1982F4E8_1736"
+	wantKeys := rfbKeysymsForTestText(t, text)
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestTypeRFB(server, "ec2-user", "example-pass", wantKeys, testTypeRFBReadyDrain)
+	}()
+
+	if err := typeRFBTextFromConn(context.Background(), client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}, localWebVNCAuthARD, text); err != nil {
+		t.Fatalf("type RFB text: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB server: %v", err)
+	}
+}
+
+func TestTypeRFBTextSendsUnicodeKeyEventsAfterReadyAndDrain(t *testing.T) {
+	useRFBInputReadySettle(t, 0)
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	const text = "Aa !\n\té🦀"
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestTypeRFB(server, "ec2-user", "example-pass", []uint32{0x41, 0x61, 0x20, 0x21, 0xff0d, 0xff09, 0xe9, 0x0101f980}, testTypeRFBReadyDrain)
+	}()
+
+	if err := typeRFBTextFromConn(context.Background(), client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}, localWebVNCAuthARD, text); err != nil {
+		t.Fatalf("type RFB text: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB server: %v", err)
+	}
+}
+
+func TestTypeRFBTextRequiresCredentialAuthentication(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestNoneAuthOfferWithoutClientInit(server)
+	}()
+
+	err := typeRFBTextFromConn(context.Background(), client, rfbCredentials{
+		Username: "screen-user",
+		Password: "screen-secret",
+	}, localWebVNCAuthAuto, "_CRABBOX")
+	_ = client.Close()
+	if err == nil || !strings.Contains(err.Error(), "did not require credential authentication") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTypeRFBTextFailsOnAuthenticationFailure(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestTypeRFB(server, "ec2-user", "example-pass", nil, testTypeRFBAuthFailed)
+	}()
+
+	err := typeRFBTextFromConn(context.Background(), client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}, localWebVNCAuthARD, "_CRABBOX")
+	if err == nil || !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTypeRFBTextHonorsCanceledContext(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := typeRFBTextFromConn(ctx, client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}, localWebVNCAuthARD, "_CRABBOX")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestTypeRFBTextFailsWhenReadyFramebufferIsMissing(t *testing.T) {
+	useRFBInputReadySettle(t, 0)
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestTypeRFB(server, "ec2-user", "example-pass", nil, testTypeRFBNoReadyFrame)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := typeRFBTextFromConn(ctx, client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}, localWebVNCAuthARD, "_CRABBOX")
+	if err == nil || !strings.Contains(err.Error(), "wait for RFB session ready") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTypeRFBTextFailsWhenDrainFramebufferIsMissing(t *testing.T) {
+	useRFBInputReadySettle(t, 0)
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	const text = "_CRABBOX"
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveTestTypeRFB(server, "ec2-user", "example-pass", rfbKeysymsForTestText(t, text), testTypeRFBReadyOnly)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := typeRFBTextFromConn(ctx, client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}, localWebVNCAuthARD, text)
+	if err == nil || !strings.Contains(err.Error(), "drain RFB session after typing") {
+		t.Fatalf("error=%v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTypeRFBTextWaitsForInputReadyBeforeFirstKey(t *testing.T) {
+	const settle = 40 * time.Millisecond
+	useRFBInputReadySettle(t, settle)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	const text = "A"
+	serverErr := make(chan error, 1)
+	go func() {
+		_ = server.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := serveTestARDHandshakeWithSecurityResult(server, "ec2-user", "example-pass", true); err != nil {
+			serverErr <- err
+			return
+		}
+		clientInit := []byte{0}
+		if _, err := io.ReadFull(server, clientInit); err != nil {
+			serverErr <- err
+			return
+		}
+		if clientInit[0] != 1 {
+			serverErr <- errUnexpectedTestBytes("client init", clientInit)
+			return
+		}
+		const width, height = 2, 1
+		serverInit := make([]byte, 24)
+		binary.BigEndian.PutUint16(serverInit[0:2], width)
+		binary.BigEndian.PutUint16(serverInit[2:4], height)
+		serverInit[4] = 32
+		serverInit[5] = 24
+		serverInit[7] = 1
+		if _, err := server.Write(serverInit); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := readTestRFBReadySetup(server); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := writeTestRFBRawFrame(server, width, height, []byte{0, 0, 255, 255, 0, 255, 0, 255}); err != nil {
+			serverErr <- err
+			return
+		}
+		frameAt := time.Now()
+		event := make([]byte, 8)
+		if _, err := io.ReadFull(server, event); err != nil {
+			serverErr <- err
+			return
+		}
+		waited := time.Since(frameAt)
+		if event[0] != 4 {
+			serverErr <- fmt.Errorf("wanted first key after input-ready settle, got message %d", event[0])
+			return
+		}
+		if waited < settle {
+			serverErr <- fmt.Errorf("first key %s after framebuffer, want >= %s input-ready settle", waited, settle)
+			return
+		}
+		if event[1] != 1 || binary.BigEndian.Uint32(event[4:8]) != 0x41 {
+			serverErr <- errUnexpectedTestBytes("key event", event)
+			return
+		}
+		up := make([]byte, 8)
+		if _, err := io.ReadFull(server, up); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := readTestRFBFramebufferRequest(server); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- writeTestRFBRawFrame(server, width, height, []byte{255, 0, 0, 255, 0, 0, 255, 255})
+	}()
+
+	if err := typeRFBTextFromConn(context.Background(), client, rfbCredentials{
+		Username: "ec2-user",
+		Password: "example-pass",
+	}, localWebVNCAuthARD, text); err != nil {
+		t.Fatalf("type RFB text: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB server: %v", err)
+	}
+}
+
+func TestTypeRFBTextHonorsCanceledContextDuringInputReady(t *testing.T) {
+	const settle = 250 * time.Millisecond
+	useRFBInputReadySettle(t, settle)
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	frameWritten := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		_ = server.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := serveTestARDHandshakeWithSecurityResult(server, "ec2-user", "example-pass", true); err != nil {
+			serverErr <- err
+			return
+		}
+		clientInit := []byte{0}
+		if _, err := io.ReadFull(server, clientInit); err != nil {
+			serverErr <- err
+			return
+		}
+		const width, height = 2, 1
+		serverInit := make([]byte, 24)
+		binary.BigEndian.PutUint16(serverInit[0:2], width)
+		binary.BigEndian.PutUint16(serverInit[2:4], height)
+		serverInit[4] = 32
+		serverInit[5] = 24
+		serverInit[7] = 1
+		if _, err := server.Write(serverInit); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := readTestRFBReadySetup(server); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := writeTestRFBRawFrame(server, width, height, []byte{0, 0, 255, 255, 0, 255, 0, 255}); err != nil {
+			serverErr <- err
+			return
+		}
+		close(frameWritten)
+		first := []byte{0}
+		n, err := server.Read(first)
+		if n > 0 && first[0] == 4 {
+			serverErr <- fmt.Errorf("key event during canceled input-ready settle")
+			return
+		}
+		if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "closed") {
+			serverErr <- nil
+			return
+		}
+		serverErr <- err
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := time.Now()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- typeRFBTextFromConn(ctx, client, rfbCredentials{
+			Username: "ec2-user",
+			Password: "example-pass",
+		}, localWebVNCAuthARD, "_CRABBOX")
+	}()
+	select {
+	case <-frameWritten:
+	case err := <-serverErr:
+		t.Fatalf("server failed before framebuffer: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ready framebuffer")
+	}
+	cancel()
+	err := <-errCh
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "wait for RFB input ready") {
+		t.Fatalf("error=%v", err)
+	}
+	if elapsed >= settle {
+		t.Fatalf("canceled input-ready wait took %s, want < settle %s", elapsed, settle)
+	}
+	_ = client.Close()
+	if err := <-serverErr; err != nil {
+		t.Fatalf("fake RFB server: %v", err)
+	}
+}
+
+func TestTypeRFBTextReleasesPressedKeyWhenInterrupted(t *testing.T) {
+	errInjected := errors.New("injected key-up failure")
+	for _, tt := range []struct {
+		name          string
+		afterKeyEvent func(client net.Conn, cancel context.CancelFunc, down bool) error
+		wantErr       error
+		wantRelease   string
+		wantEvents    []string
+	}{
+		{
+			name: "canceled after key down with expired deadline",
+			afterKeyEvent: func(client net.Conn, cancel context.CancelFunc, down bool) error {
+				if down {
+					cancel()
+					_ = client.SetDeadline(time.Now())
+				}
+				return nil
+			},
+			wantErr:    context.Canceled,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "canceled after key down with closed transport",
+			afterKeyEvent: func(client net.Conn, cancel context.CancelFunc, down bool) error {
+				if down {
+					cancel()
+					_ = client.Close()
+				}
+				return nil
+			},
+			wantErr:     context.Canceled,
+			wantRelease: "release RFB key",
+			wantEvents:  []string{"down a"},
+		},
+		{
+			name: "deadline expires before key up",
+			afterKeyEvent: func(client net.Conn, _ context.CancelFunc, down bool) error {
+				if down {
+					_ = client.SetWriteDeadline(time.Now())
+				}
+				return nil
+			},
+			wantErr:    os.ErrDeadlineExceeded,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "complete key down write with error is released",
+			afterKeyEvent: func(_ net.Conn, _ context.CancelFunc, down bool) error {
+				if down {
+					return errInjected
+				}
+				return nil
+			},
+			wantErr:    errInjected,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "canceled after key up confirms without double release",
+			afterKeyEvent: func(_ net.Conn, cancel context.CancelFunc, down bool) error {
+				if !down {
+					cancel()
+				}
+				return nil
+			},
+			wantErr:    context.Canceled,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+		{
+			name: "complete key up write with error confirms without double release",
+			afterKeyEvent: func(_ net.Conn, _ context.CancelFunc, down bool) error {
+				if !down {
+					return errInjected
+				}
+				return nil
+			},
+			wantErr:    errInjected,
+			wantEvents: []string{"down a", "up a", "frame"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			useRFBInputReadySettle(t, 0)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+
+			type serverResult struct {
+				events []string
+				err    error
+			}
+			serverDone := make(chan serverResult, 1)
+			go func() {
+				events, err := serveTestTypeRFBRecordingInput(server, "ec2-user", "example-pass")
+				serverDone <- serverResult{events: events, err: err}
+			}()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			conn := &rfbKeyEventHookConn{Conn: client, afterKeyEvent: func(down bool) error {
+				return tt.afterKeyEvent(client, cancel, down)
+			}}
+			err := typeRFBTextFromConn(ctx, conn, rfbCredentials{
+				Username: "ec2-user",
+				Password: "example-pass",
+			}, localWebVNCAuthARD, "ab")
+			_ = client.Close()
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error=%v, want %v", err, tt.wantErr)
+			}
+			if tt.wantRelease == "" && strings.Contains(err.Error(), "release") {
+				t.Fatalf("error=%v, want no release failure", err)
+			}
+			if tt.wantRelease != "" && !strings.Contains(err.Error(), tt.wantRelease) {
+				t.Fatalf("error=%v, want %q", err, tt.wantRelease)
+			}
+			result := <-serverDone
+			if result.err != nil {
+				t.Fatalf("fake RFB server: %v", result.err)
+			}
+			if !slices.Equal(result.events, tt.wantEvents) {
+				t.Fatalf("client input=%q, want %q", result.events, tt.wantEvents)
+			}
+		})
+	}
+}
+
+func TestTypeRFBTextCompletesPartialKeyRelease(t *testing.T) {
+	for _, written := range []int{0, 1, 4, 7} {
+		t.Run(fmt.Sprintf("written=%d", written), func(t *testing.T) {
+			useRFBInputReadySettle(t, 0)
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			type serverResult struct {
+				events []string
+				err    error
+			}
+			serverDone := make(chan serverResult, 1)
+			go func() {
+				events, err := serveTestTypeRFBRecordingInput(server, "ec2-user", "example-pass")
+				serverDone <- serverResult{events, err}
+			}()
+			conn := &rfbPartialKeyUpConn{Conn: client, written: written}
+			err := typeRFBTextFromConn(context.Background(), conn, rfbCredentials{
+				Username: "ec2-user", Password: "example-pass",
+			}, localWebVNCAuthARD, "ab")
+			_ = client.Close()
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("error=%v, want deadline exceeded", err)
+			}
+			result := <-serverDone
+			if result.err != nil {
+				t.Fatalf("fake RFB server: %v (events=%q)", result.err, result.events)
+			}
+			if want := []string{"down a", "up a", "frame"}; !slices.Equal(result.events, want) {
+				t.Fatalf("client input=%q, want %q", result.events, want)
+			}
+		})
+	}
+}
+
+type rfbPartialKeyUpConn struct {
+	net.Conn
+	written int
+	failed  bool
+}
+
+func (c *rfbPartialKeyUpConn) Write(p []byte) (int, error) {
+	if !c.failed && len(p) == 8 && p[0] == 4 && p[1] == 0 {
+		c.failed = true
+		if c.written > 0 {
+			if n, err := c.Conn.Write(p[:c.written]); err != nil {
+				return n, err
+			}
+		}
+		_ = c.Conn.SetWriteDeadline(time.Now())
+		return c.written, os.ErrDeadlineExceeded
+	}
+	return c.Conn.Write(p)
+}
+
+func TestReleaseRFBKeyAfterErrorBoundsCleanup(t *testing.T) {
+	for _, acceptRelease := range []bool{false, true} {
+		t.Run(fmt.Sprintf("acceptRelease=%t", acceptRelease), func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			if acceptRelease {
+				go func() {
+					// Accept the release and framebuffer request, but never reply.
+					_, _ = io.ReadFull(server, make([]byte, 8+10))
+				}()
+			}
+			started := time.Now()
+			err := releaseRFBKeyAfterError(client, 'a', 0, 2, 1, context.Canceled)
+			if !errors.Is(err, context.Canceled) || !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("error=%v, want cancellation and cleanup timeout", err)
+			}
+			if elapsed := time.Since(started); elapsed > rfbKeyReleaseTimeout+time.Second {
+				t.Fatalf("cleanup took %s, want bounded release", elapsed)
+			}
+			want := "release RFB key"
+			if acceptRelease {
+				want = "confirm RFB key release"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error=%v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestRFBKeyReleaseTunnelContextOutlivesCancellationByGrace(t *testing.T) {
+	const grace = 100 * time.Millisecond
+	cause := errors.New("caller stopped")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	tunnelCtx, stopTunnel := rfbKeyReleaseTunnelContext(ctx, grace)
+	defer stopTunnel()
+
+	started := time.Now()
+	cancel(cause)
+	select {
+	case <-tunnelCtx.Done():
+		t.Fatal("tunnel context ended with the caller context")
+	case <-time.After(grace / 2):
+	}
+	select {
+	case <-tunnelCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel context outlived its grace")
+	}
+	if elapsed := time.Since(started); elapsed < grace {
+		t.Fatalf("tunnel context ended after %s, want >= %s", elapsed, grace)
+	}
+	if !errors.Is(context.Cause(tunnelCtx), cause) {
+		t.Fatalf("tunnel cause=%v, want %v", context.Cause(tunnelCtx), cause)
+	}
+}
+
+func TestRFBKeyReleaseTunnelContextStopsImmediately(t *testing.T) {
+	tunnelCtx, stopTunnel := rfbKeyReleaseTunnelContext(context.Background(), time.Hour)
+	stopTunnel()
+	select {
+	case <-tunnelCtx.Done():
+	default:
+		t.Fatal("stopped tunnel context is still live")
+	}
+}
+
+func TestRFBKeysymForRuneRejectsUnsupportedControl(t *testing.T) {
+	if _, err := rfbKeysymForRune(0x1b); err == nil {
+		t.Fatal("Escape control character should be rejected")
+	}
+}
+
+func TestRFBTextKeyEventsArePaced(t *testing.T) {
+	if rfbKeyEventDelay < time.Millisecond {
+		t.Fatalf("RFB key event delay %s is too short for macOS Screen Sharing", rfbKeyEventDelay)
+	}
+}
+
+func TestRFBPasswordOnlyCredentialsPreferVNCAuth(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if _, err := server.Write([]byte{2, rfbSecurityARD, rfbSecurityVNC}); err != nil {
+			serverErr <- err
+			return
+		}
+		selected := []byte{0}
+		if _, err := io.ReadFull(server, selected); err != nil {
+			serverErr <- err
+			return
+		}
+		if selected[0] != rfbSecurityVNC {
+			serverErr <- errUnexpectedTestBytes("security type", selected)
+			return
+		}
+		challenge := []byte("0123456789abcdef")
+		if _, err := server.Write(challenge); err != nil {
+			serverErr <- err
+			return
+		}
+		response := make([]byte, len(challenge))
+		if _, err := io.ReadFull(server, response); err != nil {
+			serverErr <- err
+			return
+		}
+		key := []byte("password")
+		for i := range key {
+			key[i] = bits.Reverse8(key[i])
+		}
+		cipher, err := des.NewCipher(key)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		plaintext := make([]byte, len(response))
+		for offset := 0; offset < len(response); offset += cipher.BlockSize() {
+			cipher.Decrypt(plaintext[offset:offset+cipher.BlockSize()], response[offset:offset+cipher.BlockSize()])
+		}
+		if !bytes.Equal(plaintext, challenge) {
+			serverErr <- errUnexpectedTestBytes("VNC auth response", plaintext)
+			return
+		}
+		serverErr <- nil
+	}()
+
+	credentials := rfbCredentials{Password: "password"}
+	securityType, err := negotiateRFBSecurityType(client, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if securityType != rfbSecurityVNC {
+		t.Fatalf("security type = %d", securityType)
+	}
+	if err := negotiateRFBVNCAuth(client, credentials); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func serveTestPointerRFB(conn net.Conn, wantX, wantY int) error {
+	if err := serveTestInputRFBInit(conn); err != nil {
+		return err
+	}
+
+	wantMasks := []byte{0, 1, 0}
+	for _, wantMask := range wantMasks {
+		event := make([]byte, 6)
+		if _, err := io.ReadFull(conn, event); err != nil {
+			return err
+		}
+		if event[0] != 5 || event[1] != wantMask || int(binary.BigEndian.Uint16(event[2:4])) != wantX || int(binary.BigEndian.Uint16(event[4:6])) != wantY {
+			return errUnexpectedTestBytes("pointer event", event)
+		}
+	}
+	return nil
+}
+
+func serveTestVNCAuthPointerRFB(conn net.Conn, wantX, wantY int) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("RFB 003.008\n")); err != nil {
+		return err
+	}
+	clientVersion := make([]byte, 12)
+	if _, err := io.ReadFull(conn, clientVersion); err != nil {
+		return err
+	}
+	if !bytes.Equal(clientVersion, []byte("RFB 003.008\n")) {
+		return errUnexpectedTestBytes("client version", clientVersion)
+	}
+	if _, err := conn.Write([]byte{2, rfbSecurityARD, rfbSecurityVNC}); err != nil {
+		return err
+	}
+	security := []byte{0}
+	if _, err := io.ReadFull(conn, security); err != nil {
+		return err
+	}
+	if security[0] != rfbSecurityVNC {
+		return errUnexpectedTestBytes("security type", security)
+	}
+	challenge := []byte("0123456789abcdef")
+	if _, err := conn.Write(challenge); err != nil {
+		return err
+	}
+	response := make([]byte, len(challenge))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return err
+	}
+	if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+		return err
+	}
+	clientInit := []byte{0}
+	if _, err := io.ReadFull(conn, clientInit); err != nil {
+		return err
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint16(serverInit[0:2], 100)
+	binary.BigEndian.PutUint16(serverInit[2:4], 80)
+	serverInit[4] = 32
+	serverInit[5] = 24
+	serverInit[7] = 1
+	if _, err := conn.Write(serverInit); err != nil {
+		return err
+	}
+	for _, wantMask := range []byte{0, 1, 0} {
+		event := make([]byte, 6)
+		if _, err := io.ReadFull(conn, event); err != nil {
+			return err
+		}
+		if event[0] != 5 || event[1] != wantMask || int(binary.BigEndian.Uint16(event[2:4])) != wantX || int(binary.BigEndian.Uint16(event[4:6])) != wantY {
+			return errUnexpectedTestBytes("pointer event", event)
+		}
+	}
+	return nil
+}
+
+func serveTestLegacyVNCAuthPointer(conn net.Conn, serverVersion, password string, wantX, wantY int) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte(serverVersion)); err != nil {
+		return err
+	}
+	clientVersion := make([]byte, 12)
+	if _, err := io.ReadFull(conn, clientVersion); err != nil {
+		return err
+	}
+	if !bytes.Equal(clientVersion, []byte("RFB 003.003\n")) {
+		return errUnexpectedTestBytes("client version", clientVersion)
+	}
+	security := make([]byte, 4)
+	binary.BigEndian.PutUint32(security, uint32(rfbSecurityVNC))
+	if _, err := conn.Write(security); err != nil {
+		return err
+	}
+	challenge := []byte("0123456789abcdef")
+	if _, err := conn.Write(challenge); err != nil {
+		return err
+	}
+	response := make([]byte, len(challenge))
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return err
+	}
+	expected, err := directSSHWebVNCChallengeResponse(password, challenge)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(response, expected) {
+		return errUnexpectedTestBytes("VNC auth response", response)
+	}
+	if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+		return err
+	}
+	return serveTestPointerAfterAuthentication(conn, wantX, wantY)
+}
+
+func serveTestRFB37NoneAuthPointer(conn net.Conn, wantX, wantY int) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("RFB 003.007\n")); err != nil {
+		return err
+	}
+	clientVersion := make([]byte, 12)
+	if _, err := io.ReadFull(conn, clientVersion); err != nil {
+		return err
+	}
+	if !bytes.Equal(clientVersion, []byte("RFB 003.007\n")) {
+		return errUnexpectedTestBytes("client version", clientVersion)
+	}
+	if _, err := conn.Write([]byte{1, rfbSecurityNone}); err != nil {
+		return err
+	}
+	selected := []byte{0}
+	if _, err := io.ReadFull(conn, selected); err != nil {
+		return err
+	}
+	if selected[0] != rfbSecurityNone {
+		return errUnexpectedTestBytes("security type", selected)
+	}
+	// RFB 3.7 advances directly to ClientInit after None security; only 3.8
+	// requires a SecurityResult for the None security type.
+	return serveTestPointerAfterAuthentication(conn, wantX, wantY)
+}
+
+func serveTestPointerAfterAuthentication(conn net.Conn, wantX, wantY int) error {
+	clientInit := []byte{0}
+	if _, err := io.ReadFull(conn, clientInit); err != nil {
+		return err
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint16(serverInit[0:2], 100)
+	binary.BigEndian.PutUint16(serverInit[2:4], 80)
+	serverInit[4] = 32
+	serverInit[5] = 24
+	serverInit[7] = 1
+	if _, err := conn.Write(serverInit); err != nil {
+		return err
+	}
+	for _, wantMask := range []byte{0, 1, 0} {
+		event := make([]byte, 6)
+		if _, err := io.ReadFull(conn, event); err != nil {
+			return err
+		}
+		if event[0] != 5 || event[1] != wantMask || int(binary.BigEndian.Uint16(event[2:4])) != wantX || int(binary.BigEndian.Uint16(event[4:6])) != wantY {
+			return errUnexpectedTestBytes("pointer event", event)
+		}
+	}
+	return nil
+}
+
+type testTypeRFBMode int
+
+const (
+	testTypeRFBReadyDrain testTypeRFBMode = iota
+	testTypeRFBReadyOnly
+	testTypeRFBNoReadyFrame
+	testTypeRFBAuthFailed
+)
+
+func rfbKeysymsForTestText(t *testing.T, text string) []uint32 {
+	t.Helper()
+	keys := make([]uint32, 0, utf8.RuneCountInString(text))
+	for _, r := range text {
+		key, err := rfbKeysymForRune(r)
+		if err != nil {
+			t.Fatalf("keysym for %q: %v", r, err)
+		}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func serveTestTypeRFB(conn net.Conn, username, password string, wantKeys []uint32, mode testTypeRFBMode) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if mode == testTypeRFBAuthFailed {
+		if err := serveTestARDHandshakeWithSecurityResult(conn, username, password, false); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := serveTestTypeRFBInit(conn, username, password); err != nil {
+		return err
+	}
+	const width, height = testTypeRFBWidth, testTypeRFBHeight
+	if mode == testTypeRFBNoReadyFrame {
+		return conn.Close()
+	}
+	if err := writeTestRFBRawFrame(conn, width, height, []byte{0, 0, 255, 255, 0, 255, 0, 255}); err != nil {
+		return err
+	}
+	for _, wantKey := range wantKeys {
+		for _, wantDown := range []byte{1, 0} {
+			event := make([]byte, 8)
+			if _, err := io.ReadFull(conn, event); err != nil {
+				return err
+			}
+			if event[0] != 4 || event[1] != wantDown || !bytes.Equal(event[2:4], []byte{0, 0}) || binary.BigEndian.Uint32(event[4:8]) != wantKey {
+				return errUnexpectedTestBytes("key event", event)
+			}
+		}
+	}
+	if err := readTestRFBFramebufferRequest(conn); err != nil {
+		return err
+	}
+	if mode == testTypeRFBReadyOnly {
+		return conn.Close()
+	}
+	return writeTestRFBRawFrame(conn, width, height, []byte{255, 0, 0, 255, 0, 0, 255, 255})
+}
+
+const testTypeRFBWidth, testTypeRFBHeight = 2, 1
+
+func serveTestTypeRFBInit(conn net.Conn, username, password string) error {
+	if err := serveTestARDHandshakeWithSecurityResult(conn, username, password, true); err != nil {
+		return err
+	}
+	clientInit := []byte{0}
+	if _, err := io.ReadFull(conn, clientInit); err != nil {
+		return err
+	}
+	if clientInit[0] != 1 {
+		return errUnexpectedTestBytes("client init", clientInit)
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint16(serverInit[0:2], testTypeRFBWidth)
+	binary.BigEndian.PutUint16(serverInit[2:4], testTypeRFBHeight)
+	serverInit[4] = 32
+	serverInit[5] = 24
+	serverInit[7] = 1
+	if _, err := conn.Write(serverInit); err != nil {
+		return err
+	}
+	return readTestRFBReadySetup(conn)
+}
+
+// serveTestTypeRFBRecordingInput serves a ready typing session and records
+// key events and answered framebuffer requests until the client disconnects.
+func serveTestTypeRFBRecordingInput(conn net.Conn, username, password string) ([]string, error) {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := serveTestTypeRFBInit(conn, username, password); err != nil {
+		return nil, err
+	}
+	frame := []byte{0, 0, 255, 255, 0, 255, 0, 255}
+	if err := writeTestRFBRawFrame(conn, testTypeRFBWidth, testTypeRFBHeight, frame); err != nil {
+		return nil, err
+	}
+	var events []string
+	for {
+		messageType := []byte{0}
+		if _, err := io.ReadFull(conn, messageType); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+				return events, nil
+			}
+			return events, err
+		}
+		switch messageType[0] {
+		case 4:
+			event := make([]byte, 7)
+			if _, err := io.ReadFull(conn, event); err != nil {
+				return events, err
+			}
+			direction := "up"
+			if event[0] == 1 {
+				direction = "down"
+			}
+			events = append(events, fmt.Sprintf("%s %c", direction, rune(binary.BigEndian.Uint32(event[3:7]))))
+		case 3:
+			if _, err := io.ReadFull(conn, make([]byte, 9)); err != nil {
+				return events, err
+			}
+			if err := writeTestRFBRawFrame(conn, testTypeRFBWidth, testTypeRFBHeight, frame); err != nil {
+				return events, err
+			}
+			events = append(events, "frame")
+		default:
+			return events, errUnexpectedTestBytes("client message", messageType)
+		}
+	}
+}
+
+// rfbKeyEventHookConn runs afterKeyEvent once each RFB KeyEvent has been
+// written; a non-nil hook error is reported as the write error.
+type rfbKeyEventHookConn struct {
+	net.Conn
+	afterKeyEvent func(down bool) error
+}
+
+func (c *rfbKeyEventHookConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err == nil && len(p) == 8 && p[0] == 4 {
+		err = c.afterKeyEvent(p[1] == 1)
+	}
+	return n, err
+}
+
+func serveTestARDHandshakeWithSecurityResult(conn net.Conn, username, password string, success bool) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("RFB 003.889\n")); err != nil {
+		return err
+	}
+	clientVersion := make([]byte, 12)
+	if _, err := io.ReadFull(conn, clientVersion); err != nil {
+		return err
+	}
+	if !bytes.Equal(clientVersion, []byte("RFB 003.008\n")) {
+		return fmt.Errorf("client version=%q", clientVersion)
+	}
+	if _, err := conn.Write([]byte{1, rfbSecurityARD}); err != nil {
+		return err
+	}
+	security := []byte{0}
+	if _, err := io.ReadFull(conn, security); err != nil {
+		return err
+	}
+	if security[0] != rfbSecurityARD {
+		return fmt.Errorf("security type=%d", security[0])
+	}
+
+	keyLength := 8
+	g := big.NewInt(5)
+	p := big.NewInt(23)
+	serverPrivate := big.NewInt(6)
+	serverPublic := new(big.Int).Exp(g, serverPrivate, p)
+	params := make([]byte, 4+keyLength*2)
+	binary.BigEndian.PutUint16(params[0:2], uint16(g.Uint64()))
+	binary.BigEndian.PutUint16(params[2:4], uint16(keyLength))
+	copy(params[4:4+keyLength], leftPadBigInt(p, keyLength))
+	copy(params[4+keyLength:], leftPadBigInt(serverPublic, keyLength))
+	if _, err := conn.Write(params); err != nil {
+		return err
+	}
+
+	response := make([]byte, 128+keyLength)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return err
+	}
+	clientPublic := new(big.Int).SetBytes(response[128:])
+	shared := new(big.Int).Exp(clientPublic, serverPrivate, p)
+	key := md5.Sum(leftPadBigInt(shared, keyLength))
+	credentials, err := aesECBDecryptForTest(key[:], response[:128])
+	if err != nil {
+		return err
+	}
+	if got := string(credentials[:bytes.IndexByte(credentials[:64], 0)]); got != username {
+		return fmt.Errorf("username=%q", got)
+	}
+	if got := string(credentials[64 : 64+bytes.IndexByte(credentials[64:], 0)]); got != password {
+		return fmt.Errorf("password mismatch")
+	}
+	if success {
+		_, err = conn.Write([]byte{0, 0, 0, 0})
+		return err
+	}
+	_, err = conn.Write([]byte{0, 0, 0, 1, 0, 0, 0, 0})
+	return err
+}
+
+func serveTestNoneAuthOfferWithoutClientInit(conn net.Conn) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("RFB 003.008\n")); err != nil {
+		return err
+	}
+	version := make([]byte, 12)
+	if _, err := io.ReadFull(conn, version); err != nil {
+		return err
+	}
+	if _, err := conn.Write([]byte{1, rfbSecurityNone}); err != nil {
+		return err
+	}
+	selected := []byte{0}
+	if _, err := io.ReadFull(conn, selected); err != nil {
+		return err
+	}
+	if selected[0] != rfbSecurityNone {
+		return fmt.Errorf("security type=%d", selected[0])
+	}
+	extra := make([]byte, 1)
+	n, err := conn.Read(extra)
+	if n > 0 {
+		return fmt.Errorf("client continued past None auth with byte %d", extra[0])
+	}
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "closed") {
+		return nil
+	}
+	return err
+}
+
+func readTestRFBReadySetup(conn net.Conn) error {
+	first := []byte{0}
+	if _, err := io.ReadFull(conn, first); err != nil {
+		return err
+	}
+	if first[0] == 4 {
+		return fmt.Errorf("key event before RFB framebuffer ready")
+	}
+	if first[0] != 0 {
+		return fmt.Errorf("wanted SetPixelFormat, got %d", first[0])
+	}
+	rest := make([]byte, 19)
+	if _, err := io.ReadFull(conn, rest); err != nil {
+		return err
+	}
+	enc := make([]byte, 8)
+	if _, err := io.ReadFull(conn, enc); err != nil {
+		return err
+	}
+	if enc[0] == 4 {
+		return fmt.Errorf("key event before RFB encodings")
+	}
+	if enc[0] != 2 {
+		return fmt.Errorf("wanted SetEncodings, got %d", enc[0])
+	}
+	return readTestRFBFramebufferRequest(conn)
+}
+
+func readTestRFBFramebufferRequest(conn net.Conn) error {
+	fbur := make([]byte, 10)
+	if _, err := io.ReadFull(conn, fbur); err != nil {
+		return err
+	}
+	if fbur[0] == 4 {
+		return fmt.Errorf("key event before framebuffer request")
+	}
+	if fbur[0] != 3 {
+		return fmt.Errorf("wanted FramebufferUpdateRequest, got %d", fbur[0])
+	}
+	return nil
+}
+
+func writeTestRFBRawFrame(conn net.Conn, width, height uint16, pixels []byte) error {
+	update := make([]byte, 4+12+len(pixels))
+	update[0] = 0
+	binary.BigEndian.PutUint16(update[2:4], 1)
+	binary.BigEndian.PutUint16(update[8:10], width)
+	binary.BigEndian.PutUint16(update[10:12], height)
+	binary.BigEndian.PutUint32(update[12:16], uint32(rfbEncodingRaw))
+	copy(update[16:], pixels)
+	_, err := conn.Write(update)
+	return err
+}
+
+func serveTestInputRFBInit(conn net.Conn) error {
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("RFB 003.008\n")); err != nil {
+		return err
+	}
+	clientVersion := make([]byte, 12)
+	if _, err := io.ReadFull(conn, clientVersion); err != nil {
+		return err
+	}
+	if !bytes.Equal(clientVersion, []byte("RFB 003.008\n")) {
+		return errUnexpectedTestBytes("client version", clientVersion)
+	}
+	if _, err := conn.Write([]byte{1, rfbSecurityNone}); err != nil {
+		return err
+	}
+	security := []byte{0}
+	if _, err := io.ReadFull(conn, security); err != nil {
+		return err
+	}
+	if security[0] != rfbSecurityNone {
+		return errUnexpectedTestBytes("security type", security)
+	}
+	if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+		return err
+	}
+	clientInit := []byte{0}
+	if _, err := io.ReadFull(conn, clientInit); err != nil {
+		return err
+	}
+	serverInit := make([]byte, 24)
+	binary.BigEndian.PutUint16(serverInit[0:2], 100)
+	binary.BigEndian.PutUint16(serverInit[2:4], 80)
+	serverInit[4] = 32
+	serverInit[5] = 24
+	serverInit[7] = 1
+	if _, err := conn.Write(serverInit); err != nil {
+		return err
+	}
+	return nil
 }
 
 func serveTestARDRFB(conn net.Conn, username, password string) error {
@@ -291,4 +1849,12 @@ func errUnexpectedTestBytes(label string, got []byte) error {
 
 func errUnexpectedTestString(label, got string) error {
 	return testError(label + " mismatch: " + got)
+}
+
+func preflightRFBAuthenticationFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials) error {
+	return preflightRFBAuthenticationFromConnWithMode(ctx, conn, creds, localWebVNCAuthAuto)
+}
+
+func negotiateRFBSecurityType(conn net.Conn, creds rfbCredentials) (byte, error) {
+	return negotiateRFBSecurityTypeForMode(conn, creds, localWebVNCAuthAuto)
 }

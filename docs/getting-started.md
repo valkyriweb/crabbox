@@ -1,13 +1,22 @@
 # Getting Started
 
-Read this when:
+Crabbox gives coding agents and humans on-demand computers. Keep editing in
+your local checkout; Crabbox leases a box, syncs your working tree including
+uncommitted changes, runs your command, streams output, and returns its exit
+code. A one-shot run releases the box; a warm lease stays available for the next
+run.
 
-- you are new to Crabbox and want a working `crabbox run` in about ten minutes;
-- you are evaluating Crabbox for a repo and want to see the shape of a real workflow;
-- you want a reference for what a typical onboarding looks like end to end.
+Remote tests and builds free your laptop's CPU, memory, and ports so multiple
+agents can work in parallel. Choose Linux, macOS, native Windows, or WSL2 on a
+provider that supports the target. For visible work, see the
+[desktop, VNC, browser, Code, and portal guide](features/interactive-desktop-vnc.md).
 
-This is a cookbook, not a reference. It walks through one repo from install to
-`crabbox run -- pnpm test`. Each step links to deeper docs when you want more.
+This walkthrough takes one trusted repo from installation to
+`crabbox run -- pnpm test`. Review its config and setup commands before running
+them. For a first run with no account, `--provider local-container` executes
+against Docker or Podman on your own machine; the
+[`crabbox-quickstart` skill](integrations/agents.md#install-through-ecosystem-skill-managers)
+walks that credential-free path end to end.
 
 ## Step 1. Install
 
@@ -22,26 +31,59 @@ crabbox --version
 crabbox doctor
 ```
 
-`crabbox doctor` prints one line per check. Local tool checks (`git`, `ssh`,
-`ssh-keygen`, `rsync`) should report `ok`. It is fine if the broker and provider
-checks fail for now - we configure those next.
+`crabbox doctor` prints one line per check. On a fresh install, its
+provider-neutral `git` check should report `ok`; provider-specific tool checks
+begin after you select a provider. Doctor reports `no provider selected`, keeps
+the compatibility metadata as `source=compiled_default selected=false`, and
+skips provider credential readiness without failing the command. Select a
+provider through config, `CRABBOX_PROVIDER`, or `--provider` before a lifecycle
+command. That selection is strict and can fail until its credentials are
+configured; run `crabbox providers recommend` to compare options.
 
-If you do not use Homebrew, GitHub Releases ship signed archives for macOS,
-Linux, and Windows. Download the matching archive from
+If you do not use Homebrew, GitHub Releases ship platform archives for macOS,
+Linux, and Windows, with signed and notarized macOS executables. Download the matching archive from
 <https://github.com/openclaw/crabbox/releases>.
 
+Keep any included `crabbox-runtime` directory beside the real CLI executable.
+Both Linux runtime architectures belong to the matched controller; copying only
+the CLI or mixing releases does not preserve the complete runtime pack.
+
+Go users can install only the CLI from an explicit release version. Choose a
+tag from [GitHub Releases](https://github.com/openclaw/crabbox/releases); this
+channel is supported starting with v0.44.0. For example:
+
+```sh
+GOTOOLCHAIN=go1.27.2 go install github.com/openclaw/crabbox/cmd/crabbox@v0.70.0
+```
+
+The module minimum remains Go 1.26. Use the explicit patched toolchain above:
+versioned `go install` ignores the target module's toolchain suggestion. This
+command compiles the Go CLI locally. It does not install release companion
+executables or assets, including `crabbox-apple-vm-helper` and the runtime pack, and it is not the
+signed/notarized prebuilt distribution. Use Homebrew or a release archive for
+the complete platform distribution, notably Apple VM support on Apple Silicon.
+
+Supported WSL2 and x64 no-WSL Windows transfer selection requires a build from
+current `main` or Crabbox v0.42.1 and newer. See the
+[supported Windows installation](windows-install.md) for the complete setup.
+
 ## Step 2. Log In
+
+For a shared fleet, use your team's coordinator URL. It holds provider
+credentials and enforces lease limits, spend caps, and expiry. Direct cloud and
+local providers skip login; see [Choosing an access path](#choosing-an-access-path).
 
 ```sh
 crabbox login --url https://broker.example.com
 ```
 
 `login` opens a browser to the GitHub OAuth flow (pass `--no-browser` to print
-the URL instead). The broker exchanges the OAuth code, verifies your GitHub org
-membership, writes a signed token to your user config, and confirms the result:
+the URL for a browser on the same device). The broker exchanges the OAuth code,
+verifies your GitHub org membership, and redirects a one-use confirmation to the
+CLI's loopback listener before writing the signed token to your user config:
 
 ```text
-logged in broker=https://broker.example.com provider=hetzner user=alice@example.com org=example-org config=/Users/alice/.config/crabbox/config.yaml
+logged in broker=https://broker.example.com provider=hetzner user=github:12345 org=example-org config=/Users/alice/Library/Application Support/crabbox/config.yaml
 ```
 
 From then on, every `crabbox` command authenticates automatically. Check your
@@ -52,7 +94,7 @@ crabbox whoami
 ```
 
 ```text
-user=alice@example.com org=example-org auth=user broker=https://broker.example.com
+user=github:12345 org=example-org auth=user broker=https://broker.example.com
 ```
 
 ### Choosing An Access Path
@@ -113,8 +155,8 @@ Inside the repo:
 crabbox init
 ```
 
-`init` writes three files (override any path with `--config`, `--workflow`, or
-`--skill`; pass `--force` to overwrite existing files):
+`init` writes three files (override paths with `--config`, `--workflow`, or one
+or more `--skill` flags; pass `--force` to overwrite existing files):
 
 ```text
 .crabbox.yaml                          repo defaults (profile, class, sync, env)
@@ -126,7 +168,7 @@ The generated `.crabbox.yaml` ships sensible defaults. Adjust the parts that
 matter for your repo:
 
 - `profile`: a name for this lane (the template uses `<repo>-check`);
-- `class`: `standard`, `fast`, `large`, or `beast` (the template uses `beast`);
+- `class`: `tiny`, `small`, `standard`, `fast`, `large`, or `beast` (the template uses `beast`);
 - `sync.exclude`: directories that should never be sent to the runner;
 - `sync.include`: an optional root-relative whitelist — when set, **only** these
   paths are synced (after excludes), so you can ship a few paths out of a large
@@ -147,23 +189,33 @@ manifest. If it shows surprises (a `dist/` folder, a forgotten `.cache/`, a
 multi-gigabyte asset), tighten `sync.exclude` and re-run. The first sync to a
 fresh runner is bound by this size.
 
+Native Git-backed Jujutsu workspaces work with an installed `jj`: Crabbox
+snapshots working-copy edits and syncs the exact `@` tree, including multi-parent
+merges. `sync-plan --json` shows the selected revision. Use `run --no-hydrate`
+with an ordinary SSH provider. Colocated Git/Jujutsu workspaces use the Git
+path. See [Jujutsu sync](features/sync.md#jujutsu-workspaces) for prerequisites
+and fail-closed conditions.
+
 ## Step 4. Warm A Box
 
 ```sh
-crabbox warmup
+crabbox warmup --class standard --slug first-tests
 ```
 
 `warmup` acquires a lease, provisions the runner, waits for SSH and tooling to
-come up, keeps the lease (`--keep`, on by default), and prints two lines:
+come up, keeps the lease (`--keep`, on by default), and prints a lease summary,
+ready endpoint, and completion time:
 
 ```text
-leased cbx_abcdef123456 slug=swift-crab provider=hetzner server=cx... type=ccx... ip=203.0.113.10 idle_timeout=30m0s expires=2026-05-29T17:30:00Z
+leased cbx_abcdef123456 slug=first-tests provider=hetzner server=... type=... ip=203.0.113.10 idle_timeout=30m0s expires=...
 ready ssh=crabbox@203.0.113.10:2222 network=public workroot=/work/crabbox
+warmup complete total=...
 ```
 
-The lease is now waiting for commands. Two timers bound its life: the idle
-timeout (default 30m) and the TTL (default 90m). Whichever fires first releases
-the box.
+The coordinator now keeps the lease ready for commands. Its idle timeout
+(default 30m) and TTL (default 90m) bound its life. Direct providers have their
+own expiry enforcement; always stop a box explicitly when done. Machine classes
+are provider-specific: inspect `crabbox providers --json` before choosing a size.
 
 Reuse the lease by `slug` (friendly) or `id` (the `cbx_...` handle). Both work
 with `--id` on later commands.
@@ -171,7 +223,7 @@ with `--id` on later commands.
 ## Step 5. Run A Command
 
 ```sh
-crabbox run --id swift-crab -- pnpm test
+crabbox run --id first-tests -- pnpm test
 ```
 
 What happens:
@@ -184,6 +236,10 @@ What happens:
 4. It heartbeats the broker so the lease does not idle out mid-run.
 5. It records a `run_...` history entry with sync time, command time, exit code,
    and (on Linux) bounded telemetry samples.
+
+The box supplies execution plumbing; your repo still owns tool and dependency
+installation. If needed, run your setup script or
+[hydrate from Actions](features/actions-hydration.md) before the tests.
 
 You can omit `--id` for a one-shot run:
 
@@ -216,12 +272,14 @@ the same data as a browser page.
 When you are done:
 
 ```sh
-crabbox stop swift-crab
+crabbox stop first-tests
 ```
 
-`stop` releases the lease, deletes the provider machine, removes the local
-claim, and frees the reserved cost. If you forget, the broker's idle alarm
-releases the lease automatically.
+`stop` releases the lease through its provider's cleanup contract and frees
+broker-reserved cost. Most disposable providers delete the machine; static SSH
+hosts remain, and retained resources follow provider policy. Cleanup requires
+verified ownership. Recovery claims or fixed-ID terminal receipts may remain
+locally. If you forget a brokered box, the coordinator schedules expiry cleanup.
 
 ```sh
 crabbox cleanup --dry-run
@@ -235,7 +293,7 @@ direct-provider path; brokered cleanup is the broker alarm's job.
 Keep a lease alive across a longer session:
 
 ```sh
-crabbox warmup --idle-timeout 4h --ttl 8h
+crabbox warmup --idle-timeout 4h --ttl 8h --slug swift-crab
 crabbox run --id swift-crab -- pnpm test
 crabbox run --id swift-crab -- pnpm bench
 crabbox stop swift-crab
@@ -244,16 +302,33 @@ crabbox stop swift-crab
 Open a desktop session:
 
 ```sh
-crabbox warmup --desktop
-crabbox vnc --id swift-crab --open
+crabbox warmup --desktop --browser --slug ui-check
+crabbox webvnc --id ui-check --open --take-control
 ```
 
 Open a code-server tab:
 
 ```sh
-crabbox warmup --code
-crabbox code --id swift-crab --open
+crabbox warmup --code --slug code-check
+crabbox run --id code-check --sync-only
+crabbox code --id code-check --open
 ```
+
+Keep each bridge command running while using its browser tab. Desktop and Code
+support depend on the provider and target; browser Code also needs a configured
+coordinator and isolated Code origin. The
+[combined access guide](features/interactive-desktop-vnc.md) explains native VNC,
+local WebVNC, the portal, sharing, and cleanup.
+
+Open the synced checkout in Zed Remote Projects:
+
+```sh
+crabbox run --id swift-crab --sync-only
+crabbox open --editor=zed --id swift-crab
+```
+
+Paste the printed SSH command into Zed's **Connect New Server** dialog, open the
+printed folder, and keep `crabbox open` running while you work.
 
 Use a Mac you already own (static SSH, no provisioning):
 
@@ -285,6 +360,6 @@ crabbox run --provider aws --class beast -- pnpm test
 - [Commands](commands/README.md) - one page per command.
 - [Features](features/README.md) - one page per feature.
 - [Configuration](features/configuration.md) - YAML schema and precedence.
-- [Providers](features/providers.md) - which provider to pick.
+- [Providers](providers/README.md) - which provider to pick.
 - [Provider authoring](features/provider-authoring.md) - add a new provider.
 - [Troubleshooting](troubleshooting.md) - what to do when a step fails.

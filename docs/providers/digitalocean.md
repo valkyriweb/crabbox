@@ -36,6 +36,26 @@ crabbox cleanup --provider digitalocean --dry-run
 numeric DigitalOcean Droplet id. `--type` is the exact DigitalOcean Droplet size
 slug; there is no separate DigitalOcean size flag.
 
+## Machine Classes
+
+An explicit `--class` selects real Linux/amd64 capacity. Primary sizes are:
+
+| Class | Droplet size | vCPU | RAM (GiB) |
+| --- | --- | --- | --- |
+| `tiny` | `s-1vcpu-1gb` | 1 | 1 |
+| `small` | `s-2vcpu-4gb` | 2 | 4 |
+| `standard` | `s-4vcpu-8gb` | 4 | 8 |
+| `fast` | `s-8vcpu-16gb` | 8 | 16 |
+| `large` | `g-16vcpu-64gb` | 16 | 64 |
+| `beast` | `g-32vcpu-128gb` | 32 | 128 |
+
+`standard` no longer selects the smallest Droplet. Use `--class tiny` or
+`--type s-1vcpu-1gb` to retain that size and cost. An explicit `--type` overrides
+the class. `crabbox providers --json` exposes these profiles under `classCatalog`,
+including declared alternatives; this backend currently creates the primary
+without automatic retry across those alternatives. See the
+[class catalog](../commands/providers.md) for the full contract.
+
 ## Configuration
 
 ```yaml
@@ -43,7 +63,7 @@ provider: digitalocean
 target: linux
 class: standard
 digitalocean:
-  region: nyc3
+  # region: sfo2 # Optional; omit to select the closest available region to San Francisco.
   image: ubuntu-24-04-x64
   vpc: ""
   sshCIDRs: []
@@ -53,10 +73,30 @@ Config keys under `digitalocean:`:
 
 | Key | Maps to | Default | Notes |
 | --- | --- | --- | --- |
-| `region` | `cfg.DigitalOcean.Region` | `nyc3` | DigitalOcean region slug. |
+| `region` | `cfg.DigitalOcean.Region` | first available near San Francisco | Optional DigitalOcean region slug; an explicit value is authoritative. |
 | `image` | `cfg.DigitalOcean.Image` | `ubuntu-24-04-x64` | Droplet image slug. |
 | `vpc` | `cfg.DigitalOcean.VPCUUID` | empty | Optional VPC UUID for Droplet placement. |
 | `sshCIDRs` | `cfg.DigitalOcean.SSHCIDRs` | empty | Reserved for firewall-aware follow-up work; Phase 1 does not create firewalls. |
+
+These are effective runtime defaults; the raw provider configuration starts
+empty/nil. DigitalOcean adds no provider-specific flags. Configure these settings
+through YAML or the environment; generic command flags remain separate.
+
+Size availability depends on the account and can change over time. Before
+creating a Droplet or account SSH key, Crabbox checks the selected size against
+DigitalOcean's paginated `/v2/sizes` catalog. When no region is configured, it
+selects the first region offering that size in this fixed preference order:
+`sfo3`, `sfo2`, `sfo1`, `tor1`, `nyc3`, `nyc1`, `nyc2`, `lon1`, `ams3`, `fra1`,
+`sgp1`, `blr1`, `syd1`. The provisioning line reports the chosen region.
+
+An explicit `digitalocean.region` or `CRABBOX_DIGITALOCEAN_REGION` is never
+changed automatically. `digitalocean_size_unavailable_in_region` lists the
+available regions when the size cannot be used in the explicit region, or
+when none of the preferred regions offers it. For example:
+
+```sh
+CRABBOX_DIGITALOCEAN_REGION=sfo2 crabbox warmup --provider digitalocean --class small
+```
 
 The portable `--os ubuntu:24.04` selector maps to `ubuntu-24-04-x64`.
 DigitalOcean does not currently offer the portable default Ubuntu 26.04 image,
@@ -83,6 +123,20 @@ CRABBOX_DIGITALOCEAN_SSH_CIDRS     Comma-separated SSH CIDRs, reserved for firew
 
 Do not pass the DigitalOcean token as a command-line argument. Keep it in the
 environment or in a local secret manager.
+
+### Input semantics
+
+The four settings use shared typed bindings without generating a flag interface.
+Nonempty file/environment strings retain whitespace. Accepted image inputs remain
+explicit even when equal to a default, preserving the portable-OS override rules.
+Unsupported-OS validation is captured before backend defaults fill an empty image;
+defaulting does not erase that validation result.
+
+A nonempty YAML CIDR list replaces the prior list without trimming or copying;
+omitted, null, and empty lists leave it intact. Nonempty environment text is
+comma-split, trimmed, and stripped of empty items, preserving order and duplicates.
+Delimiter-only input produces a nonnil empty list; exact empty input preserves the
+prior value, and `none` is an ordinary item. No firewall behavior is added.
 
 ## Token Scopes
 
@@ -126,9 +180,21 @@ explicit VPC. Do not broaden scopes inside scripts.
 5. Add ready-state Crabbox tags and claim the lease locally.
 6. Run normal Crabbox sync/run/ssh workflows over SSH.
 7. Delete the Droplet and managed SSH key on `stop`; `cleanup` deletes only
-   resources with a complete Crabbox DigitalOcean ownership tag set. Failed
-   post-delete or key-only rollback cleanup retains an account-scoped local
-   claim so `stop` can retry it.
+   resources authorized by the exact revisioned account- and Droplet-bound
+   local claim. The Droplet is deleted before a provider-managed SSH key.
+   Acquisition rollback uses the same order: a failed Droplet deletion retains
+   its managed SSH key, local credentials, and cleanup claim for a later retry.
+
+When rollback fails, the original acquisition error and cleanup errors remain
+inspectable, and the original exit code keeps precedence. Crabbox reports the
+cleanup failure and does not automatically retry that failed acquisition with
+a fresh allocation. A successful rollback still permits the existing bootstrap
+retry behavior.
+
+The public-IP wait bounds both API reads and polling delays. Its own timeout
+retains exit code 5 and the existing timeout message while preserving deadline
+identity. Caller cancellation retains its original cause and diagnostic, including
+when it interrupts a lookup; completed provider responses keep precedence.
 
 If Droplet creation returns an indeterminate transport or server failure,
 Crabbox retains the SSH credentials and records a pending local recovery claim.
@@ -137,6 +203,42 @@ deletes a late-created Droplet when DigitalOcean exposes it. Empty inventory is
 not treated as proof that creation failed: while the outcome remains
 indeterminate, Crabbox retains the claim and credentials and asks the operator
 to retry rather than risk orphaning a billed Droplet without its SSH key.
+
+Heartbeat reads the current idle policy from the Droplet's remote tags. Ordinary
+touches preserve that policy even when local configuration differs; only an
+explicit `heartbeat --idle-timeout` changes it. A lease without a stored policy
+uses the configured fallback. The creation-based TTL still caps expiry, and a
+failed tag update is reported as a failure rather than a successful heartbeat.
+
+## Fixed operation IDs
+
+Direct leases accept `warmup --provider digitalocean --lease-id cbx_<12 lowercase hex>`.
+Repeating the same command recovers the same Droplet, including after a lost
+create reply or readiness failure. The durable local intent binds the API
+account, create inputs, per-lease SSH key, allocation nonce, and observed
+Droplet ID. Changed inputs, account changes, and replacement Droplets are
+rejected. No coordinator is needed.
+
+An automatically selected region is saved with the create intent and claim.
+Replay reuses that region even if the size catalog changes; it does not select
+a new region for an existing intent. If automatic selection fails before an
+intent can be recorded, no lease or provider resources are created.
+
+DigitalOcean has no create idempotency key: Crabbox records admission before
+the POST and never repeats an unresolved attempt on replay. A definite create
+rejection (HTTP 4xx except 408, 409, and 429), after successful SSH-key rollback,
+records the attempt as failed with no resource created. A later `warmup` with
+the same lease ID and inputs can submit a new attempt, or `stop` can release the
+claim locally without contacting DigitalOcean. A size/region preflight failure
+has the same retry/stop behavior. Transport failures, timeouts, HTTP 5xx, 408,
+409, and 429 retain unresolved custody, as do SSH-key rollback failures.
+An unresolved attempt retains its
+claim and key, even when inventory is empty. Retry later when the original
+Droplet becomes visible. `stop` uses the existing account-, Droplet-, and
+SSH-key-bound cleanup checks. Successful cleanup retains a terminal tombstone,
+so a released ID cannot allocate another Droplet. Preserve the local state
+directory across invocations; fixed-ID resources cannot be reclaimed without
+their original create intent.
 
 ## Ownership And Cleanup
 
@@ -152,9 +254,43 @@ crabbox:target:linux
 crabbox:expires_at:<unix-seconds>
 ```
 
-Release and cleanup require a complete ownership predicate: Crabbox marker,
-provider marker, lease id, slug, and Linux target. Droplets with partial,
-foreign, or malformed Crabbox-like tags are skipped/refused.
+Read-only inventory requires a complete ownership predicate: Crabbox marker,
+provider marker, canonical lease id, slug, and Linux target. Reuse and deletion
+also require an exact local claim for the same DigitalOcean account, lease, and
+Droplet id. Droplets with partial, foreign, malformed, claimless, or mismatched
+ownership are skipped or refused; a claimless Droplet must first be adopted
+through explicit supported `--reclaim` reuse.
+
+Every release target carries the full revisioned claim that authorized it.
+Immediately before deletion, Crabbox locks that exact claim, re-reads the
+token's current team or user account, and revalidates the immutable Droplet id,
+canonical name, ownership tags, and provider-key tag. If Crabbox created the
+account SSH key, it also requires the recorded immutable key id to match the
+retained local public key. A renamed key remains identifiable by immutable id;
+a replaced key, changed public key, missing local public key, stale claim, or
+account switch is refused before either resource is mutated.
+
+Claims created before SSH-key ownership was recorded are migrated before
+cleanup under an exact durable claim update. Crabbox treats their account keys
+as unowned even when the canonical name and retained public key identify an
+immutable key id, so cleanup deletes the verified Droplet but never the account
+key. A missing retained public key is allowed only when DigitalOcean confirms
+that no canonical lease key exists; provider lookup failures or an existing
+canonical key without local proof retain the claim and Droplet. Preparation and
+dry-run cleanup validate this migration without changing local state.
+
+DigitalOcean account keys and Droplets are scoped to the token's current team
+(or user account for a personal token). Crabbox does not configure DigitalOcean
+Projects, so project membership is not a separate cleanup authority; region and
+VPC choices remain creation-time Droplet placement settings.
+
+If Droplet deletion succeeds but key deletion fails, Crabbox retains the exact
+claim, key identity, and local key. A retry confirms that the same Droplet is
+absent, authorizes only the same immutable key, deletes it, and removes local
+state only after durable claim removal. Confirmed provider `not found` results
+are idempotent success. Ambiguous create or key recovery may persist only the
+immutable identities needed for deletion before the final lock; cleanup
+preparation and `cleanup --dry-run` observe recovery without changing claims.
 
 Tag updates apply only the set difference. Crabbox detaches obsolete tags from
 the Droplet but does not delete account-level tag objects: DigitalOcean tag
@@ -175,10 +311,17 @@ crabbox cleanup --provider digitalocean
 The repeatable live check is opt-in:
 
 ```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=digitalocean scripts/live-smoke.sh
+```
+
+The top-level smoke dispatches to the provider-specific script:
+
+```sh
 CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=digitalocean scripts/live-digitalocean-smoke.sh
 ```
 
-The script builds `bin/crabbox`, uses `DIGITALOCEAN_TOKEN` from the environment,
+The script builds `bin/crabbox` unless `CRABBOX_BIN` points at an existing
+binary, uses `DIGITALOCEAN_TOKEN` from the environment,
 requires an empty Crabbox-owned DigitalOcean inventory, creates a small
 `s-1vcpu-1gb` Droplet, waits for ready status, runs `echo ok`, verifies
 `list --json`, stops the lease, runs dry-run cleanup, and verifies the
@@ -219,5 +362,4 @@ in `crabbox list --provider digitalocean --json` or the DigitalOcean console.
 
 - [Provider reference](README.md)
 - [Provider backends](../provider-backends.md)
-- [Provider feature overview](../features/providers.md)
 - [Operations](../operations.md)

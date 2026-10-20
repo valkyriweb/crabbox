@@ -9,13 +9,23 @@ Read this when you:
 
 Parallels is a direct SSH-lease provider (it never goes through the broker). To
 acquire a box, Crabbox asks `prlctl` to create a clone from a configured source
-VM and snapshot, starts the clone, discovers the guest IP, injects the per-lease
-SSH key through Parallels Tools, and then uses the normal Crabbox SSH
-sync/run/checkpoint path.
+VM (and, for linked mode, a snapshot), starts the clone, discovers the guest IP,
+injects the per-lease SSH key, and then uses the normal Crabbox SSH sync/run/checkpoint path. Parallels
+Tools is the default discovery and key-install path. macOS guests can opt into a
+host-side DHCP/SSH fallback when Parallels Tools guest execution is unavailable.
 
 The provider is local-first: by default it drives the `prlctl` on the same Mac
 that runs Crabbox. Set `parallels.host` to drive a Parallels Desktop install on
 another Mac over SSH.
+
+Linux and macOS guest preparation streams its scripts over stdin through
+`prlctl exec`, including when the Parallels host is reached over SSH. Required
+preparation steps fail immediately on ordinary script errors; a later successful
+readiness check cannot hide an earlier failure. For macOS guests, recognized
+Tools-session readiness errors retry the failed, repeatable preparation step
+after another successful guest-exec probe, within the startup deadline. Commands
+intended to be best-effort, such as starting SSH services, retain their existing
+handling.
 
 **Targets:** Linux, macOS, and Windows (`--windows-mode normal` or
 `--windows-mode wsl2`).
@@ -34,7 +44,7 @@ crabbox warmup \
   --provider parallels \
   --target macos \
   --parallels-source "macOS Tahoe" \
-  --parallels-source-snapshot fresh \
+  --parallels-clone-mode full \
   --parallels-user alice \
   --ssh-port 22
 
@@ -48,7 +58,6 @@ With a template alias:
 
 ```sh
 crabbox checkpoint list --provider parallels --parallels-template tahoe-latest
-crabbox checkpoint fork --provider parallels --parallels-template tahoe-latest --slug tahoe-test
 crabbox run --provider parallels --parallels-template tahoe-latest -- xcodebuild -version
 ```
 
@@ -66,6 +75,8 @@ Each source VM should already include:
 - an OpenSSH server listening on `ssh.port`;
 - Crabbox sync tools for the target OS (`git`, `rsync` or archive sync tools,
   and a shell/PowerShell);
+- for macOS, `/bin/bash` plus either a working Node runtime or a writable
+  `/usr/local`, so guest preparation can settle the Node readiness baseline;
 - a known-good power-off snapshot for fast linked clones.
 
 Linked clones require an explicit power-off snapshot. Crabbox rejects linked
@@ -76,10 +87,195 @@ intentionally want to clone the current source VM state without a snapshot.
 Parallels also refuses to clone from a busy source VM, so keep template VMs shut
 down when they serve as local fleet bases.
 
+### macOS guests on Apple silicon
+
+When clone mode is unset, a configured `parallels.sourceSnapshot` or
+`parallels.sourceSnapshotId` (including flags and template overrides) selects
+`linked`. Without a snapshot selector, Crabbox selects `full` for a `macos`
+target on an Apple silicon Parallels host and `linked` elsewhere. Detection runs
+on the selected host, including remote and fleet hosts, and checks hardware support
+rather than the architecture of the Crabbox process. To opt back into linked
+cloning, select `--parallels-clone-mode linked` (or `parallels.cloneMode: linked`)
+and a power-off snapshot. Both explicit and snapshot-selected linked mode print one
+warning to stderr before cloning, with full-clone recovery guidance if IP
+discovery times out. Replaying an existing fixed lease does not clone or repeat
+the warning; changing its clone mode still conflicts with its recorded intent.
+
+The full default avoids the known boot issue reported in
+[issue 2398](https://github.com/openclaw/crabbox/issues/2398): an affected linked
+clone reports `running` but never supplies an IP or Tools session, while a full
+clone of the same template works. It is not a claim that all Parallels versions
+or templates have this defect. Parallels' [Apple silicon macOS limitations](https://kb.parallels.com/128867)
+explain that these guests use Apple's Virtualization framework and that
+**snapshots are supported starting with Desktop 20**. Its
+[clone command reference](https://docs.parallels.com/landing/parallels-desktop-developers-guide/command-line-interface-utility/manage-virtual-machines-from-cli/general-virtual-machine-management/clone-a-virtual-machine)
+documents `--linked` and snapshot selection via `-i`; neither reference
+establishes a universal linked-clone prohibition for these guests.
+
+Full clones use the source VM's **current state**, require additional disk
+space, and cannot select a snapshot. Crabbox never silently discards a snapshot
+selector: clear both `parallels.sourceSnapshot` and `parallels.sourceSnapshotId`
+(including template/environment overrides) with
+`--parallels-source-snapshot= --parallels-source-snapshot-id=` when choosing
+current-state cloning. Native snapshot creation, restore, and explicitly selected
+snapshot-based linked forks remain available on supported Parallels versions.
+
+### IP discovery failures
+
+A Tools-reported IP does not prove that guest execution is usable. Before key
+installation, Crabbox requires a successful guest-exec probe, retrying recognized
+Tools-not-ready errors (including `PrlJob_GetResult: Invalid argument` and
+`PrlJob_GetRetCode: Invalid argument`) every five seconds. Each probe is bounded
+to ten seconds; IP discovery and guest preparation share the overall
+`--parallels-startup-timeout`. These errors never count as successful execution.
+Unrelated terminal errors fail immediately. The configured macOS SSH bootstrap
+fallback remains available when Tools cannot execute commands.
+
+Some templates run as full clones but never boot as linked clones: Parallels
+reports the clone as `running`, yet the guest never gets a Tools session or a
+DHCP lease. While waiting for an IP, Crabbox allows a two-minute boot grace
+period, then probes guest execution every 15 seconds with a ten-second limit
+per probe. Three consecutive Tools-unavailable responses fail early with a
+classified guest-tools error (normally after 2m30s), instead of spending the
+default 15-minute `--parallels-startup-timeout`. A successful probe or a different
+error resets the count; early `GuestTools: not_installed` metadata alone never
+triggers this failure. A shorter startup timeout still bounds the entire wait,
+including host queries and probes. Increasing it does not disable Tools fail-fast.
+
+Configured macOS DHCP/SSH discovery runs before each Tools probe. A valid DHCP
+address keeps that fallback waiting for SSH within the startup timeout, even
+when Tools remain unavailable. If neither discovery route finds an address,
+the repeated Tools-unavailable responses can fail early with the fallback
+diagnostic included.
+
+Both failure messages name the clone mode and the clone's NIC MACs, and say
+whether the macOS DHCP fallback found no matching lease for them in the host's
+lease file; a missing record alone does not establish a boot failure. If the
+last VM query fails, the timeout includes that query's error and reports the
+Tools IP as unknown. State and MACs are explicitly identified as the last
+successful observation, if any; older DHCP or clone-mode advice is suppressed
+until inventory access works again. Failed
+acquisitions with generated lease IDs clean up their clone before returning the
+error. `run --keep-on-failure` takes effect only after acquisition; it does not
+retain a clone that fails IP discovery, key installation, guest preparation, or
+SSH bootstrap. Fixed lease IDs retain failed acquisitions under their existing
+replay/cleanup contract. To investigate a generated-ID acquisition,
+retry and capture the new clone's console on the Parallels host while IP
+discovery is still waiting. Use `prlctl list -a` there to identify the new VM:
+
+```sh
+prlctl capture <new-vm-id> --file /tmp/crabbox-clone.png
+```
+
+A persistently black capture can indicate a boot or display problem, but does
+not by itself prove that the guest OS failed to boot. Compare with
+`--parallels-clone-mode full` after clearing both `parallels.sourceSnapshot` and
+`parallels.sourceSnapshotId`, including template, environment, and command-line
+overrides. Explicit empty flags clear both selectors for a retry:
+`--parallels-source-snapshot= --parallels-source-snapshot-id=`.
+Full clones use the source VM's current state; alternatively,
+investigate the template snapshot on a host/guest combination that supports
+linked acquisition. When resolving an existing VM, the
+clone mode is reported as unknown rather than inferred from current configuration,
+and the capture hint targets that existing VM instead of a new acquisition.
+
 For macOS templates, use a user with SSH login permission and a writable
 `parallels.workRoot`, for example `/Users/<user>/crabbox`. For Windows native
 templates, configure OpenSSH Server and PowerShell. For Windows WSL2 templates,
 make sure `wsl.exe` works for the SSH user.
+
+macOS preparation checks for a local listener on the configured SSH port or an
+SSH fallback port, even when the template already has a readiness helper. This
+checks listener availability only; Crabbox still requires authenticated SSH
+readiness before accepting the lease. Linux preparation is unchanged.
+
+macOS readiness requires working `node` and `npm`, so a template does not have to
+ship them. Guest preparation settles the baseline before it checks
+`/usr/local/bin/crabbox-ready`, which means templates that already carry a
+readiness helper still receive it. Preparation resolves the runtime the way the
+readiness probe does, in this order:
+
+1. `node` and `npm` already resolve on the standard command PATH: nothing to do.
+2. The guest SSH user's login environment provides them — Homebrew, nvm, asdf or
+   any other user-managed install. Preparation links them into `/usr/local/bin`
+   so the probe, `crabbox-ready` and root all agree, and downloads nothing. The
+   lookup runs as that user, so a template's login setup is never sourced as
+   root. It resolves them through `bash -lc`, matching the readiness probe, so a
+   runtime exported only from zsh-specific files such as `~/.zprofile` is not
+   found here — export it from `~/.bash_profile`, `~/.profile` or
+   `/etc/paths.d` if a template relies on this case. Version-manager shims are
+   resolved to the executables they run, so an `asdf` or `nvm` runtime keeps
+   working under the fixed PATH that `crabbox-ready` uses, where the manager
+   itself is not present. If the preserved runtime still does not run there,
+   preparation falls back to the pinned installer rather than leaving a
+   readiness helper that fails.
+3. Neither: preparation installs Node 24.19.0, matching the Linux developer
+   recipe's LTS baseline. Intel and Apple Silicon both use checksum-pinned
+   official `nodejs.org` archives, with versioned installations under
+   `/usr/local/lib/crabbox` and command links in `/usr/local/bin`. Homebrew is
+   not required.
+
+A template that already satisfies readiness therefore keeps working offline: an
+existing runtime is preserved rather than replaced, so a template does not start
+depending on `nodejs.org` to stay ready. Only case 3 reaches the network, and a
+failure there stops preparation with the installer's own error rather than
+leaving the lease to time out at readiness.
+
+### Host-side Local Network access
+
+If the guest reports an IP and has an SSH listener but bootstrap reports
+`no-route-to-host`, check the host's routing and System Settings > Privacy &
+Security > Local Network. macOS privacy or code-identity problems can prevent a
+particular binary from connecting even when another tool reaches the same IP.
+Prefer signed release builds to unsigned or ad hoc signed local builds, and
+compare the actual Terminal and SSH-launched contexts when reproducing a failure.
+Apple's [Local Network privacy guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+says command-line tools launched from Terminal or SSH are normally allowed, and
+recommends an Apple-issued code-signing identity for reliable privacy tracking.
+A signature alone does not prove access is granted; a routing failure alone does
+not prove privacy is the cause.
+
+### macOS desktop credentials
+
+For `--desktop` leases, configure the real macOS guest account password with
+`CRABBOX_PARALLELS_PASSWORD` or `parallels.password` in the mode-0600 user
+configuration printed by `crabbox config path`. Crabbox uses that credential
+locally for Apple/ARD Screen Sharing authentication. It is never written to the
+guest, passed on the command line, or used to reset the macOS account password.
+There is intentionally no password flag.
+
+The Screen Sharing username is the resolved lease SSH user, normally
+`parallels.user`. Automatic login is optional image configuration: it lets a
+desktop lease reach Finder without operator input, while the account password
+continues to protect Screen Sharing. Do not put `parallels.password` in
+repository `crabbox.yaml` or `.crabbox.yaml`; repository configuration is not
+trusted to select this credential.
+
+When no account password is configured, the existing generated legacy VNC
+credential remains available for backward compatibility.
+
+### macOS without Parallels Tools guest execution
+
+Some Apple-silicon macOS guests can boot normally while `prlctl` reports no IP
+and rejects guest execution. Set `parallels.bootstrapKey` to enable the macOS-only
+fallback. Its value is an absolute private-key path **on the Parallels host**.
+The source guest must already authorize that identity for `parallels.user`, and
+that user must have non-interactive `sudo` permission for the one-time guest
+preparation script.
+
+When the normal Tools IP is absent, Crabbox reads
+`/Library/Preferences/Parallels/parallels_dhcp_leases` on the same Parallels
+host, matches an unexpired lease against the clone's exact normalized NIC MAC,
+and confirms that the configured SSH port is reachable. Missing, expired,
+malformed, or ambiguous matches fail closed. Crabbox then SSHes from that host
+with the bootstrap identity, streams the normal preparation script on stdin,
+and adds the generated per-lease key. All later sync/run traffic uses only the
+per-lease key.
+
+`bootstrapKey` is accepted only from trusted user configuration or from the
+explicit `--parallels-bootstrap-key` / `CRABBOX_PARALLELS_BOOTSTRAP_KEY`
+overrides. Repository configuration cannot select a host-side bootstrap
+identity. The fallback does not apply to Linux or Windows guests.
 
 ## Configuration
 
@@ -90,12 +286,18 @@ ssh:
   port: "22"
 parallels:
   source: macOS Tahoe
-  sourceSnapshot: fresh
-  cloneMode: linked
+  cloneMode: full
+  bootstrapKey: /Users/alice/.ssh/crabbox-bootstrap
   user: alice
   workRoot: /Users/alice/crabbox
   startupTimeout: 15m
 ```
+
+Set `parallels.vmRoot` or `--parallels-vm-root` to an existing parent directory
+on the Parallels host. Crabbox passes this directory to `prlctl clone --dst`;
+Parallels names and creates the VM bundle beneath it. With a remote host, the
+directory must exist on that Mac. Crabbox does not create the parent directory.
+Leave the setting unset to use the Parallels default location.
 
 ### Named templates
 
@@ -106,7 +308,6 @@ parallels:
     tahoe-latest:
       target: macos
       source: macOS Tahoe
-      sourceSnapshot: macOS 26.3.1 LATEST
       user: alice
       workRoot: /Users/alice/crabbox
     ubuntu-fast:
@@ -116,6 +317,9 @@ parallels:
       user: alice
       workRoot: /work/crabbox
 ```
+
+The macOS alias uses current-state cloning by default on Apple silicon. On an
+Intel host, select a power-off snapshot for linked cloning or set `cloneMode: full`.
 
 A template may set `source`, `sourceId`, `sourceSnapshot`, `sourceSnapshotId`,
 `target`, `windowsMode`, `cloneMode`, `host`, `hostUser`, `hostKey`, `vmRoot`,
@@ -141,6 +345,19 @@ When `parallels.host` is set, Crabbox runs `prlctl` over SSH on that Mac and
 reaches the guest IP through an SSH `ProxyCommand` via the host. Normal SSH
 commands, desktop input helpers, screenshots, and VNC tunnels all use the same
 proxy path.
+
+A repository-defined remote host, including one selected through `templates`
+or `hosts`, cannot silently inherit a host key or ambient SSH authentication
+from a more trusted source. Define the remote host and a relative,
+symlink-resolved key file contained by the repository together, or approve the
+destination explicitly with `--parallels-host` or `CRABBOX_PARALLELS_HOST`.
+Absolute, missing, and repository-escaping key paths require explicit host
+approval.
+
+An explicit `--parallels-host` or `CRABBOX_PARALLELS_HOST` is a direct-host
+override, so it discards any configured `hosts` fleet along with those entries'
+`maxVMs` limits. Set `parallels.maxVMs` or `CRABBOX_PARALLELS_MAX_VMS` to cap
+concurrent VMs on the overriding host.
 
 ### Fleet hosts
 
@@ -169,6 +386,46 @@ requested target, looks for the requested source VM, and picks the first host
 below its `maxVMs` limit. Host selection applies to `warmup`, `run`,
 `checkpoint fork`, `status`, `list`, `stop`, and `cleanup`.
 
+A positive `maxVMs` limits the host's inventoried VMs whose names start with
+`crabbox-`, including stopped VMs. Zero and negative values mean unlimited.
+A limited host counts these VMs and clones under one reservation, so callers
+sharing the reservation described below cannot exceed the limit through
+concurrent fan-out such as `crabbox shard --count 8`. Forks that arrive when the
+host is full fail with exit 5 and
+`host <name> is at maxVMs capacity` instead of cloning. Clones against a limited
+host are therefore serialized against each other, which adds the clone time of
+the forks ahead in the queue. A host with no `maxVMs` has no limit to enforce
+and its forks stay fully parallel.
+
+The reservation is a local file lock shared by callers using the same Crabbox
+state directory and exact configured host/account (with surrounding whitespace
+trimmed). Display names and SSH key paths do not change the reservation identity;
+all local entries share one identity. SSH/DNS aliases are not resolved, so use the
+same host/account spelling for callers that must coordinate. Different state
+directories or machines driving the same Parallels host still race against each
+other. Advisory queries such as `doctor` and `checkpoint fork --dry-run` neither
+take a reservation nor write capacity-lock state.
+
+A top-level `parallels.maxVMs` caps inventoried Crabbox VMs on a direct host:
+
+```yaml
+provider: parallels
+parallels:
+  host: mac-studio.tailnet
+  maxVMs: 4
+```
+
+Precedence: a selected fleet host's own `maxVMs` always wins, and the top-level
+`parallels.maxVMs` applies only when no fleet entry was selected (the direct-host
+path) rather than acting as a default for fleet entries that omit `maxVMs`.
+The default is unlimited. An omitted value inherits an earlier config file's
+setting; an explicit zero or negative value clears that limit. The environment
+variable `CRABBOX_PARALLELS_MAX_VMS` overrides the YAML value, including with
+zero. A direct host with a positive limit takes the same reservation as a limited
+fleet host. Concurrent callers coordinate only when they use the same state
+directory and configured host/account; this is not a quota shared across
+controller machines or different SSH aliases.
+
 ### Environment variables
 
 ```text
@@ -181,15 +438,22 @@ CRABBOX_PARALLELS_CLONE_MODE
 CRABBOX_PARALLELS_HOST
 CRABBOX_PARALLELS_HOST_USER
 CRABBOX_PARALLELS_HOST_KEY
+CRABBOX_PARALLELS_BOOTSTRAP_KEY
 CRABBOX_PARALLELS_VM_ROOT
 CRABBOX_PARALLELS_USER
+CRABBOX_PARALLELS_PASSWORD
 CRABBOX_PARALLELS_WORK_ROOT
 CRABBOX_PARALLELS_STARTUP_TIMEOUT
+CRABBOX_PARALLELS_MAX_VMS
 ```
 
 Provider flags mirror the same fields (`--parallels-source`,
 `--parallels-source-snapshot`, `--parallels-template`, `--parallels-host`, and
-so on) and never carry passwords.
+so on) and never carry passwords. The direct-host `maxVMs` setting is available
+only through YAML and `CRABBOX_PARALLELS_MAX_VMS`, not a command-line flag.
+
+`crabbox config show` displays the loaded direct-host setting as `max_vms`
+(`parallels.maxVMs` in JSON), independently of each fleet entry's own limit.
 
 ## Checkpoints
 
@@ -226,10 +490,144 @@ crabbox checkpoint delete --provider parallels --id blue-lobster --snapshot "cra
 Linked clones depend on the source VM and snapshot. Keep known-good template VMs
 and their base snapshots while any checkpoint or clone depends on them.
 
+## Fixed lease IDs
+
+An external orchestrator can name the lease itself so a repeated dispatch stays
+safe to replay:
+
+```sh
+crabbox warmup --provider parallels --lease-id cbx_abcdef123456 --parallels-template ubuntu-fast
+```
+
+The idempotency key is the VM name. Crabbox derives a host-unique
+`crabbox-<lease-id>-<slug>` name from the requested ID and records it, with the
+attested host connection identity, the immutable source VM UUID, and a hash of
+the create identity, in the durable lease claim **before** it runs
+`prlctl clone`. `prlctl` refuses a second VM with that name on the same host, so
+a concurrent duplicate create is rejected by Parallels itself even when a clone
+reply is lost.
+
+A VM name is host-unique but reusable over time, so it identifies a slot rather
+than a resource. Ownership is therefore bound to two provider-issued identities
+that configuration cannot forge:
+
+- **The host.** The provider scope is a digest of the Parallels service's own
+  server and hardware identifiers, read from `prlsrvctl info`, plus the host
+  account UID reported by `id -u`. VM visibility depends on the account's
+  registration and permissions, so another account's empty inventory cannot
+  prove that the original VM is gone (see [Parallels account sharing](https://kb.parallels.com/9303)). A fleet entry
+  that keeps its `name:` while its `host:` or `user:` is repointed at a
+  different machine or account is refused. Only attested
+  values enter the scope — not the entry's name, its configured address, or the
+  configured account name — so the same machine/account answering at a new address
+  still owns its leases and can still be stopped, and the hashed scope keeps
+  host identifiers out of claims, labels, and error messages. The `host` label
+  on a lease is an operator-facing display name and is deliberately not an
+  ownership check.
+- **The VM incarnation.** `prlctl clone` reports no UUID, and the name it is
+  given is mutable, so reading a VM back by name cannot say which incarnation
+  the clone produced. Crabbox instead clones into a per-lease directory named
+  with a secret nonce, recorded in the claim before the clone runs, and passes
+  it as `--dst`. A bundle inside that directory can only have come from this
+  attempt's own clone. The VM found there supplies the UUID, and every later
+  adoption, guest mutation, and deletion requires the observed VM to carry that
+  UUID *and* still live in that directory. The directory is removed after
+  release, and only while empty.
+
+The reconciliation contract:
+
+- **Replay.** An identical request returns the same live lease. Crabbox adopts
+  only the VM at the exact recorded name, and only after re-confirming that its
+  UUID is the incarnation this attempt's clone produced, that its name carries
+  the lease, and that the host connection still attests the recorded identity.
+- **Drift.** A different source VM, source snapshot ID, clone mode, target OS,
+  Windows mode, guest user, SSH key or ports, desktop setup, work root, VM root,
+  slug request, pond, keep policy, TTL, idle timeout, or checkpoint ID is a different
+  create identity and fails `lease_id_conflict` instead of provisioning. The
+  source is resolved to its immutable UUID before it enters the fingerprint and
+  before it is submitted to `prlctl clone`, so replacing a template VM under the
+  same name is drift rather than a silent provision from a different template.
+- **Reuse.** Run, SSH, and status resolution re-attest the host, recorded VM
+  name, UUID, and creation directory before guest access. Renaming a fleet
+  entry does not change that ownership; repointing it at another host does.
+- **Capacity.** A clone submission holds the recorded host's capacity
+  reservation across counting and cloning, so concurrent fixed-ID warmups cannot
+  each consume the same last `maxVMs` slot, and a prepared retry cannot
+  overcommit a host that filled up after its intent was recorded. The
+  reservation guards creation only: replaying or stopping a lease whose VM
+  already exists still works on a full host.
+- **Host scope.** A fixed lease never re-runs fleet selection. It reconciles
+  against the host recorded in its intent, and reserves that host alone rather
+  than shopping the fleet. A fleet whose hosts cannot be
+  attested keeps custody instead of rebinding; a fleet in which no host attests
+  the recorded identity fails `lease_id_conflict`.
+- **Absence.** Only a complete inventory listing proves a VM is gone, and only
+  the bound UUID being absent from it. The recorded claim and attempt must agree
+  on the host scope and VM UUID before absence can retire the lease; missing or
+  conflicting incarnation evidence retains custody. A failed `prlctl list` keeps custody
+  rather than cloning a second VM; an acquired VM that has been renamed to
+  another `crabbox-<lease-id>-<slug>` is found by its UUID and keeps custody
+  rather than being reported as deleted; and an acquired lease whose VM has
+  disappeared fails closed instead of recreating it.
+- **Submission.** The attempt records submission durably before invoking the
+  clone. If its VM is absent afterward, replay retains custody without another
+  submission, even if the UUID was never read back. Only an attempt explicitly
+  recorded as not yet submitted may create a VM; missing submission evidence
+  also fails closed. Failures before submission, such as a capacity or clone
+  directory error or a snapshot preflight lookup failure, can be retried with
+  the same ID.
+- **Lost replies.** A lost clone reply leaves the VM, if it was created, inside
+  the attempt's own directory, so replay recovers it there rather than cloning a
+  second one — even though its UUID was never reported. If instead a VM that
+  this attempt did not create occupies the recorded name, `warmup` and `stop`
+  both report `lease_id_conflict` and name it: nothing is started, no per-lease
+  key is installed, and nothing is deleted. The name alone cannot prove which
+  incarnation occupies it, and acting on it would hand credentials and deletion
+  authority to whatever is there.
+- **Failure.** A failed fixed acquisition keeps its claim, its recorded attempt,
+  and its per-lease key. Retry the same lease ID, or stop it. Crabbox does not
+  roll the VM back, because that would make a lost reply indistinguishable from
+  a plain failure.
+- **Release.** `stop` resolves a fixed lease from its durable claim alone. It
+  reads no guest and builds no SSH target before the recorded host and VM
+  incarnation have been re-attested, so a VM occupying the recorded name is
+  never reachable with the lease's credentials. It then deletes only the
+  recorded VM, and keeps a terminal tombstone: the ID, slug, connection scope,
+  intent hash, timestamps, and terminal state. Stopping a fixed lease whose VM
+  is already gone finalizes that tombstone, and stopping an already terminal
+  lease is an idempotent no-op after validating its terminal receipt — both through `crabbox stop`, not only through
+  the provider API. Replaying a released ID never creates another VM. Automatic
+  cleanup never prunes tombstones, and there is no reuse window — deleting local
+  claim state forfeits the protection, so automation must mint a new ID instead.
+
+No path uses the slug to decide replay ownership. A `crabbox-<slug>` VM, or
+another lease's VM carrying the same slug, is never adopted.
+
+A `prepared` intent whose VM was never observed is deliberately inconclusive:
+the clone may still be in flight, so `stop` refuses it. Replay can recover a
+submitted clone once its VM appears, then stop the lease it reconciles to. If
+that VM never appears or was removed before being observed, inspect the host;
+replay will not replace it. Use a new lease ID for any later creation.
+
+A fixed lease's VM bundle lives at
+`<vmRoot or the host's VM directory>/crabbox-<lease-id>-<slug>-<nonce>/`, one
+directory per lease, rather than directly in the VM directory. Ordinary
+generated-ID warmup is unaffected.
+
+Fixed Parallels claims are stored under the downgrade-safe
+`parallels-fixed-v1` provider marker. Current clients map it back to the
+`parallels` runtime provider, so ownership checks, resolution, and cleanup keep
+routing it; a released client that does not know the marker cannot mistake the
+claim for an ordinary Parallels lease and therefore cannot delete its VM or
+prune its tombstone.
+
 ## Safety
 
-Crabbox refuses to delete Parallels VMs unless their name starts with
-`crabbox-`. `stop` and `cleanup` are scoped to clones Crabbox created.
+Crabbox refuses to delete a Parallels VM unless an exact local claim binds the
+lease to the VM ID and selected Parallels host. A `crabbox-` name alone is not
+ownership proof. `stop` and `cleanup` skip unclaimed or mismatched clones;
+intentionally recovered clones must first be adopted through an explicit
+`--reclaim` reuse.
 
 Use `--dry-run` on direct fork, restore, and delete when validating a template
 or snapshot name. `checkpoint list` prints live Parallels state and marks

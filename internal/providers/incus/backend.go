@@ -4,34 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lxc/incus/v7/shared/api"
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-type ProviderSpec = core.ProviderSpec
-type Backend = core.Backend
-type AcquireRequest = core.AcquireRequest
-type ResolveRequest = core.ResolveRequest
-type ListRequest = core.ListRequest
-type LeaseView = core.LeaseView
-type ReleaseLeaseRequest = core.ReleaseLeaseRequest
-type TouchRequest = core.TouchRequest
-type CleanupRequest = core.CleanupRequest
-type LeaseTarget = core.LeaseTarget
-type SSHTarget = core.SSHTarget
-
 type backend struct {
-	spec ProviderSpec
-	cfg  Config
-	rt   Runtime
+	spec core.ProviderSpec
+	cfg  core.Config
+	rt   core.Runtime
 }
 
 var waitForSSHReady = core.WaitForSSHReady
+
+const (
+	incusClaimReservationUntilLabel = "incus_reservation_until"
+	incusLegacyReservationGrace     = 12 * time.Hour
+	incusResolveCompletionMargin    = time.Minute
+)
 
 type retainedAcquireError struct {
 	err     error
@@ -42,12 +37,12 @@ func (e *retainedAcquireError) Error() string { return e.err.Error() }
 
 func (e *retainedAcquireError) Unwrap() error { return e.err }
 
-func newBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	applyDefaults(&cfg)
 	return &backend{spec: spec, cfg: cfg, rt: rt}
 }
 
-func applyDefaults(cfg *Config) {
+func applyDefaults(cfg *core.Config) {
 	cfg.Provider = providerName
 	base := core.BaseConfig()
 	if cfg.TargetOS == "" {
@@ -76,30 +71,32 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
-func (b *backend) Spec() ProviderSpec { return b.spec }
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
-func (b *backend) RebindResolvedLeaseTarget(target *LeaseTarget, leaseID string) error {
-	core.UseStoredTestboxKey(&target.SSH, leaseID)
-	return nil
+func (b *backend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID string) error {
+	return core.UseStoredTestboxKey(&target.SSH, leaseID)
 }
 
-func (b *backend) configForRun() Config {
+func (b *backend) configForRun() core.Config {
 	cfg := b.cfg
 	applyDefaults(&cfg)
 	return cfg
 }
 
-func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
+func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	var lastErr error
 	attempts := core.AcquireAttempts(req.Keep)
+	if req.RequestedLeaseID != "" {
+		attempts = 1
+	}
 	for attempt := 1; attempt <= attempts; attempt++ {
-		lease, err := b.acquireOnce(ctx, req)
+		lease, err := b.acquireDurable(ctx, req)
 		if err == nil {
 			return lease, nil
 		}
 		lastErr = err
 		if attempt == attempts || !core.IsBootstrapWaitError(err) {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		var retained *retainedAcquireError
 		if errors.As(err, &retained) && retained.cleanup != nil {
@@ -107,155 +104,70 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 		}
 		fmt.Fprintf(b.rt.Stderr, "warning: bootstrap failed; retrying with fresh lease: %v\n", err)
 	}
-	return LeaseTarget{}, lastErr
+	return core.LeaseTarget{}, lastErr
 }
 
-func (b *backend) acquireOnce(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
+func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (lease core.LeaseTarget, err error) {
 	cfg := b.configForRun()
 	client, err := newClient(cfg)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	leaseID := core.NewLeaseID()
-	instances, err := client.ListInstances()
-	if err != nil {
-		return LeaseTarget{}, err
-	}
-	servers := make([]core.Server, 0, len(instances))
-	for _, inst := range instances {
-		servers = append(servers, serverFromInstance(inst, nil, cfg))
-	}
-	slug, err := core.AllocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
-	if err != nil {
-		return LeaseTarget{}, err
-	}
-	keyPath, publicKey, err := core.EnsureTestboxKeyForConfig(cfg, leaseID)
-	if err != nil {
-		return LeaseTarget{}, err
-	}
-	cleanupKey := true
-	defer func() {
-		if cleanupKey {
-			core.RemoveStoredTestboxKey(leaseID)
+	if req.ReleaseOnly {
+		claim, exists, err := core.ResolveLeaseClaimForProvider(req.ID, providerName)
+		if err != nil {
+			return core.LeaseTarget{}, err
 		}
-	}()
-	cfg.SSHKey = keyPath
-	cfg.ProviderKey = core.ProviderKeyForLease(leaseID)
-	name := core.LeaseProviderName(leaseID, slug)
-	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", req.Keep, time.Now().UTC())
-	labels["instance"] = name
-	labels["image"] = cfg.Incus.Image
-	labels["ssh_user"] = cfg.SSHUser
-	labels["ssh_port"] = cfg.SSHPort
-	labels["work_root"] = cfg.WorkRoot
-	labels["release"] = incusReleaseAction(cfg)
-	if port := strings.TrimSpace(cfg.Incus.ProxyListenPort); port != "" {
-		labels["proxy_port"] = port
-		if host := sshHostForConfig(cfg); host != "" {
-			labels["proxy_host"] = host
-		}
-	}
-	createReq := api.InstancesPost{
-		Name: name,
-		Type: api.InstanceType(normalizeInstanceType(cfg.Incus.InstanceType)),
-		InstancePut: api.InstancePut{
-			Config:   instanceConfigForCreate(cfg, labels, publicKey),
-			Profiles: profilesForConfig(cfg),
-			Devices:  devicesForCreate(cfg),
-		},
-		Source: imageSourceForConfig(cfg),
-	}
-	fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s type=%s image=%s keep=%v\n", providerName, leaseID, slug, cfg.Incus.InstanceType, cfg.Incus.Image, req.Keep)
-	if err := client.CreateInstance(createReq); err != nil {
-		return LeaseTarget{}, err
-	}
-	if req.Keep {
-		cleanupKey = false
-	}
-	cleanupInstance := func() {
-		if inst, _, err := client.GetInstance(name); err == nil && inst.IsActive() {
-			_ = client.SetInstanceState(name, api.InstanceStatePut{Action: "stop", Force: true, Timeout: durationSecondsCeil(cfg.Incus.StartTimeout)}, "")
-		}
-		_ = client.DeleteInstance(name)
-	}
-	retainedCleanup := func() {
-		cleanupInstance()
-		core.RemoveStoredTestboxKey(leaseID)
-	}
-	inst, etag, err := client.GetInstance(name)
-	if err != nil {
-		if !req.Keep {
-			cleanupInstance()
-		} else {
-			err = &retainedAcquireError{err: err, cleanup: retainedCleanup}
-		}
-		return LeaseTarget{}, err
-	}
-	if !inst.IsActive() {
-		if err := client.SetInstanceState(name, api.InstanceStatePut{Action: "start", Timeout: durationSecondsCeil(cfg.Incus.StartTimeout)}, etag); err != nil {
-			if !req.Keep {
-				cleanupInstance()
-			} else {
-				err = &retainedAcquireError{err: err, cleanup: retainedCleanup}
+		// Terminal slugs may belong to a newer live lease; only replay an exact ID.
+		if exists && incusLeaseKind.IsFixedClaim(claim) && claim.FixedCreateIntent.State == "released" && core.IsCanonicalLeaseID(req.ID) && claim.LeaseID == req.ID {
+			if err := verifyConnection(client, claim.ProviderScope); err != nil {
+				return core.LeaseTarget{}, err
 			}
-			return LeaseTarget{}, err
+			lease, _, err := incusLeaseKind.ResolveTerminal(claim, true)
+			if err != nil {
+				return core.LeaseTarget{}, err
+			}
+			lease.Server.Status = "deleted"
+			return lease, nil
 		}
-	}
-	inst, _, err = b.waitForAddress(ctx, client, name)
-	if err != nil {
-		if !req.Keep {
-			cleanupInstance()
-		} else {
-			err = &retainedAcquireError{err: err, cleanup: retainedCleanup}
+		if exists && claim.FixedCreateIntent != nil && (claim.FixedCreateIntent.State == "acquired" || claim.FixedCreateIntent.State == "deleting") {
+			if err := verifyConnection(client, claim.ProviderScope); err != nil {
+				return core.LeaseTarget{}, err
+			}
+			_, _, lookupErr := client.GetInstance(claim.CloudID)
+			if api.StatusErrorCheck(lookupErr, 404) {
+				return core.LeaseTarget{LeaseID: claim.LeaseID, Server: core.Server{Provider: providerName, Name: claim.CloudID, CloudID: claim.CloudID, ImmutableID: claim.CloudImmutableID, Labels: claim.Labels}}, nil
+			}
+			if lookupErr != nil {
+				return core.LeaseTarget{}, lookupErr
+			}
 		}
-		return LeaseTarget{}, err
-	}
-	server := serverFromInstance(*inst, nil, cfg)
-	target := core.SSHTargetFromConfig(cfg, sshTargetHost(server, cfg))
-	if err := waitForSSHReady(ctx, &target, b.rt.Stderr, "bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
-		if !req.Keep {
-			cleanupInstance()
-		} else {
-			err = &retainedAcquireError{err: err, cleanup: retainedCleanup}
-		}
-		return LeaseTarget{}, err
-	}
-	server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, "ready", time.Now().UTC())
-	if err := setInstanceLabels(ctx, client, name, server.Labels); err != nil {
-		fmt.Fprintf(b.rt.Stderr, "warning: set incus labels: %v\n", err)
-	}
-	if err := core.ClaimLeaseForRepoProviderScopePond(leaseID, slug, providerName, instanceScope(name), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
-		if !req.Keep {
-			cleanupInstance()
-		} else {
-			err = &retainedAcquireError{err: err, cleanup: retainedCleanup}
-		}
-		return LeaseTarget{}, err
-	}
-	if err := core.UpdateLeaseClaimEndpoint(leaseID, server, target); err != nil {
-		if !req.Keep {
-			cleanupInstance()
-		} else {
-			err = &retainedAcquireError{err: err, cleanup: retainedCleanup}
-		}
-		return LeaseTarget{}, err
-	}
-	cleanupKey = false
-	return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
-}
-
-func (b *backend) Resolve(ctx context.Context, req ResolveRequest) (lease LeaseTarget, err error) {
-	cfg := b.configForRun()
-	client, err := newClient(cfg)
-	if err != nil {
-		return LeaseTarget{}, err
 	}
 	inst, server, leaseID, err := b.resolveInstance(ctx, client, req.ID)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if req.ReleaseOnly {
-		return LeaseTarget{Server: server, LeaseID: leaseID}, nil
+		claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if !exists || !incusLeaseKind.IsFixedClaim(claim) {
+			return core.LeaseTarget{}, core.Exit(4, "Incus lease %s requires its durable ownership claim for release; inspect legacy instances with Incus directly", leaseID)
+		}
+		return core.LeaseTarget{Server: server, LeaseID: leaseID}, nil
+	}
+	if !req.StatusOnly {
+		claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if !exists {
+			return core.LeaseTarget{}, core.Exit(4, "Incus instance %s requires an existing ownership claim for reuse; automatic adoption is not supported", inst.Name)
+		}
+		if err := requireAcquiredIntent(claim); err != nil {
+			return core.LeaseTarget{}, err
+		}
 	}
 	var previousClaim, preflightClaim core.LeaseClaim
 	var previousClaimExists, rollbackClaim bool
@@ -267,21 +179,52 @@ func (b *backend) Resolve(ctx context.Context, req ResolveRequest) (lease LeaseT
 			fmt.Fprintf(b.rt.Stderr, "warning: restore Incus lease claim %s after resolve failure: %v\n", leaseID, restoreErr)
 		}
 	}()
-	if req.Repo.Root != "" && leaseID != "" {
+	if !req.StatusOnly && req.Repo.Root != "" && leaseID != "" {
+		// Reserve the existing instance before starting or relabeling it. Cleanup
+		// holds this same claim lock across deletion, so a reuse either publishes
+		// ownership first or waits for cleanup to finish.
 		previousClaim, previousClaimExists, err = core.ReadLeaseClaimWithPresence(leaseID)
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
-		preflightClaim, err = core.ClaimLeaseForRepoProviderScopePondIfUnchanged(leaseID, server.Labels["slug"], providerName, instanceScope(inst.Name), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, previousClaim, previousClaimExists)
+		if !previousClaimExists {
+			return core.LeaseTarget{}, core.Exit(4, "Incus lease %s ownership claim disappeared before reservation", leaseID)
+		}
+		if err := requireAcquiredIntent(previousClaim); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		reservationWindow := 2*cfg.Incus.StartTimeout + core.BootstrapWaitTimeout(cfg) + incusResolveCompletionMargin
+		preflightClaim, err = core.ClaimLeaseForRepoProviderScopePondEndpointReservationIfUnchanged(leaseID, server.Labels["slug"], providerName, claimScopeForInstance(inst), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, server, core.SSHTarget{}, incusClaimReservationUntilLabel, reservationWindow, previousClaim, previousClaimExists)
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		rollbackClaim = true
+		// Re-read the provider after reservation publication; failure rolls the
+		// reservation back through the deferred comparison above.
+		current, _, currentErr := client.GetInstance(inst.Name)
+		if currentErr != nil {
+			return core.LeaseTarget{}, fmt.Errorf("revalidate Incus instance %s after reserving claim: %w", inst.Name, currentErr)
+		}
+		if err := validateClaimInstance(client, previousClaim, *current); err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if !isCrabboxInstance(*current) {
+			return core.LeaseTarget{}, core.Exit(4, "Incus instance %s changed ownership while reserving claim", inst.Name)
+		}
+		currentServer := serverFromInstance(*current, nil, cfg)
+		if strings.TrimSpace(currentServer.Labels["lease"]) != leaseID ||
+			strings.TrimSpace(currentServer.Labels["provider"]) != providerName ||
+			strings.TrimSpace(currentServer.Labels["created_at"]) == "" ||
+			currentServer.Labels["created_at"] != server.Labels["created_at"] {
+			return core.LeaseTarget{}, core.Exit(4, "Incus instance %s changed lease identity while reserving claim", inst.Name)
+		}
+		inst = *current
+		server = currentServer
 	}
 	if req.StatusOnly {
 		state, _, err := client.GetInstanceState(inst.Name)
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		server = serverFromInstance(inst, state, cfg)
 		if liveState := strings.ToLower(strings.TrimSpace(state.Status)); liveState != "" {
@@ -294,12 +237,12 @@ func (b *backend) Resolve(ctx context.Context, req ResolveRequest) (lease LeaseT
 	} else {
 		if !inst.IsActive() {
 			if err := client.SetInstanceState(inst.Name, api.InstanceStatePut{Action: "start", Timeout: durationSecondsCeil(cfg.Incus.StartTimeout)}, ""); err != nil {
-				return LeaseTarget{}, err
+				return core.LeaseTarget{}, err
 			}
 		}
 		instWithAddress, _, err := b.waitForAddress(ctx, client, inst.Name)
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		inst = *instWithAddress
 		server = serverFromInstance(inst, nil, cfg)
@@ -312,15 +255,13 @@ func (b *backend) Resolve(ctx context.Context, req ResolveRequest) (lease LeaseT
 		target.Port = labelPort
 	}
 	if leaseID != "" {
-		if keyPath, keyErr := core.TestboxKeyPath(leaseID); keyErr == nil {
-			if _, statErr := os.Stat(keyPath); statErr == nil {
-				target.Key = keyPath
-			}
+		if err := core.UseStoredTestboxKey(&target, leaseID); err != nil {
+			return core.LeaseTarget{}, err
 		}
 	}
 	if !req.StatusOnly {
 		if err := waitForSSHReady(ctx, &target, b.rt.Stderr, "reuse", core.BootstrapWaitTimeout(cfg)); err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		server.Status = "ready"
 		server.Labels = core.TouchDirectLeaseLabels(server.Labels, cfg, "ready", time.Now().UTC())
@@ -328,20 +269,20 @@ func (b *backend) Resolve(ctx context.Context, req ResolveRequest) (lease LeaseT
 			fmt.Fprintf(b.rt.Stderr, "warning: set incus labels: %v\n", err)
 		}
 	}
-	if req.Repo.Root != "" && leaseID != "" {
+	if !req.StatusOnly && req.Repo.Root != "" && leaseID != "" {
 		if _, err = core.UpdateLeaseClaimEndpointIfUnchanged(leaseID, preflightClaim, server, target); err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		rollbackClaim = false
 	} else if !req.StatusOnly && leaseID != "" {
 		if err := core.UpdateLeaseClaimEndpoint(leaseID, server, target); err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 	}
-	return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 }
 
-func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) {
+func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
 	cfg := b.configForRun()
 	client, err := newClient(cfg)
 	if err != nil {
@@ -351,7 +292,7 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 	if err != nil {
 		return nil, err
 	}
-	views := make([]LeaseView, 0, len(instances))
+	views := make([]core.LeaseView, 0, len(instances))
 	for _, inst := range instances {
 		if !isCrabboxInstance(inst) {
 			continue
@@ -367,7 +308,7 @@ func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.Doctor
 	if err != nil {
 		return core.DoctorResult{}, err
 	}
-	views, err := b.List(ctx, ListRequest{})
+	views, err := b.List(ctx, core.ListRequest{})
 	if err != nil {
 		return core.DoctorResult{}, err
 	}
@@ -395,15 +336,35 @@ func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.Doctor
 	return core.DoctorResult{Provider: providerName, Message: strings.Join(fields, " ")}, nil
 }
 
-func (b *backend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error {
+func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	_, err := b.ReleaseLeaseWithOutcome(ctx, req)
+	return err
+}
+
+func (b *backend) ReleaseLeaseWithOutcome(ctx context.Context, req core.ReleaseLeaseRequest) (core.ReleaseLeaseOutcome, error) {
+	var outcome core.ReleaseLeaseOutcome
+	err := b.releaseLease(ctx, req, &outcome)
+	return outcome, err
+}
+
+func (b *backend) releaseLease(ctx context.Context, req core.ReleaseLeaseRequest, outcome *core.ReleaseLeaseOutcome) error {
 	cfg := b.configForRun()
 	client, err := newClient(cfg)
 	if err != nil {
 		return err
 	}
-	inst, _, leaseID, err := b.resolveInstance(ctx, client, req.Lease.LeaseID)
+	if req.Lease.LeaseID != "" {
+		claim, exists, err := core.ReadLeaseClaimWithPresence(req.Lease.LeaseID)
+		if err != nil {
+			return err
+		}
+		if exists && claim.Provider == providerName && claim.FixedCreateIntent != nil {
+			return b.releaseDurableWithOutcome(ctx, client, req.Lease.LeaseID, incusDeleteOnRelease(req.Lease, cfg), req.Force, outcome)
+		}
+	}
+	_, _, leaseID, err := b.resolveInstance(ctx, client, req.Lease.LeaseID)
 	if err != nil && strings.TrimSpace(req.Lease.Server.CloudID) != "" {
-		inst, _, leaseID, err = b.resolveInstance(ctx, client, req.Lease.Server.CloudID)
+		_, _, leaseID, err = b.resolveInstance(ctx, client, req.Lease.Server.CloudID)
 	}
 	if err != nil {
 		return err
@@ -413,64 +374,32 @@ func (b *backend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) err
 		return err
 	}
 	deleteInstance := incusDeleteOnRelease(req.Lease, cfg)
-	if deleteInstance {
-		if inst.IsActive() {
-			if err := client.SetInstanceState(inst.Name, api.InstanceStatePut{Action: "stop", Force: req.Force, Timeout: durationSecondsCeil(cfg.Incus.StartTimeout)}, ""); err != nil {
-				return err
-			}
-		}
-		if err := client.DeleteInstance(inst.Name); err != nil {
-			return err
-		}
-	} else {
-		labels := labelsFromInstance(inst)
-		labels["state"] = "stopped"
-		labels["release"] = "stop"
-		delete(labels, "host")
-		stopAndPersist := func() error {
-			if inst.IsActive() {
-				if err := client.SetInstanceState(inst.Name, api.InstanceStatePut{Action: "stop", Force: true, Timeout: durationSecondsCeil(cfg.Incus.StartTimeout)}, ""); err != nil {
-					return err
-				}
-			}
-			return setInstanceLabels(ctx, client, inst.Name, labels)
-		}
-		if leaseID != "" && claimOK {
-			server := core.Server{CloudID: inst.Name, Provider: providerName, Name: inst.Name, Status: "stopped", Labels: labels}
-			if _, err := core.UpdateLeaseClaimEndpointIfUnchangedAfter(leaseID, claim, server, core.SSHTarget{}, stopAndPersist); err != nil {
-				return err
-			}
-		} else if err := stopAndPersist(); err != nil {
-			return err
-		}
+	if claimOK && claim.FixedCreateIntent != nil {
+		return b.releaseDurableWithOutcome(ctx, client, leaseID, deleteInstance, req.Force, outcome)
 	}
-	if leaseID != "" && deleteInstance {
-		core.RemoveLeaseClaim(leaseID)
-		core.RemoveStoredTestboxKey(leaseID)
-	}
-	return nil
+	return core.Exit(4, "Incus lease %s requires its durable ownership claim for release; inspect legacy instances with Incus directly", leaseID)
 }
 
-func (b *backend) ReleaseLeaseMessage(lease LeaseTarget) string {
+func (b *backend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
 	instance := core.Blank(core.Blank(lease.Server.CloudID, lease.Server.Name), "-")
-	if incusDeleteOnRelease(lease, b.configForRun()) {
+	if lease.Server.Status == "deleted" || incusDeleteOnRelease(lease, b.configForRun()) {
 		return fmt.Sprintf("deleted lease=%s instance=%s", lease.LeaseID, instance)
 	}
 	return fmt.Sprintf("stopped lease=%s instance=%s retained=true", lease.LeaseID, instance)
 }
 
-func (b *backend) RetainLeaseClaimAfterRelease(lease LeaseTarget) bool {
-	return !incusDeleteOnRelease(lease, b.configForRun())
+func (b *backend) RetainLeaseClaimAfterRelease(lease core.LeaseTarget) bool {
+	return !incusDeleteOnRelease(lease, b.configForRun()) || lease.Server.Labels["fixed_intent_sha256"] != ""
 }
 
-func incusReleaseAction(cfg Config) string {
+func incusReleaseAction(cfg core.Config) string {
 	if cfg.Incus.DeleteOnRelease {
 		return "delete"
 	}
 	return "stop"
 }
 
-func incusDeleteOnRelease(lease LeaseTarget, cfg Config) bool {
+func incusDeleteOnRelease(lease core.LeaseTarget, cfg core.Config) bool {
 	if core.DeleteOnReleaseExplicit(cfg, providerName) {
 		return cfg.Incus.DeleteOnRelease
 	}
@@ -485,7 +414,7 @@ func incusDeleteOnRelease(lease LeaseTarget, cfg Config) bool {
 	return cfg.Incus.DeleteOnRelease
 }
 
-func (b *backend) Touch(ctx context.Context, req TouchRequest) (core.Server, error) {
+func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
 	cfg := b.configForRun()
 	client, err := newClient(cfg)
 	if err != nil {
@@ -497,50 +426,160 @@ func (b *backend) Touch(ctx context.Context, req TouchRequest) (core.Server, err
 	if name == "" {
 		return core.Server{}, core.Exit(2, "provider=%s touch requires an Incus instance name", providerName)
 	}
+	inst, _, err := client.GetInstance(name)
+	if err != nil {
+		return core.Server{}, err
+	}
+	if req.Lease.Server.ImmutableID != "" && inst.Config["volatile.uuid"] != req.Lease.Server.ImmutableID {
+		return core.Server{}, core.Exit(4, "Incus touch resource identity changed")
+	}
+	if err := validateResolvedInstance(client, *inst, req.Lease.LeaseID); err != nil {
+		return core.Server{}, err
+	}
 	if err := setInstanceLabels(ctx, client, name, server.Labels); err != nil {
 		return core.Server{}, err
 	}
 	return server, nil
 }
 
-func (b *backend) Cleanup(ctx context.Context, req CleanupRequest) error {
+func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	cfg := b.configForRun()
 	client, err := newClient(cfg)
 	if err != nil {
 		return err
 	}
+	// Snapshot claim ownership before listing instances. Resolve reserves a reused
+	// instance by replacing its claim before it starts or refreshes the instance,
+	// while Cleanup still holds the stale expired view returned by ListInstances.
+	claimCandidates, err := core.ListLeaseClaims()
+	if err != nil {
+		return err
+	}
+	claimsByLease := make(map[string]core.LeaseClaim, len(claimCandidates))
+	for _, claim := range claimCandidates {
+		if claim.LeaseID != "" {
+			claimsByLease[claim.LeaseID] = claim
+		}
+	}
 	instances, err := client.ListInstances()
 	if err != nil {
 		return err
 	}
+	// A committed delete can disappear from the inventory before its reply arrives.
+	// Replay the same durable deletion owner even when no instance is listed.
+	for _, claim := range claimCandidates {
+		if !incusLeaseKind.IsFixedClaim(claim) || claim.FixedCreateIntent.State != "deleting" {
+			continue
+		}
+		if err := verifyConnection(client, claim.ProviderScope); err != nil {
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s reason=connection-identity err=%v\n", claim.LeaseID, err)
+			continue
+		}
+		if req.DryRun {
+			fmt.Fprintf(b.rt.Stdout, "would reconcile deletion lease=%s\n", claim.LeaseID)
+			continue
+		}
+		started, err := b.deleteDurable(ctx, client, claim, true)
+		if err != nil {
+			if started {
+				return err
+			}
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s reason=changed-during-cleanup err=%v\n", claim.LeaseID, err)
+			continue
+		}
+		fmt.Fprintf(b.rt.Stdout, "reconciled deletion lease=%s\n", claim.LeaseID)
+	}
+	now := time.Now().UTC()
 	for _, inst := range instances {
 		if !isCrabboxInstance(inst) {
 			continue
 		}
 		server := serverFromInstance(inst, nil, cfg)
-		shouldDelete, reason := core.ShouldCleanupServer(server, time.Now().UTC())
+		shouldDelete, reason := core.ShouldCleanupServer(server, now)
 		if !shouldDelete {
 			fmt.Fprintf(b.rt.Stderr, "skip instance name=%s reason=%s\n", inst.Name, reason)
 			continue
 		}
-		fmt.Fprintf(b.rt.Stdout, "remove instance name=%s lease=%s reason=%s\n", inst.Name, core.Blank(server.Labels["lease"], "-"), reason)
-		if req.DryRun {
+		leaseID := strings.TrimSpace(server.Labels["lease"])
+		expectedClaim, expectedClaimExists := claimsByLease[leaseID]
+		if expectedClaim.FixedCreateIntent != nil && expectedClaim.FixedCreateIntent.State == "deleting" {
 			continue
 		}
-		if inst.IsActive() {
-			if err := client.SetInstanceState(inst.Name, api.InstanceStatePut{Action: "stop", Force: true, Timeout: durationSecondsCeil(cfg.Incus.StartTimeout)}, ""); err != nil {
-				return err
+		if !expectedClaimExists || !incusLeaseKind.IsFixedClaim(expectedClaim) {
+			fmt.Fprintf(b.rt.Stderr, "skip instance name=%s reason=missing-durable-ownership-claim\n", inst.Name)
+			continue
+		}
+		if err := validateClaimInstance(client, expectedClaim, inst); err != nil {
+			fmt.Fprintf(b.rt.Stderr, "skip instance name=%s reason=ownership-mismatch err=%v\n", inst.Name, err)
+			continue
+		}
+		if !incusCleanupClaimAllowsInstanceCleanup(expectedClaim, server.Labels, now) {
+			fmt.Fprintf(b.rt.Stderr, "skip instance name=%s lease=%s reason=claim-newer-than-instance\n", inst.Name, core.Blank(leaseID, "-"))
+			continue
+		}
+		if req.DryRun {
+			if leaseID != "" {
+				if err := core.VerifyLeaseClaimUnchanged(leaseID, expectedClaim); err != nil {
+					fmt.Fprintf(b.rt.Stderr, "skip instance name=%s lease=%s reason=changed-during-cleanup err=%v\n", inst.Name, leaseID, err)
+					continue
+				}
 			}
+			fmt.Fprintf(b.rt.Stdout, "would remove instance name=%s lease=%s reason=%s\n", inst.Name, core.Blank(leaseID, "-"), reason)
+			continue
 		}
-		if err := client.DeleteInstance(inst.Name); err != nil {
-			return err
+		cleanupStarted, cleanupErr := b.deleteDurable(ctx, client, expectedClaim, true)
+		if cleanupErr != nil {
+			if cleanupStarted {
+				return cleanupErr
+			}
+			fmt.Fprintf(b.rt.Stderr, "skip instance name=%s lease=%s reason=changed-during-cleanup err=%v\n", inst.Name, leaseID, cleanupErr)
+			continue
 		}
-		if leaseID := strings.TrimSpace(server.Labels["lease"]); leaseID != "" {
-			core.RemoveLeaseClaim(leaseID)
-			core.RemoveStoredTestboxKey(leaseID)
-		}
+		// Retain the stored testbox key. Acquire prepares or reuses it before
+		// publishing replacement claim ownership, outside the claim lock. Deleting
+		// it here could strand a concurrent reuse that has not published yet.
+		fmt.Fprintf(b.rt.Stdout, "remove instance name=%s lease=%s reason=%s\n", inst.Name, core.Blank(leaseID, "-"), reason)
 	}
 	return nil
+}
+
+func incusCleanupClaimAllowsInstanceCleanup(claim core.LeaseClaim, labels map[string]string, now time.Time) bool {
+	claimAt, claimOK := latestIncusCleanupTime(claim.ClaimedAt, claim.LastUsedAt)
+	instanceAt, instanceOK := latestIncusCleanupTime(labels["created_at"], labels["last_touched_at"])
+	if !claimOK || !instanceOK {
+		return false
+	}
+	reservationUntil, reservationOK := latestIncusCleanupTime(claim.Labels[incusClaimReservationUntilLabel])
+	reservationOK = reservationOK && reservationUntil.After(claimAt)
+	if reservationOK && !now.After(reservationUntil) {
+		return false
+	}
+	if !claimAt.After(instanceAt) {
+		return true
+	}
+	if reservationOK {
+		return true
+	}
+	// Older binaries did not persist a reservation deadline. Give their newest
+	// claim timestamp the same conservative post-idle grace used by the local
+	// provider cleanup paths, then permit cleanup instead of leaking forever.
+	legacyWindow := time.Duration(claim.IdleTimeoutSeconds)*time.Second + incusLegacyReservationGrace
+	return now.After(claimAt.Add(legacyWindow))
+}
+
+func latestIncusCleanupTime(values ...string) (time.Time, bool) {
+	var latest time.Time
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		parsed, err := time.Parse(time.RFC3339, value)
+		if seconds, unixErr := strconv.ParseInt(value, 10, 64); unixErr == nil && seconds > 0 {
+			parsed, err = time.Unix(seconds, 0).UTC(), nil
+		}
+		if err == nil && parsed.After(latest) {
+			latest = parsed
+		}
+	}
+	return latest, !latest.IsZero()
 }
 
 func (b *backend) waitForAddress(ctx context.Context, client instanceClient, name string) (*api.Instance, string, error) {
@@ -550,32 +589,48 @@ func (b *backend) waitForAddress(ctx context.Context, client instanceClient, nam
 		timeout = 10 * time.Minute
 	}
 	deadline := time.Now().Add(timeout)
-	for {
-		inst, etag, err := client.GetInstance(name)
-		if err != nil {
-			return nil, "", err
-		}
-		state, _, stateErr := client.GetInstanceState(name)
-		if stateErr != nil {
-			return nil, "", stateErr
-		}
-		if inst.Config == nil {
-			inst.Config = map[string]string{}
-		}
-		delete(inst.Config, labelKey("host"))
-		if host := instanceHost(*inst, state, cfg); host != "" {
-			inst.Config[labelKey("host")] = host
-			return inst, etag, nil
-		}
-		if time.Now().After(deadline) {
-			return nil, "", core.Exit(5, "timed out waiting for Incus address for %s", name)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, "", context.Cause(ctx)
-		case <-time.After(2 * time.Second):
-		}
+	type observation struct {
+		instance *api.Instance
+		etag     string
+		host     string
 	}
+	result, err := shared.Poll(context.WithoutCancel(ctx), 0, 2*time.Second,
+		func(context.Context, time.Duration) error { return shared.SleepContext(ctx, 2*time.Second) },
+		func(context.Context) (observation, error) {
+			inst, etag, err := client.GetInstance(name)
+			if err != nil {
+				return observation{}, err
+			}
+			state, _, err := client.GetInstanceState(name)
+			if err != nil {
+				return observation{}, err
+			}
+			if inst.Config == nil {
+				inst.Config = map[string]string{}
+			}
+			delete(inst.Config, labelKey("host"))
+			host := instanceHost(*inst, state, cfg)
+			if host != "" {
+				inst.Config[labelKey("host")] = host
+			}
+			return observation{instance: inst, etag: etag, host: host}, nil
+		},
+		func(_ context.Context, current observation, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			if current.host != "" {
+				return true, nil
+			}
+			if time.Now().After(deadline) {
+				return false, core.Exit(5, "timed out waiting for Incus address for %s", name)
+			}
+			return false, nil
+		}, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	return result.Value.instance, result.Value.etag, nil
 }
 
 func (b *backend) resolveInstance(ctx context.Context, client instanceClient, identifier string) (api.Instance, core.Server, string, error) {
@@ -606,6 +661,9 @@ func (b *backend) resolveInstance(ctx context.Context, client instanceClient, id
 		if !ok {
 			return api.Instance{}, core.Server{}, "", core.Exit(4, "lease/server not found: %s", identifier)
 		}
+		if err := validateResolvedInstance(client, inst, leaseID); err != nil {
+			return api.Instance{}, core.Server{}, "", err
+		}
 		return inst, server, leaseID, nil
 	}
 	inst, _, err := client.GetInstance(identifier)
@@ -616,17 +674,21 @@ func (b *backend) resolveInstance(ctx context.Context, client instanceClient, id
 		return api.Instance{}, core.Server{}, "", core.Exit(4, "lease/server not found: %s (instance exists but is not Crabbox-managed)", identifier)
 	}
 	server = serverFromInstance(*inst, nil, b.configForRun())
-	return *inst, server, strings.TrimSpace(server.Labels["lease"]), nil
+	leaseID = strings.TrimSpace(server.Labels["lease"])
+	if err := validateResolvedInstance(client, *inst, leaseID); err != nil {
+		return api.Instance{}, core.Server{}, "", err
+	}
+	return *inst, server, leaseID, nil
 }
 
-func instanceConfigForCreate(cfg Config, labels map[string]string, publicKey string) map[string]string {
+func instanceConfigForCreate(cfg core.Config, labels map[string]string, publicKey string) map[string]string {
 	bootstrapCfg := cfg
 	if strings.TrimSpace(cfg.Incus.ProxyListenPort) != "" {
 		bootstrapCfg.SSHPort = core.Blank(strings.TrimSpace(cfg.Incus.LaunchPort), "22")
 		bootstrapCfg.SSHFallbackPorts = nil
 	}
 	config := map[string]string{
-		"cloud-init.user-data": core.CloudInitUserData(bootstrapCfg, publicKey),
+		"cloud-init.user-data": core.CloudInitUserData(core.WithGuestLeaseExpiry(bootstrapCfg, labels), publicKey),
 	}
 	for key, value := range labels {
 		config[labelKey(key)] = value
@@ -634,7 +696,7 @@ func instanceConfigForCreate(cfg Config, labels map[string]string, publicKey str
 	return config
 }
 
-func profilesForConfig(cfg Config) []string {
+func profilesForConfig(cfg core.Config) []string {
 	profile := strings.TrimSpace(cfg.Incus.Profile)
 	if profile == "" {
 		return nil
@@ -642,7 +704,7 @@ func profilesForConfig(cfg Config) []string {
 	return []string{profile}
 }
 
-func devicesForCreate(cfg Config) api.DevicesMap {
+func devicesForCreate(cfg core.Config) api.DevicesMap {
 	port := strings.TrimSpace(cfg.Incus.ProxyListenPort)
 	if port == "" {
 		return nil
@@ -672,6 +734,14 @@ func setInstanceLabels(ctx context.Context, client instanceClient, name string, 
 	if err != nil {
 		return err
 	}
+	if labels[identityLabel] != "" {
+		if err := verifyConnection(client, labels[identityLabel]); err != nil {
+			return err
+		}
+		if labels["incus_uuid"] == "" || inst.Config["volatile.uuid"] != labels["incus_uuid"] || inst.Config[labelKey("lease")] != labels["lease"] {
+			return core.Exit(4, "Incus instance identity changed before metadata update")
+		}
+	}
 	put := inst.Writable()
 	if put.Config == nil {
 		put.Config = map[string]string{}
@@ -687,20 +757,21 @@ func setInstanceLabels(ctx context.Context, client instanceClient, name string, 
 	return client.UpdateInstance(name, put, etag)
 }
 
-func serverFromInstance(inst api.Instance, state *api.InstanceState, cfg Config) core.Server {
+func serverFromInstance(inst api.Instance, state *api.InstanceState, cfg core.Config) core.Server {
 	server := core.Server{
-		CloudID:  inst.Name,
-		Provider: providerName,
-		Name:     inst.Name,
-		Status:   strings.ToLower(strings.TrimSpace(inst.Status)),
-		Labels:   labelsFromInstance(inst),
+		CloudID:     inst.Name,
+		ImmutableID: inst.Config["volatile.uuid"],
+		Provider:    providerName,
+		Name:        inst.Name,
+		Status:      strings.ToLower(strings.TrimSpace(inst.Status)),
+		Labels:      labelsFromInstance(inst),
 	}
 	server.ServerType.Name = core.Blank(server.Labels["server_type"], core.IncusServerTypeForConfig(cfg))
 	server.PublicNet.IPv4.IP = instanceHost(inst, state, cfg)
 	return server
 }
 
-func instanceHost(inst api.Instance, state *api.InstanceState, cfg Config) string {
+func instanceHost(inst api.Instance, state *api.InstanceState, cfg core.Config) string {
 	if strings.TrimSpace(cfg.Incus.ProxyListenPort) != "" {
 		if host := sshHostForConfig(cfg); host != "" {
 			return host
@@ -712,7 +783,7 @@ func instanceHost(inst api.Instance, state *api.InstanceState, cfg Config) strin
 	return bestAddress(inst, state)
 }
 
-func sshTargetHost(server core.Server, cfg Config) string {
+func sshTargetHost(server core.Server, cfg core.Config) string {
 	if strings.TrimSpace(cfg.Incus.ProxyListenPort) != "" {
 		if host := sshHostForConfig(cfg); host != "" {
 			return host

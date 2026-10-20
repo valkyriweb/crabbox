@@ -7,7 +7,8 @@ import (
 	"time"
 )
 
-func directLeaseLabels(cfg Config, leaseID, slug, provider, market string, keep bool, now time.Time) map[string]string {
+func DirectLeaseLabels(cfg Config, leaseID, slug, provider, market string, keep bool, now time.Time) map[string]string {
+	cfg = clampDirectLeaseDurations(cfg)
 	expiresAt := directLeaseExpiresAt(now, cfg)
 	labels := map[string]string{
 		"class":             cfg.Class,
@@ -15,24 +16,25 @@ func directLeaseLabels(cfg Config, leaseID, slug, provider, market string, keep 
 		"created_by":        "crabbox",
 		"keep":              fmt.Sprint(keep),
 		"lease":             leaseID,
-		"slug":              normalizeLeaseSlug(slug),
+		"slug":              NormalizeLeaseSlug(slug),
 		"profile":           cfg.Profile,
 		"provider_key":      cfg.ProviderKey,
 		"provider":          provider,
 		"target":            cfg.TargetOS,
 		"server_type":       cfg.ServerType,
 		"state":             "leased",
-		"created_at":        leaseLabelTime(now),
-		"last_touched_at":   leaseLabelTime(now),
+		"created_at":        LeaseLabelTime(now),
+		"last_touched_at":   LeaseLabelTime(now),
 		"idle_timeout":      durationSecondsLabel(cfg.IdleTimeout),
 		"idle_timeout_secs": durationSecondsLabel(cfg.IdleTimeout),
 		"ttl_secs":          durationSecondsLabel(cfg.TTL),
-		"expires_at":        leaseLabelTime(expiresAt),
+		"max_ttl_secs":      durationSecondsLabel(EffectiveMaxTTL(cfg)),
+		"expires_at":        LeaseLabelTime(expiresAt),
 	}
 	if market != "" {
 		labels["market"] = market
 	}
-	if pond := normalizePondName(cfg.Pond); pond != "" {
+	if pond := NormalizePondName(cfg.Pond); pond != "" {
 		labels[pondLabelKey] = pond
 	}
 	if ports := renderExposedPortsLabel(cfg.ExposedPorts); ports != "" {
@@ -64,24 +66,32 @@ func directLeaseLabels(cfg Config, leaseID, slug, provider, market string, keep 
 	return sanitizeProviderLabels(labels)
 }
 
-func touchDirectLeaseLabels(labels map[string]string, cfg Config, state string, now time.Time) map[string]string {
+func TouchDirectLeaseLabels(labels map[string]string, cfg Config, state string, now time.Time) map[string]string {
+	return TouchDirectLeaseLabelsWithIdleTimeoutOverride(labels, cfg, state, now, nil)
+}
+
+func TouchDirectLeaseLabelsWithIdleTimeoutOverride(labels map[string]string, cfg Config, state string, now time.Time, idleTimeoutOverride *time.Duration) map[string]string {
 	next := make(map[string]string, len(labels)+4)
 	for key, value := range labels {
 		next[key] = value
 	}
 	if state != "" {
-		next["state"] = state
+		next["state"] = sanitizeProviderLabelValue(state)
 	}
 	createdAt, ok := parseLeaseLabelTime(next["created_at"])
 	if !ok {
 		createdAt = now
-		next["created_at"] = leaseLabelTime(createdAt)
+		next["created_at"] = LeaseLabelTime(createdAt)
 	}
 	idleTimeout := cfg.IdleTimeout
-	if stored, ok := parseDurationSecondsLabel(next["idle_timeout_secs"]); ok {
-		idleTimeout = stored
-	} else if stored, ok := parseDurationSecondsLabel(next["idle_timeout"]); ok {
-		idleTimeout = stored
+	if idleTimeoutOverride != nil {
+		idleTimeout = *idleTimeoutOverride
+	} else {
+		if stored, ok := parseDurationSecondsLabel(next["idle_timeout_secs"]); ok {
+			idleTimeout = stored
+		} else if stored, ok := parseDurationSecondsLabel(next["idle_timeout"]); ok {
+			idleTimeout = stored
+		}
 	}
 	if idleTimeout <= 0 {
 		idleTimeout = defaultConfig().IdleTimeout
@@ -93,12 +103,16 @@ func touchDirectLeaseLabels(labels map[string]string, cfg Config, state string, 
 	if ttl <= 0 {
 		ttl = defaultConfig().TTL
 	}
-	next["last_touched_at"] = leaseLabelTime(now)
+	ttl = min(ttl, EffectiveMaxTTL(cfg))
+	idleTimeout = min(idleTimeout, ttl)
+	next["last_touched_at"] = LeaseLabelTime(now)
 	next["idle_timeout"] = durationSecondsLabel(idleTimeout)
 	next["idle_timeout_secs"] = durationSecondsLabel(idleTimeout)
 	next["ttl_secs"] = durationSecondsLabel(ttl)
-	next["expires_at"] = leaseLabelTime(directLeaseExpiresAtFrom(createdAt, now, ttl, idleTimeout))
-	return sanitizeProviderLabels(next)
+	next["expires_at"] = LeaseLabelTime(directLeaseExpiresAtFrom(createdAt, now, ttl, idleTimeout))
+	// Existing labels belong to their provider and may contain full fingerprints,
+	// empty attestation fields, or exact paths. Touch only normalizes values it writes.
+	return next
 }
 
 func directLeaseExpiresAtFrom(createdAt, lastTouchedAt time.Time, ttl, idleTimeout time.Duration) time.Time {
@@ -112,7 +126,7 @@ func directLeaseExpiresAtFrom(createdAt, lastTouchedAt time.Time, ttl, idleTimeo
 	return expiresAt
 }
 
-func leaseLabelTime(t time.Time) string {
+func LeaseLabelTime(t time.Time) string {
 	return strconv.FormatInt(t.UTC().Unix(), 10)
 }
 
@@ -132,7 +146,7 @@ func parseLeaseLabelTime(value string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func leaseLabelTimeDisplay(value string) string {
+func LeaseLabelTimeDisplay(value string) string {
 	t, ok := parseLeaseLabelTime(value)
 	if !ok {
 		return ""
@@ -145,6 +159,10 @@ func durationSecondsLabel(duration time.Duration) string {
 		return ""
 	}
 	return strconv.FormatInt(int64(duration.Round(time.Second)/time.Second), 10)
+}
+
+func LeaseLabelDuration(value string) (time.Duration, bool) {
+	return parseDurationSecondsLabel(value)
 }
 
 func parseDurationSecondsLabel(value string) (time.Duration, bool) {
@@ -161,7 +179,7 @@ func parseDurationSecondsLabel(value string) (time.Duration, bool) {
 	return 0, false
 }
 
-func leaseLabelDurationDisplay(secondsValue, fallbackValue string) string {
+func LeaseLabelDurationDisplay(secondsValue, fallbackValue string) string {
 	if duration, ok := parseDurationSecondsLabel(secondsValue); ok {
 		return duration.String()
 	}

@@ -116,7 +116,7 @@ vercelSandbox:
   projectId: prj_example
   teamId: team_example
   scope: example-org
-  vcpus: 1
+  vcpus: 1                    # finite; 0 = service default, otherwise >= 0.25
   timeoutSecs: 0
   execTimeoutSecs: 600
   persistent: false
@@ -222,6 +222,24 @@ egress and cannot be combined with allow/deny entries. `ports` accepts ports or
    still-active claims, and treats missing-or-inaccessible sandboxes
    conservatively unless forget-missing is explicit.
 
+Run sequencing and finalization use the shared delegated-sandbox lifecycle.
+The adapter retains project scope, ownership metadata, operation locking,
+creation rollback, SDK transport, and its separate missing-resource policies.
+The operation lock stays held through cleanup, retained-lease bookkeeping, and
+timing output, including when reuse is rejected after locking.
+
+An early failure followed by failed deletion returns a kept recovery session.
+Command preparation failures also honor `--keep-on-failure`, and admitted
+retained runs refresh lease activity after setup or sync failure. Cleanup and
+timing errors add diagnostics without replacing an earlier command exit or
+provider failure. Final timing includes cleanup and agrees with the returned
+outcome. The automatic deletion request keeps its 15-second timeout.
+
+On POSIX hosts, interrupted bridge subprocesses preserve cancellation and deadline causes.
+Successful bridge completion still reports the sandbox's observed command exit,
+including nonzero exits. The SDK persistence setting controls sandbox creation;
+it does not independently request Crabbox retention after a successful run.
+
 ## Capabilities
 
 - SSH: no.
@@ -232,6 +250,9 @@ egress and cannot be combined with allow/deny entries. `ports` accepts ports or
 - Desktop / browser / code / VNC: no.
 - Actions hydration: no.
 - Coordinator broker: no, Vercel Sandbox runs direct from the CLI.
+- Run session: yes, `run` returns a reusable Crabbox lease/session handle for
+  `--lease-output`, retained failure inspection, and later `run --id`,
+  `status`, or `stop`.
 - Pause/resume: retained sessions resume automatically for sync and execution;
   explicit pause/resume commands are not advertised in v1.
 - Ports, snapshots, and persistence: configuration is accepted and passed to
@@ -256,6 +277,16 @@ linked Vercel project may supply it at runtime.
 
 Run the guarded hosted lifecycle smoke only when you intend to create a real
 short-lived Vercel Sandbox:
+
+```sh
+CRABBOX_LIVE=1 \
+CRABBOX_LIVE_PROVIDERS=vercel-sandbox \
+CRABBOX_VERCEL_SANDBOX_PROJECT_ID=prj_example \
+CRABBOX_VERCEL_SANDBOX_TEAM_ID=team_example \
+scripts/live-smoke.sh
+```
+
+The top-level smoke dispatches to the provider-specific script:
 
 ```sh
 CRABBOX_LIVE=1 \
@@ -311,4 +342,9 @@ is `diagnostic_only`.
 ## Related Docs
 
 - [Provider backends](../provider-backends.md)
-- [Provider feature overview](../features/providers.md)
+- [Provider Reference](README.md)
+
+For contributors, the config wiring is generated from the concrete
+`VercelSandboxConfig` declaration. See [Typed provider config](../refactor/typed-provider-config.md)
+before adding fields; runtime credentials and cross-field validation remain
+outside the generator.

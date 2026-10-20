@@ -4,20 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestWriteBrokerLoginStoresTokenInUserConfig(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	isolateTestUserDirs(t)
 	t.Setenv("CRABBOX_CONFIG", "")
 	t.Setenv("CRABBOX_COORDINATOR", "")
 	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
@@ -32,6 +33,95 @@ func TestWriteBrokerLoginStoresTokenInUserConfig(t *testing.T) {
 	}
 	if cfg.Coordinator != "https://crabbox.example.test" || cfg.CoordToken != "secret" || cfg.Provider != "aws" {
 		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestOpenLoginBrowserScrubsExternalDesktopPassword(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell opener fixture")
+	}
+	name, _ := openURLCommand("https://github.com/login")
+	if name == "" {
+		t.Skip("local URL opening unsupported")
+	}
+	dir := t.TempDir()
+	result := filepath.Join(dir, "result")
+	home := filepath.Join(dir, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	opener := filepath.Join(dir, name)
+	script := "#!/bin/sh\n" +
+		"if [ \"${TEST_LOGIN_DESKTOP_PASSWORD+x}\" = x ] || [ \"${CRABBOX_COORDINATOR_TOKEN+x}\" = x ] || [ \"${GH_TOKEN+x}\" = x ]; then printf leaked > " + shellQuote(result) + "; exit 0; fi\n" +
+		"if [ \"$HOME\" != " + shellQuote(home) + " ]; then printf stripped > " + shellQuote(result) + "; exit 0; fi\n" +
+		"printf scrubbed > " + shellQuote(result) + "\n"
+	if err := os.WriteFile(opener, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", home)
+	t.Setenv("TEST_LOGIN_DESKTOP_PASSWORD", "must-not-reach-browser")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "must-not-reach-browser")
+	t.Setenv("GH_TOKEN", "must-not-reach-browser")
+	t.Setenv("DISPLAY", ":99")
+	cfg := Config{Provider: "external", TargetOS: targetMacOS}
+	cfg.External.Connection.Desktop.PasswordEnv = "TEST_LOGIN_DESKTOP_PASSWORD"
+	MarkExternalDesktopPasswordEnvExplicit(&cfg)
+	MarkTargetExplicit(&cfg)
+	if err := openLoginBrowser("https://github.com/login", cfg); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(result); err == nil {
+			if len(data) == 0 {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if string(data) != "scrubbed" {
+				t.Fatalf("login opener environment=%q", data)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("fake login opener did not report its environment")
+}
+
+func TestOpenLoginBrowserRejectsUntrustedDesktopEnvironment(t *testing.T) {
+	cfg := Config{Provider: "external", TargetOS: targetMacOS}
+	cfg.External.Connection.Desktop.PasswordEnv = "REPOSITORY_SELECTED_PASSWORD"
+	cfg.credentialProvenance.externalDesktopEnv = credentialSourceRepository
+	if err := openLoginBrowser("https://github.com/login", cfg); err == nil || !strings.Contains(err.Error(), "trusted user config") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestWriteBrokerLoginReturnsWrittenBrokerDespiteEnvironmentOverrides(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(home, "config.yaml"))
+	t.Setenv("CRABBOX_COORDINATOR", "https://ambient.example.test")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "ambient-token")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN_COMMAND", `["printf","ambient-token"]`)
+
+	_, cfg, err := writeBrokerLogin(
+		"https://login.example.test",
+		"login-token",
+		"aws",
+		BrokerModeManaged,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Coordinator != "https://login.example.test" || cfg.CoordToken != "login-token" {
+		t.Fatalf("login verification config used ambient broker credentials: %#v", cfg)
+	}
+	if len(cfg.CoordTokenCommand) != 0 {
+		t.Fatalf("login verification retained ambient token command: %v", cfg.CoordTokenCommand)
+	}
+	if cfg.Provider != "aws" || cfg.brokerProvider != "aws" {
+		t.Fatalf("login verification retained ambient provider: %#v", cfg)
 	}
 }
 
@@ -95,6 +185,87 @@ func TestWriteBrokerLoginAcceptsDirectProviderInRegisteredMode(t *testing.T) {
 	}
 	if cfg.BrokerMode != BrokerModeRegistered || cfg.Provider != "xcp-ng" || cfg.CoordToken != "secret" {
 		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestFinishLoginRedactsBrokerURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/whoami" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(CoordinatorWhoami{
+			Owner: "alice@example.test",
+			Org:   "example-org",
+			Auth:  "token",
+		})
+	}))
+	defer server.Close()
+
+	const brokerURL = "https://broker-user:broker-password@broker.example.test/path?token=query-secret#fragment-secret"
+	coord := &CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	for _, jsonOut := range []bool{false, true} {
+		var stdout bytes.Buffer
+		app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+		if err := app.finishLogin(context.Background(), coord, "/tmp/config.yaml", Config{
+			Coordinator: brokerURL,
+			Provider:    "aws",
+		}, jsonOut); err != nil {
+			t.Fatal(err)
+		}
+		output := stdout.String()
+		brokerOutput := output
+		if jsonOut {
+			var view map[string]any
+			if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+				t.Fatal(err)
+			}
+			brokerOutput, _ = view["broker"].(string)
+		}
+		if !strings.Contains(brokerOutput, "https://<redacted>@broker.example.test/path") {
+			t.Fatalf("login output missing redacted broker URL: %q", output)
+		}
+		for _, secret := range []string{"broker-user", "broker-password", "query-secret", "fragment-secret"} {
+			if strings.Contains(output, secret) {
+				t.Fatalf("login output leaked %q: %q", secret, output)
+			}
+		}
+	}
+}
+
+func TestWhoamiRedactsBrokerURL(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/whoami" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(CoordinatorWhoami{
+			Owner: "alice@example.test",
+			Org:   "example-org",
+			Auth:  "token",
+		})
+	}))
+	defer server.Close()
+	brokerURL := strings.Replace(server.URL, "http://", "http://broker-user:broker-password@", 1)
+	t.Setenv("CRABBOX_COORDINATOR", brokerURL)
+
+	var stdout bytes.Buffer
+	if err := (App{Stdout: &stdout, Stderr: &bytes.Buffer{}}).whoami(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	output := stdout.String()
+	if !strings.Contains(output, strings.Replace(server.URL, "http://", "http://<redacted>@", 1)) {
+		t.Fatalf("whoami output missing redacted broker URL: %q", output)
+	}
+	for _, secret := range []string{"broker-user", "broker-password"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("whoami output leaked %q: %q", secret, output)
+		}
 	}
 }
 
@@ -320,7 +491,11 @@ func TestCoordinatorClientForLoginAppliesURLBeforeRegisteredModeValidation(t *te
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
 
-	client, err := coordinatorClientForLogin(server.URL, "")
+	cfg, err := loadConfigWithOverrides(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, _, err := coordinatorClientConfigForLogin(cfg, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,6 +507,133 @@ func TestCoordinatorClientForLoginAppliesURLBeforeRegisteredModeValidation(t *te
 	}
 	if got := strings.Join(client.TokenCommand, "\x00"); got != "token-helper\x00--scope\x00example" {
 		t.Fatalf("login token command=%q", client.TokenCommand)
+	}
+}
+
+func TestCoordinatorClientConfigForLoginPreservesProvenance(t *testing.T) {
+	const brokerURL = "https://broker.example.test"
+	for _, test := range []struct {
+		name       string
+		source     credentialValueSource
+		sameSource bool
+	}{
+		{"repository without inherited credentials", credentialSourceRepository, false},
+		{"repository with same-source Access", credentialSourceRepository, true},
+		{"trusted user broker", credentialSourceTrustedFile, false},
+		{"environment-selected broker", credentialSourceEnvironment, false},
+		{"explicit URL", credentialSourceFlag, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Chdir(t.TempDir())
+			configPath := "crabbox.yaml"
+			if test.source == credentialSourceTrustedFile {
+				configPath = userConfigPath()
+				if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			contents := "broker:\n  url: " + brokerURL + "\n  token: fixture-stored-token\n"
+			if test.sameSource {
+				contents += "  access:\n    clientId: fixture-id\n    clientSecret: fixture-secret\n    token: fixture-access-token\n"
+			} else if test.source != credentialSourceRepository {
+				t.Setenv("CRABBOX_COORDINATOR_TOKEN_COMMAND", `["crabbox-login-helper-must-not-run"]`)
+				t.Setenv("CRABBOX_ACCESS_CLIENT_ID", "fixture-id")
+				t.Setenv("CRABBOX_ACCESS_CLIENT_SECRET", "fixture-secret")
+				t.Setenv("CRABBOX_ACCESS_TOKEN", "fixture-access-token")
+			}
+			if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var explicitURL string
+			if test.source == credentialSourceEnvironment {
+				t.Setenv("CRABBOX_COORDINATOR", brokerURL)
+			} else if test.source == credentialSourceFlag {
+				explicitURL = brokerURL
+			}
+			cfg, err := loadConfigWithOverrides(explicitURL, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, loginCfg, err := coordinatorClientConfigForLogin(cfg, "aws")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := loginCfg.credentialProvenance.coordinator; got != test.source {
+				t.Errorf("broker source=%v want %v", got, test.source)
+			}
+			if client.BaseURL != brokerURL || loginCfg.Coordinator != brokerURL {
+				t.Errorf("login broker changed: client=%q config=%q", client.BaseURL, loginCfg.Coordinator)
+			}
+			if client.Token != "" || loginCfg.CoordToken != "" || cfg.CoordToken != "fixture-stored-token" {
+				t.Error("login must omit the stored token without changing the input config")
+			}
+			if client.Access != cfg.Access || loginCfg.Access != cfg.Access || strings.Join(client.TokenCommand, "\x00") != strings.Join(cfg.CoordTokenCommand, "\x00") {
+				t.Error("login changed approved Access or token-helper credentials")
+			}
+		})
+	}
+}
+
+func TestLoginRejectsInheritedCredentialsForRepositoryBroker(t *testing.T) {
+	credentials := []struct {
+		name  string
+		yaml  string
+		env   string
+		value string
+	}{
+		{"token helper", "", "CRABBOX_COORDINATOR_TOKEN_COMMAND", `["crabbox-login-helper-must-not-run"]`},
+		{"Access client secret", "  access:\n    clientId: fixture-id\n    clientSecret: fixture-secret\n", "CRABBOX_ACCESS_CLIENT_SECRET", "fixture-secret"},
+		{"Access token", "  access:\n    token: fixture-token\n", "CRABBOX_ACCESS_TOKEN", "fixture-token"},
+	}
+	for _, explicitConfig := range []bool{false, true} {
+		for _, environmentCredential := range []bool{false, true} {
+			for _, credential := range credentials {
+				if !environmentCredential && (explicitConfig || credential.yaml == "") {
+					continue
+				}
+				name := fmt.Sprintf("explicit_config=%t/environment_credential=%t/%s", explicitConfig, environmentCredential, credential.name)
+				t.Run(name, func(t *testing.T) {
+					clearConfigEnv(t)
+					repo := t.TempDir()
+					t.Chdir(repo)
+					if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					var requests atomic.Int32
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						requests.Add(1)
+						w.WriteHeader(http.StatusTeapot)
+					}))
+					defer server.Close()
+					config := "broker:\n  url: " + server.URL + "\n"
+					if explicitConfig {
+						t.Setenv("CRABBOX_CONFIG", filepath.Join(repo, "crabbox.yaml"))
+					}
+					if environmentCredential {
+						t.Setenv(credential.env, credential.value)
+					} else {
+						if err := os.MkdirAll(filepath.Dir(userConfigPath()), 0o700); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(userConfigPath(), []byte("broker:\n"+credential.yaml), 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := os.WriteFile("crabbox.yaml", []byte(config), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					app := App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
+					err := app.login(context.Background(), []string{"--no-browser"})
+					if err == nil || !strings.Contains(err.Error(), "repository-configured broker.url cannot be combined with inherited coordinator credentials") {
+						t.Errorf("login error=%v; want inherited-credential rejection before helper or request activity", err)
+					}
+					if got := requests.Load(); got != 0 {
+						t.Errorf("login sent %d requests before rejecting inherited credentials", got)
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -347,6 +649,8 @@ func TestGitHubLoginNoBrowserStoresReturnedToken(t *testing.T) {
 	t.Setenv("CRABBOX_ACCESS_CLIENT_SECRET", "access-secret")
 
 	var seenPollSecretHash string
+	var loopbackResult = make(chan error, 1)
+	const browserConfirmation = "confirm_0123456789abcdef0123456789abcdef"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -358,8 +662,9 @@ func TestGitHubLoginNoBrowserStoresReturnedToken(t *testing.T) {
 				t.Fatalf("start CF-Access-Client-Secret=%q", got)
 			}
 			var body struct {
-				PollSecretHash string `json:"pollSecretHash"`
-				Provider       string `json:"provider"`
+				PollSecretHash      string `json:"pollSecretHash"`
+				Provider            string `json:"provider"`
+				LoopbackRedirectURI string `json:"loopbackRedirectURI"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
@@ -371,11 +676,29 @@ func TestGitHubLoginNoBrowserStoresReturnedToken(t *testing.T) {
 				t.Fatalf("poll secret hash=%q", body.PollSecretHash)
 			}
 			seenPollSecretHash = body.PollSecretHash
+			loopbackURL, err := url.Parse(body.LoopbackRedirectURI)
+			if err != nil || loopbackURL.Scheme != "http" || loopbackURL.Hostname() != "127.0.0.1" || loopbackURL.Port() == "" {
+				t.Fatalf("loopback redirect URI=%q err=%v", body.LoopbackRedirectURI, err)
+			}
 			_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginStart{
 				LoginID:   "login_test",
 				URL:       "https://github.com/login/oauth/authorize?state=test",
 				ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
 			})
+			go func() {
+				callback := *loopbackURL
+				query := callback.Query()
+				query.Set("confirmation", browserConfirmation)
+				callback.RawQuery = query.Encode()
+				response, err := http.Get(callback.String())
+				if err == nil {
+					defer response.Body.Close()
+					if response.StatusCode != http.StatusOK {
+						err = fmt.Errorf("loopback callback status=%d", response.StatusCode)
+					}
+				}
+				loopbackResult <- err
+			}()
 		case "/v1/auth/github/poll":
 			if got := r.Header.Get("CF-Access-Client-Id"); got != "access-client" {
 				t.Fatalf("poll CF-Access-Client-Id=%q", got)
@@ -384,8 +707,9 @@ func TestGitHubLoginNoBrowserStoresReturnedToken(t *testing.T) {
 				t.Fatalf("poll CF-Access-Client-Secret=%q", got)
 			}
 			var body struct {
-				LoginID    string `json:"loginID"`
-				PollSecret string `json:"pollSecret"`
+				LoginID             string `json:"loginID"`
+				PollSecret          string `json:"pollSecret"`
+				BrowserConfirmation string `json:"browserConfirmation"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
@@ -395,6 +719,10 @@ func TestGitHubLoginNoBrowserStoresReturnedToken(t *testing.T) {
 			}
 			if sha256Hex(body.PollSecret) != seenPollSecretHash {
 				t.Fatal("poll secret did not match start hash")
+			}
+			if body.BrowserConfirmation != browserConfirmation {
+				_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginPoll{Status: "confirmation_required"})
+				return
 			}
 			_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginPoll{
 				Status:   "complete",
@@ -430,6 +758,9 @@ func TestGitHubLoginNoBrowserStoresReturnedToken(t *testing.T) {
 	if err := app.login(context.Background(), []string{"--url", server.URL, "--provider", "aws", "--no-browser"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := <-loopbackResult; err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(stderr.String(), "open this GitHub login URL") {
 		t.Fatalf("stderr=%q", stderr.String())
 	}
@@ -442,6 +773,96 @@ func TestGitHubLoginNoBrowserStoresReturnedToken(t *testing.T) {
 	}
 	if cfg.Coordinator != server.URL || cfg.CoordToken != "github-session-token" || cfg.Provider != "aws" {
 		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestGitHubLoginLoopbackRejectsUnboundRequests(t *testing.T) {
+	loopback, err := startGitHubLoginLoopback()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loopback.Close()
+
+	wrongPath, err := http.Get("http://" + loopback.listener.Addr().String() + "/wrong")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPath.Body.Close()
+	if wrongPath.StatusCode != http.StatusNotFound {
+		t.Fatalf("wrong path status=%d", wrongPath.StatusCode)
+	}
+
+	invalid, err := http.Get(loopback.URL() + "?confirmation=wrong")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid.Body.Close()
+	if invalid.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid confirmation status=%d", invalid.StatusCode)
+	}
+
+	const confirmation = "confirm_0123456789abcdef0123456789abcdef"
+	valid, err := http.Get(loopback.URL() + "?confirmation=" + confirmation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid.Body.Close()
+	if valid.StatusCode != http.StatusOK {
+		t.Fatalf("valid confirmation status=%d", valid.StatusCode)
+	}
+	if got := valid.Header.Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("referrer policy=%q", got)
+	}
+	select {
+	case got := <-loopback.confirmations:
+		if got != confirmation {
+			t.Fatalf("confirmation=%q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for loopback confirmation")
+	}
+}
+
+func TestGitHubLoginRejectsCompletionWithoutLoopbackConfirmation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_COORDINATOR", "")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
+	t.Setenv("CRABBOX_PROVIDER", "")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/github/start":
+			_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginStart{
+				LoginID:   "login_downgrade",
+				URL:       githubAuthorizeURLForTest("http://" + r.Host),
+				ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
+			})
+		case "/v1/auth/github/poll":
+			_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginPoll{
+				Status: "complete",
+				Token:  "unbound-session-token",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	app := App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
+	err := app.login(context.Background(), []string{"--url", server.URL, "--no-browser"})
+	if err == nil || !strings.Contains(err.Error(), "before this device received") {
+		t.Fatalf("error=%v", err)
+	}
+	cfg, loadErr := loadConfig()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if cfg.CoordToken != "" {
+		t.Fatal("unbound broker token was persisted")
 	}
 }
 
@@ -536,7 +957,76 @@ func TestLoginWithTokenUsesEffectiveRegisteredMode(t *testing.T) {
 	}
 }
 
-func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
+func TestGitHubLoginRejectsMismatchedRedirectOrigin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_COORDINATOR", "")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
+	t.Setenv("CRABBOX_PROVIDER", "")
+
+	callbackOrigin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer callbackOrigin.Close()
+
+	repo := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(repo, ".crabbox.yaml"),
+		[]byte("broker:\n  loginRedirectOrigins:\n    - "+callbackOrigin.URL+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(repo)
+
+	var startCount int
+	var pollCount int
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/github/start":
+			startCount++
+			_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginStart{
+				LoginID:   "login_test",
+				URL:       githubAuthorizeURLForTest(callbackOrigin.URL),
+				ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
+			})
+		case "/v1/auth/github/poll":
+			pollCount++
+			http.Error(w, "unexpected poll", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer broker.Close()
+
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err := app.login(context.Background(), []string{"--url", broker.URL, "--provider", "aws", "--no-browser"})
+	if err == nil || !strings.Contains(err.Error(), "redirect_uri broker origin") {
+		t.Fatalf("error=%v", err)
+	}
+	if startCount != 1 || pollCount != 0 {
+		t.Fatalf("counts start=%d poll=%d", startCount, pollCount)
+	}
+	if strings.Contains(stderr.String(), "open this GitHub login URL") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Coordinator == callbackOrigin.URL || cfg.CoordToken != "" {
+		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestGitHubLoginMigratesToAllowedRedirectOrigin(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
@@ -546,6 +1036,8 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 	t.Setenv("CRABBOX_PROVIDER", "")
 
 	var seenPollSecretHash string
+	const browserConfirmation = "confirm_0123456789abcdef0123456789abcdef"
+	loopbackResult := make(chan error, 1)
 	var canonicalStartCount int
 	var canonical *httptest.Server
 	canonical = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -554,8 +1046,9 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 		case "/v1/auth/github/start":
 			canonicalStartCount++
 			var body struct {
-				PollSecretHash string `json:"pollSecretHash"`
-				Provider       string `json:"provider"`
+				PollSecretHash      string `json:"pollSecretHash"`
+				Provider            string `json:"provider"`
+				LoopbackRedirectURI string `json:"loopbackRedirectURI"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
@@ -564,15 +1057,31 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 				t.Fatalf("provider=%q", body.Provider)
 			}
 			seenPollSecretHash = body.PollSecretHash
+			loopbackURL, err := url.Parse(body.LoopbackRedirectURI)
+			if err != nil {
+				t.Fatal(err)
+			}
 			_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginStart{
 				LoginID:   "login_canonical",
 				URL:       githubAuthorizeURLForTest(canonical.URL),
 				ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
 			})
+			go func() {
+				callback := *loopbackURL
+				query := callback.Query()
+				query.Set("confirmation", browserConfirmation)
+				callback.RawQuery = query.Encode()
+				response, err := http.Get(callback.String())
+				if err == nil {
+					response.Body.Close()
+				}
+				loopbackResult <- err
+			}()
 		case "/v1/auth/github/poll":
 			var body struct {
-				LoginID    string `json:"loginID"`
-				PollSecret string `json:"pollSecret"`
+				LoginID             string `json:"loginID"`
+				PollSecret          string `json:"pollSecret"`
+				BrowserConfirmation string `json:"browserConfirmation"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
@@ -582,6 +1091,10 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 			}
 			if sha256Hex(body.PollSecret) != seenPollSecretHash {
 				t.Fatal("poll secret did not match canonical start hash")
+			}
+			if body.BrowserConfirmation != browserConfirmation {
+				_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginPoll{Status: "confirmation_required"})
+				return
 			}
 			_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginPoll{
 				Status:   "complete",
@@ -605,6 +1118,7 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 		}
 	}))
 	defer canonical.Close()
+	t.Setenv("CRABBOX_BROKER_LOGIN_REDIRECT_ORIGINS", canonical.URL)
 
 	var staleStartCount int
 	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -618,7 +1132,7 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 				ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
 			})
 		case "/v1/auth/github/poll":
-			t.Fatal("poll should restart against canonical redirect origin")
+			t.Fatal("poll should restart against allowed redirect origin")
 		default:
 			http.NotFound(w, r)
 		}
@@ -628,6 +1142,9 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	app := App{Stdout: &stdout, Stderr: &stderr}
 	if err := app.login(context.Background(), []string{"--url", stale.URL, "--provider", "aws", "--no-browser"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-loopbackResult; err != nil {
 		t.Fatal(err)
 	}
 	if staleStartCount != 1 || canonicalStartCount != 1 {
@@ -648,10 +1165,86 @@ func TestGitHubLoginMigratesToCanonicalRedirectOrigin(t *testing.T) {
 	}
 }
 
+func TestGitHubLoginRejectsAllowedRedirectOriginThatChangesAgain(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_COORDINATOR", "")
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "")
+	t.Setenv("CRABBOX_PROVIDER", "")
+
+	nextOrigin := httptest.NewServer(http.NotFoundHandler())
+	defer nextOrigin.Close()
+
+	var canonical *httptest.Server
+	canonical = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/auth/github/start" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginStart{
+			LoginID:   "login_canonical",
+			URL:       githubAuthorizeURLForTest(nextOrigin.URL),
+			ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
+		})
+	}))
+	defer canonical.Close()
+	t.Setenv("CRABBOX_BROKER_LOGIN_REDIRECT_ORIGINS", canonical.URL)
+
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/auth/github/start" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(CoordinatorGitHubLoginStart{
+			LoginID:   "login_stale",
+			URL:       githubAuthorizeURLForTest(canonical.URL),
+			ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339),
+		})
+	}))
+	defer stale.Close()
+
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err := app.login(context.Background(), []string{"--url", stale.URL, "--provider", "aws", "--no-browser"})
+	if err == nil || !strings.Contains(err.Error(), "does not match approved broker") {
+		t.Fatalf("error=%v", err)
+	}
+	if strings.Contains(stderr.String(), "open this GitHub login URL") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
 func TestCanonicalBrokerURLFromLoginURL(t *testing.T) {
 	got, ok := canonicalBrokerURLFromLoginURL("https://github.com/login/oauth/authorize?redirect_uri=https%3A%2F%2Fbroker.example.com%2Fv1%2Fauth%2Fgithub%2Fcallback&state=x")
 	if !ok || got != "https://broker.example.com" {
 		t.Fatalf("canonical=%q ok=%v", got, ok)
+	}
+}
+
+func TestSameBrokerURLNormalizesDefaultPorts(t *testing.T) {
+	tests := []struct {
+		name  string
+		left  string
+		right string
+		want  bool
+	}{
+		{name: "https default port", left: "https://broker.example.com", right: "https://BROKER.example.com:443/", want: true},
+		{name: "http default port", left: "http://broker.example.com", right: "HTTP://broker.example.com:80", want: true},
+		{name: "custom port", left: "https://broker.example.com", right: "https://broker.example.com:8443"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sameBrokerURL(test.left, test.right); got != test.want {
+				t.Fatalf("sameBrokerURL(%q, %q)=%v, want %v", test.left, test.right, got, test.want)
+			}
+		})
 	}
 }
 

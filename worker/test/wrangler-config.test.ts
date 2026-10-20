@@ -31,10 +31,86 @@ describe("wrangler config", () => {
     }
   });
 
+  it("leaves individual memberships and lease policy overrides out of deployment config", () => {
+    for (const name of [
+      "CRABBOX_SERVE_ALLOWED_OWNERS",
+      "CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS",
+      "CRABBOX_CAPACITY_ADMIN_OWNERS",
+      "CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS",
+      "CRABBOX_LEASE_POLICY_OVERRIDES",
+    ]) {
+      expect(configStringValues(name)).toEqual([]);
+    }
+    expect(wranglerConfig).not.toMatch(/github:\d+/);
+  });
+
+  it.each([
+    ["CRABBOX_MAX_ACTIVE_LEASES", 50],
+    ["CRABBOX_MAX_ACTIVE_LEASES_PER_ORG", 50],
+    ["CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN", 50],
+    ["CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER", 10],
+    ["CRABBOX_MAX_MONTHLY_USD", 100000],
+    ["CRABBOX_MAX_MONTHLY_USD_PER_OWNER", 50000],
+    ["CRABBOX_MAX_MONTHLY_USD_PER_ORG", 100000],
+  ])("keeps deployed and preview %s at %i", (name, limit) => {
+    expect(configValues(name)).toEqual([limit, limit]);
+  });
+
+  it("keeps deployed and preview checkpoint and use-claim admission bounded", () => {
+    expect(configValues("CRABBOX_MAX_CHECKPOINTS")).toEqual([100, 20]);
+    expect(configValues("CRABBOX_MAX_CHECKPOINTS_PER_OWNER")).toEqual([100, 10]);
+    expect(configValues("CRABBOX_MAX_CHECKPOINTS_PER_ORG")).toEqual([100, 20]);
+    expect(configValues("CRABBOX_MAX_CHECKPOINT_USE_CLAIMS")).toEqual([16, 16]);
+    expect(configValues("CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER")).toEqual([64, 64]);
+    expect(configValues("CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL")).toEqual([256, 256]);
+  });
+
   it("routes deployed and preview workspaces through the verified AWS backend", () => {
     expect(configStringValues("CRABBOX_WORKSPACE_PROVIDER")).toEqual(["aws", "aws"]);
     expect(configStringValues("CRABBOX_AWS_SSH_CIDRS")).toEqual([]);
     expect(configStringValues("CRABBOX_PUBLIC_URL")).toEqual(["https://crabbox.openclaw.ai"]);
+  });
+
+  it("configures the production-only R2 artifact backend without credentials or public reads", () => {
+    const productionVars = wranglerConfig.match(/"vars"\s*:\s*\{([^}]*)\}/)?.[1] ?? "";
+    const artifactVars = {
+      CRABBOX_ARTIFACTS_BACKEND: "r2",
+      CRABBOX_ARTIFACTS_BUCKET: "openclaw-crabbox-artifacts",
+      CRABBOX_ARTIFACTS_PREFIX: "crabbox-artifacts",
+      CRABBOX_ARTIFACTS_REGION: "auto",
+      CRABBOX_ARTIFACTS_ENDPOINT_URL:
+        "https://91b59577e757131d68d55a471fe32aca.r2.cloudflarestorage.com",
+    };
+    for (const [name, value] of Object.entries(artifactVars)) {
+      expect(productionVars).toContain(`"${name}": "${value}"`);
+      expect(configStringValues(name)).toEqual([value]);
+    }
+
+    const previewConfig = wranglerConfig.split(/"previews"\s*:/)[1];
+    expect(previewConfig).toBeDefined();
+    expect(previewConfig).not.toContain("CRABBOX_ARTIFACTS_");
+    for (const name of [
+      "CRABBOX_ARTIFACTS_ACCESS_KEY_ID",
+      "CRABBOX_ARTIFACTS_SECRET_ACCESS_KEY",
+      "CRABBOX_ARTIFACTS_SESSION_TOKEN",
+      "CRABBOX_ARTIFACTS_BASE_URL",
+      "CRABBOX_ARTIFACTS_PUBLIC_READS",
+    ]) {
+      expect(wranglerConfig).not.toContain(name);
+    }
+    expect(wranglerConfig).not.toContain('"r2_buckets"');
+  });
+
+  it("binds deployment version metadata for interrupted provisioning recovery", () => {
+    expect(wranglerConfig).toContain('"version_metadata"');
+    expect(wranglerConfig).toContain('"binding": "CF_VERSION_METADATA"');
+  });
+
+  it("keeps Workers Logs enabled without sampling away rare failures", () => {
+    const observability = wranglerConfig.match(/"observability"\s*:\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(observability).toMatch(/"enabled"\s*:\s*true/);
+    expect(observability).toMatch(/"head_sampling_rate"\s*:\s*1\s*,/);
+    expect(observability).toMatch(/"redact_query_string"\s*:\s*true/);
   });
 });
 

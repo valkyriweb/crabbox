@@ -141,3 +141,141 @@ func TestAllowedEnvFromProfilesOnlyForAllowlist(t *testing.T) {
 		t.Fatalf("unlisted profile secret forwarded: %#v", env)
 	}
 }
+
+func TestIsRunExecutionMetadataEnvName(t *testing.T) {
+	for _, name := range []string{"CRABBOX_LEASE_ID", "CRABBOX_RUN_ID", "CRABBOX_SLUG", "crabbox_run_id", "CrAbBoX_SlUg"} {
+		if !IsRunExecutionMetadataEnvName(name) {
+			t.Errorf("framework-owned name not recognized: %q", name)
+		}
+	}
+	for _, name := range []string{"", "FOO", "CRABBOX_CUSTOM", "CRABBOX_RUN_ID_EXTRA", "PREFIX_CRABBOX_RUN_ID", "CRABBOX_SLUG_PREFIX", "CRABBOX_LEASE_ID_SUFFIX", " CRABBOX_RUN_ID", "CRABBOX_RUN_ID "} {
+		if IsRunExecutionMetadataEnvName(name) {
+			t.Errorf("nonreserved name treated as framework-owned: %q", name)
+		}
+	}
+}
+
+func TestRunExecutionMetadataOverridesForwardedValues(t *testing.T) {
+	selection := runEnvSelection{
+		Profile: map[string]string{
+			"CRABBOX_LEASE_ID": "profile-lease",
+			"crabbox_run_id":   "profile-run",
+			"CRABBOX_SLUG":     "profile-slug",
+			"PROFILE_VALUE":    "preserved",
+		},
+		Inline: map[string]string{
+			"CRABBOX_LEASE_ID": "inline-lease",
+			"crabbox_run_id":   "inline-run",
+			"CRABBOX_SLUG":     "inline-slug",
+			"INLINE_VALUE":     "preserved",
+		},
+		Effective: map[string]string{
+			"CRABBOX_LEASE_ID": "effective-lease",
+			"crabbox_run_id":   "effective-run",
+			"CRABBOX_SLUG":     "effective-slug",
+			"PROFILE_VALUE":    "preserved",
+			"INLINE_VALUE":     "preserved",
+		},
+	}
+
+	applyRunExecutionMetadata(&selection, " cbx_abcdef123456 ", " run_123456abcdef ", " blue-lobster ")
+
+	want := map[string]string{
+		runEnvLeaseID: "cbx_abcdef123456",
+		runEnvRunID:   "run_123456abcdef",
+		runEnvSlug:    "blue-lobster",
+	}
+	for name, value := range want {
+		if selection.Inline[name] != value || selection.Effective[name] != value {
+			t.Fatalf("reserved %s did not win: inline=%#v effective=%#v", name, selection.Inline, selection.Effective)
+		}
+	}
+	for name := range selection.Profile {
+		for _, reserved := range reservedRunEnvNames {
+			if strings.EqualFold(name, reserved) {
+				t.Fatalf("profile retained reserved name %q: %#v", name, selection.Profile)
+			}
+		}
+	}
+	for _, values := range []map[string]string{selection.Inline, selection.Effective} {
+		if _, found := values["crabbox_run_id"]; found {
+			t.Fatalf("case-insensitive override survived: %#v", values)
+		}
+	}
+	if selection.Profile["PROFILE_VALUE"] != "preserved" || selection.Inline["INLINE_VALUE"] != "preserved" {
+		t.Fatalf("unrelated environment changed: %#v", selection)
+	}
+}
+
+func TestExternalDesktopPasswordNeverEntersRunEnvironmentForAnyTarget(t *testing.T) {
+	t.Setenv("SCREEN_SHARING_PASSWORD", "operator-secret")
+	t.Setenv("SCREEN_SAFE_VALUE", "preserved")
+	for _, targetOS := range []string{targetLinux, targetMacOS, targetWindows} {
+		t.Run(targetOS, func(t *testing.T) {
+			profile := map[string]string{
+				"SCREEN_SHARING_PASSWORD": "profile-secret",
+				"SCREEN_SAFE_VALUE":       "profile-safe",
+			}
+			selection := runEnvSelection{
+				Profile:   allowedProfileEnv([]string{"SCREEN_*"}, profile),
+				Inline:    allowedEnvWithoutProfileKeys([]string{"SCREEN_*"}, profile),
+				Effective: allowedEnvFromProfiles([]string{"SCREEN_*"}, profile),
+			}
+			selection.Inline["SCREEN_SHARING_PASSWORD"] = "expanded-secret"
+			selection.Effective["SCREEN_SHARING_PASSWORD"] = "expanded-secret"
+			cfg := Config{Provider: "external", TargetOS: targetOS}
+			cfg.External.Connection.Desktop.PasswordEnv = "SCREEN_SHARING_PASSWORD"
+			selection.remove(externalDesktopChildEnvDenylist(cfg, cfg.TargetOS)...)
+			for name, values := range map[string]map[string]string{"profile": selection.Profile, "inline": selection.Inline, "effective": selection.Effective} {
+				if _, found := values["SCREEN_SHARING_PASSWORD"]; found {
+					t.Fatalf("%s environment retained desktop password: %#v", name, values)
+				}
+			}
+			if selection.Effective["SCREEN_SAFE_VALUE"] != "profile-safe" {
+				t.Fatalf("unrelated allowed environment lost: %#v", selection.Effective)
+			}
+		})
+	}
+}
+
+func TestTrustedExternalDesktopPasswordStaysLocalAfterProviderSwitch(t *testing.T) {
+	t.Setenv("OPERATOR_ARD_PASSWORD", "operator-secret")
+	t.Setenv("SAFE_REMOTE_VALUE", "preserved")
+	cfg := Config{
+		Provider: "aws",
+		TargetOS: targetLinux,
+		EnvAllow: []string{"OPERATOR_ARD_PASSWORD", "SAFE_REMOTE_VALUE"},
+	}
+	cfg.External.Connection.Desktop.PasswordEnv = "OPERATOR_ARD_PASSWORD"
+	cfg.credentialProvenance.externalDesktopEnv = credentialSourceTrustedFile
+
+	values := allowedRemoteEnv(cfg)
+	if _, found := values["OPERATOR_ARD_PASSWORD"]; found {
+		t.Fatalf("provider switch forwarded trusted desktop password: %#v", values)
+	}
+	if values["SAFE_REMOTE_VALUE"] != "preserved" {
+		t.Fatalf("provider switch removed unrelated value: %#v", values)
+	}
+}
+
+func TestResolvedTargetPasswordStaysOutOfRunAndCacheEnvironment(t *testing.T) {
+	t.Setenv("ROUTED_SCREEN_PASSWORD", "operator-secret")
+	t.Setenv("SAFE_REMOTE_VALUE", "preserved")
+	cfg := Config{EnvAllow: []string{"ROUTED_SCREEN_PASSWORD", "SAFE_REMOTE_VALUE"}}
+	selection := runEnvSelection{
+		Profile:   allowedEnv(cfg.EnvAllow),
+		Inline:    allowedEnv(cfg.EnvAllow),
+		Effective: allowedEnv(cfg.EnvAllow),
+	}
+	target := SSHTarget{ChildEnvDenylist: []string{"ROUTED_SCREEN_PASSWORD"}}
+	selection.remove(target.ChildEnvDenylist...)
+	for name, values := range map[string]map[string]string{"profile": selection.Profile, "inline": selection.Inline, "effective": selection.Effective} {
+		if _, ok := values["ROUTED_SCREEN_PASSWORD"]; ok {
+			t.Fatalf("%s retained resolved credential: %#v", name, values)
+		}
+	}
+	values := allowedRemoteEnvForTarget(cfg, target)
+	if _, ok := values["ROUTED_SCREEN_PASSWORD"]; ok || values["SAFE_REMOTE_VALUE"] != "preserved" {
+		t.Fatalf("resolved cache environment=%#v", values)
+	}
+}

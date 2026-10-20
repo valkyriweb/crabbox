@@ -3,11 +3,170 @@ package freestyle
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+func TestFreestyleFallbackBoundsControlAndPreservesCommand(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 30 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v5/vms/vm123":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"id":`)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			case "/v5/vms/vm123/exec-await":
+				time.Sleep(3 * controlTimeout)
+				_ = json.NewEncoder(w).Encode(map[string]any{"stdout": "ok", "statusCode": 0})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		control.Transport, data.Transport = server.Client().Transport, server.Client().Transport
+		trusted, _ := url.Parse(server.URL)
+		client := &freestyleHTTPClient{
+			apiKey:         "test-key",
+			apiURL:         server.URL,
+			httpClient:     shared.SecureHTTPClient(control, trusted, freestyleRedirectError),
+			dataHTTPClient: shared.SecureHTTPClient(data, trusted, freestyleRedirectError),
+		}
+		started := time.Now()
+		_, err := client.GetVM(context.Background(), "vm123")
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetVM error=%v, want whole-request deadline", err)
+		}
+		controlElapsed := time.Since(started)
+		if controlElapsed >= time.Second {
+			t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
+		}
+
+		started = time.Now()
+		code, err := client.Exec(context.Background(), "vm123", "true", io.Discard, io.Discard)
+		if err != nil || code != 0 {
+			t.Fatalf("Exec code=%d err=%v", code, err)
+		}
+		dataElapsed := time.Since(started)
+		if dataElapsed <= controlTimeout {
+			t.Fatalf("command completed in %s, want beyond %s", dataElapsed, controlTimeout)
+		}
+		t.Logf("Freestyle control body bounded in %s; synchronous command completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+	})
+}
+
+func TestFreestyleInjectedHTTPSettingsArePreservedForBothPlanes(t *testing.T) {
+	transport := &http.Transport{DisableKeepAlives: true}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirectErr := errors.New("caller redirect policy")
+	redirectCalls := 0
+	injected := &http.Client{Transport: transport, Jar: jar, Timeout: 17 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+		redirectCalls++
+		return redirectErr
+	}}
+	api, err := newFreestyleClient(core.Config{Freestyle: core.FreestyleConfig{
+		APIKey: "test-key",
+		APIURL: "http://127.0.0.1:8787",
+	}}, core.Runtime{HTTP: injected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := api.(*freestyleHTTPClient)
+	if client.httpClient.Transport != transport || client.dataHTTPClient.Transport != transport || client.httpClient.Jar != jar || client.dataHTTPClient.Jar != jar || client.httpClient.Timeout != injected.Timeout || client.dataHTTPClient.Timeout != injected.Timeout {
+		t.Fatalf("settings=control:(%T,%s) data:(%T,%s)", client.httpClient.Transport, client.httpClient.Timeout, client.dataHTTPClient.Transport, client.dataHTTPClient.Timeout)
+	}
+	if client.httpClient == injected || client.dataHTTPClient == injected || client.httpClient == client.dataHTTPClient {
+		t.Fatal("secure wrappers must isolate their redirect policies")
+	}
+	sameOrigin := &http.Request{URL: &url.URL{Scheme: "http", Host: "127.0.0.1:8787", Path: "/next"}}
+	crossOrigin := &http.Request{URL: &url.URL{Scheme: "https", Host: "example.invalid"}}
+	for _, secured := range []*http.Client{client.httpClient, client.dataHTTPClient} {
+		if !errors.Is(secured.CheckRedirect(sameOrigin, nil), redirectErr) {
+			t.Fatal("secure wrapper lost caller redirect policy")
+		}
+		if err := secured.CheckRedirect(crossOrigin, nil); err == nil || errors.Is(err, redirectErr) {
+			t.Fatal("cross-origin rejection no longer precedes the caller policy")
+		}
+	}
+	if !errors.Is(injected.CheckRedirect(crossOrigin, nil), redirectErr) || redirectCalls != 3 {
+		t.Fatalf("source redirect policy mutated: calls=%d", redirectCalls)
+	}
+}
+
+func TestFreestyleClientRedactsAPIKeyFromAllResponseErrors(t *testing.T) {
+	const apiKey = "fs_test_response_secret"
+	tests := []struct {
+		name   string
+		invoke func(*freestyleHTTPClient) error
+	}{
+		{name: "create vm", invoke: func(client *freestyleHTTPClient) error {
+			_, err := client.CreateVM(context.Background(), freestyleCreateVMRequest{Name: "test"})
+			return err
+		}},
+		{name: "get vm", invoke: func(client *freestyleHTTPClient) error {
+			_, err := client.GetVM(context.Background(), "vm123")
+			return err
+		}},
+		{name: "list vms", invoke: func(client *freestyleHTTPClient) error {
+			_, err := client.ListVMs(context.Background())
+			return err
+		}},
+		{name: "delete vm", invoke: func(client *freestyleHTTPClient) error {
+			return client.DeleteVM(context.Background(), "vm123")
+		}},
+		{name: "exec", invoke: func(client *freestyleHTTPClient) error {
+			_, err := client.Exec(context.Background(), "vm123", "true", io.Discard, io.Discard)
+			return err
+		}},
+		{name: "write file", invoke: func(client *freestyleHTTPClient) error {
+			return client.WriteFile(context.Background(), "vm123", "/tmp/file", "content", "utf8")
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got, want := r.Header.Get("Authorization"), "Bearer "+apiKey; got != want {
+					t.Errorf("authorization header = %q, want %q", got, want)
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, "rejected Bearer "+apiKey+" (key "+apiKey+")")
+			}))
+			defer server.Close()
+			client := &freestyleHTTPClient{apiKey: apiKey, apiURL: server.URL, httpClient: server.Client()}
+
+			err := tt.invoke(client)
+			if err == nil {
+				t.Fatal("expected response error")
+			}
+			if strings.Contains(err.Error(), apiKey) {
+				t.Fatalf("API key leaked in response error: %v", err)
+			}
+			if !strings.Contains(err.Error(), "Bearer [redacted] (key [redacted])") {
+				t.Fatalf("response error was not redacted: %v", err)
+			}
+		})
+	}
+}
 
 func TestValidateFreestyleAPIURL(t *testing.T) {
 	tests := []struct {
@@ -60,12 +219,12 @@ func TestFreestyleClientRefusesCrossOriginRedirect(t *testing.T) {
 	}))
 	defer trusted.Close()
 
-	api, err := newFreestyleClient(Config{
-		Freestyle: FreestyleConfig{
+	api, err := newFreestyleClient(core.Config{
+		Freestyle: core.FreestyleConfig{
 			APIKey: "test-key",
 			APIURL: trusted.URL,
 		},
-	}, Runtime{HTTP: trusted.Client()})
+	}, core.Runtime{HTTP: trusted.Client()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,64 +237,12 @@ func TestFreestyleClientRefusesCrossOriginRedirect(t *testing.T) {
 	}
 }
 
-func TestFreestyleFileOperationsUseFilesPathPrefix(t *testing.T) {
-	const (
-		writePath = "/v1/vms/vm123/files/%2Ftmp%2Fcrabbox%20upload.tgz"
-		readPath  = "/v1/vms/vm123/files/%2Fworkspace%2Frepo%2Ffile.txt"
-	)
-	var sawWrite, sawRead bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got, want := r.Header.Get("Authorization"), "Bearer test-key"; got != want {
-			t.Errorf("authorization header=%q want %q", got, want)
-		}
-		switch r.Method {
-		case http.MethodPut:
-			sawWrite = true
-			if got := r.URL.EscapedPath(); got != writePath {
-				t.Errorf("write path=%q want %q", got, writePath)
-			}
-			w.WriteHeader(http.StatusNoContent)
-		case http.MethodGet:
-			sawRead = true
-			if got := r.URL.EscapedPath(); got != readPath {
-				t.Errorf("read path=%q want %q", got, readPath)
-			}
-			if err := json.NewEncoder(w).Encode(freestyleReadFileResponse{Content: "ok"}); err != nil {
-				t.Errorf("encode response: %v", err)
-			}
-		default:
-			t.Errorf("unexpected method %s", r.Method)
-			w.WriteHeader(http.StatusMethodNotAllowed)
-		}
-	}))
-	defer server.Close()
-
-	client := &freestyleHTTPClient{
-		apiKey:     "test-key",
-		apiURL:     server.URL,
-		httpClient: server.Client(),
-	}
-	if err := client.WriteFile(context.Background(), "vm123", "/tmp/crabbox upload.tgz", "payload", "base64"); err != nil {
-		t.Fatalf("WriteFile err=%v", err)
-	}
-	got, err := client.ReadFile(context.Background(), "vm123", "workspace/repo/file.txt")
-	if err != nil {
-		t.Fatalf("ReadFile err=%v", err)
-	}
-	if got != "ok" {
-		t.Fatalf("ReadFile content=%q", got)
-	}
-	if !sawWrite || !sawRead {
-		t.Fatalf("sawWrite=%v sawRead=%v", sawWrite, sawRead)
-	}
-}
-
 func TestFreestyleCreateVMOmitsUnsetSizing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.Method, http.MethodPost; got != want {
 			t.Errorf("method=%s want %s", got, want)
 		}
-		if got, want := r.URL.EscapedPath(), "/v1/vms"; got != want {
+		if got, want := r.URL.EscapedPath(), "/v5/vms"; got != want {
 			t.Errorf("path=%q want %q", got, want)
 		}
 		var body map[string]any
@@ -151,13 +258,10 @@ func TestFreestyleCreateVMOmitsUnsetSizing(t *testing.T) {
 		if _, ok := body["template"]; ok {
 			t.Fatalf("template should be omitted from default create request: %#v", body)
 		}
-		ports, ok := body["ports"].([]any)
-		if !ok || len(ports) != 0 {
-			t.Fatalf("ports=%#v want explicit empty array", body["ports"])
+		if _, ok := body["firewall"]; !ok {
+			t.Fatal("missing firewall")
 		}
-		if err := json.NewEncoder(w).Encode(freestyleCreateVMResponse{ID: "vm123"}); err != nil {
-			t.Errorf("encode response: %v", err)
-		}
+		_, _ = io.WriteString(w, `{"id":"vm123","state":"running"}`)
 	}))
 	defer server.Close()
 
@@ -175,47 +279,55 @@ func TestFreestyleCreateVMOmitsUnsetSizing(t *testing.T) {
 	}
 }
 
-func TestFreestyleCreateVMNestsCustomSizing(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if _, ok := body["vcpuCount"]; ok {
-			t.Fatalf("vcpuCount must not be top-level: %#v", body)
-		}
-		if _, ok := body["memSizeGb"]; ok {
-			t.Fatalf("memSizeGb must not be top-level: %#v", body)
-		}
-		template, ok := body["template"].(map[string]any)
-		if !ok || template["vcpuCount"] != float64(4) || template["memSizeGb"] != float64(8) {
-			t.Fatalf("template=%#v want nested custom sizing", body["template"])
-		}
-		ports, ok := body["ports"].([]any)
-		if !ok || len(ports) != 0 {
-			t.Fatalf("ports=%#v want explicit empty array", body["ports"])
-		}
-		if err := json.NewEncoder(w).Encode(freestyleCreateVMResponse{ID: "vm123"}); err != nil {
-			t.Errorf("encode response: %v", err)
-		}
-	}))
-	defer server.Close()
-
-	client := &freestyleHTTPClient{
-		apiKey:     "test-key",
-		apiURL:     server.URL,
-		httpClient: server.Client(),
-	}
-	_, err := client.CreateVM(context.Background(), freestyleCreateVMRequest{
-		Name:  "crabbox-test",
-		Ports: []freestylePortMapping{},
-		Template: &freestyleCreateVMTemplate{
-			VcpuCount: 4,
-			MemSizeGb: 8,
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreateVM err=%v", err)
+func TestFreestyleCreateVMResizesCustomSizing(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("resize failure=%t", fail), func(t *testing.T) {
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests = append(requests, r.Method+" "+r.URL.Path)
+				switch r.Method + " " + r.URL.Path {
+				case "POST /v5/vms":
+					var body map[string]any
+					json.NewDecoder(r.Body).Decode(&body)
+					for _, field := range []string{"template", "vcpuCount", "memSizeGb"} {
+						if _, ok := body[field]; ok {
+							t.Errorf("legacy sizing field %s", field)
+						}
+					}
+					io.WriteString(w, `{"id":"vm123","state":"starting"}`)
+				case "POST /v5/vms/vm123/resize":
+					var body map[string]int
+					json.NewDecoder(r.Body).Decode(&body)
+					if len(body) != 2 || body["cpu"] != 4 || body["memory"] != 8192 {
+						t.Errorf("resize=%v", body)
+					}
+					if fail {
+						http.Error(w, "CUSTOM_SIZING_NOT_ALLOWED", http.StatusForbidden)
+						return
+					}
+					io.WriteString(w, `{"id":"vm123","state":"running"}`)
+				case "DELETE /v5/vms/vm123":
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(404)
+				}
+			}))
+			defer server.Close()
+			client := &freestyleHTTPClient{apiKey: "test-key", apiURL: server.URL, httpClient: server.Client()}
+			vm, err := client.CreateVM(t.Context(), freestyleCreateVMRequest{Name: "crabbox-test", VCPUs: 4, MemoryGB: 8})
+			wantRequests := 2
+			if fail {
+				if err == nil || !strings.Contains(err.Error(), "CUSTOM_SIZING_NOT_ALLOWED") || vm.ID != "vm123" {
+					t.Fatalf("vm=%+v err=%v", vm, err)
+				}
+			} else if err != nil || vm.ID != "vm123" {
+				t.Fatalf("vm=%+v err=%v", vm, err)
+			}
+			if len(requests) != wantRequests {
+				t.Fatalf("requests=%v", requests)
+			}
+		})
 	}
 }
 
@@ -264,7 +376,7 @@ func TestFreestyleDeleteVMTreatsNotFoundAsSuccess(t *testing.T) {
 		if got, want := r.Method, http.MethodDelete; got != want {
 			t.Errorf("method=%s want %s", got, want)
 		}
-		if got, want := r.URL.EscapedPath(), "/v1/vms/vm123"; got != want {
+		if got, want := r.URL.EscapedPath(), "/v5/vms/vm123"; got != want {
 			t.Errorf("path=%q want %q", got, want)
 		}
 		http.Error(w, "missing", http.StatusNotFound)

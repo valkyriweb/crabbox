@@ -1,0 +1,39 @@
+package fastapicloud
+
+import (
+	"flag"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func init() {
+	core.RegisterProvider(Provider{})
+}
+
+type Provider struct{}
+
+func (Provider) Spec() core.ProviderSpec {
+	return core.ProviderSpec{
+		Aliases:          []string{"fastapicloud", "fastapi"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIToken),
+		Name:             providerName,
+		Family:           "fastapi-cloud",
+		Kind:             core.ProviderKindServiceControl,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+	}
+}
+
+func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return RegisterFastAPICloudProviderFlags(fs, defaults)
+}
+
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	return ApplyFastAPICloudProviderFlags(cfg, fs, values)
+}
+
+func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	return NewFastAPICloudBackend(p.Spec(), cfg, rt), nil
+}

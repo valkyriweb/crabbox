@@ -2,6 +2,7 @@ package ovh
 
 import (
 	"flag"
+	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -14,59 +15,42 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
+var _ core.ProviderClassProfileProvider = Provider{}
+
+var classProfiles = core.UniformLinuxAMD64ClassProfiles(core.ProviderClassMachine{Type: "b3-8"})
+
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      providerName,
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureTailscale},
-		Coordinator: core.CoordinatorNever,
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPICredentials),
+		Name:             providerName,
+		Family:           providerName,
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureTailscale},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionMapped,
 	}
 }
 
-type flagValues struct {
-	Endpoint  *string
-	ProjectID *string
-	Region    *string
-	Image     *string
-	Flavor    *string
+func (Provider) ClassProfiles() []core.ProviderClassProfile {
+	return classProfiles
 }
 
 func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
-	return flagValues{
-		Endpoint:  fs.String("ovh-endpoint", defaults.OVH.Endpoint, "OVHcloud API endpoint"),
-		ProjectID: fs.String("ovh-project-id", defaults.OVH.ProjectID, "OVHcloud Public Cloud project ID"),
-		Region:    fs.String("ovh-region", defaults.OVH.Region, "OVHcloud Public Cloud region"),
-		Image:     fs.String("ovh-image", defaults.OVH.Image, "OVHcloud Public Cloud image name or ID"),
-		Flavor:    fs.String("ovh-flavor", defaults.OVH.Flavor, "OVHcloud Public Cloud flavor name or ID"),
-	}
+	return core.RegisterOVHConfigFlags(fs, defaults.OVH)
 }
 
 func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
-	v, ok := values.(flagValues)
+	v, ok := values.(core.OVHConfigFlagValues)
 	if !ok {
 		return nil
 	}
-	if core.FlagWasSet(fs, "ovh-endpoint") {
-		cfg.OVH.Endpoint = *v.Endpoint
-	}
-	if core.FlagWasSet(fs, "ovh-project-id") {
-		cfg.OVH.ProjectID = *v.ProjectID
-	}
-	if core.FlagWasSet(fs, "ovh-region") {
-		cfg.OVH.Region = *v.Region
-	}
-	if core.FlagWasSet(fs, "ovh-image") {
-		cfg.OVH.Image = *v.Image
+	applied, err := v.Apply(&cfg.OVH, fs)
+	core.RecordProviderFlagInputs(cfg, applied.InputAccepted, providerName)
+	if applied.Image {
 		core.SetOVHImageExplicit(cfg)
 	}
-	if core.FlagWasSet(fs, "ovh-flavor") {
-		cfg.OVH.Flavor = *v.Flavor
-	}
-	return nil
+	return err
 }
 
 func (Provider) ServerTypeForConfig(cfg core.Config) string {
@@ -76,26 +60,43 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.OVH.Flavor != "" {
 		return cfg.OVH.Flavor
 	}
-	return ovhServerTypeForClass(cfg.Class)
+	return core.ProviderClassPrimaryTypeForProfiles(classProfiles, cfg, ovhServerTypeForClass(cfg.Class))
 }
 
-func (Provider) ServerTypeForClass(class string) string {
-	return ovhServerTypeForClass(class)
+func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
+	flavor := strings.TrimSpace(cfg.OVH.Flavor)
+	return flavor, flavor != ""
 }
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	return NewBackend(p.Spec(), cfg, rt), nil
+func ovhServerTypeForClass(class string) string {
+	for _, profile := range classProfiles {
+		if profile.Class == class {
+			return profile.Primary.Type
+		}
+	}
+	return "b3-8"
 }
 
-func ovhServerTypeForClass(class string) string {
-	switch class {
-	case "standard", "fast", "large", "beast":
-		return "b3-8"
-	default:
-		return "b3-8"
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	if cfg.OVH.Endpoint == "" {
+		cfg.OVH.Endpoint = core.OVHConfigDefaultEndpoint
 	}
+	cfg.OVH.Image = imageForConfig(*cfg)
+	if cfg.OVH.Flavor == "" {
+		cfg.OVH.Flavor = core.OVHConfigDefaultFlavor
+	}
+	base := core.BaseConfig()
+	core.ApplyLinuxConnectionDefaults(cfg, base.SSHUser, base.SSHPort)
+	return nil
+}
+
+func imageForConfig(cfg core.Config) string {
+	if cfg.OVH.Image == "" {
+		return core.OVHConfigDefaultImage
+	}
+	return cfg.OVH.Image
 }

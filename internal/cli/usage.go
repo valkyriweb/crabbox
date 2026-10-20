@@ -11,7 +11,7 @@ import (
 func (a App) usage(ctx context.Context, args []string) error {
 	fs := newFlagSet("usage", a.Stderr)
 	scope := fs.String("scope", "user", "scope: user, org, or all")
-	owner := fs.String("user", "", "user email")
+	owner := fs.String("user", "", "owner identity")
 	org := fs.String("org", "", "org name")
 	month := fs.String("month", time.Now().UTC().Format("2006-01"), "month: YYYY-MM")
 	jsonOut := fs.Bool("json", false, "print JSON")
@@ -19,7 +19,7 @@ func (a App) usage(ctx context.Context, args []string) error {
 		return err
 	}
 	if *scope != "user" && *scope != "org" && *scope != "all" {
-		return exit(2, "usage scope must be user, org, or all")
+		return Exit(2, "usage scope must be user, org, or all")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -30,7 +30,7 @@ func (a App) usage(ctx context.Context, args []string) error {
 		return err
 	}
 	if !ok {
-		return exit(2, "usage requires a configured coordinator")
+		return Exit(2, "usage requires a configured coordinator")
 	}
 	res, err := coord.Usage(ctx, *scope, *owner, *org, *month)
 	if err != nil {
@@ -53,12 +53,13 @@ func printUsageSummary(out interface{ Write([]byte) (int, error) }, usage Coordi
 		scopeParts = append(scopeParts, "org="+usage.Org)
 	}
 	fmt.Fprintf(out, "usage month=%s %s\n", usage.Month, strings.Join(scopeParts, " "))
-	fmt.Fprintf(out, "total leases=%d active=%d runtime=%s estimated=$%.2f reserved=$%.2f\n",
-		usage.Leases, usage.ActiveLeases, formatDurationSeconds(usage.RuntimeSeconds), usage.EstimatedUSD, usage.ReservedUSD)
+	fmt.Fprintf(out, "total leases=%d active=%d runtime=%s estimated=$%.2f reserved=$%.2f%s\n",
+		usage.Leases, usage.ActiveLeases, formatDurationSeconds(usage.RuntimeSeconds), usage.EstimatedUSD, usage.ReservedUSD, formatCommittedUSD(usage.CommittedUSD))
 	printUsageGroups(out, "owners", usage.ByOwner)
 	printUsageGroups(out, "orgs", usage.ByOrg)
 	printUsageGroups(out, "providers", usage.ByProvider)
 	printUsageGroups(out, "server_types", usage.ByServerType)
+	printUsageGroups(out, "by machine", usage.ByMachine)
 }
 
 func printUsageGroups(out interface{ Write([]byte) (int, error) }, title string, groups []CoordinatorUsageGroup) {
@@ -67,9 +68,24 @@ func printUsageGroups(out interface{ Write([]byte) (int, error) }, title string,
 	}
 	fmt.Fprintf(out, "%s:\n", title)
 	for _, group := range groups {
-		fmt.Fprintf(out, "  %-24s leases=%-3d active=%-3d runtime=%-9s estimated=$%-8.2f reserved=$%.2f\n",
-			group.Key, group.Leases, group.ActiveLeases, formatDurationSeconds(group.RuntimeSeconds), group.EstimatedUSD, group.ReservedUSD)
+		name := group.Key
+		if group.Label != "" {
+			name = group.Label + " (" + group.Key + ")"
+		}
+		cpu := ""
+		if group.CPUSeconds != nil {
+			cpu = fmt.Sprintf(" cpu-hours=%.2f", float64(*group.CPUSeconds)/3600)
+		}
+		fmt.Fprintf(out, "  %-24s leases=%-3d active=%-3d runtime=%-9s estimated=$%-8.2f reserved=$%.2f%s\n",
+			name, group.Leases, group.ActiveLeases, formatDurationSeconds(group.RuntimeSeconds), group.EstimatedUSD, group.ReservedUSD, formatCommittedUSD(group.CommittedUSD)+cpu)
 	}
+}
+
+func formatCommittedUSD(value *float64) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprintf(" committed=$%.2f", *value)
 }
 
 func printCostLimits(out interface{ Write([]byte) (int, error) }, limits CoordinatorCostLimits) {

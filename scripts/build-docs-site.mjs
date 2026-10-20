@@ -1,15 +1,104 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { scanSiteMarkdownLines } from "./lib/markdown-headings.mjs";
+import { locales, loadTranslations, localizeHTML, sourceHash } from "./lib/docs-i18n.mjs";
 
 const root = process.cwd();
 const docsDir = path.join(root, "docs");
 const outDir = path.join(root, "dist", "docs-site");
 const repoEditBase = "https://github.com/openclaw/crabbox/edit/main/docs";
 const customDomain = "crabbox.sh";
+const providerMetadata = JSON.parse(
+  fs.readFileSync(path.join(docsDir, "providers", "provider-metadata.json"), "utf8"),
+);
+// Specialized service-control adapters are built in too; external is the plugin contract.
+const builtInProviderCount = Object.values(providerMetadata).filter(
+  (entry) => entry.category !== "external-provider",
+).length;
+const providerMetadataByDocs = new Map(
+  Object.entries(providerMetadata).map(([name, metadata]) => [metadata.docs, { name, metadata }]),
+);
+const skillsDir = path.join(root, "skills");
+// AI Catalog editorial metadata, one entry per skills/<name>.
+const catalogMetadata = {
+  crabbox: {
+    displayName: "Crabbox Agent Skill",
+    tags: ["remote-testing", "remote-execution", "developer-tools", "agent-skill"],
+    capabilities: [
+      "RemoteTestExecution",
+      "ReusableRemoteEnvironment",
+      "CrossPlatformValidation",
+      "AuditableExecutionEvidence",
+    ],
+    representativeQueries: [
+      "run this repository's tests on a clean remote machine",
+      "validate this change on Linux, macOS, or Windows",
+      "use Crabbox to collect auditable remote test evidence",
+    ],
+  },
+  "crabbox-quickstart": {
+    displayName: "Crabbox Quickstart Skill",
+    tags: ["getting-started", "onboarding", "local-container", "docker", "test-execution", "developer-tools"],
+    capabilities: [
+      "GuidedFirstRun",
+      "LocalContainerExecution",
+      "CredentialFreeEvaluation",
+      "ZeroConfigEvaluation",
+      "LeaseLifecycleHygiene",
+    ],
+    representativeQueries: [
+      "run my repository's tests in a throwaway Docker container without a cloud account",
+      "what is Crabbox and how do I try it without an account",
+      "set up Crabbox in this repo that has no crabbox.yaml yet",
+      "why does crabbox say no provider selected",
+    ],
+  },
+};
+
+// Parsed at module load because llms.txt is written before the discovery files.
+const agentSkills = readAgentSkills();
+const legacyProviderFeatureNotes = new Set([
+  "aws.md",
+  "azure.md",
+  "aws-private-workspaces.md",
+  "blacksmith-testbox.md",
+  "capacity-fallback.md",
+  "daytona.md",
+  "delegated-runner-contract.md",
+  "e2b.md",
+  "hetzner.md",
+  "islo.md",
+  "namespace-devbox.md",
+  "namespace-devbox-setup.md",
+  "provider-authoring.md",
+  "provider-landscape.md",
+  "provider-live-smoke.md",
+  "provider-selection.md",
+  "providers.md",
+  "semaphore.md",
+  "slurm-academic-sandboxes.md",
+  "sprites.md",
+]);
 
 const sections = [
-  ["Start", ["README.md", "how-it-works.md", "architecture.md", "orchestrator.md", "cli.md"]],
+  [
+    "Start",
+    [
+      "README.md",
+      "getting-started.md",
+      "use-cases.md",
+      "pricing.md",
+      "how-it-works.md",
+      "concepts.md",
+      "architecture.md",
+      "orchestrator.md",
+      "cli.md",
+    ],
+  ],
+  ["Integrations", rels("integrations")],
+  ["Providers", rels("providers")],
   ["Features", rels("features")],
   ["Commands", rels("commands")],
   [
@@ -28,6 +117,12 @@ const pages = allMarkdown(docsDir).map((file) => {
   return { file, rel, title, outRel: outPath(rel), markdown };
 });
 
+const translations = loadTranslations(root, pages);
+const siteMessages = new Map(Object.keys(locales).filter((locale) => locale !== "en").map((locale) => {
+  const file = path.join(docsDir, ".i18n", locale, "site.json");
+  return [locale, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : { messages: {} }];
+}));
+const siteSourceHash = sourceHash(fs.readFileSync(new URL(import.meta.url)));
 const pageMap = new Map(pages.map((page) => [page.rel, page]));
 const nav = sections
   .map(([name, rels]) => ({
@@ -40,22 +135,181 @@ const sectionByRel = new Map();
 for (const section of nav) for (const page of section.pages) sectionByRel.set(page.rel, section.name);
 const orderedPages = nav.flatMap((s) => s.pages);
 
-for (const page of pages) {
-  const html = markdownToHtml(page.markdown, page.rel);
-  const toc = tocFromHtml(html);
-  const idx = orderedPages.findIndex((p) => p.rel === page.rel);
-  const prev = idx > 0 ? orderedPages[idx - 1] : null;
-  const next = idx >= 0 && idx < orderedPages.length - 1 ? orderedPages[idx + 1] : null;
-  const sectionName = sectionByRel.get(page.rel) || "Crabbox docs";
-  const pageOut = path.join(outDir, page.outRel);
-  fs.mkdirSync(path.dirname(pageOut), { recursive: true });
-  fs.writeFileSync(pageOut, layout({ page, html, toc, prev, next, sectionName }), "utf8");
+for (const original of pages) {
+  for (const locale of Object.keys(locales)) {
+    const translation = translations.get(`${locale}/${original.rel}`);
+    if (locale !== "en" && !translation) continue;
+    const page = { ...original, locale, translation };
+    if (translation) {
+      page.markdown = translation.markdown;
+      page.title = firstHeading(page.markdown)?.replace(/\s+\{#[^}]+\}$/, "") || original.title;
+    }
+    const html = markdownToHtml(page.markdown, page.rel);
+    const toc = tocFromHtml(html);
+    const idx = orderedPages.findIndex((p) => p.rel === page.rel);
+    const prev = idx > 0 ? orderedPages[idx - 1] : null;
+    const next = idx >= 0 && idx < orderedPages.length - 1 ? orderedPages[idx + 1] : null;
+    const sectionName = sectionByRel.get(page.rel) || "Crabbox docs";
+    const pageOut = path.join(outDir, localizedPath(page.outRel, locale));
+    fs.mkdirSync(path.dirname(pageOut), { recursive: true });
+    let output = layout({ page, html, toc, prev, next, sectionName });
+    if (locale !== "en") {
+      output = localizeHTML(output, siteMessages.get(locale).messages);
+      output = routeLocaleLinks(output, page);
+    }
+    fs.writeFileSync(pageOut, output, "utf8");
+  }
+}
+
+function localizedPath(outRel, locale) {
+  return locale === "en" ? outRel : `${locale}/${outRel}`;
+}
+
+function routeLocaleLinks(html, page) {
+  const byOutput = new Map(pages.map((entry) => [entry.outRel, entry]));
+  const from = path.posix.dirname(localizedPath(page.outRel, page.locale));
+  return html.replace(/\b(href|src)="([^"#]+)(#[^"]*)?"/g, (match, attr, href, hash = "") => {
+    if (/^(?:[a-z]+:|\/)/i.test(href)) return match;
+    const target = path.posix.normalize(path.posix.join(path.posix.dirname(page.outRel), href));
+    const linkedPage = byOutput.get(target);
+    const translated = linkedPage && translations.has(`${page.locale}/${linkedPage.rel}`);
+    const destination = translated ? localizedPath(target, page.locale) : target;
+    return `${attr}="${escapeAttr(path.posix.relative(from, destination))}${hash}"`;
+  });
+}
+
+function languageLinks(page) {
+  const links = Object.entries(locales).map(([locale, label]) => {
+    const available = locale === "en" || translations.has(`${locale}/${page.rel}`);
+    const actual = available ? locale : "en";
+    return `<a href="${pageUrl(docsOrigin(), localizedPath(page.outRel, actual))}" hreflang="${actual}" lang="${locale}"${page.locale === locale ? ' aria-current="page"' : ""}>${label}${available ? "" : " (English)"}</a>`;
+  }).join("");
+  return `<details class="language-switcher"><summary>${locales[page.locale]}</summary><nav aria-label="Language">${links}</nav></details>`;
+}
+
+function alternateLinks(page) {
+  return Object.keys(locales).filter((locale) => locale === "en" || translations.has(`${locale}/${page.rel}`))
+    .map((locale) => `<link rel="alternate" hreflang="${locale}" href="${pageUrl(docsOrigin(), localizedPath(page.outRel, locale))}">`).join("\n  ")
+    + `\n  <link rel="alternate" hreflang="x-default" href="${pageUrl(docsOrigin(), page.outRel)}">`;
 }
 
 fs.writeFileSync(path.join(outDir, "crabbox.svg"), crabSvg(), "utf8");
 fs.writeFileSync(path.join(outDir, ".nojekyll"), "", "utf8");
 fs.writeFileSync(path.join(outDir, "llms.txt"), llmsTxt(), "utf8");
+writeAgentSkillsDiscovery();
+writeAgentMap();
 console.log(`built docs site: ${path.relative(root, outDir)}`);
+
+// Preserve the original first entry; sort any additional skills by name.
+export function readAgentSkills(sourceDir = skillsDir, metadata = catalogMetadata) {
+  return fs
+    .readdirSync(sourceDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((a, b) => (a === b ? 0 : a === "crabbox" ? -1 : b === "crabbox" ? 1 : a < b ? -1 : 1))
+    .map((name) => {
+      const sourcePath = path.join(sourceDir, name, "SKILL.md");
+      const skill = fs.readFileSync(sourcePath, "utf8");
+      const frontmatter = skill.match(/^---\n([\s\S]*?)\n---\n/);
+      if (!frontmatter) throw new Error(`${path.relative(root, sourcePath)} has no YAML frontmatter`);
+
+      const declared = frontmatter[1].match(/^name:\s*([a-z0-9-]+)$/m)?.[1];
+      const encodedDescription = frontmatter[1].match(/^description:\s*("(?:\\.|[^"\\])*")$/m)?.[1];
+      if (!declared || !encodedDescription) {
+        throw new Error(`${path.relative(root, sourcePath)} must declare a quoted description and name`);
+      }
+      if (declared !== name) {
+        throw new Error(`${path.relative(root, sourcePath)} declares name ${declared} but lives in skills/${name}`);
+      }
+      const catalog = Object.hasOwn(metadata, name) ? metadata[name] : undefined;
+      if (!catalog) {
+        throw new Error(`skills/${name} has no AI Catalog metadata in build-docs-site.mjs`);
+      }
+      if (typeof catalog.displayName !== "string" || !catalog.displayName.trim()) {
+        throw new Error(`skills/${name} AI Catalog displayName must be a non-empty string`);
+      }
+      for (const field of ["tags", "capabilities", "representativeQueries"]) {
+        if (!Array.isArray(catalog[field]) || !catalog[field].length ||
+            catalog[field].some((value) => typeof value !== "string" || !value.trim())) {
+          throw new Error(`skills/${name} AI Catalog ${field} must be a non-empty array of non-empty strings`);
+        }
+      }
+      return {
+        name,
+        skill,
+        catalog,
+        description: JSON.parse(encodedDescription),
+        digest: crypto.createHash("sha256").update(skill).digest("hex"),
+      };
+    });
+}
+
+function writeAgentSkillsDiscovery() {
+  const discoveryDir = path.join(outDir, ".well-known", "agent-skills");
+  for (const { name, skill } of agentSkills) {
+    const publishedSkillDir = path.join(discoveryDir, name);
+    fs.mkdirSync(publishedSkillDir, { recursive: true });
+    fs.writeFileSync(path.join(publishedSkillDir, "SKILL.md"), skill, "utf8");
+  }
+  fs.writeFileSync(
+    path.join(discoveryDir, "index.json"),
+    `${JSON.stringify(
+      {
+        $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+        skills: agentSkills.map(({ name, description, digest }) => ({
+          name,
+          type: "skill-md",
+          description,
+          url: `/.well-known/agent-skills/${name}/SKILL.md`,
+          digest: `sha256:${digest}`,
+        })),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  writeAICatalog();
+}
+
+function writeAICatalog() {
+  const origin = docsOrigin();
+  if (!origin) throw new Error("Agentic Resource Discovery requires a canonical docs origin");
+  const catalog = {
+    specVersion: "1.0",
+    host: {
+      displayName: "Crabbox",
+      documentationUrl: `${origin}/integrations/agents.html`,
+    },
+    entries: agentSkills.map(({ name, description, catalog: meta }) => ({
+      identifier: `urn:air:crabbox.sh:skill:${name}`,
+      displayName: meta.displayName,
+      // Current AI Catalog integrated-ecosystem type. ARD's draft examples
+      // and bundled conformance helper still disagree on older alternatives.
+      type: "application/agent-skills+md",
+      url: `${origin}/.well-known/agent-skills/${name}/SKILL.md`,
+      description,
+      tags: meta.tags,
+      capabilities: meta.capabilities,
+      representativeQueries: meta.representativeQueries,
+    })),
+  };
+  fs.writeFileSync(
+    path.join(outDir, ".well-known", "ai-catalog.json"),
+    `${JSON.stringify(catalog, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+function writeAgentMap() {
+  const origin = docsOrigin();
+  if (!origin) return;
+  fs.writeFileSync(
+    path.join(outDir, "robots.txt"),
+    `User-agent: *\nAllow: /\nAgentmap: ${origin}/.well-known/ai-catalog.json\n`,
+    "utf8",
+  );
+}
 
 function llmsTxt() {
   const origin = docsOrigin();
@@ -77,6 +331,15 @@ function llmsTxt() {
   }
   if (source) {
     lines.push("", `Source: ${source}`);
+  }
+  if (origin) {
+    lines.push(
+      "",
+      "Agent Skill and resource discovery:",
+      `- ${origin}/.well-known/agent-skills/index.json`,
+      ...agentSkills.map(({ name }) => `- ${origin}/.well-known/agent-skills/${name}/SKILL.md`),
+      `- ${origin}/.well-known/ai-catalog.json`,
+    );
   }
   lines.push("", "Guidance for agents:", "- Prefer the canonical documentation URLs above over README excerpts or package metadata.", "- Fetch only the pages needed for the current task; this is an index, not a full-site corpus.");
   return `${lines.join("\n")}\n`;
@@ -123,7 +386,7 @@ function rels(dir) {
   if (!fs.existsSync(full)) return [];
   return fs
     .readdirSync(full)
-    .filter((name) => name.endsWith(".md"))
+    .filter((name) => name.endsWith(".md") && !(dir === "features" && legacyProviderFeatureNotes.has(name)))
     .sort((a, b) => (a === "README.md" ? -1 : b === "README.md" ? 1 : a.localeCompare(b)))
     .map((name) => `${dir}/${name}`);
 }
@@ -133,7 +396,7 @@ function allMarkdown(dir) {
     .readdirSync(dir, { withFileTypes: true })
     .flatMap((entry) => {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) return allMarkdown(full);
+      if (entry.isDirectory()) return entry.name.startsWith(".") ? [] : allMarkdown(full);
       return entry.name.endsWith(".md") ? [full] : [];
     })
     .sort();
@@ -153,8 +416,9 @@ function titleize(input) {
   return input.replaceAll("-", " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
-function markdownToHtml(markdown, currentRel) {
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+export function markdownToHtml(markdown, currentRel) {
+  const structure = scanSiteMarkdownLines(markdown);
+  const lines = structure.map((entry) => entry.line);
   const html = [];
   let paragraph = [];
   let list = null;
@@ -167,7 +431,12 @@ function markdownToHtml(markdown, currentRel) {
   };
   const closeList = () => {
     if (!list) return;
-    html.push(`</${list}>`);
+    if (list.current) list.items.push(list.current);
+    html.push(
+      `<${list.tag}>${list.items
+        .map((item) => `<li>${inline(item, currentRel)}</li>`)
+        .join("")}</${list.tag}>`,
+    );
     list = null;
   };
   const splitRow = (line) => line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((s) => s.trim());
@@ -175,20 +444,26 @@ function markdownToHtml(markdown, currentRel) {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const fenceMatch = line.match(/^```(\w+)?\s*$/);
-    if (fenceMatch) {
+    const entry = structure[i];
+    if (entry.kind === "fence-open" || entry.kind === "fence-close") {
       flushParagraph();
       closeList();
-      if (fence) {
+      if (entry.kind === "fence-close") {
         html.push(`<pre><code class="language-${fence.lang}">${escapeHtml(fence.lines.join("\n"))}</code></pre>`);
         fence = null;
       } else {
-        fence = { lang: fenceMatch[1] || "text", lines: [] };
+        fence = { lang: entry.language, lines: [] };
       }
       continue;
     }
-    if (fence) {
+    if (entry.kind === "code") {
       fence.lines.push(line);
+      continue;
+    }
+    if (entry.kind === "comment") continue;
+    if (entry.kind === "comment-start") {
+      flushParagraph();
+      closeList();
       continue;
     }
     if (!line.trim()) {
@@ -196,13 +471,10 @@ function markdownToHtml(markdown, currentRel) {
       closeList();
       continue;
     }
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
+    if (entry.kind === "heading") {
       flushParagraph();
       closeList();
-      const level = heading[1].length;
-      const text = heading[2].trim();
-      const id = slug(text);
+      const { level, text, id } = entry;
       const inner = inline(text, currentRel);
       if (level === 1) {
         html.push(`<h1 id="${id}">${inner}</h1>`);
@@ -226,9 +498,17 @@ function markdownToHtml(markdown, currentRel) {
         i += 1;
         rows.push(splitRow(lines[i]));
       }
+      const isProviderMatrix = currentRel === "providers/README.md" && header[0] === "Provider";
       const th = header.map((c, idx) => `<th${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ""}>${inline(c, currentRel)}</th>`).join("");
-      const tb = rows.map((r) => `<tr>${r.map((c, idx) => `<td${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ""}>${inline(c, currentRel)}</td>`).join("")}</tr>`).join("");
-      html.push(`<table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);
+      const tb = rows.map((r) => {
+        const attrs = isProviderMatrix ? providerRowAttributes(r) : "";
+        const cells = r.map((c, idx) => `<td${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ""}>${inline(c, currentRel)}</td>`).join("");
+        return `<tr${attrs}>${cells}</tr>`;
+      }).join("");
+      const tableClass = isProviderMatrix ? ' class="provider-matrix"' : "";
+      const tableLabel = `${stripHtmlTags(inline(header[0], currentRel)) || "Data"} table`;
+      if (isProviderMatrix) html.push(providerFilterHtml(rows.length));
+      html.push(`<div class="table-scroll" role="region" aria-label="${escapeAttr(tableLabel)}" tabindex="0"><table${tableClass}><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`);
       continue;
     }
     const bullet = line.match(/^\s*-\s+(.+)$/);
@@ -236,19 +516,81 @@ function markdownToHtml(markdown, currentRel) {
     if (bullet || numbered) {
       flushParagraph();
       const tag = bullet ? "ul" : "ol";
-      if (list && list !== tag) closeList();
+      if (list && list.tag !== tag) closeList();
       if (!list) {
-        list = tag;
-        html.push(`<${tag}>`);
+        list = { tag, items: [], current: "" };
       }
-      html.push(`<li>${inline((bullet || numbered)[1], currentRel)}</li>`);
+      if (list.current) list.items.push(list.current);
+      list.current = (bullet || numbered)[1];
       continue;
     }
+    if (list && /^\s{2,}\S/.test(line)) {
+      list.current += ` ${line.trim()}`;
+      continue;
+    }
+    closeList();
     paragraph.push(line.trim());
   }
   flushParagraph();
   closeList();
   return html.join("\n");
+}
+
+function providerRowAttributes(row) {
+  const docsMatch = row[0]?.match(/\]\(([^)#]+\.md)(?:#[^)]+)?\)/);
+  const docs = docsMatch?.[1] || "";
+  const entry = providerMetadataByDocs.get(docs);
+  const name = entry?.name || path.basename(docs, ".md");
+  const metadata = entry?.metadata || {};
+  const search = [name, ...row, ...Object.values(metadata)]
+    .filter((value) => typeof value === "string")
+    .join(" ")
+    .replace(/[\[\]()`*_]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  return ` data-provider="${escapeAttr(name)}" data-provider-groups="${escapeAttr(providerGroups(metadata).join(" "))}" data-provider-search="${escapeAttr(search)}"`;
+}
+
+function providerGroups(metadata) {
+  const groups = [primaryProviderGroup(metadata.category)];
+  if (metadata.coordinator === true && !groups.includes("team-cloud")) groups.push("team-cloud");
+  return groups;
+}
+
+function primaryProviderGroup(category) {
+  if (category === "brokerable-cloud") return "team-cloud";
+  if (category === "direct-cloud") return "managed-cloud";
+  if (category === "delegated-sandbox") return "sandboxes";
+  if (category === "gpu-cloud") return "gpu";
+  if (["local-sandbox", "local-runtime", "local-vm"].includes(category)) return "local";
+  if (["self-hosted-virtualization", "external-provider", "byo-ssh"].includes(category)) return "self-hosted";
+  if (["ci-proof-runner", "service-control"].includes(category)) return "ci-services";
+  return "other";
+}
+
+function providerFilterHtml(count) {
+  const groups = [
+    ["all", "All"],
+    ["team-cloud", "Team cloud"],
+    ["managed-cloud", "Managed cloud"],
+    ["sandboxes", "Sandboxes"],
+    ["gpu", "GPU & ML"],
+    ["local", "Local"],
+    ["self-hosted", "Self-hosted & BYO"],
+    ["ci-services", "CI & services"],
+  ];
+  return `<div class="provider-filter" data-provider-filter>
+  <div class="provider-filter-head">
+    <label for="provider-filter-input">Find a provider</label>
+    <output for="provider-filter-input" aria-live="polite" data-provider-count>${count} providers</output>
+  </div>
+  <input id="provider-filter-input" name="provider-filter" type="search" autocomplete="off" spellcheck="false" placeholder="Try GPU, local, macOS…">
+  <div class="provider-filter-groups" role="group" aria-label="Provider category">
+    ${groups.map(([value, label], index) => `<button type="button" data-provider-group-filter="${value}" aria-pressed="${index === 0 ? "true" : "false"}">${label}</button>`).join("")}
+  </div>
+  <p class="provider-empty" role="status" hidden data-provider-empty>No providers match these filters.</p>
+</div>`;
 }
 
 function inline(text, currentRel) {
@@ -307,49 +649,79 @@ function layout({ page, html, toc, prev, next, sectionName }) {
   const rootPrefix = depth ? "../".repeat(depth) : "";
   const editUrl = `${repoEditBase}/${page.rel}`;
   const isHome = page.rel === "README.md";
+  const isProviderIndex = page.rel === "providers/README.md";
+  const messages = siteMessages.get(page.locale)?.messages || {};
+  const documentTitle = isHome
+    ? "Crabbox — On-demand Computers for Agents"
+    : `${page.title} - ${messages["Crabbox Docs"] || "Crabbox Docs"}`;
+  const metaDescription = isHome
+    ? "Give coding agents on-demand computers for tests and builds. Keep editing locally, run on Linux, macOS, Windows or WSL2, and stream results back."
+    : page.locale === "en" ? `${page.title} documentation for Crabbox remote execution.` : `${page.title} — ${messages["Crabbox remote execution documentation."]}`;
+  const canonicalUrl = pageUrl(docsOrigin(), localizedPath(page.outRel, page.locale));
+  const stale = page.translation && (page.translation.stale || siteMessages.get(page.locale).sourceHash !== siteSourceHash);
+  const notice = stale ? `<aside class="translation-notice" role="note">${escapeHtml(siteMessages.get(page.locale).outdated || "This translation may be outdated.")} <a href="${pageUrl(docsOrigin(), page.outRel)}" lang="en">English</a></aside>` : "";
   const prevNext = !isHome && (prev || next) ? pageNavHtml(prev, next, rootPrefix) : "";
   const heroBlock = isHome ? landingHero(rootPrefix) : standardHero(page, sectionName, editUrl);
-  const articleClass = isHome ? "doc doc-home" : "doc";
-  const tocBlock = isHome ? "" : toc;
+  const articleClass = isProviderIndex ? "doc doc-wide" : "doc";
+  const tocBlock = isProviderIndex ? "" : toc;
+  const articleBlock = isHome
+    ? ""
+    : `<div class="doc-grid${isProviderIndex ? " doc-grid-wide" : ""}">
+        <article class="${articleClass}">${html}${prevNext}</article>
+        ${tocBlock}
+      </div>`;
   return `<!doctype html>
-<html lang="en">
+<html lang="${page.locale}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>${escapeHtml(page.title)} - Crabbox Docs</title>
+  <meta name="theme-color" id="theme-color" content="#f4f5f5">
+  <title>${escapeHtml(documentTitle)}</title>
+  <meta name="description" content="${escapeAttr(metaDescription)}">
+  <link rel="canonical" href="${escapeAttr(canonicalUrl)}">
+  ${alternateLinks(page)}
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Crabbox">
+  <meta property="og:title" content="${escapeAttr(documentTitle)}">
+  <meta property="og:description" content="${escapeAttr(metaDescription)}">
+  <meta property="og:url" content="${escapeAttr(canonicalUrl)}">
   <link rel="icon" href="${rootPrefix}crabbox.svg">
-  <script>(function(){var s;try{s=localStorage.getItem('crabbox-docs-theme')}catch(e){}var d=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.dataset.theme=(s==='light'||s==='dark')?s:(d?'dark':'light')})();</script>
+  <link rel="ai-catalog" href="/.well-known/ai-catalog.json" type="application/ai-catalog+json">
+  <script>(function(){var s;try{s=localStorage.getItem('crabbox-docs-theme')}catch(e){}var d=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches;var t=(s==='light'||s==='dark')?s:(d?'dark':'light');document.documentElement.dataset.theme=t;document.getElementById('theme-color').content=t==='dark'?'#17191b':'#f4f5f5'})();</script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
   <style>${css()}</style>
 </head>
 <body${isHome ? ' class="home"' : ""}>
-  <button class="nav-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <button class="nav-toggle" type="button" aria-label="Open navigation" aria-controls="docs-sidebar" aria-expanded="false">
     <span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true"></span>
   </button>
+  <button class="nav-backdrop" type="button" aria-label="Close navigation" aria-hidden="true" hidden></button>
   <div class="shell">
-    <aside class="sidebar">
+    <aside class="sidebar" id="docs-sidebar" tabindex="-1">
       <div class="sidebar-head">
         <a class="brand" href="${rootPrefix}index.html" aria-label="Crabbox docs home">
-          <img src="${rootPrefix}crabbox.svg" alt="">
-          <span><strong>Crabbox</strong><small>Remote testbox docs</small></span>
+          <img src="${rootPrefix}crabbox.svg" alt="" width="42" height="42">
+          <span><strong>Crabbox</strong><small>Execution control plane</small></span>
         </a>
         ${themeToggleHtml()}
+        ${languageLinks(page)}
       </div>
-      <label class="search"><span>Search docs</span><input id="doc-search" type="search" placeholder="leases, cost, ssh"></label>
-      <nav>${navHtml(page.rel, rootPrefix)}</nav>
+      <label class="search"><span>Search docs</span><input id="doc-search" name="docs-search" type="search" autocomplete="off" spellcheck="false" placeholder="Provider, command, topic…"></label>
+      <nav class="sidebar-nav" aria-label="Documentation">${navHtml(page.rel, rootPrefix)}</nav>
+      <p class="nav-empty" role="status" aria-live="polite" hidden>No matching pages.</p>
+      <div class="sidebar-foot"><a href="https://github.com/openclaw/crabbox" rel="noopener">GitHub repository</a></div>
     </aside>
-    <main>
+    <main id="main-content" tabindex="-1">
+      ${notice}
       ${heroBlock}
-      <div class="doc-grid${isHome ? " doc-grid-home" : ""}">
-        <article class="${articleClass}">${html}${prevNext}</article>
-        ${tocBlock}
-      </div>
+      ${articleBlock}
     </main>
   </div>
-  <script>${js()}</script>
+  <script>${js(messages)}</script>
 </body>
 </html>`;
 }
@@ -368,35 +740,235 @@ function standardHero(page, sectionName, editUrl) {
 }
 
 function landingHero(rootPrefix) {
-  const features = [
-    ["Local loop, remote box", "Keep your editor and git workflow. Crabbox rsyncs your dirty checkout to a leased remote box and streams the run back."],
-    ["Brokered, not BYO creds", "A Cloudflare Worker holds provider credentials and serializes lease state. Your CLI only carries a bearer token."],
-    ["Cost-aware leases", "TTL-bounded machines, monthly spend caps, and per-user / per-org / per-provider usage from the broker."],
-    ["Reuse what's warm", "<code>crabbox warmup</code> keeps a box hot. Reuse it with <code>--id</code> across runs, SSH, and CI hydration."],
-    ["Many providers, one loop", "Brokered Hetzner / AWS / Azure, delegated E2B / Daytona / Blacksmith / Semaphore, or static SSH targets - Linux, Windows, and macOS."],
-    ["Plays with Actions", "<code>actions hydrate</code> reuses your repository's GitHub Actions setup steps so local runs land in the same hydrated workspace."],
-    ["Desktop in your browser", "<code>crabbox webvnc</code> streams a Linux, macOS, or Windows desktop into the browser. Drive UI tests, capture screenshots, hand the live session to a teammate - no VPN."],
-    ["Proof for every run", "<code>crabbox artifacts collect</code> bundles screenshots, video, JUnit summaries, logs, and lease metadata. Drop it on a PR as before/after evidence instead of scraping log output."],
+  const useCases = [
+    {
+      id: "fast-feedback",
+      number: "01",
+      title: "Fast Test Loops",
+      summary: "Warm boxes and reusable caches",
+      resultTitle: "Shorten the edit–run loop.",
+      resultBody: "Start with providers that favor local execution, reusable caches, warm sessions, or other fast-feedback paths.",
+      commands: ["crabbox providers recommend fast-feedback", "crabbox doctor --provider <name>"],
+      href: "use-cases.html#speed-up-test-and-build-loops",
+      linkLabel: "Open the Fast Test Loop Guide",
+    },
+    {
+      id: "agent-sandbox",
+      number: "02",
+      title: "Coding Agents",
+      summary: "Agent workspaces and cleanup routes",
+      resultTitle: "Separate agent fit from cleanup guarantees.",
+      resultBody: "Compare agent- and devbox-shaped runtimes with the stricter disposable route, then inspect the selected provider’s isolation, network, secret, and cleanup boundary.",
+      commands: [
+        "crabbox providers recommend agent-sandbox",
+        "crabbox providers recommend disposable-execution",
+        "crabbox doctor --provider <name>",
+      ],
+      href: "use-cases.html#give-a-coding-agent-a-disposable-environment",
+      linkLabel: "Open the Coding Agent Guide",
+    },
+    {
+      id: "cross-platform",
+      number: "03",
+      title: "Cross-Platform",
+      summary: "Linux, Windows, WSL2, macOS",
+      resultTitle: "Match the operating system before the vendor.",
+      resultBody: "Compare the platform routes independently; Windows includes native and WSL2-capable paths, subject to the selected host.",
+      commands: [
+        "crabbox providers recommend linux-vm",
+        "crabbox providers recommend windows",
+        "crabbox providers recommend macos",
+      ],
+      href: "use-cases.html#validate-linux-windows-wsl2-or-macos",
+      linkLabel: "Open the Platform Validation Guide",
+    },
+    {
+      id: "desktop",
+      number: "04",
+      title: "Browser & Desktop QA",
+      summary: "Visible browser and desktop sessions",
+      resultTitle: "Start with a visible desktop-capable target.",
+      resultBody: "Compare browser and desktop paths first, then add evidence routing when screenshots, video, or diagnostics must survive the lease.",
+      commands: ["crabbox providers recommend desktop", "crabbox doctor --provider <name>"],
+      href: "use-cases.html#test-a-browser-or-visible-desktop",
+      linkLabel: "Open the Browser & Desktop Guide",
+    },
+    {
+      id: "fanout-testing",
+      number: "05",
+      title: "Parallel Experiments",
+      summary: "Parallel runs from prepared state",
+      resultTitle: "Fan prepared state out across multiple attempts.",
+      resultBody: "Start with checkpoint- and fork-capable workspace providers for test shards, branch comparisons, or best-of-N runs.",
+      commands: ["crabbox providers recommend fanout-testing", "crabbox doctor --provider <name>"],
+      href: "use-cases.html#fan-out-parallel-experiments",
+      linkLabel: "Open the Parallel Experiments Guide",
+    },
+    {
+      id: "gpu",
+      number: "06",
+      title: "GPU Workloads",
+      summary: "GPU machines and sandboxes",
+      resultTitle: "Require GPU capability before choosing capacity.",
+      resultBody: "Compare SSH-accessible and delegated accelerator paths for model tests, CUDA builds, rendering, or other GPU-shaped work.",
+      commands: ["crabbox providers recommend gpu", "crabbox doctor --provider <name>"],
+      href: "use-cases.html#run-gpu-workloads",
+      linkLabel: "Open the GPU Workload Guide",
+    },
   ];
-  const cards = features
-    .map(([title, body]) => `<article class="feature"><h3>${escapeHtml(title)}</h3><p>${body}</p></article>`)
+  const jobChoices = useCases
+    .map(
+      ({ id, number, title, summary }, index) =>
+        `<div class="home-job-option">
+          <input class="home-job-radio sr-only" type="radio" name="home-job" id="home-job-${escapeAttr(id)}" value="${escapeAttr(id)}" aria-controls="home-job-result-${escapeAttr(id)}" data-home-job-radio${index === 0 ? " checked" : ""}>
+          <label for="home-job-${escapeAttr(id)}"><span>${number}</span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(summary)}</small></label>
+        </div>`,
+    )
     .join("");
-  return `<header class="hero hero-home">
-        <div class="hero-text">
-          <p class="eyebrow">OpenClaw - remote testbox</p>
-          <h1>A short-lived box for every <em>run</em>.</h1>
-          <p class="lede">Crabbox gives maintainers and agents a fast local loop on shared cloud capacity: lease, sync, run, release. The CLI keeps the developer story simple; a Cloudflare-hosted broker keeps the fleet safe.</p>
-          <div class="cta">
-            <a class="cta-primary" href="${rootPrefix}how-it-works.html">Read the overview</a>
-            <a class="cta-secondary" href="https://github.com/openclaw/crabbox" rel="noopener">View on GitHub</a>
+  const jobResults = useCases
+    .map(({ id, resultTitle, resultBody, commands, href, linkLabel }, index) => {
+      const recommendationCommands = commands.filter((command) => !command.startsWith("crabbox doctor "));
+      const copyLabel = recommendationCommands.length === 1 ? "Copy recommendation command" : "Copy recommendation commands";
+      return `<article class="home-job-result" id="home-job-result-${escapeAttr(id)}" data-home-job-result="${escapeAttr(id)}" aria-labelledby="home-job-result-title-${escapeAttr(id)}"${index === 0 ? ' data-home-job-default="true"' : ""}>
+          <div class="home-job-result-copy">
+            <p class="eyebrow">Recommended starting path</p>
+            <h3 id="home-job-result-title-${escapeAttr(id)}">${escapeHtml(resultTitle)}</h3>
+            <p>${escapeHtml(resultBody)}</p>
           </div>
+          <div class="home-job-command">
+            <div><span>Built-in recommendations</span><small>verify after selection</small></div>
+            <pre data-copyable data-copy-text="${escapeAttr(recommendationCommands.join("\n"))}" data-copy-label="${copyLabel}"><code>${commands.map((command) => `<span class="home-job-command-line"><i aria-hidden="true">$</i><b>${escapeHtml(command)}</b></span>`).join("")}</code></pre>
+            <a href="${rootPrefix}${href}">${escapeHtml(linkLabel)} <i aria-hidden="true">→</i></a>
+          </div>
+        </article>`;
+    })
+    .join("");
+  const providerCount = Object.keys(providerMetadata).length;
+  return `<header class="hero hero-home">
+        <div class="home-hero-copy">
+          <p class="eyebrow">Keep editing. Keep agents moving.</p>
+          <h1>On-demand computers <em>for agents.</em></h1>
+          <p class="lede">Run tests and builds on remote boxes while your coding agents keep editing locally.</p>
+          <div class="cta">
+            <a class="cta-primary" href="${rootPrefix}getting-started.html">Get started <span aria-hidden="true">→</span></a>
+            <a class="cta-secondary" href="${rootPrefix}providers/index.html">Providers</a>
+            <a class="cta-secondary" href="https://github.com/openclaw/crabbox">GitHub</a>
+          </div>
+          <ul class="home-facts" aria-label="Crabbox product facts">
+            <li>For agents and humans</li>
+            <li>MIT licensed</li>
+            <li>${builtInProviderCount} built-in providers</li>
+          </ul>
         </div>
-        <pre class="hero-snippet" aria-hidden="true"><code><span class="prompt">$</span> crabbox run -- pnpm test
-<span class="comment"># lease cbx_8f2 - hetzner cax21 - ready 11s</span>
-<span class="comment"># sync 184 files (1.2 MB)</span>
-<span class="comment"># tests passed in 47s - released</span></code></pre>
+        <div class="home-console" role="group" aria-label="Illustrative successful Crabbox run">
+          <div class="home-console-bar"><span aria-hidden="true"><i></i><i></i><i></i></span><strong>your checkout → a box</strong><small>example run</small></div>
+          <pre data-copyable data-copy-text="crabbox run -- pnpm test" data-copy-label="Copy run command"><code><span aria-hidden="true">$ </span>crabbox run -- pnpm test</code></pre>
+          <p class="home-console-note">Use your configured provider and your repo’s test command.</p>
+          <ol>
+            <li><b>01</b><div><strong>Lease a box</strong><small>Compute for this run</small></div><i aria-hidden="true">✓</i></li>
+            <li><b>02</b><div><strong>Sync your working tree</strong><small>Uncommitted changes included</small></div><i aria-hidden="true">✓</i></li>
+            <li><b>03</b><div><strong>Run and stream output</strong><small>The command you already use</small></div><i aria-hidden="true">✓</i></li>
+          </ol>
+          <div class="home-console-result"><i aria-hidden="true">↳</i><div><strong>Exit code back. Box released.</strong><small>Keep a warm box when you want another run.</small></div></div>
+        </div>
       </header>
-      <section class="features" aria-label="Highlights">${cards}</section>`;
+      <section class="home-loop" aria-labelledby="home-loop-heading">
+        <h2 id="home-loop-heading">Local edits. Remote execution.</h2>
+        <ol>${["Edit locally", "Lease a box", "Sync", "Run", "Stream + exit code", "Cleanup"].map((step, i) => `<li><span>${String(i + 1).padStart(2, "0")}</span><strong>${step}</strong></li>`).join("")}</ol>
+        <p>The standard remote loop. Sync, reuse, and cleanup follow each provider’s contract. <a href="${rootPrefix}how-it-works.html">How it works →</a></p>
+      </section>
+      <section class="home-section home-benefits" id="home-paths-heading" aria-labelledby="home-benefits-heading">
+        <header><div><p class="eyebrow">Room to work</p><h2 id="home-benefits-heading">More agents.<br>Less waiting.</h2></div><p>Your laptop is where you edit. Give the heavy work its own compute, without rebuilding your workflow around a CI queue.</p></header>
+        <div class="home-benefit-grid">
+          <article><span class="home-card-number" aria-hidden="true">01 / PARALLEL</span><h3>Let agents work in parallel.</h3><p>Run tests and builds on separate boxes, so agents don’t compete for your laptop’s CPU, RAM, and ports.</p><a href="${rootPrefix}use-cases.html#fan-out-parallel-experiments">Explore parallel runs →</a></article>
+          <article><span class="home-card-number" aria-hidden="true">02 / WARM</span><h3>Keep the next run close.</h3><p>Reuse warm boxes and prepared environments. Spend the next iteration running your changes instead of provisioning again.</p><a href="${rootPrefix}commands/warmup.html">Warm a box →</a></article>
+          <article><span class="home-card-number" aria-hidden="true">03 / CROSS-PLATFORM</span><h3>Test where it needs to work.</h3><p>Choose Linux, macOS, native Windows, or WSL2 targets. Catch platform differences from the same local checkout.</p><a href="${rootPrefix}use-cases.html#validate-linux-windows-wsl2-or-macos">Explore OS targets →</a></article>
+          <article class="home-benefit-wide"><span class="home-card-number" aria-hidden="true">04 / INTERACTIVE</span><h3>See it. Drive it. Take over.</h3><p>Open supported desktops with VNC or WebVNC, request a browser, or use VS Code in the browser with <code>--code</code> on managed Linux.</p><p>The authenticated coordinator portal shows leases and run logs. Its WebVNC viewer lets you watch a desktop or take control while the local bridge runs.</p><div class="home-card-links"><a href="${rootPrefix}features/interactive-desktop-vnc.html">Desktop &amp; browser →</a><a href="${rootPrefix}features/portal.html">Explore the portal →</a></div></article>
+          <article class="home-benefit-wide"><span class="home-card-number" aria-hidden="true">05 / SHARED CAPACITY</span><h3>A fleet for the whole team.</h3><p>An optional coordinator owns cloud credentials and shares capacity across trusted teammates. Lease expiry and configured spend caps bound brokered usage.</p><p>Self-host on Cloudflare or Node.js with PostgreSQL. You choose the infrastructure; Crabbox manages the leases.</p><a href="${rootPrefix}architecture.html">How the coordinator works →</a></article>
+        </div>
+      </section>
+      <section class="home-os" aria-labelledby="home-os-heading">
+        <div><p class="eyebrow">One CLI. Across operating systems.</p><h2 id="home-os-heading">Same checkout. Different OS.</h2></div>
+        <ul aria-label="Supported target operating systems"><li>Linux</li><li>macOS</li><li>Windows <small>native</small></li><li>WSL2</li></ul>
+        <p>Target and desktop support vary by provider. <a href="${rootPrefix}providers/index.html">Compare capabilities →</a></p>
+      </section>
+      ${homeProviderWall(rootPrefix)}
+      <section class="home-section home-use-cases" aria-labelledby="home-use-cases-heading">
+        <header><div><p class="eyebrow">Choose your starting point</p><h2 id="home-use-cases-heading">Find a box for your next job.</h2></div><p>Turn ${providerCount} registered providers into a focused comparison path. Choose a workload, run the matching built-in recommendations, then verify the provider you select with <code>crabbox doctor</code>.</p></header>
+        <form class="home-job-finder" data-home-job-finder>
+          <fieldset>
+            <legend class="sr-only">Choose the job Crabbox should help with</legend>
+            <div class="home-job-layout">
+              <div class="home-job-choices">${jobChoices}</div>
+              <div class="home-job-results">${jobResults}</div>
+            </div>
+          </fieldset>
+          <p class="home-job-disclaimer"><strong>Built-in guidance, not a live provider check.</strong> Availability, price, performance, credentials, quota, and security still depend on the provider. Verify readiness with <code>crabbox doctor</code>.</p>
+        </form>
+        <a class="home-section-link" href="${rootPrefix}use-cases.html">See all recommendation paths <span aria-hidden="true">→</span></a>
+      </section>
+      <section class="home-section home-pricing" aria-labelledby="home-pricing-heading">
+        <header><div><p class="eyebrow">Cost model</p><h2 id="home-pricing-heading">Crabbox is free. Compute isn’t.</h2></div><p>The CLI and coordinator are MIT-licensed. You pay your provider for compute and your own coordinator infrastructure.</p></header>
+        <div class="home-price-grid">
+          <article><span>Crabbox Software</span><strong>$0 license fee</strong><p>MIT-licensed CLI and coordinator.</p></article>
+          <article><span>Compute</span><strong>Provider rate</strong><p>Cloud, sandbox, GPU, or local runtime bills remain external.</p></article>
+          <article><span>Coordinator</span><strong>Your infrastructure</strong><p>Run it on Cloudflare or Node.js with PostgreSQL.</p></article>
+          <article><span>Coordinator Guardrails</span><strong>TTL and spend caps</strong><p>For brokered providers, estimate reserved cost and reject leases over configured limits.</p></article>
+        </div>
+        <a class="home-section-link" href="${rootPrefix}pricing.html">See Pricing and Cost Boundaries <span aria-hidden="true">→</span></a>
+      </section>
+      <aside class="home-capability-note" aria-labelledby="home-nested-heading">
+        <div><p class="eyebrow">Conditional capability</p><h2 id="home-nested-heading">Need WSL2 or KVM?</h2></div>
+        <p>WSL2 works on compatible AWS and Azure Windows targets. Firecracker requires Crabbox to run on a prepared Linux <code>/dev/kvm</code> host. There is no generic nested mode. <a href="${rootPrefix}features/nested-execution.html">Read the exact boundaries <span aria-hidden="true">→</span></a></p>
+      </aside>
+      <section class="home-install" aria-labelledby="home-install-heading">
+        <div><p class="eyebrow">Install the CLI</p><h2 id="home-install-heading">One command to start.</h2><p>Install Crabbox, choose direct, local, delegated, or team-coordinator access, then run the command your repository already knows.</p><a href="${rootPrefix}getting-started.html">Open the 10-minute guide <span aria-hidden="true">→</span></a></div>
+        <pre><code><span>$</span> brew install openclaw/tap/crabbox
+<span>$</span> crabbox doctor
+<span>$</span> crabbox run -- pnpm test</code></pre>
+      </section>
+      <aside class="home-trust" aria-labelledby="home-trust-heading">
+        <div><p class="eyebrow">Trust boundary</p><h2 id="home-trust-heading">Trusted repos. Clear ownership.</h2></div>
+        <p>Run trusted repositories with trusted teammates. Isolation depends on the provider. Reuse and destructive cleanup require verified ownership; ambiguous ownership fails closed. <a href="${rootPrefix}security.html">Read the security model</a> before running unfamiliar code.</p>
+      </aside>`;
+}
+
+function homeProviderWall(rootPrefix) {
+  const groups = new Map();
+  for (const [name, metadata] of Object.entries(providerMetadata)) {
+    if (!groups.has(metadata.category)) groups.set(metadata.category, []);
+    groups.get(metadata.category).push({ name, ...metadata });
+  }
+  const categoryTitles = {
+    "brokerable-cloud": "Coordinator-brokered clouds",
+    "direct-cloud": "Direct clouds",
+    "delegated-sandbox": "Delegated sandboxes",
+    "local-vm": "Local virtual machines",
+    "self-hosted-virtualization": "Self-hosted virtualization",
+    "gpu-cloud": "GPU clouds",
+    "local-sandbox": "Local sandboxes",
+    "service-control": "Service control",
+    "local-runtime": "Local runtimes",
+    "ci-proof-runner": "CI proof runners",
+    "byo-ssh": "Bring your own SSH host",
+    "external-provider": "External plugin contract",
+  };
+  const categories = [...groups].sort(([a], [b]) => {
+    const order = Object.keys(categoryTitles);
+    return order.indexOf(a) - order.indexOf(b) || a.localeCompare(b);
+  });
+  return `<section class="home-section home-providers" aria-labelledby="home-providers-heading">
+    <header><div><p class="eyebrow">Bring your own compute</p><h2 id="home-providers-heading">${builtInProviderCount} <span class="home-nowrap">built-in</span> providers.<br>One way to run.</h2></div><p>Cloud boxes, local VMs, existing hosts, and delegated sandboxes. ${Object.keys(providerMetadata).length} catalog entries, including the <a href="${rootPrefix}providers/external.html">external plugin contract</a> for your own backend. Each provider defines its capabilities and cleanup contract.</p></header>
+    <div class="home-provider-wall">${categories.map(([category, entries]) => `<section class="home-provider-group" data-provider-category="${escapeAttr(category)}" aria-labelledby="home-category-${escapeAttr(category)}">
+      <h3 id="home-category-${escapeAttr(category)}">${escapeHtml(categoryTitles[category] || titleize(category))}<span class="home-provider-count">${entries.length}<span class="sr-only"> catalog entries</span></span></h3>
+      <ul>${entries.sort((a, b) => a.name.localeCompare(b.name)).map((entry) => {
+        const page = pageMap.get(`providers/${entry.docs}`);
+        if (!page) throw new Error(`Missing provider page for ${entry.name}: ${entry.docs}`);
+        return `<li><a data-home-provider="${escapeAttr(entry.name)}" href="${rootPrefix}${escapeAttr(page.outRel)}">${escapeHtml(page.title.replace(/ provider$/i, ""))}</a></li>`;
+      }).join("")}</ul>
+    </section>`).join("")}</div>
+    <a class="home-section-link" href="${rootPrefix}providers/index.html">Compare targets, capabilities, and requirements <span aria-hidden="true">→</span></a>
+  </section>`;
 }
 
 function pageNavHtml(prev, next, rootPrefix) {
@@ -408,17 +980,26 @@ function pageNavHtml(prev, next, rootPrefix) {
 }
 
 function navHtml(currentRel, rootPrefix) {
+  const currentSection = nav.find((section) => section.pages.some((page) => page.rel === currentRel));
   return nav
-    .map((section) => `<section><h2>${section.name}</h2>${section.pages.map((page) => {
+    .map((section) => {
+      const activeSection = section === currentSection;
+      const open = activeSection || (!currentSection && section.name === "Start") ? " open" : "";
+      return `<details class="nav-section" data-nav-section${open}>
+      <summary><h2>${section.name}</h2><span class="nav-count">${section.pages.length}</span><span class="nav-chevron" aria-hidden="true"></span></summary>
+      <div class="nav-links">${section.pages.map((page) => {
       const href = rootPrefix + page.outRel;
       const active = page.rel === currentRel ? " active" : "";
-      return `<a class="nav-link${active}" href="${href}">${escapeHtml(page.title)}</a>`;
-    }).join("")}</section>`)
+      const current = page.rel === currentRel ? ' aria-current="page"' : "";
+      const search = `${page.title} ${page.rel} ${path.basename(page.rel, ".md")}`.toLowerCase();
+      return `<a class="nav-link${active}" href="${href}" data-nav-search="${escapeAttr(search)}"${current}>${escapeHtml(page.title)}</a>`;
+    }).join("")}</div></details>`;
+    })
     .join("");
 }
 
 function themeToggleHtml() {
-  return `<button class="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false" data-theme-toggle>
+  return `<button class="theme-toggle" type="button" aria-label="Toggle dark mode" aria-pressed="false" title="Toggle color theme" data-theme-toggle>
           <svg class="theme-icon-moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M14.6 12.1A6.5 6.5 0 0 1 7.4 2.7a6.5 6.5 0 1 0 7.2 9.4z" fill="currentColor"/></svg>
           <svg class="theme-icon-sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4" fill="currentColor"/><g stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="10" y1="2" x2="10" y2="4"/><line x1="10" y1="16" x2="10" y2="18"/><line x1="2" y1="10" x2="4" y2="10"/><line x1="16" y1="10" x2="18" y2="10"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="14.4" y1="14.4" x2="15.8" y2="15.8"/><line x1="4.2" y1="15.8" x2="5.6" y2="14.4"/><line x1="14.4" y1="5.6" x2="15.8" y2="4.2"/></g></svg>
         </button>`;
@@ -426,92 +1007,233 @@ function themeToggleHtml() {
 
 function css() {
   return `
-:root{color-scheme:light;--ink:#12211f;--muted:#5d6e69;--shell:#f7efe3;--paper:#fffbf4;--reef:#145f58;--tide:#1f7b93;--coral:#e35e46;--ochre:#c89231;--line:#dfd2c0;--line-soft:#ebdfca;--shadow:0 18px 48px rgba(18,33,31,.10);--panel:rgba(255,251,244,.78);--sidebar:rgba(255,251,244,.86);--grid-line:rgba(18,33,31,.04);--body-soft:#384744;--code-bg:#0f1c1a;--code-fg:#f8efe4;--code-border:#0a1513;--code-comment:#7e948f;--code-scroll:#3a4a47;--inline-bg:#efe2d0;--inline-border:#e2d2bd;--nav-active-bg:#efe2d0;--nav-active-fg:#0e423c;--quote-bg:#f0e3d3}
-:root[data-theme="dark"]{color-scheme:dark;--ink:#e9e3d6;--muted:#9aa8a2;--shell:#0d1a18;--paper:#15211e;--reef:#54bda9;--tide:#5fb4cb;--coral:#f0775f;--ochre:#d8a847;--line:#2b3a36;--line-soft:#23332f;--shadow:0 18px 48px rgba(0,0,0,.5);--panel:rgba(255,255,255,.022);--sidebar:rgba(17,28,25,.88);--grid-line:rgba(255,255,255,.025);--body-soft:#b7c2bd;--code-bg:#0a1513;--code-fg:#e9e2d4;--code-border:#05100e;--code-comment:#6f857f;--code-scroll:#3a4a47;--inline-bg:#23312d;--inline-border:#31403b;--nav-active-bg:#1d3a34;--nav-active-fg:#86d7c5;--quote-bg:#172724}
+.sidebar-head{flex-wrap:wrap}.language-switcher{position:relative;margin-left:auto;font-size:.8rem}.language-switcher summary{cursor:pointer}.language-switcher nav{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--paper);position:absolute;right:0;top:100%;z-index:20;min-width:170px}.language-switcher a{color:var(--ink);white-space:nowrap}.language-switcher [aria-current]{font-weight:700}.translation-notice{padding:16px;border:1px solid var(--coral);border-radius:8px;margin-bottom:24px;background:var(--panel);color:var(--ink)}
+
+:root{color-scheme:light;--ink:#1d2023;--muted:#5c646a;--shell:#f6f6f4;--paper:#fff;--reef:#0b6e69;--coral:#b4432e;--ochre:#a66d0a;--line:#dcdfe0;--line-soft:#eaeced;--panel:#fff;--sidebar:#f6f6f4;--body-soft:#454b50;--code-bg:#161a1c;--code-fg:#f4f1ea;--code-border:#0f1214;--code-comment:#97a2a3;--code-scroll:#50575b;--inline-bg:#eef1f1;--inline-border:#dde2e2;--nav-active-bg:#f9e9e5;--nav-active-fg:#8a3122;--quote-bg:#eef5f4;--focus:#0b6e69;--console-line:rgba(255,255,255,.08);--console-raised:rgba(255,255,255,.04);--mint:#7dd3c7;--r-s:6px;--r-m:12px;--r-l:18px;--shadow:0 1px 2px rgba(20,24,28,.04),0 12px 32px -16px rgba(20,24,28,.18)}
+:root[data-theme="dark"]{color-scheme:dark;--ink:#f1eee8;--muted:#a3abae;--shell:#141618;--paper:#1c1f22;--reef:#5fc6bb;--coral:#ff8b78;--ochre:#efc15b;--line:#2d3236;--line-soft:#25292c;--panel:#1c1f22;--sidebar:#141618;--body-soft:#c3c8c8;--code-bg:#0f1214;--code-fg:#f1eee8;--code-border:#2a2f33;--code-comment:#8d9999;--code-scroll:#4e565a;--inline-bg:#262b2e;--inline-border:#353b3f;--nav-active-bg:#3d2622;--nav-active-fg:#ffb3a5;--quote-bg:#1a2c2b;--focus:#5fc6bb;--console-line:rgba(255,255,255,.08);--console-raised:rgba(255,255,255,.035);--shadow:0 1px 2px rgba(0,0,0,.2),0 12px 32px -16px rgba(0,0,0,.5)}
 *{box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:24px}
-body{margin:0;background:var(--shell);color:var(--ink);font-family:"IBM Plex Sans",Avenir Next,sans-serif;line-height:1.65;overflow-x:hidden;-webkit-font-smoothing:antialiased;transition:background-color .18s,color .18s}
-body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(90deg,var(--grid-line) 1px,transparent 1px),linear-gradient(var(--grid-line) 1px,transparent 1px);background-size:44px 44px;mask-image:linear-gradient(90deg,#000,transparent 72%)}
-::selection{background:var(--coral);color:var(--paper)}
+body{margin:0;background:var(--shell);color:var(--ink);font-family:"IBM Plex Sans",Avenir Next,sans-serif;line-height:1.6;-webkit-font-smoothing:antialiased;transition:background-color .18s,color .18s}
+[hidden]{display:none!important}
+::selection{background:var(--coral);color:#fff}
 a{color:var(--reef);text-decoration-thickness:.07em;text-underline-offset:.18em;transition:color .15s}
 a:hover{color:var(--coral)}
-.shell{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}
+button,input{font:inherit}
+:is(a,button,input,summary,[tabindex]):focus-visible{outline:2px solid var(--focus);outline-offset:3px}
+.skip-link{position:fixed;top:12px;left:12px;z-index:40;padding:8px 12px;background:var(--ink);color:var(--paper);border-radius:var(--r-s);text-decoration:none;transform:translateY(-160%)}
+.skip-link:focus{transform:translateY(0)}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+.shell{display:grid;grid-template-columns:272px minmax(0,1fr);min-height:100vh}
+.eyebrow{margin:0 0 10px;color:var(--coral);font-weight:600;text-transform:uppercase;letter-spacing:.08em;font-size:.72rem}
+code,kbd,pre{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,monospace}
 
 /* sidebar */
-.sidebar{position:sticky;top:0;height:100vh;overflow:auto;padding:24px 20px;background:var(--sidebar);border-right:1px solid var(--line);backdrop-filter:blur(20px);scrollbar-width:thin;scrollbar-color:var(--line) transparent;transition:background-color .18s,border-color .18s}
+.sidebar{position:sticky;top:0;height:100vh;overflow:auto;overscroll-behavior:contain;padding:20px 16px 20px 20px;background:var(--sidebar);border-right:1px solid var(--line);scrollbar-width:thin;scrollbar-color:var(--line) transparent;transition:background-color .18s,border-color .18s}
 .sidebar::-webkit-scrollbar{width:6px}
 .sidebar::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
-.sidebar-head{display:flex;align-items:center;gap:10px;margin-bottom:22px}
-.brand{display:flex;align-items:center;gap:11px;color:var(--ink);text-decoration:none;flex:1;min-width:0}
-.brand img{width:42px;height:42px;flex:0 0 42px}
-.theme-toggle{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:36px;height:36px;border-radius:9px;border:1px solid var(--line);background:var(--paper);color:var(--muted);cursor:pointer;padding:0;transition:border-color .15s,color .15s,background-color .15s,transform .12s}
-.theme-toggle:hover{border-color:var(--coral);color:var(--coral)}
-.theme-toggle:active{transform:scale(.94)}
-.theme-toggle svg{width:17px;height:17px;display:block}
+.sidebar-head{display:flex;align-items:center;gap:10px;margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:10px;color:var(--ink);text-decoration:none;flex:1;min-width:0}
+.brand img{width:34px;height:34px;flex:0 0 34px;border-radius:8px}
+.brand strong{display:block;font-family:Fraunces,serif;font-size:1.15rem;line-height:1;letter-spacing:-.01em}
+.brand small{display:block;color:var(--muted);font-size:.72rem;margin-top:3px}
+.theme-toggle{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:32px;height:32px;border-radius:var(--r-s);border:1px solid var(--line);background:var(--paper);color:var(--muted);cursor:pointer;padding:0;touch-action:manipulation;transition:border-color .15s,color .15s,background-color .15s}
+.theme-toggle:hover{border-color:var(--muted);color:var(--ink)}
+.theme-toggle svg{width:15px;height:15px;display:block}
 .theme-toggle .theme-icon-sun{display:none}
 :root[data-theme="dark"] .theme-toggle .theme-icon-sun{display:block}
 :root[data-theme="dark"] .theme-toggle .theme-icon-moon{display:none}
-.brand strong{display:block;font-family:Fraunces,serif;font-size:1.32rem;line-height:1;letter-spacing:.005em}
-.brand small{display:block;color:var(--muted);font-size:.74rem;margin-top:4px}
-.search{display:block;margin:0 0 22px}
-.search span{display:block;color:var(--muted);font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;margin-bottom:7px}
-.search input{width:100%;border:1px solid var(--line);background:var(--paper);border-radius:8px;padding:10px 12px;font:inherit;font-size:.92rem;color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
-.search input:focus{border-color:var(--coral);box-shadow:0 0 0 3px rgba(227,94,70,.18)}
-nav section{margin:0 0 20px}
-nav h2{font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin:0 0 6px;font-weight:700}
-.nav-link{display:block;color:var(--ink);text-decoration:none;border-radius:7px;padding:6px 10px;margin:1px 0;font-size:.91rem;line-height:1.4;border-left:2px solid transparent;transition:background .12s,color .12s}
-.nav-link:hover{background:rgba(227,94,70,.08);color:var(--reef)}
-.nav-link.active{background:var(--nav-active-bg);color:var(--nav-active-fg);border-left-color:var(--coral);font-weight:600}
+.search{display:block;margin:0 0 10px}
+.search span{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+.search input{width:100%;border:1px solid var(--line);background:var(--paper);border-radius:var(--r-s);padding:8px 10px;font-size:.86rem;color:var(--ink);transition:border-color .15s,box-shadow .15s}
+.search input::placeholder{color:var(--muted)}
+.search input:focus-visible{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 16%,transparent);outline:0}
+.sidebar-nav{display:block}
+.nav-section{border-top:1px solid var(--line-soft)}
+.nav-section:first-child{border-top:0}
+.nav-section>summary{display:grid;grid-template-columns:minmax(0,1fr) auto 12px;align-items:center;gap:8px;min-height:40px;padding:4px 6px 4px 8px;list-style:none;color:var(--muted);cursor:pointer;touch-action:manipulation;transition:color .12s}
+.nav-section>summary::-webkit-details-marker{display:none}
+.nav-section>summary:hover,.nav-section[open]>summary{color:var(--ink)}
+.nav-section>summary h2{margin:0;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em}
+.nav-count{color:var(--muted);font-size:.7rem;font-variant-numeric:tabular-nums}
+.nav-chevron{width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform .15s;opacity:.7}
+.nav-section[open] .nav-chevron{transform:rotate(45deg)}
+.nav-links{padding:0 0 10px}
+.nav-link{display:block;color:var(--body-soft);text-decoration:none;border-radius:var(--r-s);padding:6px 8px;margin:1px 0;font-size:.86rem;line-height:1.35;overflow-wrap:anywhere;transition:background-color .12s,color .12s}
+.nav-link:hover{background:color-mix(in srgb,var(--ink) 5%,transparent);color:var(--ink)}
+.nav-link.active{background:var(--nav-active-bg);color:var(--nav-active-fg);font-weight:600}
+.nav-empty{margin:16px 8px;color:var(--muted);font-size:.86rem}
+.sidebar-foot{padding:16px 8px 0;font-size:.78rem;border-top:1px solid var(--line-soft)}
+.sidebar-foot a{color:var(--muted);text-decoration:none}
+.sidebar-foot a:hover{color:var(--ink)}
 
 /* main */
-main{min-width:0;padding:28px clamp(20px,4.5vw,60px) 72px;max-width:1180px;margin:0 auto;width:100%}
+main{min-width:0;padding:28px 48px 80px;max-width:1280px;margin:0 auto;width:100%}
 .hero{display:flex;align-items:flex-end;justify-content:space-between;gap:22px;border-bottom:1px solid var(--line);padding:18px 0 22px;position:relative;flex-wrap:wrap}
-.hero:after{content:"";position:absolute;left:0;bottom:-1px;width:88px;height:3px;background:linear-gradient(90deg,var(--coral),var(--ochre),var(--tide));border-radius:3px}
+.hero:after{content:"";position:absolute;left:0;bottom:-1px;width:48px;height:2px;background:var(--coral)}
 .hero-text{min-width:0;flex:1 1 320px}
-.eyebrow{margin:0 0 8px;color:var(--coral);font-weight:700;text-transform:uppercase;letter-spacing:.14em;font-size:.72rem}
-.hero h1{font-family:Fraunces,Georgia,serif;font-size:clamp(1.9rem,3.4vw,2.85rem);line-height:1.05;letter-spacing:-.005em;margin:0;font-weight:700;color:var(--ink)}
+.hero h1{font-family:Fraunces,Georgia,serif;font-size:2.4rem;line-height:1.12;letter-spacing:-.02em;margin:0;font-weight:600;color:var(--ink);text-wrap:balance}
 .hero-meta{display:flex;gap:8px;flex:0 0 auto}
-.repo,.edit{border:1px solid var(--line);color:var(--ink);text-decoration:none;border-radius:8px;padding:7px 12px;font-weight:600;font-size:.84rem;background:var(--paper);transition:border-color .15s,color .15s}
-.repo:hover,.edit:hover{border-color:var(--coral);color:var(--coral)}
+.repo,.edit{border:1px solid var(--line);color:var(--ink);text-decoration:none;border-radius:var(--r-s);padding:6px 11px;font-weight:500;font-size:.82rem;background:var(--paper);transition:border-color .15s,color .15s}
+.repo:hover,.edit:hover{border-color:var(--muted);color:var(--ink)}
 .edit{color:var(--muted)}
 
-/* landing hero */
-.hero-home{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:36px;align-items:center;border-bottom:0;padding:24px 0 12px}
+/* landing */
+.home main{max-width:1280px;padding-top:0}
+.hero-home{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(360px,.95fr);align-items:center;gap:56px;padding:72px 0 64px;border-bottom:1px solid var(--line)}
 .hero-home:after{display:none}
-.hero-home .eyebrow{margin-bottom:14px}
-.hero-home h1{font-size:clamp(2.1rem,4.6vw,3.8rem);line-height:1.02;letter-spacing:-.012em;font-weight:700;margin:0 0 16px;max-width:18ch}
-.hero-home h1 em{font-style:italic;color:var(--coral);font-weight:600}
-.lede{margin:0 0 22px;color:var(--body-soft);font-size:clamp(1rem,1.25vw,1.1rem);line-height:1.55;max-width:46ch}
+.home-hero-copy{min-width:0}
+.hero-home h1{font-size:clamp(2.6rem,4vw,3.9rem);line-height:1.04;letter-spacing:-.03em;font-weight:600;margin:0}
+.hero-home h1 em{display:block;color:var(--coral);font-style:normal}
+.lede{margin:22px 0 28px;color:var(--body-soft);font-size:1.08rem;line-height:1.6;max-width:54ch;text-wrap:pretty}
 .cta{display:flex;gap:10px;flex-wrap:wrap}
-.cta-primary,.cta-secondary{display:inline-flex;align-items:center;border-radius:9px;padding:10px 16px;font-weight:600;font-size:.93rem;text-decoration:none;transition:transform .15s,box-shadow .15s,background .15s,border-color .15s,color .15s}
-.cta-primary{background:var(--ink);color:var(--paper);border:1px solid var(--ink)}
-.cta-primary:hover{background:var(--reef);border-color:var(--reef);color:var(--paper);transform:translateY(-1px);box-shadow:0 8px 20px rgba(20,95,88,.25)}
-.cta-secondary{border:1px solid var(--ink);color:var(--ink);background:transparent}
-.cta-secondary:hover{border-color:var(--coral);color:var(--coral);transform:translateY(-1px)}
-.hero-snippet{margin:0;background:var(--code-bg);color:var(--code-fg);border-radius:12px;padding:22px 22px;font:500 .88rem/1.65 "IBM Plex Mono",ui-monospace,monospace;border:1px solid var(--code-border);box-shadow:0 18px 40px rgba(18,33,31,.18);overflow:hidden}
-.hero-snippet code{background:transparent;border:0;padding:0;color:inherit;font:inherit;display:block;white-space:pre}
-.hero-snippet .prompt{color:var(--ochre)}
-.hero-snippet .comment{color:var(--code-comment)}
+.cta-primary,.cta-secondary{display:inline-flex;align-items:center;gap:10px;min-height:44px;border-radius:var(--r-s);padding:10px 18px;font-weight:600;font-size:.92rem;text-decoration:none;touch-action:manipulation;transition:background-color .15s,border-color .15s,color .15s}
+.cta-primary{background:var(--ink);color:var(--shell);border:1px solid var(--ink)}
+.cta-primary:hover{background:var(--coral);border-color:var(--coral);color:#fff}
+.cta-secondary{border:1px solid var(--line);color:var(--ink);background:var(--paper)}
+.cta-secondary:hover{border-color:var(--ink);color:var(--ink)}
+.home-facts{display:flex;flex-wrap:wrap;gap:8px 20px;padding:0;margin:30px 0 0;color:var(--muted);font-size:.8rem;font-weight:500;list-style:none}
+.home-facts li{position:relative;padding-left:14px}
+.home-facts li:before{content:"";position:absolute;left:0;top:.55em;width:6px;height:6px;border-radius:50%;background:var(--reef)}
+.home-console{min-width:0;border:1px solid var(--code-border);border-radius:var(--r-l);background:var(--code-bg);color:var(--code-fg);box-shadow:var(--shadow);overflow:hidden;font-size:.82rem}
+.home-console-bar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:12px 16px;border-bottom:1px solid var(--console-line);font-size:.72rem}
+.home-console-bar>span{display:flex;gap:6px}
+.home-console-bar>span i{width:10px;height:10px;border-radius:50%;background:var(--console-line)}
+.home-console-bar strong{font-weight:500;color:var(--code-comment)}
+.home-console-bar small{text-align:right;color:var(--mint)}
+.home-console pre{position:relative;display:flex;align-items:center;min-height:64px;max-width:100%;margin:0;padding:10px 92px 10px 18px;overflow:auto;font:500 .8rem/1.55 "IBM Plex Mono",ui-monospace,monospace}
+.home-console pre code{white-space:pre-wrap;overflow-wrap:anywhere}
+.home-console pre code>span{color:var(--ochre)}
+.home-console-note{margin:0;padding:0 18px 14px;border-bottom:1px solid var(--console-line);color:var(--code-comment);font-size:.76rem;line-height:1.5}
+.home-console [data-copyable] .copy{top:10px;right:10px;min-height:44px;min-width:64px;opacity:1}
+.home-console ol{display:block;padding:6px 0;margin:0;list-style:none}
+.home-console li{display:grid;grid-template-columns:28px minmax(0,1fr) 20px;align-items:center;gap:12px;padding:10px 18px}
+.home-console li b{color:var(--code-comment);font:500 .7rem/1 "IBM Plex Mono",monospace}
+.home-console li strong,.home-console li small,.home-console-result strong,.home-console-result small{display:block}
+.home-console li strong{font-weight:600;font-size:.86rem}
+.home-console li small,.home-console-result small{overflow-wrap:anywhere;color:var(--code-comment);font-size:.76rem}
+.home-console li i,.home-console-result>i{color:var(--mint);font-style:normal;font-weight:700}
+.home-console-result{display:flex;gap:12px;align-items:center;padding:14px 18px;border-top:1px solid var(--console-line);background:color-mix(in srgb,var(--reef) 16%,transparent)}
+.home-console-result strong{font-weight:600;font-size:.86rem}
+.home-section{padding:72px 0;border-bottom:1px solid var(--line)}
+.home-section>header{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,.62fr);align-items:end;gap:40px;margin-bottom:28px}
+.home-section>header h2,.home-install h2,.home-capability-note h2,.home-trust h2{margin:0;color:var(--ink);font:600 clamp(1.8rem,2.6vw,2.5rem)/1.12 Fraunces,Georgia,serif;letter-spacing:-.02em;text-wrap:balance}
+.home-section>header>p{max-width:52ch;margin:0 0 4px;color:var(--body-soft);font-size:.98rem;text-wrap:pretty}
+.home-section>header code,.home-capability-note code{font-size:.88em;background:var(--inline-bg);border:1px solid var(--inline-border);border-radius:4px;padding:.04em .3em}
+.home-job-finder{border:1px solid var(--line);border-radius:var(--r-l);background:var(--paper);box-shadow:var(--shadow);overflow:hidden}
+.home-job-finder fieldset{min-width:0;padding:0;margin:0;border:0}
+.home-job-layout{display:grid;grid-template-columns:minmax(260px,.42fr) minmax(0,1fr);align-items:stretch}
+.home-job-choices{display:flex;flex-direction:column;border-right:1px solid var(--line);background:var(--shell)}
+.home-job-option{position:relative;min-width:0;border-bottom:1px solid var(--line-soft)}
+.home-job-option:last-child{border-bottom:0}
+.home-job-option label{display:grid;grid-template-columns:28px minmax(0,1fr);column-gap:10px;align-items:baseline;min-height:64px;padding:14px 18px 14px 20px;color:var(--ink);cursor:pointer;touch-action:manipulation;box-shadow:inset 2px 0 0 transparent;transition:background-color .15s,box-shadow .15s}
+.home-job-option label:hover{background:var(--paper)}
+.home-job-option input:focus-visible+label{outline:2px solid var(--focus);outline-offset:-2px}
+.home-job-option input:checked+label{background:var(--paper);box-shadow:inset 2px 0 0 var(--coral)}
+.home-job-option label>span{color:var(--muted);font:500 .7rem/1 "IBM Plex Mono",monospace}
+.home-job-option label>strong{font-weight:600;font-size:.95rem;line-height:1.3}
+.home-job-option label>small{grid-column:2;margin-top:2px;color:var(--muted);font-size:.78rem;line-height:1.4;overflow-wrap:anywhere}
+.home-job-option input:checked+label>strong{color:var(--ink)}
+.home-job-results{min-width:0}
+.home-job-result{display:none;min-width:0;height:100%;flex-direction:column;gap:22px;padding:30px 32px}
+.home-job-result:first-child{display:flex}
+.home-job-finder:has(.home-job-radio:checked) .home-job-result{display:none}
+.home-job-finder:has(#home-job-fast-feedback:checked) [data-home-job-result="fast-feedback"],
+.home-job-finder:has(#home-job-agent-sandbox:checked) [data-home-job-result="agent-sandbox"],
+.home-job-finder:has(#home-job-cross-platform:checked) [data-home-job-result="cross-platform"],
+.home-job-finder:has(#home-job-desktop:checked) [data-home-job-result="desktop"],
+.home-job-finder:has(#home-job-fanout-testing:checked) [data-home-job-result="fanout-testing"],
+.home-job-finder:has(#home-job-gpu:checked) [data-home-job-result="gpu"]{display:flex}
+.home-job-result-copy{min-width:0;max-width:60ch}
+.home-job-result-copy .eyebrow{margin-bottom:8px}
+.home-job-result h3{margin:0;color:var(--ink);font:600 1.5rem/1.2 Fraunces,Georgia,serif;letter-spacing:-.01em;text-wrap:balance}
+.home-job-result-copy>p:not(.eyebrow){margin:10px 0 0;color:var(--body-soft);font-size:.95rem;text-wrap:pretty}
+.home-job-command{display:flex;min-width:0;flex-direction:column;border:1px solid var(--code-border);border-radius:var(--r-m);background:var(--code-bg);color:var(--code-fg);overflow:hidden}
+.home-job-command>div{display:flex;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid var(--console-line);font-size:.7rem}
+.home-job-command>div span{color:var(--code-comment);font-weight:500}
+.home-job-command>div small{color:var(--mint)}
+/* Reserve the 44px copy target plus clearance above and below it, even for short snippets. */
+.home-job-command pre{position:relative;min-height:64px;max-width:100%;margin:0;padding:12px 72px 12px 16px;overflow:auto;background:transparent;border:0;color:var(--code-fg);font:500 .78rem/1.8 "IBM Plex Mono",ui-monospace,monospace}
+.home-job-command pre code{display:grid;min-width:0;gap:2px;white-space:normal}
+.home-job-command-line{display:grid;min-width:0;grid-template-columns:auto minmax(0,1fr);gap:8px}
+.home-job-command-line i{color:var(--ochre);font-style:normal}
+.home-job-command-line b{min-width:0;font:inherit;overflow-wrap:anywhere}
+.home-job-command a{display:inline-flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid var(--console-line);color:var(--mint);font-size:.8rem;font-weight:600;text-decoration:none}
+.home-job-command a:hover{color:var(--coral)}
+.home-job-command a i{font-style:normal;transition:transform .16s}
+.home-job-command a:hover i{transform:translateX(3px)}
+.home-job-disclaimer{margin:0;padding:14px 32px;border-top:1px solid var(--line);color:var(--muted);font-size:.8rem;text-wrap:pretty}
+.home-job-disclaimer strong{color:var(--ink);font-weight:600}
+.home-job-disclaimer code{font-size:.9em}
+.home-section-link{display:inline-flex;align-items:center;gap:8px;margin-top:22px;color:var(--ink);font-weight:600;font-size:.92rem;text-decoration:none}
+.home-section-link span{transition:transform .16s}
+.home-section-link:hover{color:var(--coral)}
+.home-section-link:hover span{transform:translateX(3px)}
+.home-price-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:var(--r-l);background:var(--paper);overflow:hidden}
+.home-price-grid article{min-width:0;padding:24px 26px}
+.home-price-grid article+article{border-left:1px solid var(--line)}
+.home-price-grid span,.home-price-grid strong{display:block}
+.home-price-grid span{color:var(--muted);font-size:.72rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+.home-price-grid strong{margin:22px 0 8px;font:600 1.3rem/1.2 Fraunces,Georgia,serif;letter-spacing:-.01em;overflow-wrap:anywhere}
+.home-price-grid p{margin:0;color:var(--body-soft);font-size:.88rem;line-height:1.5}
+.home-capability-note{display:grid;grid-template-columns:minmax(220px,.5fr) minmax(0,1.5fr);align-items:center;gap:40px;margin-top:24px;padding:26px 28px;border:1px solid var(--line);border-radius:var(--r-l);background:var(--paper)}
+.home-capability-note .eyebrow{margin-bottom:6px}
+.home-capability-note h2{font-size:1.5rem}
+.home-capability-note>p{margin:0;color:var(--body-soft);font-size:.95rem;text-wrap:pretty}
+.home-capability-note a{font-weight:600;white-space:nowrap}
+.home-install{display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,.9fr);align-items:center;gap:56px;margin:72px 0 0;padding:0}
+.home-install>div>p:not(.eyebrow){max-width:50ch;margin:16px 0 20px;color:var(--body-soft)}
+.home-install a{display:inline-flex;gap:8px;align-items:center;font-weight:600;font-size:.92rem;text-decoration:none}
+.home-install pre{max-width:100%;margin:0;padding:22px 24px;overflow:auto;border:1px solid var(--code-border);border-radius:var(--r-l);background:var(--code-bg);color:var(--code-fg);font:500 .84rem/1.9 "IBM Plex Mono",ui-monospace,monospace;box-shadow:var(--shadow)}
+.home-install pre code{white-space:pre}
+.home-install pre span{color:var(--ochre)}
+.home-trust{display:grid;grid-template-columns:minmax(240px,.5fr) minmax(0,1.5fr);gap:40px;align-items:start;margin-top:72px;padding:28px 0 0;border-top:1px solid var(--line)}
+.home-trust h2{font-size:1.5rem}
+.home-trust>p{max-width:68ch;margin:0;color:var(--body-soft);font-size:.95rem}
 
-/* feature grid */
-.features{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:30px 0 8px}
-.feature{background:var(--panel);border:1px solid var(--line-soft);border-radius:10px;padding:18px 18px 16px;transition:border-color .15s,transform .15s,box-shadow .15s}
-.feature:hover{border-color:var(--coral);transform:translateY(-2px);box-shadow:0 10px 24px rgba(18,33,31,.08)}
-.feature h3{font-family:Fraunces,Georgia,serif;font-size:1.05rem;margin:0 0 6px;font-weight:600;letter-spacing:-.005em;line-height:1.2}
-.feature p{margin:0;color:var(--body-soft);font-size:.92rem;line-height:1.5}
-.feature code{font-size:.86em;background:var(--inline-bg);border:1px solid var(--inline-border);border-radius:5px;padding:.04em .3em}
+.home-nowrap{white-space:nowrap}
+.home-loop{padding:36px 0;border-bottom:1px solid var(--line)}
+.home-loop h2{margin:0 0 18px;font-size:.72rem;color:var(--coral);font-weight:600;letter-spacing:.08em;text-transform:uppercase}
+.home-loop ol{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:16px;padding:0;margin:0;list-style:none}
+.home-loop li{display:flex;flex-direction:column;gap:6px;border-top:2px solid var(--line);padding-top:12px}
+.home-loop li span,.home-card-number{color:var(--muted);font:500 .72rem/1.5 "IBM Plex Mono",monospace}
+.home-loop li strong{font-size:.9rem;line-height:1.4;font-weight:600}
+.home-loop p,.home-os>p{margin:20px 0 0;color:var(--muted);font-size:.88rem}
+.home-loop p a,.home-os>p a{font-weight:600;text-decoration:none}
+.home-benefit-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}
+.home-benefit-grid article{display:flex;flex-direction:column;grid-column:span 2;min-width:0;padding:26px;border:1px solid var(--line);border-radius:var(--r-l);background:var(--paper)}
+.home-benefit-grid .home-benefit-wide{grid-column:span 3}
+.home-benefit-grid h3{margin:28px 0 10px;font:600 1.3rem/1.2 Fraunces,Georgia,serif;letter-spacing:-.01em;text-wrap:balance}
+.home-benefit-grid p{margin:0 0 14px;color:var(--body-soft);font-size:.92rem}
+.home-benefit-grid a{font-size:.9rem;font-weight:600;text-decoration:none}
+.home-benefit-grid article>a,.home-card-links{margin-top:auto;padding-top:8px}
+.home-card-links{display:flex;flex-wrap:wrap;gap:10px 22px}
+.home-benefit-grid code{font-size:.88em;background:var(--inline-bg);border:1px solid var(--inline-border);border-radius:4px;padding:.04em .3em}
+.home-os{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,.62fr);align-items:end;gap:40px;padding:72px 0;border-bottom:1px solid var(--line)}
+.home-os>div .eyebrow{margin-bottom:10px}
+.home-os h2{margin:0;font:600 clamp(1.8rem,2.6vw,2.5rem)/1.12 Fraunces,Georgia,serif;letter-spacing:-.02em}
+.home-os ul{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));list-style:none;padding:0;margin:8px 0 0;border:1px solid var(--line);border-radius:var(--r-l);background:var(--paper);overflow:hidden}
+.home-os li{padding:22px 18px;text-align:center;font:600 1.2rem/1.4 "IBM Plex Sans",sans-serif}
+.home-os li+li{border-left:1px solid var(--line)}
+.home-os small{display:block;color:var(--muted);font:500 .72rem/1.4 "IBM Plex Mono",monospace}
+.home-os>p{grid-column:1/-1;margin:0}
+.home-provider-wall{border-top:1px solid var(--line)}
+.home-provider-group{display:grid;grid-template-columns:minmax(180px,.36fr) minmax(0,1fr);gap:24px;padding:24px 0;border-bottom:1px solid var(--line)}
+.home-provider-group h3{display:flex;align-items:baseline;gap:12px;justify-content:space-between;margin:10px 0;font-size:.95rem;font-weight:600;line-height:1.4}
+.home-provider-count{flex:0 0 auto;color:var(--muted);font:500 .75rem "IBM Plex Mono",monospace;font-variant-numeric:tabular-nums}
+.home-provider-group ul{display:flex;flex-wrap:wrap;align-content:start;gap:8px;list-style:none;padding:0;margin:0}
+.home-provider-group li{min-width:0;max-width:100%}
+.home-provider-group a{display:flex;align-items:center;min-height:44px;max-width:100%;padding:9px 13px;border:1px solid var(--line);border-radius:var(--r-s);background:var(--paper);color:var(--body-soft);font-size:.84rem;font-weight:500;line-height:1.4;text-decoration:none;overflow-wrap:anywhere;transition:border-color .15s,color .15s}
+.home-provider-group a:hover{border-color:var(--ink);color:var(--ink)}
+.home-section>header a,.home-trust>p a{font-weight:600}
 
 /* layout: doc + toc */
 .doc-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:36px;margin-top:30px}
-.doc-grid-home{margin-top:14px}
-.doc-home{background:transparent;box-shadow:none;border:0;padding:8px clamp(18px,3vw,30px) 0;max-width:74ch;margin-inline:auto;width:100%}
-.doc-home>:first-child{margin-top:0}
-@media(min-width:1180px){.doc-grid{grid-template-columns:minmax(0,74ch) 200px;justify-content:start}.doc-grid-home{grid-template-columns:minmax(0,1fr)}}
-.doc{min-width:0;max-width:74ch;background:var(--panel);box-shadow:var(--shadow);border:1px solid var(--line-soft);border-radius:10px;padding:clamp(22px,3.6vw,44px);overflow-wrap:break-word}
-.doc-home{max-width:none}
+@media(min-width:1180px){.doc-grid{grid-template-columns:minmax(0,76ch) 210px;justify-content:start}.doc-grid-wide{grid-template-columns:minmax(0,1fr)}}
+.doc{min-width:0;max-width:76ch;overflow-wrap:break-word}
+.doc-wide{max-width:none}
 .doc h1{display:none}
-.doc h2{font-family:Fraunces,Georgia,serif;font-size:1.65rem;line-height:1.15;margin:1.9em 0 .5em;font-weight:600;letter-spacing:-.005em;position:relative}
-.doc h3{font-size:1.12rem;margin:1.6em 0 .3em;position:relative;font-weight:600}
+.doc h2{font-family:Fraunces,Georgia,serif;font-size:1.6rem;line-height:1.2;margin:1.9em 0 .5em;font-weight:600;letter-spacing:-.01em;position:relative;text-wrap:balance;scroll-margin-top:24px}
+.doc h3{font-size:1.1rem;margin:1.6em 0 .3em;position:relative;font-weight:600}
 .doc h4{font-size:.98rem;margin:1.3em 0 .2em;color:var(--reef);position:relative;font-weight:600}
 .doc h2:first-child,.doc h3:first-child,.doc h4:first-child{margin-top:0}
 .doc :is(h2,h3,h4) .anchor{position:absolute;left:-1em;top:0;color:var(--muted);opacity:0;text-decoration:none;font-weight:400;padding-right:.3em;transition:opacity .12s,color .12s}
@@ -522,86 +1244,186 @@ main{min-width:0;padding:28px clamp(20px,4.5vw,60px) 72px;max-width:1180px;margi
 .doc li{margin:.25em 0}
 .doc li>p{margin:0 0 .4em}
 .doc strong{font-weight:600}
-.doc code{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.86em;background:var(--inline-bg);border:1px solid var(--inline-border);border-radius:5px;padding:.08em .34em}
-.doc pre{position:relative;overflow:auto;background:var(--code-bg);color:var(--code-fg);border-radius:9px;padding:16px 20px;border:1px solid var(--code-border);box-shadow:inset 0 0 0 1px rgba(255,255,255,.03);margin:1.35em 0;font-size:.88em;scrollbar-width:thin;scrollbar-color:var(--code-scroll) transparent}
+.doc code{font-size:.86em;background:var(--inline-bg);border:1px solid var(--inline-border);border-radius:4px;padding:.08em .34em}
+.doc pre{position:relative;overflow:auto;background:var(--code-bg);color:var(--code-fg);border-radius:var(--r-m);padding:16px 20px;border:1px solid var(--code-border);margin:1.35em 0;font-size:.86em;scrollbar-width:thin;scrollbar-color:var(--code-scroll) transparent}
 .doc pre::-webkit-scrollbar{height:8px}
 .doc pre::-webkit-scrollbar-thumb{background:var(--code-scroll);border-radius:8px}
 .doc pre code{display:block;background:transparent;border:0;color:inherit;padding:0;font-size:1em;white-space:pre;overflow-wrap:normal;word-break:normal;tab-size:2}
-.doc pre .copy{position:absolute;top:8px;right:8px;background:rgba(255,251,244,.06);color:var(--code-fg);border:1px solid rgba(255,251,244,.18);border-radius:6px;padding:3px 9px;font:600 .7rem/1 "IBM Plex Sans",sans-serif;cursor:pointer;opacity:0;transition:opacity .15s,background .15s,border-color .15s}
-.doc pre:hover .copy,.doc pre .copy:focus{opacity:1}
-.doc pre .copy:hover{background:rgba(255,251,244,.14)}
-.doc pre .copy.copied{background:var(--coral);border-color:var(--coral);opacity:1}
-.doc blockquote{margin:1.4em 0;padding:12px 16px;border-left:3px solid var(--coral);background:var(--quote-bg);border-radius:0 8px 8px 0;color:var(--ink)}
+:is(.doc pre,[data-copyable]) .copy{position:absolute;top:8px;right:8px;background:rgba(255,251,244,.06);color:var(--code-fg);border:1px solid rgba(255,251,244,.18);border-radius:var(--r-s);padding:3px 9px;font:600 .7rem/1 "IBM Plex Sans",sans-serif;cursor:pointer;opacity:0;transition:opacity .15s,background-color .15s,border-color .15s}
+:is(.doc pre,[data-copyable]):hover .copy,:is(.doc pre,[data-copyable]) .copy:focus-visible{opacity:1}
+:is(.doc pre,[data-copyable]) .copy:hover{background:rgba(255,251,244,.14)}
+:is(.doc pre,[data-copyable]) .copy.copied{background:var(--coral);border-color:var(--coral);opacity:1}
+.home-job-command [data-copyable] .copy{min-width:44px;min-height:44px;top:10px;right:10px;opacity:1}
+.doc blockquote{margin:1.4em 0;padding:12px 16px;border-left:3px solid var(--coral);background:var(--quote-bg);border-radius:0 var(--r-s) var(--r-s) 0;color:var(--ink)}
 .doc blockquote p:last-child{margin-bottom:0}
-.doc table{width:100%;border-collapse:collapse;margin:1.2em 0;font-size:.94em}
-.doc th,.doc td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left}
-.doc th{font-weight:600;color:var(--reef)}
+.table-scroll{width:100%;max-width:100%;overflow-x:auto;overscroll-behavior-inline:contain;margin:1.2em 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);scrollbar-width:thin;scrollbar-color:var(--code-scroll) transparent}
+.table-scroll:focus-visible{outline:2px solid var(--focus);outline-offset:3px}
+.doc table{width:100%;min-width:680px;border-collapse:collapse;font-size:.92em;font-variant-numeric:tabular-nums}
+.doc th,.doc td{border-bottom:1px solid var(--line);padding:10px 12px;text-align:left;vertical-align:top}
+.doc th{font-weight:600;color:var(--ink);font-size:.86em}
 .doc td code{overflow-wrap:anywhere;word-break:break-word}
+.doc tbody tr:last-child td{border-bottom:0}
+.doc tbody tr:hover td{background:color-mix(in srgb,var(--reef) 5%,var(--paper))}
+.provider-filter{margin:1.4em 0 1em;padding:18px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.provider-filter-head{display:flex;align-items:baseline;justify-content:space-between;gap:18px;margin-bottom:8px}
+.provider-filter label{font-weight:600;color:var(--ink)}
+.provider-filter output{color:var(--muted);font-size:.86rem;font-variant-numeric:tabular-nums}
+.provider-filter>input{width:100%;border:1px solid var(--line);background:var(--paper);color:var(--ink);border-radius:var(--r-s);padding:10px 12px}
+.provider-filter-groups{display:flex;gap:0;margin-top:10px;overflow-x:auto;overscroll-behavior-inline:contain;padding:2px 0 5px;scrollbar-width:thin}
+.provider-filter-groups button{flex:0 0 auto;border:1px solid var(--line);border-right:0;background:var(--paper);color:var(--muted);padding:7px 10px;font-size:.78rem;font-weight:600;cursor:pointer;touch-action:manipulation}
+.provider-filter-groups button:first-child{border-radius:var(--r-s) 0 0 var(--r-s)}
+.provider-filter-groups button:last-child{border-right:1px solid var(--line);border-radius:0 var(--r-s) var(--r-s) 0}
+.provider-filter-groups button:hover{color:var(--ink);background:var(--inline-bg)}
+.provider-filter-groups button[aria-pressed="true"]{background:var(--ink);border-color:var(--ink);color:var(--paper)}
+.provider-filter-groups button[aria-pressed="true"]+button{border-left-color:var(--ink)}
+.provider-empty{margin:14px 0 0;color:var(--muted)}
+.provider-matrix{min-width:1180px!important}
+.provider-matrix :is(th,td):first-child{position:sticky;left:0;z-index:1;background:var(--paper);box-shadow:1px 0 0 var(--line)}
+.provider-matrix th:first-child{z-index:2}
+.provider-matrix tbody tr:hover td:first-child{background:color-mix(in srgb,var(--reef) 5%,var(--paper))}
 .doc hr{border:0;border-top:1px solid var(--line);margin:2em 0}
 
 /* toc */
-.toc{position:sticky;top:24px;align-self:start;font-size:.85rem;padding-left:14px;border-left:1px solid var(--line);max-height:calc(100vh - 48px);overflow:auto;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.toc{position:sticky;top:24px;align-self:start;font-size:.84rem;padding-left:14px;border-left:1px solid var(--line);max-height:calc(100vh - 48px);overflow:auto;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
 .toc::-webkit-scrollbar{width:5px}
 .toc::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
-.toc h2{font-size:.66rem;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin:0 0 10px;font-weight:700}
-.toc a{display:block;color:var(--muted);text-decoration:none;padding:4px 0 4px 10px;line-height:1.35;border-left:2px solid transparent;margin-left:-12px;transition:color .12s,border-color .12s}
+.toc h2{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:0 0 10px;font-weight:600}
+.toc a{display:block;color:var(--muted);text-decoration:none;padding:4px 0 4px 10px;line-height:1.35;border-left:2px solid transparent;margin-left:-15px;transition:color .12s,border-color .12s}
 .toc a:hover{color:var(--ink)}
-.toc a.active{color:var(--reef);border-left-color:var(--coral);font-weight:600}
+.toc a.active{color:var(--ink);border-left-color:var(--coral);font-weight:600}
 .toc-l3{padding-left:22px!important;font-size:.94em}
 @media(max-width:1179px){.toc{display:none}}
 
 /* prev/next pager */
 .page-nav{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:48px}
-.page-nav>a{display:block;border:1px solid var(--line);background:var(--paper);border-radius:10px;padding:14px 18px;text-decoration:none;color:var(--ink);transition:border-color .15s,transform .15s,box-shadow .15s}
-.page-nav>a:hover{border-color:var(--coral);transform:translateY(-1px);box-shadow:0 6px 18px rgba(18,33,31,.08)}
-.page-nav small{display:block;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;margin-bottom:5px;font-weight:700}
+.page-nav>a{display:block;border:1px solid var(--line);background:var(--paper);border-radius:var(--r-m);padding:14px 18px;text-decoration:none;color:var(--ink);transition:border-color .15s}
+.page-nav>a:hover{border-color:var(--ink)}
+.page-nav small{display:block;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;font-weight:600}
 .page-nav span{display:block;font-weight:600;line-height:1.3}
 .page-nav-prev{text-align:left}
 .page-nav-next{text-align:right;grid-column:2}
 .page-nav-prev:only-child{grid-column:1}
 
 /* mobile nav toggle */
-.nav-toggle{display:none;position:fixed;top:14px;right:14px;top:calc(14px + env(safe-area-inset-top, 0px));right:calc(14px + env(safe-area-inset-right, 0px));z-index:20;width:40px;height:40px;border-radius:9px;background:var(--paper);border:1px solid var(--line);color:var(--ink);cursor:pointer;padding:10px 9px;flex-direction:column;align-items:stretch;justify-content:space-between;box-shadow:0 6px 18px rgba(18,33,31,.12)}
+.nav-toggle{display:none;position:fixed;top:14px;right:14px;top:calc(14px + env(safe-area-inset-top,0px));right:calc(14px + env(safe-area-inset-right,0px));z-index:30;width:42px;height:42px;border-radius:var(--r-s);background:var(--paper);border:1px solid var(--line);color:var(--ink);cursor:pointer;padding:10px 9px;flex-direction:column;align-items:stretch;justify-content:space-between;box-shadow:var(--shadow);touch-action:manipulation}
 .nav-toggle span{display:block;width:100%;height:2px;flex:0 0 2px;background:currentColor;border-radius:2px;transition:transform .2s,opacity .2s}
 .nav-toggle[aria-expanded="true"] span:nth-child(1){transform:translateY(8px) rotate(45deg)}
 .nav-toggle[aria-expanded="true"] span:nth-child(2){opacity:0}
 .nav-toggle[aria-expanded="true"] span:nth-child(3){transform:translateY(-8px) rotate(-45deg)}
+.nav-backdrop{display:none;position:fixed;inset:0;z-index:20;width:100%;height:100%;border:0;background:rgba(0,0,0,.48);padding:0;cursor:pointer}
 
-/* mobile */
+/* responsive */
+@media(max-width:1180px){
+  .hero-home{grid-template-columns:1fr;gap:40px;padding:48px 0}
+  .home-console{max-width:640px}
+  .home-price-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .home-price-grid article:nth-child(2n+1){border-left:0}
+  .home-price-grid article:nth-child(n+3){border-top:1px solid var(--line)}
+}
 @media(max-width:900px){
   .shell{display:block}
-  .sidebar{position:fixed;inset:0 30% 0 0;max-width:320px;height:100vh;z-index:15;transform:translateX(-100%);transition:transform .25s ease;box-shadow:0 18px 40px rgba(18,33,31,.18);background:var(--paper);pointer-events:none}
+  body.nav-open{overflow:hidden}
+  .sidebar{position:fixed;inset:0 auto 0 0;width:min(86vw,340px);max-width:none;height:100vh;height:100dvh;z-index:25;transform:translateX(-100%);transition:transform .25s ease;box-shadow:0 18px 40px rgba(0,0,0,.24);background:var(--sidebar);pointer-events:none;padding-top:calc(20px + env(safe-area-inset-top,0px));padding-bottom:calc(18px + env(safe-area-inset-bottom,0px));padding-left:calc(18px + env(safe-area-inset-left,0px))}
   .sidebar.open{transform:translateX(0);pointer-events:auto}
+  .nav-backdrop:not([hidden]){display:block}
   .nav-toggle{display:flex}
-  main{padding:64px 18px 56px}
+  main{padding:68px 20px 56px}
+  .home main{padding-top:68px}
   .hero{padding-top:8px}
-  .hero h1{font-size:clamp(1.7rem,7vw,2.2rem)}
+  .hero h1{font-size:2rem}
   .hero-meta{width:100%;justify-content:flex-start}
-  .hero-home{grid-template-columns:1fr;gap:22px}
-  .hero-home h1{font-size:clamp(2rem,8vw,2.6rem);max-width:none}
-  .hero-snippet{font-size:.78rem;padding:16px 16px}
-  .features{grid-template-columns:1fr;margin-top:22px}
-  .doc{padding:20px;border-radius:8px}
-  .doc-home{padding:0 18px}
+  .hero-home{padding:8px 0 48px}
+  .hero-home h1{font-size:clamp(2.4rem,8vw,3.4rem)}
+  .home-section{padding:56px 0}
+  .home-section>header{grid-template-columns:1fr;gap:12px}
+  .home-loop ol{grid-template-columns:repeat(3,minmax(0,1fr));gap:20px 12px}
+  .home-benefit-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .home-benefit-grid article,.home-benefit-grid .home-benefit-wide{grid-column:auto}
+  .home-benefit-grid article:last-child{grid-column:1/-1}
+  .home-os{grid-template-columns:1fr;gap:12px;padding:56px 0}
+  .home-provider-group{grid-template-columns:1fr;gap:12px}
+  .home-provider-group h3{justify-content:flex-start;margin:0}
+  .home-job-layout{grid-template-columns:1fr}
+  .home-job-choices{flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--line)}
+  .home-job-option{flex:1 1 33%;border-right:1px solid var(--line-soft)}
+  .home-job-option:nth-child(3n){border-right:0}
+  .home-job-option:nth-child(n+4){border-bottom:0}
+  .home-job-option label{min-height:56px;padding:12px 14px}
+  .home-job-option input:checked+label{box-shadow:inset 0 -2px 0 var(--coral)}
+  .home-job-result{padding:24px 22px}
+  .home-job-disclaimer{padding:14px 22px}
+  .home-capability-note{grid-template-columns:1fr;gap:12px}
+  .home-install{grid-template-columns:1fr;gap:28px;margin-top:56px}
+  .home-trust{grid-template-columns:1fr;gap:12px;margin-top:56px}
   .doc-grid{margin-top:22px;gap:24px}
   .doc :is(h2,h3,h4) .anchor{display:none}
 }
 @media(max-width:520px){
-  main{padding:60px 14px 48px}
-  .doc{padding:18px 16px}
-  .doc-home{padding-inline:16px}
+  main,.home main{padding:64px 16px 48px}
+  .hero-home h1{font-size:clamp(2.2rem,11vw,3rem)}
+  .lede{font-size:1rem}
+  .cta-primary,.cta-secondary{justify-content:center}
+  .home-facts{display:grid;gap:7px}
+  .home-console{border-radius:var(--r-m)}
+  .home-console-bar{grid-template-columns:1fr auto}
+  .home-console-bar strong{display:none}
+  .home-console pre{font-size:.72rem;padding:14px}
+  .home-console li{padding:9px 14px}
+  .home-console-result{padding:12px 14px}
+  .home-price-grid{grid-template-columns:1fr}
+  .home-price-grid article+article{border-left:0;border-top:1px solid var(--line)}
+  .home-section{padding:48px 0}
+  .home-loop ol{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .home-benefit-grid{grid-template-columns:1fr}
+  .home-benefit-grid article{padding:22px}
+  .home-os{padding:48px 0}
+  .home-os ul{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .home-os li:nth-child(3){border-left:0}
+  .home-os li:nth-child(n+3){border-top:1px solid var(--line)}
+  .home-console pre{padding-right:84px}
+  .cta-primary{width:100%}
+  .cta-secondary{flex:1}
+  .home-section>header h2,.home-install h2{font-size:1.7rem}
+  .home-job-finder{border-radius:var(--r-m)}
+  .home-job-option{flex-basis:50%}
+  .home-job-option:nth-child(3n){border-right:1px solid var(--line-soft)}
+  .home-job-option:nth-child(2n){border-right:0}
+  .home-job-option:nth-child(n+4){border-bottom:1px solid var(--line-soft)}
+  .home-job-option:nth-child(n+5){border-bottom:0}
+  .home-job-option label{min-height:48px;padding:10px 12px}
+  .home-job-option label>small{display:none}
+  .home-job-result{gap:18px;padding:20px 16px}
+  .home-job-result h3{font-size:1.3rem}
+  .home-job-command pre{font-size:.72rem;padding-right:68px}
+  .home-job-disclaimer{padding:12px 16px}
+  .home-capability-note{padding:20px 18px}
+  .home-capability-note a{white-space:normal}
+  .home-install pre{padding:16px;font-size:.74rem;border-radius:var(--r-m)}
+  .page-nav{grid-template-columns:1fr}
+  .page-nav-next{grid-column:1}
   .doc pre{margin-left:-16px;margin-right:-16px;border-radius:0;border-left:0;border-right:0}
 }
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{transition-duration:.01ms!important;animation-duration:.01ms!important;animation-iteration-count:1!important}}
 `;
 }
 
-function js() {
+function js(messages = {}) {
+  const keys = ["Switch to light mode", "Switch to dark mode", "Close navigation", "Open navigation", "Copy code", "Copy", "Copied", "Failed", "Copy failed"];
+  const clientMessages = Object.fromEntries(keys.filter((key) => messages[key]).map((key) => [key, messages[key]]));
   return `
+const docsMessages=${JSON.stringify(clientMessages).replaceAll("<", "\\u003c")};
+const ui=(text)=>docsMessages[text]||text;
+
 const themeRoot=document.documentElement;
 function storedDocsTheme(){try{return localStorage.getItem('crabbox-docs-theme')}catch(e){return null}}
 function applyDocsTheme(mode){
   themeRoot.dataset.theme=mode;
-  document.querySelectorAll('[data-theme-toggle]').forEach((b)=>b.setAttribute('aria-pressed',mode==='dark'?'true':'false'));
+  const themeColor=document.getElementById('theme-color');
+  if(themeColor)themeColor.content=mode==='dark'?'#17191b':'#f4f5f5';
+  document.querySelectorAll('[data-theme-toggle]').forEach((button)=>{
+    button.setAttribute('aria-pressed',mode==='dark'?'true':'false');
+    button.setAttribute('aria-label',mode==='dark'?ui('Switch to light mode'):ui('Switch to dark mode'));
+  });
 }
 applyDocsTheme(themeRoot.dataset.theme==='dark'?'dark':'light');
 document.querySelectorAll('[data-theme-toggle]').forEach((btn)=>{
@@ -620,75 +1442,164 @@ if(docsSystemDark){
 
 const sidebar=document.querySelector('.sidebar');
 const toggle=document.querySelector('.nav-toggle');
+const backdrop=document.querySelector('.nav-backdrop');
+const main=document.querySelector('main');
 const mobileNav=window.matchMedia('(max-width: 900px)');
-const sidebarFocusable='a[href],button,input,select,textarea,[tabindex]';
-const sidebarScrollKey='crabbox.docs.sidebar.scrollTop';
-let sidebarScrollSaveTimer=0;
-function readSidebarScroll(){
-  try{
-    const raw=sessionStorage.getItem(sidebarScrollKey);
-    const value=raw===null?NaN:Number(raw);
-    return Number.isFinite(value)?Math.max(0,value):0;
-  }catch{
-    return 0;
-  }
-}
-function saveSidebarScroll(){
-  if(!sidebar)return;
-  try{sessionStorage.setItem(sidebarScrollKey,String(Math.round(sidebar.scrollTop)))}catch{}
-}
-function scheduleSidebarScrollSave(){
-  if(sidebarScrollSaveTimer)return;
-  sidebarScrollSaveTimer=window.setTimeout(()=>{sidebarScrollSaveTimer=0;saveSidebarScroll()},120);
-}
-if(sidebar)sidebar.scrollTop=readSidebarScroll();
-function setSidebarFocusable(enabled){
-  sidebar?.querySelectorAll(sidebarFocusable).forEach((el)=>{
-    if(enabled){
-      if(el.dataset.sidebarTabindex!==undefined){
-        if(el.dataset.sidebarTabindex)el.setAttribute('tabindex',el.dataset.sidebarTabindex);
-        else el.removeAttribute('tabindex');
-        delete el.dataset.sidebarTabindex;
-      }
-    }else if(el.dataset.sidebarTabindex===undefined){
-      el.dataset.sidebarTabindex=el.getAttribute('tabindex')??'';
-      el.setAttribute('tabindex','-1');
-    }
-  });
-}
-function setSidebarOpen(open){
+const sidebarFocusable='a[href],button:not([disabled]),input:not([disabled]),summary,[tabindex]:not([tabindex="-1"])';
+function setSidebarOpen(open,{focus=false,restore=false}={}){
   if(!sidebar||!toggle)return;
+  const mobile=mobileNav.matches;
+  open=mobile&&open;
   sidebar.classList.toggle('open',open);
   toggle.setAttribute('aria-expanded',open?'true':'false');
-  if(mobileNav.matches){
+  toggle.setAttribute('aria-label',open?ui('Close navigation'):ui('Open navigation'));
+  document.body.classList.toggle('nav-open',open);
+  if(backdrop){backdrop.hidden=!open;backdrop.setAttribute('aria-hidden',open?'false':'true')}
+  if(mobile){
     sidebar.inert=!open;
     if(open)sidebar.removeAttribute('aria-hidden');
     else sidebar.setAttribute('aria-hidden','true');
-    setSidebarFocusable(open);
+    if(main)main.inert=open;
   }else{
     sidebar.inert=false;
     sidebar.removeAttribute('aria-hidden');
-    setSidebarFocusable(true);
+    if(main)main.inert=false;
   }
+  if(open&&focus)sidebar.focus({preventScroll:true});
+  if(!open&&restore)toggle.focus({preventScroll:true});
 }
 setSidebarOpen(false);
-sidebar?.addEventListener('scroll',scheduleSidebarScrollSave,{passive:true});
-sidebar?.addEventListener('click',(e)=>{
-  const link=e.target.closest?.('a[href]');
-  if(link)saveSidebarScroll();
+toggle?.addEventListener('click',()=>setSidebarOpen(!sidebar?.classList.contains('open'),{focus:true,restore:true}));
+backdrop?.addEventListener('click',()=>setSidebarOpen(false,{restore:true}));
+document.addEventListener('keydown',(e)=>{if(e.key==='Escape'&&sidebar?.classList.contains('open'))setSidebarOpen(false,{restore:true})});
+sidebar?.addEventListener('keydown',(e)=>{
+  if(e.key!=='Tab'||!mobileNav.matches||!sidebar.classList.contains('open'))return;
+  const focusable=[...sidebar.querySelectorAll(sidebarFocusable)].filter((el)=>el.getClientRects().length);
+  if(!focusable.length)return;
+  const first=focusable[0];
+  const last=focusable[focusable.length-1];
+  if(e.shiftKey&&(document.activeElement===first||document.activeElement===sidebar)){e.preventDefault();last.focus()}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
 });
-window.addEventListener('pagehide',saveSidebarScroll);
-toggle?.addEventListener('click',()=>setSidebarOpen(!sidebar?.classList.contains('open')));
-document.addEventListener('click',(e)=>{if(!sidebar?.classList.contains('open'))return;if(sidebar.contains(e.target)||toggle?.contains(e.target))return;setSidebarOpen(false)});
-document.addEventListener('keydown',(e)=>{if(e.key==='Escape')setSidebarOpen(false)});
-const syncSidebarForViewport=()=>setSidebarOpen(sidebar?.classList.contains('open')??false);
+const syncSidebarForViewport=()=>setSidebarOpen(false);
 if(mobileNav.addEventListener)mobileNav.addEventListener('change',syncSidebarForViewport);
 else mobileNav.addListener?.(syncSidebarForViewport);
+const activeNavLink=sidebar?.querySelector('.nav-link.active');
+if(sidebar&&activeNavLink)requestAnimationFrame(()=>{sidebar.scrollTop=Math.max(0,activeNavLink.offsetTop-sidebar.clientHeight/2)});
 
 const input=document.getElementById('doc-search');
-input?.addEventListener('input',()=>{const q=input.value.trim().toLowerCase();document.querySelectorAll('nav section').forEach(sec=>{let any=false;sec.querySelectorAll('.nav-link').forEach(a=>{const m=!q||a.textContent.toLowerCase().includes(q);a.style.display=m?'block':'none';if(m)any=true});sec.style.display=any?'block':'none'})});
+const navSections=[...document.querySelectorAll('[data-nav-section]')];
+const navEmpty=document.querySelector('.nav-empty');
+let navOpenState=null;
+const navParams=new URLSearchParams(location.search);
+if(input)input.value=navParams.get('docs')||'';
+const syncNavURL=()=>{
+  if(location.protocol==='file:')return;
+  const next=new URL(location.href);
+  const value=input?.value.trim()||'';
+  value?next.searchParams.set('docs',value):next.searchParams.delete('docs');
+  history.replaceState(null,'',next);
+};
+const applyNavFilters=(updateURL=true)=>{
+  const q=input.value.trim().toLowerCase();
+  const terms=q.split(/\\s+/).filter(Boolean);
+  if(q&&!navOpenState)navOpenState=new Map(navSections.map((section)=>[section,section.open]));
+  let matches=0;
+  navSections.forEach((section)=>{
+    let sectionMatches=0;
+    section.querySelectorAll('.nav-link').forEach((link)=>{
+      const haystack=link.dataset.navSearch||link.textContent.toLowerCase();
+      const match=!q||terms.every((term)=>haystack.includes(term));
+      link.hidden=!match;
+      if(match)sectionMatches+=1;
+    });
+    section.hidden=Boolean(q&&!sectionMatches);
+    if(q)section.open=sectionMatches>0;
+    else if(navOpenState?.has(section))section.open=navOpenState.get(section);
+    matches+=sectionMatches;
+  });
+  if(!q)navOpenState=null;
+  if(navEmpty)navEmpty.hidden=!q||matches>0;
+  if(updateURL)syncNavURL();
+};
+input?.addEventListener('input',()=>applyNavFilters());
+if(input?.value)applyNavFilters(false);
 
-document.querySelectorAll('.doc pre').forEach(pre=>{const btn=document.createElement('button');btn.type='button';btn.className='copy';btn.textContent='Copy';btn.addEventListener('click',async()=>{const code=pre.querySelector('code')?.textContent??'';try{await navigator.clipboard.writeText(code);btn.textContent='Copied';btn.classList.add('copied');setTimeout(()=>{btn.textContent='Copy';btn.classList.remove('copied')},1400)}catch{btn.textContent='Failed';setTimeout(()=>{btn.textContent='Copy'},1400)}});pre.appendChild(btn)});
+const providerFilter=document.querySelector('[data-provider-filter]');
+if(providerFilter){
+  const providerInput=providerFilter.querySelector('input');
+  const providerButtons=[...providerFilter.querySelectorAll('[data-provider-group-filter]')];
+  const providerRows=[...document.querySelectorAll('.provider-matrix tbody tr')];
+  const providerCount=providerFilter.querySelector('[data-provider-count]');
+  const providerEmpty=providerFilter.querySelector('[data-provider-empty]');
+  const providerParams=new URLSearchParams(location.search);
+  let providerGroup=providerParams.get('group')||'all';
+  if(!providerButtons.some((button)=>button.dataset.providerGroupFilter===providerGroup))providerGroup='all';
+  if(providerInput)providerInput.value=providerParams.get('q')||'';
+  providerButtons.forEach((button)=>button.setAttribute('aria-pressed',button.dataset.providerGroupFilter===providerGroup?'true':'false'));
+  const syncProviderURL=()=>{
+    if(location.protocol==='file:')return;
+    const next=new URL(location.href);
+    const value=providerInput?.value.trim()||'';
+    value?next.searchParams.set('q',value):next.searchParams.delete('q');
+    providerGroup!=='all'?next.searchParams.set('group',providerGroup):next.searchParams.delete('group');
+    history.replaceState(null,'',next);
+  };
+  const applyProviderFilters=(updateURL=true)=>{
+    const terms=(providerInput?.value.trim().toLowerCase()||'').split(/\\s+/).filter(Boolean);
+    let count=0;
+    providerRows.forEach((row)=>{
+      const groups=(row.dataset.providerGroups||'').split(/\\s+/);
+      const groupMatch=providerGroup==='all'||groups.includes(providerGroup);
+      const search=row.dataset.providerSearch||row.textContent.toLowerCase();
+      const textMatch=terms.every((term)=>search.includes(term));
+      const match=groupMatch&&textMatch;
+      row.hidden=!match;
+      if(match)count+=1;
+    });
+    if(providerCount)providerCount.textContent=count===1?'1 provider':count+' providers';
+    if(providerEmpty)providerEmpty.hidden=count>0;
+    if(updateURL)syncProviderURL();
+  };
+  providerInput?.addEventListener('input',applyProviderFilters);
+  providerButtons.forEach((button)=>button.addEventListener('click',()=>{
+    providerGroup=button.dataset.providerGroupFilter;
+    providerButtons.forEach((item)=>item.setAttribute('aria-pressed',item===button?'true':'false'));
+    applyProviderFilters();
+  }));
+  applyProviderFilters(false);
+}
+
+const homeJobFinder=document.querySelector('[data-home-job-finder]');
+if(homeJobFinder){
+  const homeJobRadios=[...homeJobFinder.querySelectorAll('[data-home-job-radio]')];
+  const selectHomeJob=(value)=>{
+    const radio=homeJobRadios.find((item)=>item.value===value)||homeJobRadios[0];
+    if(radio)radio.checked=true;
+    return radio?.value||'';
+  };
+  const homeJobParams=new URLSearchParams(location.search);
+  const syncHomeJobURL=(value)=>{
+    if(location.protocol==='file:')return;
+    const next=new URL(location.href);
+    if(value)next.searchParams.set('job',value);
+    else next.searchParams.delete('job');
+    history.replaceState(null,'',next);
+  };
+  const requestedHomeJob=homeJobParams.get('job');
+  const selectedHomeJob=selectHomeJob(requestedHomeJob);
+  if(requestedHomeJob&&requestedHomeJob!==selectedHomeJob)syncHomeJobURL('');
+  homeJobRadios.forEach((radio)=>radio.addEventListener('change',()=>{
+    if(radio.checked)syncHomeJobURL(radio.value);
+  }));
+  window.addEventListener('popstate',()=>{
+    const requested=new URLSearchParams(location.search).get('job');
+    const selected=selectHomeJob(requested);
+    if(requested&&requested!==selected)syncHomeJobURL('');
+  });
+}
+
+document.querySelectorAll('.doc pre,[data-copyable]').forEach(pre=>{const btn=document.createElement('button');const copyLabel=pre.dataset.copyLabel||ui('Copy code');btn.type='button';btn.className='copy';btn.setAttribute('aria-live','polite');btn.setAttribute('aria-label',copyLabel);btn.textContent=ui('Copy');btn.addEventListener('click',async()=>{const code=pre.dataset.copyText??pre.querySelector('code')?.textContent??'';try{await navigator.clipboard.writeText(code);btn.textContent=ui('Copied');btn.setAttribute('aria-label',ui('Copied'));btn.classList.add('copied');setTimeout(()=>{btn.textContent=ui('Copy');btn.setAttribute('aria-label',copyLabel);btn.classList.remove('copied')},1400)}catch{btn.textContent=ui('Failed');btn.setAttribute('aria-label',ui('Copy failed'));setTimeout(()=>{btn.textContent=ui('Copy');btn.setAttribute('aria-label',copyLabel)},1400)}});pre.appendChild(btn)});
 
 const tocLinks=document.querySelectorAll('.toc a');
 if(tocLinks.length){const map=new Map();tocLinks.forEach(a=>{const id=a.getAttribute('href').slice(1);const el=document.getElementById(id);if(el)map.set(el,a)});const setActive=l=>{tocLinks.forEach(x=>x.classList.remove('active'));l.classList.add('active')};const obs=new IntersectionObserver(entries=>{const visible=entries.filter(e=>e.isIntersecting).sort((a,b)=>a.boundingClientRect.top-b.boundingClientRect.top);if(visible.length){const link=map.get(visible[0].target);if(link)setActive(link)}},{rootMargin:'-15% 0px -65% 0px',threshold:0});map.forEach((_,el)=>obs.observe(el))}
@@ -697,31 +1608,27 @@ if(tocLinks.length){const map=new Map();tocLinks.forEach(a=>{const id=a.getAttri
 
 function crabSvg() {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Crabbox">
-<rect width="120" height="120" rx="24" fill="#12211f"/>
-<path d="M24 60c9-26 62-26 72 0 3 9-4 28-36 28S21 69 24 60Z" fill="#e35e46"/>
-<path d="M38 55c4-8 12-13 22-13s18 5 22 13" fill="none" stroke="#fffbf4" stroke-width="6" stroke-linecap="round"/>
-<circle cx="48" cy="62" r="5" fill="#12211f"/><circle cx="72" cy="62" r="5" fill="#12211f"/>
-<path d="M27 54 11 42m82 12 16-12M36 82 22 96m62-14 14 14M46 86l-5 17m33-17 5 17" stroke="#fffbf4" stroke-width="7" stroke-linecap="round"/>
-<path d="M20 35c-4-13 8-22 18-14-10 2-13 9-18 14Zm80 0c4-13-8-22-18-14 10 2 13 9 18 14Z" fill="#e35e46"/>
+<defs>
+<linearGradient id="cbx-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#173430"/><stop offset="1" stop-color="#0f1c1a"/></linearGradient>
+<linearGradient id="cbx-shell" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f27358"/><stop offset="1" stop-color="#d9503a"/></linearGradient>
+<linearGradient id="cbx-box" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2f9187"/><stop offset="1" stop-color="#1f6760"/></linearGradient>
+</defs>
+<rect width="120" height="120" rx="26" fill="url(#cbx-bg)"/>
+<path d="M39 64Q26 61 26 47M81 64Q94 61 94 47" fill="none" stroke="#e35e46" stroke-width="7" stroke-linecap="round"/>
+<path d="M30.1 33.6A12 12 0 1 1 20.1 34.7L25.5 45Z" fill="url(#cbx-shell)" transform="rotate(-14 25.5 45)"/>
+<path d="M89.9 33.6A12 12 0 1 0 99.9 34.7L94.5 45Z" fill="url(#cbx-shell)" transform="rotate(14 94.5 45)"/>
+<path d="M51 52 47 38M69 52l4-14" stroke="#e35e46" stroke-width="4.5" stroke-linecap="round"/>
+<ellipse cx="60" cy="70" rx="29" ry="21" fill="url(#cbx-shell)"/>
+<path d="M41 60q8-9 19-9" fill="none" stroke="#ff9b85" stroke-width="4" stroke-linecap="round" opacity=".75"/>
+<circle cx="46.5" cy="35.5" r="7" fill="#fffbf4"/><circle cx="73.5" cy="35.5" r="7" fill="#fffbf4"/>
+<circle cx="48" cy="36.5" r="3.4" fill="#12211f"/><circle cx="72" cy="36.5" r="3.4" fill="#12211f"/>
+<path d="M54.5 61.5q5.5 4 11 0" fill="none" stroke="#12211f" stroke-width="2.6" stroke-linecap="round"/>
+<rect x="18" y="72" width="84" height="34" rx="8" fill="url(#cbx-box)"/>
+<rect x="13" y="67" width="94" height="11" rx="5.5" fill="#62c7bd"/>
+<path d="M29 67.5q-2 4.5 1 8M37 67q-2 5 1 9M91 67.5q2 4.5-1 8M83 67q2 5-1 9" fill="none" stroke="#e35e46" stroke-width="3.6" stroke-linecap="round"/>
+<path d="M44 85l7 5-7 5" fill="none" stroke="#fffbf4" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M56 95h18" stroke="#fffbf4" stroke-width="3.6" stroke-linecap="round"/>
 </svg>`;
-}
-
-function slug(text) {
-  let out = "";
-  let lastDash = false;
-  for (const char of text.toLowerCase()) {
-    if (char === "`") continue;
-    const code = char.charCodeAt(0);
-    const ok = (code >= 97 && code <= 122) || (code >= 48 && code <= 57);
-    if (ok) {
-      out += char;
-      lastDash = false;
-    } else if (!lastDash) {
-      out += "-";
-      lastDash = true;
-    }
-  }
-  return trimDashes(out);
 }
 
 function firstIndex(left, right) {
@@ -751,14 +1658,6 @@ function stripHtmlTags(value) {
     if (!inTag) out += char;
   }
   return out;
-}
-
-function trimDashes(value) {
-  let start = 0;
-  let end = value.length;
-  while (start < end && value[start] === "-") start += 1;
-  while (end > start && value[end - 1] === "-") end -= 1;
-  return value.slice(start, end);
 }
 
 function escapeHtml(value) {

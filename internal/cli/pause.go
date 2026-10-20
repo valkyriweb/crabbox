@@ -16,7 +16,7 @@ func (a App) resume(ctx context.Context, args []string) error {
 func (a App) pauseResume(ctx context.Context, args []string, action string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet(action, a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpAll())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	id := fs.String("id", "", "lease id or slug")
 	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
@@ -26,22 +26,25 @@ func (a App) pauseResume(ctx context.Context, args []string, action string) erro
 	idFlagSet := flagWasSet(fs, "id")
 	setIDFromFirstArg(fs, id)
 	if strings.TrimSpace(*id) == "" || fs.NArg() > 1 || (idFlagSet && fs.NArg() > 0) {
-		return exit(2, "usage: crabbox %s --id <lease-or-server-id>", action)
+		return Exit(2, "usage: crabbox %s --id <lease-or-server-id>", action)
 	}
-	cfg, err := loadConfig()
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
 	if err := prepareProviderSelection(&cfg, *provider); err != nil {
 		return err
 	}
+	if err := autoRouteClaimLeaseProvider(&cfg, fs, *id); err != nil {
+		return err
+	}
+	if err := autoRouteStaticLease(&cfg, fs, *id); err != nil {
+		return err
+	}
 	if err := autoRouteExternalLease(&cfg, fs, *id); err != nil {
 		return err
 	}
-	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
-		return err
-	}
-	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
+	if err := applyTargetAndProviderFlags(&cfg, fs, targetFlags, providerFlags); err != nil {
 		return err
 	}
 	if err := finalizeProviderSelection(&cfg); err != nil {
@@ -53,7 +56,7 @@ func (a App) pauseResume(ctx context.Context, args []string, action string) erro
 	}
 	pausable, ok := backend.(PausableBackend)
 	if !ok {
-		return exit(2, "provider=%s does not support %s", backend.Spec().Name, action)
+		return Exit(2, "provider=%s does not support %s", backend.Spec().Name, action)
 	}
 	opts := leaseOptionsFromConfig(cfg)
 	if action == "pause" {

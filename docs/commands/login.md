@@ -14,11 +14,14 @@ command exits with an error.
 crabbox login --url <broker-url>
 ```
 
-This starts a GitHub OAuth login: Crabbox opens the login URL in your browser,
-polls the broker until you complete the flow, then stores the user-scoped bearer
-token it returns.
+This starts a GitHub OAuth login: Crabbox opens the login URL in your browser and
+listens on a random `127.0.0.1` port for a one-use browser confirmation. The
+broker releases the user-scoped bearer token only when the initiating terminal
+presents both that confirmation and its private polling secret.
 
-If the browser cannot open, print the URL and finish the flow manually:
+If the browser cannot open automatically, print the URL and open it manually in
+a browser on the same device. Cross-device completion intentionally fails
+closed because the browser must return to the initiating CLI's loopback listener:
 
 ```sh
 crabbox login --url https://broker.example.com --no-browser
@@ -34,15 +37,23 @@ logged in broker=https://broker.example.com provider=aws user=alice@example.com 
 ## Flags
 
 ```text
---url <url>                       broker URL (falls back to the configured broker)
---provider hetzner|aws|azure|gcp  default brokered provider to store with the broker
---no-browser                      print the GitHub login URL instead of opening it
---token-stdin                     read a broker token from stdin (operator automation)
---json                            print machine-readable JSON
+--url <url>                              broker URL (falls back to the configured broker)
+--provider aws|azure|daytona|gcp|hetzner default managed provider to store with the broker
+--no-browser                             print the same-device GitHub login URL instead of opening it
+--token-stdin                            read a broker token from stdin (operator automation)
+--json                                   print machine-readable JSON
 ```
 
 When `--url` is omitted, the configured broker URL is used; `--provider` likewise
 falls back to the configured default provider when unset.
+
+Browser login preserves the configured broker's credential-source checks. A
+repository-defined broker cannot use inherited token helpers or Cloudflare
+Access credentials from your user config or environment. To approve a trusted
+broker for those credentials, pass its URL with `--url` or set
+`CRABBOX_COORDINATOR` explicitly. Credentials defined alongside the broker in
+the same repository config remain supported. Browser login omits the stored
+broker token while obtaining a new one.
 
 ## Operator automation with `--token-stdin`
 
@@ -78,6 +89,11 @@ Each broker owns its own GitHub OAuth credentials and admission policy. A
 separate organization or private deployment needs its own coordinator runtime,
 secret injection, and GitHub OAuth app.
 
+The coordinator requires current CLIs to provide an ephemeral HTTP loopback
+callback using the literal `127.0.0.1` address, a random port, and a random path.
+Old clients that can only poll for a completed browser token are rejected before
+OAuth starts.
+
 Configure that GitHub OAuth app with a callback URL that exactly matches the
 broker's public origin:
 
@@ -87,7 +103,8 @@ https://<your-broker-host>/v1/auth/github/callback
 
 Set the same public origin in `CRABBOX_PUBLIC_URL` on the coordinator, then deploy
 `CRABBOX_GITHUB_CLIENT_ID`, `CRABBOX_GITHUB_CLIENT_SECRET`,
-`CRABBOX_SESSION_SECRET`, and the relevant `CRABBOX_GITHUB_ALLOWED_ORG(S)` or
+`CRABBOX_SESSION_SECRET` (distinct from `CRABBOX_SHARED_TOKEN`), and the relevant
+`CRABBOX_GITHUB_ALLOWED_ORG(S)` or
 `CRABBOX_GITHUB_ALLOWED_TEAMS` values. A GitHub `Invalid redirect_uri` error means
 the callback URL generated during `crabbox login` does not match one configured on
 that OAuth app.

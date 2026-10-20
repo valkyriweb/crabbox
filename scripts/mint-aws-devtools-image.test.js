@@ -1,14 +1,79 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const script = path.join(scriptDir, "mint-aws-devtools-image.sh");
+
+test("Windows prep failure reports the step, exception, native exit meaning and 200 log lines", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "crabbox-prep-status-test-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const text = await readFile(script, "utf8");
+  const command = text.match(/windows_prep_status_command\(\) \{\n  cat <<'POWERSHELL'\n([\s\S]*?)\nPOWERSHELL/)[1];
+  await writeFile(path.join(dir, "image-prep.failed"), "-1");
+  await writeFile(path.join(dir, "image-prep.exit"), "-1");
+  await writeFile(path.join(dir, "image-prep.step"), "docker pull mcr.microsoft.com/windows/servercore:ltsc2025");
+  await writeFile(path.join(dir, "image-prep.error"), "registry connection reset at prep.ps1:42");
+  await writeFile(path.join(dir, "image-prep.log"), Array.from({ length: 250 }, (_, i) => `layer-line-${i + 1}`).join("\n"));
+  const fixture = path.join(dir, "status.ps1");
+  await writeFile(fixture, command.replace("$dir = 'C:\\ProgramData\\crabbox'", `$dir = '${dir.replaceAll("'", "''")}'`));
+  const env = Object.fromEntries(Object.entries(process.env).filter(
+    ([name]) => process.platform !== "win32" || name.toLowerCase() !== "psmodulepath",
+  ));
+  const result = spawnSync(process.platform === "win32" ? "powershell.exe" : "pwsh", [
+    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", fixture,
+  ], { encoding: "utf8", timeout: 30000, env });
+  if (result.error?.code === "ENOENT") return t.skip("PowerShell is not installed");
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /crabbox-prep-failed/);
+  assert.match(result.stdout, /failed during: docker pull mcr.microsoft.com\/windows\/servercore:ltsc2025/);
+  assert.match(result.stdout, /registry connection reset at prep.ps1:42/);
+  assert.match(result.stdout, /exit code: -1 \(0xFFFFFFFF\)/);
+  assert.match(result.stdout, /does not identify the failing statement/);
+  assert.match(result.stdout, /\nlayer-line-51\r?\n/);
+  assert.doesNotMatch(result.stdout, /\nlayer-line-50\r?\n/);
+});
+
+for (const exitCode of [0, -1, null]) {
+  test(`Windows prep runner records ${exitCode ?? "missing"} process exit without false success`, async (t) => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "crabbox-prep-runner-test-"));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const text = await readFile(script, "utf8");
+    const runner = text.match(/\n@'\n([\s\S]*?)\n'@ \| Set-Content -Path \$runner/)[1];
+    const fixture = path.join(dir, "runner.ps1");
+    await writeFile(fixture, `
+function powershell { Write-Output 'fixture child log'; $global:LASTEXITCODE = ${exitCode === null ? "$null" : exitCode} }
+${runner.replace("$dir = 'C:\\ProgramData\\crabbox'", `$dir = '${dir.replaceAll("'", "''")}'`)}
+`);
+    const env = Object.fromEntries(Object.entries(process.env).filter(
+      ([name]) => process.platform !== "win32" || name.toLowerCase() !== "psmodulepath",
+    ));
+    const result = spawnSync(process.platform === "win32" ? "powershell.exe" : "pwsh", [
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", fixture,
+    ], { encoding: "utf8", timeout: 30000, env });
+    if (result.error?.code === "ENOENT") return t.skip("PowerShell is not installed");
+    const recorded = (await readFile(path.join(dir, "image-prep.exit"), "utf8")).trim();
+    assert.equal(recorded, String(exitCode ?? 1), result.stdout + result.stderr);
+    await readFile(path.join(dir, exitCode === 0 ? "image-prep.done" : "image-prep.failed"));
+    await assert.rejects(readFile(path.join(dir, exitCode === 0 ? "image-prep.failed" : "image-prep.done")));
+    if (exitCode === null) assert.match(await readFile(path.join(dir, "image-prep.error"), "utf8"), /did not return an exit code/);
+  });
+}
 
 async function setupFakeCrabbox() {
   const dir = await mkdtemp(path.join(os.tmpdir(), "crabbox-aws-image-mint-test-"));
@@ -16,6 +81,12 @@ async function setupFakeCrabbox() {
   const fake = path.join(dir, "crabbox");
   const linuxPrep = path.join(dir, "linux.sh");
   const windowsPrep = path.join(dir, "windows.ps1");
+  const bin = path.join(dir, "maintenance-bin");
+  await mkdir(bin);
+  await writeFile(path.join(bin, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
+  await chmod(path.join(bin, "sleep"), 0o755);
+  await writeFile(path.join(bin, "ssh"), '#!/usr/bin/env bash\nexec "$(dirname "$0")/../crabbox" maintenance-ssh "$@"\n');
+  await chmod(path.join(bin, "ssh"), 0o755);
   await writeFile(linuxPrep, "#!/usr/bin/env bash\nexit 0\n");
   await chmod(linuxPrep, 0o755);
   await writeFile(windowsPrep, "exit 0\n");
@@ -24,28 +95,143 @@ async function setupFakeCrabbox() {
     `#!/usr/bin/env bash
 set -euo pipefail
 printf 'env CRABBOX_AWS_REGION=%s AWS_REGION=%s CRABBOX_AWS_AMI=%s args %s\\n' "\${CRABBOX_AWS_REGION:-}" "\${AWS_REGION:-}" "\${CRABBOX_AWS_AMI:-}" "$*" >>"\${CRABBOX_FAKE_LOG:?}"
+printf 'source-options stock=%s root=%s command=%s\\n' "\${CRABBOX_AWS_STOCK_IMAGE-unset}" "\${CRABBOX_AWS_ROOT_GB-unset}" "$1" >>"\${CRABBOX_FAKE_LOG}"
+printf 'selection os=%s ami=%s command=%s\\n' "\${CRABBOX_OS-unset}" "\${CRABBOX_AWS_AMI-unset}" "$1" >>"\${CRABBOX_FAKE_LOG}"
+printf 'capacity regions=%s zones=%s command=%s\\n' "\${CRABBOX_CAPACITY_REGIONS-unset}" "\${CRABBOX_CAPACITY_AVAILABILITY_ZONES-unset}" "$1" >>"\${CRABBOX_FAKE_LOG}"
 case "$1" in
+  ssh)
+    [[ "\${CRABBOX_FAKE_SSH_RESOLVE_FAIL:-0}" == 0 ]] || exit 41
+    printf '%q -i %q -p 2222 fixture@windows\\n' "$(dirname "$0")/maintenance-bin/ssh" "fixture key with spaces"
+    ;;
+  maintenance-ssh)
+    previous=""
+    for arg in "$@"; do
+      [[ "$previous" != -i || "$arg" == "fixture key with spaces" ]] || exit 43
+      previous="$arg"
+    done
+    remote="\${@: -1}"
+    command="$(node -e 'process.stdout.write(Buffer.from(process.argv[1], "base64").toString("utf16le"))' "\${remote##* }")"
+    printf 'maintenance command %s\\n' "$command" >>"\${CRABBOX_FAKE_LOG}"
+    if [[ "$command" == *"shutdown /r"* ]]; then
+      [[ "\${CRABBOX_FAKE_REBOOT_FAIL:-0}" == 0 ]] || exit 42
+      touch "\${CRABBOX_FAKE_LOG}.reboot-pending"
+      printf 'reboot scheduled\\n'
+    elif [[ -f "\${CRABBOX_FAKE_LOG}.reboot-pending" ]]; then
+      if [[ "\${CRABBOX_FAKE_REBOOT_NEVER_DOWN:-0}" == 1 ]]; then exit 0; fi
+      if [[ ! -f "\${CRABBOX_FAKE_LOG}.reboot-probed" ]]; then
+        touch "\${CRABBOX_FAKE_LOG}.reboot-probed"
+        printf 'transition still-up\\n' >>"\${CRABBOX_FAKE_LOG}"
+        exit 0
+      fi
+      rm "\${CRABBOX_FAKE_LOG}.reboot-pending"
+      touch "\${CRABBOX_FAKE_LOG}.rebooted"
+      printf 'transition down\\n' >>"\${CRABBOX_FAKE_LOG}"
+      exit 255
+    elif [[ "\${CRABBOX_FAKE_REBOOT_NEVER_UP:-0}" == 1 ]]; then
+      exit 255
+    else
+      printf 'transition ready\\n' >>"\${CRABBOX_FAKE_LOG}"
+    fi
+    ;;
   warmup)
     count_file="\${CRABBOX_FAKE_LOG}.count"
     count=0
     [[ -f "$count_file" ]] && count="$(cat "$count_file")"
     count="$((count + 1))"
     printf '%s\\n' "$count" >"$count_file"
+    printf '%s\\n' "\${CRABBOX_AWS_REGION:-eu-west-1}" >"\${CRABBOX_FAKE_LOG}.region"
+    if [[ "$count" == "\${CRABBOX_FAKE_ROUTED_WARMUP:-1}" ]]; then
+      CRABBOX_AWS_REGION="\${CRABBOX_FAKE_IMAGE_REGION-\${CRABBOX_AWS_REGION:-eu-west-1}}"
+    fi
     case "$count" in
-      1) printf '{"leaseId":"cbx_source"}\\n' ;;
-      2) printf '{"leaseId":"cbx_candidate"}\\n' ;;
-      *) printf '{"leaseId":"cbx_promoted"}\\n' ;;
+      1)
+        if [[ "\${CRABBOX_AWS_STOCK_IMAGE:-0}" == 1 && "\${CRABBOX_FAKE_STOCK_SOURCE_IGNORED:-0}" != 1 ]]; then
+          printf 'image selected id=ami-stock source=stock kind=aws-ami region=%s\\n' "\${CRABBOX_AWS_REGION-eu-west-1}"
+        else
+          printf 'image selected id=ami-previous source=promoted kind=aws-ami region=%s promoted_at=2026-09-01T00:00:00Z\\n' "\${CRABBOX_AWS_REGION-eu-west-1}"
+        fi
+        printf '{"leaseId":"cbx_source"}\\n'
+        ;;
+      2)
+        printf 'image selected id=%s source=explicit kind=aws-ami region=%s promoted_at=-\\n' "\${CRABBOX_AWS_AMI:-}" "\${CRABBOX_AWS_REGION:-eu-west-1}"
+        printf '{"leaseId":"cbx_candidate"}\\n'
+        ;;
+      *)
+        printf 'image selected id=ami-devtools source=promoted kind=aws-ami region=%s promoted_at=2026-07-31T00:00:00Z\\n' "\${CRABBOX_AWS_REGION:-eu-west-1}"
+        printf '{"leaseId":"cbx_promoted"}\\n'
+        ;;
     esac
-    if [[ "\${CRABBOX_FAKE_WARMUP_FAIL_AFTER_LEASE:-0}" == "1" ]]; then
+    if [[ "\${CRABBOX_FAKE_WARMUP_FAIL_AFTER_LEASE:-0}" == "1" || "$count" == "\${CRABBOX_FAKE_WARMUP_FAIL_NUMBER:-0}" ]]; then
       exit 23
     fi
     ;;
+  admin)
+    count="$(cat "\${CRABBOX_FAKE_LOG}.count")"
+    observed_region="$(cat "\${CRABBOX_FAKE_LOG}.region")"
+    lease=cbx_source
+    [[ "$count" != 2 ]] || lease=cbx_candidate
+    [[ "$count" != 3 ]] || lease=cbx_promoted
+    printf '[{"id":"%s","provider":"aws","target":"linux","region":"%s","serverType":"m7i.large","cloudID":"i-fixture","image":{"id":"ami-fixture","source":"stock","kind":"aws-ami","region":"%s"}}]\\n' "$lease" "\${CRABBOX_FAKE_LEASE_REGION-$observed_region}" "$observed_region"
+    ;;
   run)
+    run_script="\${@: -1}"
+    if [[ " $* " == *" --script-stdin "* ]]; then
+      run_script="$(cat)"
+      printf 'stdin script %s\\n' "$run_script" >>"\${CRABBOX_FAKE_LOG}"
+    fi
+    if [[ " $* " == *" --allow-env CRABBOX_LINUX_NODE_MAJOR,CRABBOX_LINUX_PNPM_VERSION "* ]]; then
+      printf 'builder overrides node=%s pnpm=%s\\n' "\${CRABBOX_LINUX_NODE_MAJOR:-}" "\${CRABBOX_LINUX_PNPM_VERSION:-}" >>"\${CRABBOX_FAKE_LOG}"
+      [[ "\${CRABBOX_FAKE_PREP_EXIT:-0}" == "0" ]] || exit "$CRABBOX_FAKE_PREP_EXIT"
+    fi
+    capture=""
+    lease=""
+    previous=""
+    for arg in "$@"; do
+      [[ "$previous" != "--capture-stdout" ]] || capture="$arg"
+      [[ "$previous" != "--id" ]] || lease="$arg"
+      previous="$arg"
+    done
+    if [[ -n "$capture" ]]; then
+      if [[ -n "\${CRABBOX_FAKE_PNPM_RUNNER:-}" ]]; then
+        "$CRABBOX_FAKE_PNPM_RUNNER" "$lease" "\${@: -1}" >"$capture" || exit $?
+      else
+        printf '%s\\n' "\${CRABBOX_FAKE_RESOLVED_PNPM:-11.1.0}" >"$capture"
+      fi
+      if [[ -n "\${CRABBOX_FAKE_CAPTURE_BASE64+x}" ]]; then
+        node -e 'require("node:fs").writeFileSync(process.argv[1], Buffer.from(process.argv[2], "base64"))' "$capture" "$CRABBOX_FAKE_CAPTURE_BASE64"
+      fi
+      exit "\${CRABBOX_FAKE_CAPTURE_EXIT:-0}"
+    fi
+    if [[ -n "\${CRABBOX_FAKE_PNPM_RUNNER:-}" && "$run_script" == *"docker_probe="* ]]; then
+      "$CRABBOX_FAKE_PNPM_RUNNER" "$lease" "$run_script" || exit $?
+      exit 0
+    fi
+    if [[ -n "\${CRABBOX_FAKE_SMOKE_FAIL_LEASE:-}" && " $* " == *" --id \${CRABBOX_FAKE_SMOKE_FAIL_LEASE} "* && "$run_script" == *"docker_probe="* ]]; then
+      printf 'offline artifact smoke failed\\n' >&2
+      exit 73
+    fi
+    if [[ "\${CRABBOX_FAKE_READINESS_FAIL:-0}" == "1" && "$*" == *"linux-readiness.generated.sh"* && "$*" != *"-- --install"* ]]; then
+      printf 'Linux readiness producer: minimal capability proof failed\\n' >&2
+      exit 74
+    fi
+    if [[ -n "\${CRABBOX_FAKE_READINESS_FAIL_LEASE:-}" && "$*" == *"--id \${CRABBOX_FAKE_READINESS_FAIL_LEASE} "* && "$*" == *"-- --verify linux-builder"* ]]; then
+      printf 'Linux readiness verification: linux-builder manifest required\\n' >&2
+      exit 74
+    fi
     if [[ -n "\${CRABBOX_FAKE_CAPTURE_RUN_SCRIPT:-}" ]]; then
-      last_arg="\${@: -1}"
+      last_arg="$run_script"
       if [[ "$last_arg" == *"docker_probe="* ]]; then
         printf '%s\\n' "$last_arg" >"\${CRABBOX_FAKE_CAPTURE_RUN_SCRIPT}"
       fi
+    fi
+    if [[ -n "\${CRABBOX_FAKE_NODE_CHECK_RUNNER:-}" && "$run_script" == *"docker_probe="* ]]; then
+      lease=""
+      previous=""
+      for arg in "$@"; do
+        if [[ "$previous" == "--id" ]]; then lease="$arg"; break; fi
+        previous="$arg"
+      done
+      "\${CRABBOX_FAKE_NODE_CHECK_RUNNER}" "$lease" "$run_script" || exit $?
     fi
     if [[ "$*" == *"Test-Path 'C:\\ProgramData\\crabbox\\image-prep-reboot-required'"* ]]; then
       if [[ "\${CRABBOX_FAKE_WINDOWS_REBOOT:-0}" == "1" && ! -f "\${CRABBOX_FAKE_LOG}.rebooted" ]]; then
@@ -58,6 +244,10 @@ case "$1" in
     if [[ "$*" == *"shutdown /r"* ]]; then
       touch "\${CRABBOX_FAKE_LOG}.rebooted"
       printf 'reboot scheduled\\n'
+      if [[ "\${CRABBOX_FAKE_REBOOT_OWNER_RACE:-0}" == 1 ]]; then
+        printf 'warning: workspace owner release failed: ambiguous remote state: ssh: port 2222: Connection refused\\n' >&2
+        exit 7
+      fi
       exit 0
     fi
     if [[ "$*" == *"FromBase64String"* && "\${CRABBOX_FAKE_WINDOWS_PREP_DISCONNECT:-0}" == "1" && ! -f "\${CRABBOX_FAKE_LOG}.prep-disconnected" ]]; then
@@ -70,19 +260,51 @@ case "$1" in
       exit 0
     fi
     if [[ "$*" == *"image-prep.done"* ]]; then
+      if [[ "\${CRABBOX_FAKE_WINDOWS_PREP_FAIL:-0}" == "1" ]]; then
+        printf 'crabbox-prep-failed\\nexit code: -1 (0xFFFFFFFF)\\n'
+        exit 0
+      fi
       printf 'crabbox-prep-done\\n0\\n'
       exit 0
     fi
     printf 'devtools-smoke-ok\\n'
     ;;
-  image)
+  checkpoint)
     if [[ "$2" == "create" ]]; then
-      printf '{"id":"ami-devtools"}\\n'
-    elif [[ "$2" == "promote" ]]; then
-      printf '{"image":{"id":"ami-devtools"}}\\n'
+      printf 'checkpoint created id=chk_devtools kind=aws-ami resource=ami-devtools state=available region=%s workdir=-\\n' "\${CRABBOX_FAKE_CAPTURE_REGION-\${CRABBOX_AWS_REGION:-eu-west-1}}"
+    elif [[ "$2" == "delete" ]]; then
+      exit "\${CRABBOX_FAKE_DELETE_EXIT:-0}"
+    fi
+    ;;
+  image)
+    if [[ "$2" == "promote" ]]; then
+      if [[ " $* " == *" --expected-current-image capture "* ]]; then
+        if [[ "\${CRABBOX_FAKE_PROMOTION_FAIL:-0}" == "1" ]]; then
+          printf 'transactional promotion unavailable\\n' >&2
+          exit 55
+        fi
+        if [[ "\${CRABBOX_FAKE_PREVIOUS_ABSENT:-0}" == "1" ]]; then
+          printf '{"image":{"id":"ami-devtools","region":"us-west-2","revision":"rev-new"},"previous":{"state":"absent","aliases":[{"alias":"regional","state":"absent"}]}}\\n'
+        else
+          printf '{"image":{"id":"ami-devtools","region":"us-west-2","revision":"rev-new"},"previous":{"state":"present","imageId":"%s","revision":"rev-old","aliases":[{"alias":"regional","state":"present","image":{"id":"%s","region":"us-west-2","name":"previous","state":"available","provider":"aws","promotedAt":"2026-09-01T00:00:00Z","revision":"rev-old"}}]}}\\n' "\${CRABBOX_FAKE_PREVIOUS_IMAGE:-ami-previous}" "\${CRABBOX_FAKE_PREVIOUS_IMAGE:-ami-previous}"
+        fi
+      elif [[ "\${CRABBOX_FAKE_ROLLBACK_FAIL:-0}" == "1" ]]; then
+        printf 'coordinator: http 409: image default changed\\n' >&2
+        exit 19
+      else
+        printf '{"image":{"id":"ami-previous","revision":"rev-restored"},"previous":{"state":"present","imageId":"ami-devtools","revision":"rev-new"}}\\n'
+      fi
     fi
     ;;
   stop)
+    if [[ "\${CRABBOX_FAKE_STOP_PENDING:-0}" == "1" ]]; then
+      printf 'coordinator accepted release for %s, but remote cleanup observation was canceled; local claim and SSH artifacts were preserved; context deadline exceeded\\n' "\${*: -1}" >&2
+      exit 5
+    fi
+    if [[ "\${CRABBOX_FAKE_STOP_FAIL_LEASE:-}" == "\${*: -1}" ]]; then
+      printf 'stop failed for %s\\n' "\${*: -1}" >&2
+      exit 27
+    fi
     printf 'stopped %s\\n' "\${*: -1}"
     ;;
   status)
@@ -92,13 +314,13 @@ esac
 `,
   );
   await chmod(fake, 0o755);
-  return { dir, fake, log, linuxPrep, windowsPrep };
+  return { dir, fake, log, linuxPrep, windowsPrep, bin };
 }
 
-function runScript(args, env) {
+function runScript(args, env, scriptPath = script, onOutput) {
   return new Promise((resolve, reject) => {
-    const child = spawn("bash", [script, ...args], {
-      cwd: repoRoot,
+    const child = spawn("bash", [scriptPath, ...args], {
+      cwd: path.resolve(path.dirname(scriptPath), ".."),
       env: { ...process.env, ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -108,6 +330,7 @@ function runScript(args, env) {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
+      onOutput?.(chunk, child);
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
@@ -116,6 +339,299 @@ function runScript(args, env) {
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
+
+test("Windows failure cleanup preserves the prep failure and reports accepted but unconfirmed release", async (t) => {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const result = await runScript(["--target", "windows", "--run", "--prep-script", fake.windowsPrep], {
+    CRABBOX_BIN: fake.fake, CRABBOX_FAKE_LOG: fake.log, CRABBOX_IMAGE_LOG_DIR: fake.dir,
+    CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0", CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS: "0",
+    CRABBOX_FAKE_WINDOWS_PREP_FAIL: "1", CRABBOX_FAKE_STOP_PENDING: "1",
+  });
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stderr, /Windows failure cleanup: release accepted for cbx_source; cleanup remains unconfirmed/);
+  assert.match(result.stderr, /preserving original mint failure/);
+  assert.match(result.stderr, /crabbox status --provider aws --id cbx_source --json/);
+  assert.match(result.stderr, /crabbox stop --provider aws --target windows cbx_source/);
+  const log = await readFile(fake.log, "utf8");
+  assert.equal((log.match(/args stop /g) ?? []).length, 1);
+  assert.doesNotMatch(log, /checkpoint create|image promote/);
+  const handles = (await readdir(fake.dir)).filter((name) => name.startsWith(".image-mint-"));
+  assert.equal(handles.length, 1);
+  assert.equal(await readFile(path.join(fake.dir, handles[0], "source.lease"), "utf8"), "cbx_source\n");
+});
+
+test("Windows mint cannot pass with unconfirmed release after successful prep", async (t) => {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const result = await runScript(["--target", "windows", "--run", "--prep-script", fake.windowsPrep], {
+    CRABBOX_BIN: fake.fake, CRABBOX_FAKE_LOG: fake.log, CRABBOX_IMAGE_LOG_DIR: fake.dir,
+    CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0", CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS: "0",
+    CRABBOX_FAKE_STOP_PENDING: "1",
+  });
+  assert.equal(result.code, 5, result.stderr);
+  assert.doesNotMatch(await readFile(fake.log, "utf8"), /image promote/);
+});
+
+async function runtimePnpmFixture(t, options = {}) {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const bin = path.join(fake.dir, "bin");
+  await mkdir(bin);
+  const writeTool = async (name, body) => {
+    const file = path.join(bin, name);
+    await writeFile(file, `#!/usr/bin/env bash\nset -euo pipefail\n${body}\n`);
+    await chmod(file, 0o755);
+  };
+  for (const tool of ["git", "gh", "jq", "rg", "fd", "npm", "trufflehog", "docker"]) {
+    await writeTool(tool, "exit 0");
+  }
+  await writeTool("id", 'printf "1000\\n"');
+  await writeNodeVersionFixture(bin);
+  await writeTool(
+    "corepack",
+    `
+case "$*" in
+  --version) printf '0.35.0\\n' ;;
+  prepare*)
+    printf '%s\\n' "$2" >"$HOME/prepare-request"
+    [[ "$#" == "3" && "$3" == "--activate" ]] || exit 90
+    [[ "\${FIXTURE_ACTIVATION_EXIT:-0}" == "0" ]] || exit "$FIXTURE_ACTIVATION_EXIT"
+    printf '%s\\n' "$FIXTURE_RESOLVED_PNPM" >"$HOME/default"
+    printf 'Preparing package manager for immediate activation...\\n'
+    ;;
+  'pnpm --version')
+    [[ "\${COREPACK_ENABLE_NETWORK:-}" == "0" && "$PWD" == "/" ]] || exit 91
+    [[ "\${FIXTURE_COREPACK_EXIT:-0}" == "0" ]] || exit "$FIXTURE_COREPACK_EXIT"
+    cat "$HOME/default"
+    ;;
+  *) exit 92 ;;
+esac`,
+  );
+  await writeTool(
+    "pnpm",
+    `
+[[ "$*" == "--version" ]] || exit 93
+[[ "\${COREPACK_ENABLE_NETWORK:-}" == "0" && "$PWD" == "/" ]] || exit 94
+[[ "\${FIXTURE_PNPM_EXIT:-0}" == "0" ]] || exit "$FIXTURE_PNPM_EXIT"
+if [[ -n "\${FIXTURE_ACTUAL_PNPM:-}" ]]; then
+  printf '%s\\n' "$FIXTURE_ACTUAL_PNPM"
+else
+  cat "$HOME/default"
+fi`,
+  );
+  const runner = path.join(fake.dir, "runtime.cjs");
+  await writeFile(
+    runner,
+    `#!${process.execPath}
+const {spawnSync} = require("node:child_process");
+const [lease, source] = process.argv.slice(2);
+const actual = JSON.parse(process.env.FIXTURE_PNPM_VERSIONS)[lease] || "";
+// Keep the real generated tool checks; unrelated machine/artifact checks have separate proof.
+const boundary = source.indexOf("\\nsmoke_dir=");
+const command = boundary < 0 ? source : source.slice(0, boundary);
+const result = spawnSync("bash", ["-c", command], {
+  cwd: ${JSON.stringify(fake.dir)},
+  env: {...process.env, PATH: ${JSON.stringify(bin)} + ":" + process.env.PATH,
+    HOME: ${JSON.stringify(fake.dir)}, FIXTURE_ACTUAL_PNPM: actual},
+  stdio: "inherit",
+});
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+`,
+  );
+  await chmod(runner, 0o755);
+  const args = ["--target", "linux", "--run"];
+  if (options.customPrep) args.push("--prep-script", fake.linuxPrep);
+  const result = await runScript(args, {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+    CRABBOX_FAKE_PNPM_RUNNER: runner,
+    CRABBOX_LINUX_PNPM_VERSION: options.selector ?? "11.1.0",
+    FIXTURE_RESOLVED_PNPM: options.resolved ?? "11.1.0",
+    FIXTURE_PNPM_VERSIONS: JSON.stringify(options.versions ?? {}),
+    ...options.env,
+  });
+  return { fake, result, log: await readFile(fake.log, "utf8") };
+}
+
+for (const selector of [
+  "11.1.0",
+  "latest",
+  "^11.0.0",
+  "11.1.0+sha512.deadbeef",
+  '11.1.0; touch "$HOME/injected"',
+]) {
+  test(`runtime-user pnpm freezes the resolved default for selector ${selector}`, async (t) => {
+    const { fake, result, log } = await runtimePnpmFixture(t, { selector });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(
+      await readFile(path.join(fake.dir, "prepare-request"), "utf8"),
+      `pnpm@${selector}\n`,
+    );
+    assert.equal((log.match(/--capture-stdout /g) ?? []).length, 1);
+    assert.match(result.stdout, /promoted linux developer image passed/);
+    await assert.rejects(readFile(path.join(fake.dir, "injected")), { code: "ENOENT" });
+  });
+}
+
+for (const lease of ["cbx_candidate", "cbx_promoted"]) {
+  test(`runtime-user pnpm rejects version drift on ${lease}`, async (t) => {
+    const { result, log } = await runtimePnpmFixture(t, { versions: { [lease]: "11.22.0" } });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /pnpm default mismatch/);
+    assert.match(log, new RegExp(`stop --provider aws --target linux ${lease}`));
+    assert.doesNotMatch(result.stdout, /promoted linux developer image passed/);
+    if (lease === "cbx_candidate") assert.doesNotMatch(log, /image promote/);
+    else assert.match(log, /--restore-receipt/);
+  });
+}
+
+for (const [name, env, status, activated] of [
+  ["privileged prep", { CRABBOX_FAKE_PREP_EXIT: "43" }, 43, false],
+  ["user activation", { FIXTURE_ACTIVATION_EXIT: "44" }, 44, true],
+  ["ordinary pnpm", { FIXTURE_PNPM_EXIT: "45" }, 45, true],
+  ["Corepack pnpm", { FIXTURE_COREPACK_EXIT: "46" }, 46, true],
+  ["capture transport", { CRABBOX_FAKE_CAPTURE_EXIT: "47" }, 47, true],
+]) {
+  test(`runtime-user pnpm preserves ${name} failure and stops before image capture`, async (t) => {
+    const { fake, result, log } = await runtimePnpmFixture(t, { env });
+    assert.equal(result.code, status, result.stderr);
+    assert.doesNotMatch(log, /checkpoint create|docker_probe=|image promote/);
+    assert.match(log, /stop --provider aws --target linux cbx_source/);
+    if (activated) await readFile(path.join(fake.dir, "prepare-request"));
+    else await assert.rejects(readFile(path.join(fake.dir, "prepare-request")), { code: "ENOENT" });
+  });
+}
+
+for (const [name, bytes] of [
+  ["empty", ""],
+  ["blank", "\n"],
+  ["extra line", "11.1.0\nextra\n"],
+  ["oversized", `${"1".repeat(129)}\n`],
+  ["missing newline", "11.1.0"],
+  ["control byte", "11.\0.0\n"],
+]) {
+  test(`runtime-user pnpm refuses ${name} version capture`, async (t) => {
+    const { result, log } = await runtimePnpmFixture(t, {
+      env: { CRABBOX_FAKE_CAPTURE_BASE64: Buffer.from(bytes).toString("base64") },
+    });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /invalid runtime-user pnpm version/);
+    assert.doesNotMatch(log, /checkpoint create|docker_probe=|image promote/);
+    assert.match(log, /stop --provider aws --target linux cbx_source/);
+  });
+}
+
+test("runtime-user pnpm rejects a shadowing ordinary command before image capture", async (t) => {
+  const { result, log } = await runtimePnpmFixture(t, { versions: { cbx_source: "12.3.4" } });
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /pnpm.*does not match Corepack/);
+  assert.doesNotMatch(log, /checkpoint create|docker_probe=|image promote/);
+  assert.match(log, /stop --provider aws --target linux cbx_source/);
+});
+
+async function qualificationFixture(t, { providerImageIDs = false } = {}) {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  if (providerImageIDs) {
+    const cli = await readFile(fake.fake, "utf8");
+    await writeFile(
+      fake.fake,
+      cli.replaceAll("ami-devtools", "ami-11111111").replaceAll("ami-previous", "ami-22222222"),
+    );
+  }
+  const workflow = await readFile(
+    path.join(repoRoot, ".github/workflows/image-qualification.yml"),
+    "utf8",
+  );
+  const copyCommand = workflow.match(
+    /^          cp candidate\/scripts\/mint-aws-devtools-image\.sh \\\n(?:            .*\n)+/m,
+  )?.[0];
+  assert.ok(copyCommand, "qualification workflow publisher copy command is missing");
+  const artifact = path.join(fake.dir, "artifact");
+  await mkdir(path.join(artifact, "candidate/scripts"), { recursive: true });
+  await symlink(repoRoot, path.join(fake.dir, "candidate"));
+  execFileSync("bash", ["-euc", copyCommand], {
+    cwd: fake.dir,
+    env: { ...process.env, ARTIFACT: artifact },
+  });
+  return {
+    ...fake,
+    script: path.join(artifact, "candidate/scripts/mint-aws-devtools-image.sh"),
+    env: {
+      CRABBOX_BIN: fake.fake,
+      CRABBOX_FAKE_LOG: fake.log,
+      CRABBOX_IMAGE_LOG_DIR: fake.dir,
+      CRABBOX_OS: undefined,
+      CRABBOX_AWS_AMI: undefined,
+    },
+  };
+}
+
+test("qualification bundle runs the bundled installer and all three Linux smokes", async (t) => {
+  const fake = await qualificationFixture(t);
+  const result = await runScript(["--target", "linux", "--run"], fake.env, fake.script);
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /stop --provider aws --target linux cbx_source/);
+  if (result.code !== 0) {
+    assert.doesNotMatch(log, /checkpoint create|image promote/);
+  }
+  assert.equal(result.code, 0, result.stderr);
+  assert.ok(log.includes(`--script ${path.dirname(fake.script)}/install-linux-developer-tools.sh`));
+  assert.equal((log.match(/docker_probe=/g) ?? []).length, 3);
+  for (const lease of ["cbx_source", "cbx_candidate", "cbx_promoted"]) {
+    assert.match(log, new RegExp(`run .*--id ${lease} --no-sync --script-stdin\\n`));
+    assert.match(log, new RegExp(`stop --provider aws --target linux ${lease}`));
+  }
+  assert.match(log, /checkpoint create/);
+  assert.match(log, /--expected-current-image capture/);
+  assert.doesNotMatch(log, /--restore-receipt/);
+});
+
+test("qualification bundle preserves the protected promoted-smoke failure and receipt rollback", async (t) => {
+  const fake = await qualificationFixture(t, { providerImageIDs: true });
+  const state = path.join(fake.dir, "adapter");
+  const result = await runScript(
+    ["--target", "linux", "--run"],
+    {
+      ...fake.env,
+      CRABBOX_BIN: path.join(scriptDir, "image-qualification-crabbox-adapter.sh"),
+      QUALIFICATION_REAL_CRABBOX: fake.fake,
+      QUALIFICATION_ADAPTER_STATE: state,
+    },
+    fake.script,
+  );
+  assert.equal(result.code, 86, result.stderr);
+  assert.equal(await readFile(path.join(state, "injected"), "utf8"), "after-promoted-smoke\n");
+  const promotion = JSON.parse(await readFile(path.join(state, "promotion-receipt.json"), "utf8"));
+  const rollback = JSON.parse(await readFile(path.join(state, "rollback-receipt.json"), "utf8"));
+  assert.equal(promotion.previous.imageId, rollback.image.id);
+  const log = await readFile(fake.log, "utf8");
+  assert.equal((log.match(/docker_probe=/g) ?? []).length, 3);
+  assert.match(log, /--restore-receipt \S+ ami-11111111/);
+  for (const lease of ["cbx_source", "cbx_candidate", "cbx_promoted"]) {
+    assert.match(log, new RegExp(`stop --provider aws --target linux ${lease}`));
+  }
+});
+
+test("qualification bundle rolls back when promoted lease cleanup fails after successful smoke", async (t) => {
+  const fake = await qualificationFixture(t);
+  const result = await runScript(
+    ["--target", "linux", "--run"],
+    { ...fake.env, CRABBOX_FAKE_STOP_FAIL_LEASE: "cbx_promoted" },
+    fake.script,
+  );
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stderr, /stop failed for cbx_promoted/);
+  assert.match(result.stderr, /restored previous default image=ami-previous/);
+  const log = await readFile(fake.log, "utf8");
+  assert.equal((log.match(/docker_probe=/g) ?? []).length, 3);
+  const stop = log.indexOf("stop --provider aws --target linux cbx_promoted");
+  const restore = log.indexOf("--restore-receipt");
+  assert.ok(stop !== -1 && restore > stop, "cleanup failure must trigger receipt rollback");
+});
 
 test("AWS devtools mint wrapper defaults to dry plan", async () => {
   const fake = await setupFakeCrabbox();
@@ -126,6 +642,35 @@ test("AWS devtools mint wrapper defaults to dry plan", async () => {
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /dry plan only/);
   await assert.rejects(readFile(fake.log, "utf8"));
+});
+
+test("AWS developer image smoke executes package managers and requires TruffleHog", async () => {
+  const text = await readFile(script, "utf8");
+  const windowsSmoke = await readFile(
+    path.join(scriptDir, "devtools-image-smoke-windows.ps1"),
+    "utf8",
+  );
+  assert.match(windowsSmoke, /pnpm --version\ntrufflehog --no-update --version\ndocker --version/);
+  assert.match(
+    windowsSmoke,
+    /docker image inspect .*\nif \(\$LASTEXITCODE -ne 0\).*throw.*\nWrite-Output "devtools-smoke-ok"\n$/,
+  );
+  assert.match(text, /trap 'exit 130' INT\ntrap 'exit 143' TERM/);
+  assert.match(text, /rollback_pending=1\nrun_json_tee "\$promotion_log"/);
+  assert.doesNotMatch(text, /\bBASHPID\b/);
+});
+
+test("AWS Linux image capture refuses a failed minimal readiness proof", async () => {
+  const fake = await setupFakeCrabbox();
+  const result = await runScript(
+    ["--target", "linux", "--run", "--no-promote", "--prep-script", fake.linuxPrep],
+    { CRABBOX_BIN: fake.fake, CRABBOX_FAKE_LOG: fake.log, CRABBOX_FAKE_READINESS_FAIL: "1" },
+  );
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /minimal capability proof failed/);
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /linux-readiness\.generated\.sh -- --install/);
+  assert.doesNotMatch(log, /checkpoint create/);
 });
 
 test("AWS devtools mint wrapper runs linux source candidate and promoted proof", async () => {
@@ -142,8 +687,6 @@ test("AWS devtools mint wrapper runs linux source candidate and promoted proof",
       "--fast-snapshot-restore",
       "--fsr-az",
       "us-west-2a",
-      "--prep-script",
-      fake.linuxPrep,
     ],
     {
       CRABBOX_BIN: fake.fake,
@@ -155,35 +698,541 @@ test("AWS devtools mint wrapper runs linux source candidate and promoted proof",
   );
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /candidate AMI smoke passed: ami-devtools/);
+  assert.match(result.stdout, /promoted image selection proved: ami-devtools/);
   assert.match(result.stdout, /promoted linux developer image passed: ami-devtools/);
   const log = await readFile(fake.log, "utf8");
-  assert.match(log, /env CRABBOX_AWS_REGION=us-west-2 AWS_REGION=us-west-2 CRABBOX_AWS_AMI= args warmup --provider aws --target linux/);
-  assert.match(log, /env CRABBOX_AWS_REGION=us-west-2 AWS_REGION=us-west-2 CRABBOX_AWS_AMI=ami-devtools args warmup --provider aws --target linux/);
+  assert.match(
+    log,
+    /env CRABBOX_AWS_REGION=us-west-2 AWS_REGION=us-west-2 CRABBOX_AWS_AMI= args warmup --provider aws --target linux/,
+  );
+  assert.match(
+    log,
+    /env CRABBOX_AWS_REGION=us-west-2 AWS_REGION=us-west-2 CRABBOX_AWS_AMI=ami-devtools args warmup --provider aws --target linux/,
+  );
   assert.match(log, /--class standard/);
   assert.match(log, /--browser/);
   assert.doesNotMatch(log, /warmup .*--region us-west-2/);
   assert.match(log, /run --provider aws --target linux --id cbx_source --no-sync --script/);
+  assert.match(log, /linux-readiness\.generated\.sh -- --install/);
+  assert.equal((log.match(/linux-readiness\.generated\.sh/g) ?? []).length, 4);
+  assert.match(
+    log,
+    /run --provider aws --target linux --id cbx_source --no-sync --script .*linux-readiness\.generated\.sh -- --verify linux-builder/,
+  );
+  assert.match(log, /run --provider aws --target linux --id cbx_source --no-sync --script-stdin\n/);
+  assert.equal((log.match(/corepack --version/g) ?? []).length, 3);
+  assert.equal(
+    (log.match(/\n  offline_node_pnpm_probe\nfi\npublic_toolchain_archive_dir=/g) ?? []).length,
+    3,
+  );
+  assert.equal(
+    (log.match(/\n  offline_go_probe\nfi\npublic_toolchain_archive_dir=/g) ?? []).length,
+    3,
+  );
+  for (const probe of ["bun", "rust"]) {
+    assert.equal(
+      (
+        log.match(
+          new RegExp(`\\n  offline_${probe}_probe\\nfi\\npublic_toolchain_archive_dir=`, "g"),
+        ) ?? []
+      ).length,
+      3,
+    );
+  }
+  assert.equal((log.match(/\n  offline_uv_probe\nfi\n}/g) ?? []).length, 3);
+  assert.equal((log.match(/\ndeveloper_archive_probe\necho devtools-smoke-ok/g) ?? []).length, 3);
   assert.match(log, /docker image inspect hello-world ubuntu:24\.04 node:24-bookworm/);
-  assert.match(log, /image create --id cbx_source --name crabbox-linux-devtools-/);
-  assert.match(log, /image promote --target linux --json --region us-west-2 --fast-snapshot-restore --fsr-az us-west-2a ami-devtools/);
+  assert.match(
+    log,
+    /env CRABBOX_AWS_REGION=us-west-2 AWS_REGION=us-west-2 CRABBOX_AWS_AMI= args checkpoint create --provider aws --target linux --id cbx_source --name crabbox-linux-devtools-/,
+  );
+  assert.match(log, /--mode native --strategy image --no-reboot=false --wait --wait-timeout 60m/);
+  assert.match(
+    log,
+    /image promote --target linux --json --expected-current-image capture --region us-west-2 --fast-snapshot-restore --fsr-az us-west-2a ami-devtools/,
+  );
+});
+
+for (const [target, osImage] of [
+  ["linux", undefined],
+  ["linux", "ubuntu:26.04"],
+  ["linux", "ubuntu:24.04"],
+  ["windows", "ubuntu:24.04"],
+]) {
+  for (const failPromotedSmoke of target === "linux" ? [false, true] : [false]) {
+    test(`AWS ${target} OS ${osImage ?? "unset"} survives ${failPromotedSmoke ? "receipt rollback" : "promotion"}`, async (t) => {
+      const fake = await setupFakeCrabbox();
+      t.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const result = await runScript(
+        [
+          "--target",
+          target,
+          "--region",
+          "us-west-2",
+          "--run",
+          "--prep-script",
+          target === "linux" ? fake.linuxPrep : fake.windowsPrep,
+        ],
+        {
+          CRABBOX_BIN: fake.fake,
+          CRABBOX_FAKE_LOG: fake.log,
+          CRABBOX_IMAGE_LOG_DIR: fake.dir,
+          CRABBOX_OS: osImage,
+          CRABBOX_AWS_AMI: undefined,
+          CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
+          CRABBOX_FAKE_SMOKE_FAIL_LEASE: failPromotedSmoke ? "cbx_promoted" : "",
+        },
+      );
+      assert.equal(result.code, failPromotedSmoke ? 73 : 0, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      assert.doesNotMatch(log, /--capture-stdout/);
+      assert.deepEqual(
+        log.split("\n").filter((line) => /^selection .* command=warmup$/.test(line)),
+        ["unset", "ami-devtools", "unset"].map(
+          (ami) => `selection os=${osImage ?? "unset"} ami=${ami} command=warmup`,
+        ),
+      );
+      const promotions = log.split("\n").filter((line) => line.includes("args image promote "));
+      assert.equal(promotions.length, failPromotedSmoke ? 2 : 1);
+      for (const line of promotions) {
+        assert.equal(line.match(/--os (\S+)/)?.[1], target === "linux" ? osImage : undefined);
+      }
+      assert.match(promotions[0], /--expected-current-image capture/);
+      for (const lease of ["cbx_source", "cbx_candidate", "cbx_promoted"]) {
+        assert.match(log, new RegExp(`stop --provider aws --target ${target} ${lease}`));
+      }
+      if (failPromotedSmoke) {
+        assert.match(promotions[1], /--restore-receipt \S+ ami-devtools$/);
+        assert.match(result.stderr, /restored previous default image=ami-previous/);
+        assert.doesNotMatch(result.stdout, /promoted linux developer image passed/);
+      } else {
+        assert.match(result.stdout, /promoted image selection proved: ami-devtools/);
+      }
+    });
+  }
+}
+
+for (const lease of ["cbx_source", "cbx_candidate", "cbx_promoted"]) {
+  test(`AWS image mint stops at failed offline smoke on ${lease}`, async (t) => {
+    const fake = await setupFakeCrabbox();
+    t.after(() => rm(fake.dir, { recursive: true, force: true }));
+    const result = await runScript(["--target", "linux", "--run"], {
+      CRABBOX_BIN: fake.fake,
+      CRABBOX_FAKE_LOG: fake.log,
+      CRABBOX_FAKE_SMOKE_FAIL_LEASE: lease,
+    });
+    assert.equal(result.code, 73, result.stderr);
+    assert.match(result.stderr, /offline artifact smoke failed/);
+    assert.doesNotMatch(result.stdout, /promoted linux developer image passed/);
+    const log = await readFile(fake.log, "utf8");
+    assert.match(log, new RegExp(`stop --provider aws --target linux ${lease}`));
+    if (lease === "cbx_source") assert.doesNotMatch(log, /checkpoint create/);
+    if (lease !== "cbx_promoted") {
+      assert.doesNotMatch(log, /image promote/);
+    } else {
+      assert.match(log, /image promote --json --target linux --restore-receipt \S+ ami-devtools/);
+      assert.match(result.stderr, /restored previous default image=ami-previous/);
+    }
+  });
+}
+
+async function writeNodeVersionFixture(bin) {
+  const file = path.join(bin, "node");
+  await writeFile(
+    file,
+    `#!${process.execPath}
+const vm = require("node:vm");
+const args = process.argv.slice(2);
+const version = process.env.FIXTURE_NODE_VERSION || "24.0.0";
+if (args[0] === "--version") {
+  console.log("v" + version);
+} else {
+  if (args[0] !== "-e") throw new Error("unexpected Node fixture invocation");
+  const argv = args.slice(args[2] === "--" ? 3 : 2);
+  vm.runInNewContext(args[1], {
+    process: { version: "v" + version, versions: { node: version },
+      argv: [process.execPath, ...argv], env: process.env },
+    console,
+  });
+}
+`,
+  );
+  await chmod(file, 0o755);
+}
+
+async function runNodeMajorMint(
+  t,
+  { major = "24", actual = "24.0.0", versions = {}, customPrep = false, ambient = "99" } = {},
+) {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const bin = path.join(fake.dir, "bin");
+  await mkdir(bin);
+  await writeNodeVersionFixture(bin);
+  const runner = path.join(fake.dir, "node-check.cjs");
+  await writeFile(
+    runner,
+    `#!${process.execPath}
+const { spawnSync } = require("node:child_process");
+const [lease, source] = process.argv.slice(2);
+const checks = source.split("\\n").filter(line => line.startsWith("node -e "));
+if (checks.length !== 1) throw new Error("expected one generated Node version check");
+const selections = source.split("\\n").filter(line => line.startsWith("expected_node_major="));
+if (selections.length !== 1) throw new Error("expected one frozen Node selection");
+const versions = JSON.parse(process.env.FIXTURE_NODE_VERSIONS);
+const result = spawnSync("bash", ["-c", selections[0] + "\\n" + checks[0]], {
+  env: {
+    PATH: ${JSON.stringify(bin)} + ":" + process.env.PATH,
+    HOME: ${JSON.stringify(fake.dir)},
+    FIXTURE_NODE_VERSION: versions[lease] || process.env.FIXTURE_NODE_VERSION,
+    CRABBOX_LINUX_NODE_MAJOR: process.env.FIXTURE_GUEST_NODE_MAJOR,
+  },
+  stdio: "inherit",
+});
+if (result.error) throw result.error;
+if (result.status === 0) console.log("node-major-checked " + lease);
+process.exit(result.status ?? 1);
+`,
+  );
+  await chmod(runner, 0o755);
+  const args = ["--target", "linux", "--run"];
+  if (customPrep) args.push("--prep-script", fake.linuxPrep);
+  const result = await runScript(args, {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+    CRABBOX_FAKE_NODE_CHECK_RUNNER: runner,
+    CRABBOX_LINUX_NODE_MAJOR: major,
+    FIXTURE_NODE_VERSION: actual,
+    FIXTURE_NODE_VERSIONS: JSON.stringify(versions),
+    FIXTURE_GUEST_NODE_MAJOR: ambient,
+  });
+  return { fake, result, log: await readFile(fake.log, "utf8") };
+}
+
+for (const major of ["22", "26"]) {
+  test(`Node-major smoke accepts selected ${major} through source, candidate, and promoted checks`, async (t) => {
+    const { result, log } = await runNodeMajorMint(t, { major, actual: `${major}.0.0` });
+    assert.equal(result.code, 0, result.stderr);
+    for (const lease of ["cbx_source", "cbx_candidate", "cbx_promoted"]) {
+      assert.match(result.stdout, new RegExp(`node-major-checked ${lease}`));
+    }
+    assert.match(log, /checkpoint create/);
+    assert.match(log, /image promote/);
+    assert.match(result.stdout, /promoted linux developer image passed/);
+  });
+}
+
+for (const lease of ["cbx_source", "cbx_candidate", "cbx_promoted"]) {
+  test(`Node-major smoke rejects mismatched selected 26 on ${lease}`, async (t) => {
+    const { result, log } = await runNodeMajorMint(t, {
+      major: "26",
+      actual: "26.0.0",
+      versions: { [lease]: "24.0.0" },
+      ambient: "24",
+    });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /Node\.js.*26.*required.*v24\.0\.0/);
+    assert.doesNotMatch(result.stdout, /promoted linux developer image passed/);
+    assert.match(log, new RegExp(`stop --provider aws --target linux ${lease}`));
+    if (lease === "cbx_source") assert.doesNotMatch(log, /checkpoint create/);
+    if (lease !== "cbx_promoted") assert.doesNotMatch(log, /image promote/);
+    else assert.match(log, /image promote --json --target linux --restore-receipt/);
+  });
+}
+
+for (const [name, options, passes] of [
+  ["default below 24", { actual: "22.0.0" }, false],
+  ["default newer major", { actual: "26.0.0" }, true],
+  ["custom prep ignores selected 22", { major: "22", actual: "26.0.0", customPrep: true }, true],
+  [
+    "custom prep still rejects below 24",
+    { major: "22", actual: "22.0.0", customPrep: true },
+    false,
+  ],
+  [
+    "ambient major cannot replace selected 22",
+    { major: "22", actual: "26.0.0", ambient: "26" },
+    false,
+  ],
+  [
+    "shell-sensitive selection stays data",
+    { major: '22; touch "$HOME/injected"', actual: "26.0.0" },
+    false,
+  ],
+]) {
+  test(`Node-major smoke ${name}`, async (t) => {
+    const { fake, result, log } = await runNodeMajorMint(t, options);
+    assert.equal(result.code === 0, passes, result.stderr);
+    if (passes) assert.match(result.stdout, /promoted linux developer image passed/);
+    else {
+      assert.match(result.stderr, /Node\.js.*required/);
+      assert.doesNotMatch(log, /checkpoint create|image promote/);
+    }
+    await assert.rejects(readFile(path.join(fake.dir, "injected")), { code: "ENOENT" });
+  });
+}
+
+async function linuxSmokeFixture(t, { major = "24", pnpm = "11.1.0", customPrep = false } = {}) {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const captured = path.join(fake.dir, "smoke.sh");
+  const args = ["--target", "linux", "--run", "--no-promote"];
+  if (customPrep) args.push("--prep-script", fake.linuxPrep);
+  const result = await runScript(args, {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_FAKE_CAPTURE_RUN_SCRIPT: captured,
+    CRABBOX_LINUX_NODE_MAJOR: major,
+    CRABBOX_LINUX_PNPM_VERSION: pnpm,
+    CRABBOX_FAKE_RESOLVED_PNPM: pnpm,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  if (customPrep) {
+    assert.doesNotMatch(log, /builder overrides/);
+    assert.doesNotMatch(log, /--capture-stdout/);
+  } else {
+    assert.ok(log.includes(`builder overrides node=${major} pnpm=${pnpm}\n`));
+    assert.match(log, /--allow-env CRABBOX_LINUX_NODE_MAJOR,CRABBOX_LINUX_PNPM_VERSION --script/);
+  }
+  const bin = path.join(fake.dir, "bin");
+  await mkdir(bin);
+  const tmp = path.join(fake.dir, "tmp");
+  await mkdir(tmp);
+  const writeTool = async (name, body) => {
+    const file = path.join(bin, name);
+    await writeFile(file, `#!/usr/bin/env bash\n${body}\n`);
+    await chmod(file, 0o755);
+  };
+  for (const name of ["git", "gh", "jq", "rg", "fd", "npm", "trufflehog", "docker"]) {
+    await writeTool(name, "exit 0");
+  }
+  await writeNodeVersionFixture(bin);
+  await writeTool("go", "printf 'go version go1.27.0 linux/amd64\\n'");
+  await writeTool("gofmt", "exit 0");
+  await writeTool("bun", '[[ "$*" == "--version" ]] && printf "1.4.0\\n" || printf "42\\n"');
+  await writeTool("bunx", 'printf "42\\n"');
+  await writeTool(
+    "uname",
+    'if [[ "$*" == "-s" ]]; then printf "%s\\n" "${FIXTURE_OS:-Linux}"; else printf "x86_64\\n"; fi',
+  );
+  await writeTool("getconf", 'printf "%s\\n" "${FIXTURE_LIBC:-glibc 2.39}"');
+  await writeTool(
+    "corepack",
+    '[[ "${FIXTURE_TOOL_EXIT:-0}" == "0" ]] || exit "$FIXTURE_TOOL_EXIT"\nprintf "%s\\n" "$FIXTURE_RESOLVED_PNPM"',
+  );
+  await writeTool("id", 'printf "%s\\n" "$FIXTURE_UID"');
+  await writeTool(
+    "dpkg",
+    '[[ "$*" == "--print-architecture" ]] || exit 65\nprintf "%s\\n" "$FIXTURE_ARCH"',
+  );
+  await writeTool(
+    "pnpm",
+    '[[ "$*" == "--version" ]] || exit 65\nprintf "%s\\n" "$HOME" >>"$HOME/normal-pnpm.called"\nprintf "%s\\n" "$FIXTURE_RESOLVED_PNPM"\nexit "${FIXTURE_PNPM_EXIT:-0}"',
+  );
+  const generated = (await readFile(captured, "utf8"))
+    .replace(/smoke_dir="[\s\S]*?(?=docker_group_member\(\))/, "")
+    .replace("test -f /var/lib/crabbox-readiness/linux.json", "true")
+    .replace("test -f /var/lib/crabbox/image-ready", "true")
+    .replace(
+      /^public_toolchain_archive_dir=.*$/gm,
+      'public_toolchain_archive_dir="$HOME/missing-archives"',
+    );
+  const execute = (env = {}, source = generated) =>
+    spawnSync("bash", ["-c", source], {
+      cwd: fake.dir,
+      env: {
+        PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+        HOME: fake.dir,
+        TMPDIR: tmp,
+        FIXTURE_RESOLVED_PNPM: pnpm,
+        FIXTURE_UID: "1000",
+        FIXTURE_ARCH: "amd64",
+        FIXTURE_NODE_VERSION: `${major}.0.0`,
+        ...env,
+      },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+  return { fake, tmp, generated, execute };
+}
+
+test("generated Linux smoke emits success only after nonroot, tool, and offline artifact checks", async (t) => {
+  const { fake, tmp, generated, execute } = await linuxSmokeFixture(t);
+  for (const [env, diagnostic] of [
+    [{ FIXTURE_UID: "0" }, /requires a nonroot user/],
+    [{ FIXTURE_TOOL_EXIT: "46" }, null],
+    [{}, /verified public toolchain archive unavailable offline/],
+  ]) {
+    const smoke = execute(env);
+    assert.notEqual(smoke.status, 0, JSON.stringify(env));
+    assert.doesNotMatch(smoke.stdout, /devtools-smoke-ok/);
+    if (diagnostic) assert.match(smoke.stderr, diagnostic);
+    assert.deepEqual(await readdir(tmp), [], "failed smoke must remove private staging");
+  }
+  await mkdir(path.join(fake.dir, "missing-archives"));
+  await writeFile(
+    path.join(fake.dir, "missing-archives", "node-v24.19.0-linux-x64.tar.xz"),
+    "corrupt",
+  );
+  await writeFile(path.join(fake.dir, "missing-archives", "x64.complete"), "");
+  const corrupt = execute({ CRABBOX_LINUX_NODE_MAJOR: "26" });
+  assert.notEqual(corrupt.status, 0);
+  assert.match(corrupt.stderr, /checksum mismatch/);
+  assert.doesNotMatch(corrupt.stdout, /devtools-smoke-ok/);
+  assert.deepEqual(await readdir(tmp), []);
+  // The real artifact probe is covered separately; this assertion owns marker ordering.
+  const successful = execute(
+    {},
+    generated
+      .replace(/\n[ \t]*offline_node_pnpm_probe\n/, "\nprintf 'node-proof-done\\n'\n")
+      .replace(/\n[ \t]*offline_go_probe\n/, "\nprintf 'go-proof-done\\n'\n")
+      .replace(/\n[ \t]*offline_bun_probe\n/, "\nprintf 'bun-proof-done\\n'\n")
+      .replace(/\n[ \t]*offline_rust_probe\n/, "\nprintf 'rust-proof-done\\n'\n")
+      .replace(/\n[ \t]*offline_uv_probe\n/, "\nprintf 'uv-proof-done\\n'\n"),
+  );
+  assert.equal(successful.status, 0, successful.stderr);
+  const orderedMarkers = [
+    "node-proof-done\n",
+    "go-proof-done\n",
+    "bun-proof-done\n",
+    "rust-proof-done\n",
+    "uv-proof-done\n",
+    "devtools-smoke-ok\n",
+  ].map((marker) => successful.stdout.indexOf(marker));
+  assert.ok(
+    orderedMarkers.every((index) => index >= 0),
+    successful.stdout,
+  );
+  assert.deepEqual(
+    orderedMarkers,
+    [...orderedMarkers].sort((left, right) => left - right),
+  );
+});
+
+for (const route of [
+  { name: "ARM guest", arch: "arm64" },
+  { name: "ARM selected Node 22", arch: "arm64", major: "22" },
+  { name: "custom prep", arch: "amd64", customPrep: true },
+]) {
+  test(`generated Linux smoke preserves the ${route.name} route without x64 archives`, async (t) => {
+    const { fake, execute } = await linuxSmokeFixture(t, route);
+    const result = execute({ FIXTURE_ARCH: route.arch, CRABBOX_LINUX_NODE_MAJOR: "24" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /devtools-smoke-ok/);
+    assert.equal(
+      (await readFile(path.join(fake.dir, "normal-pnpm.called"), "utf8")).trim(),
+      fake.dir,
+    );
+  });
+}
+
+test("generated Go smoke requires its own archive under an alternate Node major", async (t) => {
+  // Node selection only: these command fixtures do not assert native Node26 packaging support.
+  const { fake, execute } = await linuxSmokeFixture(t, { major: "26" });
+  const absent = execute();
+  assert.notEqual(absent.status, 0);
+  assert.match(absent.stderr, /unavailable offline: go1\.27\.0\.linux-amd64\.tar\.gz/);
+  assert.doesNotMatch(absent.stdout, /devtools-smoke-ok/);
+  await mkdir(path.join(fake.dir, "missing-archives"));
+  await writeFile(
+    path.join(fake.dir, "missing-archives", "go1.27.0.linux-amd64.tar.gz"),
+    "corrupt",
+  );
+  const corrupt = execute();
+  assert.notEqual(corrupt.status, 0);
+  assert.match(corrupt.stderr, /checksum mismatch/);
+  assert.doesNotMatch(corrupt.stdout, /devtools-smoke-ok/);
+});
+
+test("generated Bun smoke is required independently of Node overrides and cannot be disabled by cache absence", async (t) => {
+  const { fake, tmp, generated, execute } = await linuxSmokeFixture(t, { major: "26" });
+  const source = generated.replace(/\n[ \t]*offline_go_probe\n/, "\ntrue\n");
+  const missing = execute({}, source);
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /unavailable offline: bun-v1\.4\.0-linux-x64-baseline\.zip/);
+  assert.doesNotMatch(missing.stdout, /devtools-smoke-ok/);
+  assert.deepEqual(await readdir(tmp), []);
+  await mkdir(path.join(fake.dir, "missing-archives"));
+  await writeFile(
+    path.join(fake.dir, "missing-archives", "bun-v1.4.0-linux-x64-baseline.zip"),
+    "corrupt",
+  );
+  const corrupt = execute({}, source);
+  assert.notEqual(corrupt.status, 0);
+  assert.match(corrupt.stderr, /checksum mismatch/);
+  assert.doesNotMatch(corrupt.stdout, /devtools-smoke-ok/);
+  assert.deepEqual(await readdir(tmp), []);
+  for (const env of [
+    { FIXTURE_ARCH: "arm64" },
+    { FIXTURE_LIBC: "musl" },
+    { FIXTURE_OS: "Darwin" },
+  ]) {
+    const unsupported = execute(env, source);
+    assert.equal(unsupported.status, 0, unsupported.stderr);
+    assert.match(unsupported.stdout, /devtools-smoke-ok/);
+  }
+});
+
+test("generated Linux smoke requires the normal nonroot pnpm command even when private probes pass", async (t) => {
+  const { fake, generated, execute } = await linuxSmokeFixture(t);
+  const result = execute(
+    { FIXTURE_PNPM_EXIT: "48" },
+    generated.replace(/\n[ \t]*offline_node_pnpm_probe\n/, "\ntrue\n"),
+  );
+  assert.equal(result.status, 48, result.stderr);
+  assert.doesNotMatch(result.stdout, /devtools-smoke-ok/);
+  assert.equal(
+    (await readFile(path.join(fake.dir, "normal-pnpm.called"), "utf8")).trim(),
+    fake.dir,
+  );
+});
+
+test("generated Linux smoke keeps required x64 archives under a pnpm override", async (t) => {
+  const { execute } = await linuxSmokeFixture(t, { pnpm: "12.3.4" });
+  const result = execute();
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /verified public toolchain archive unavailable offline/,
+    JSON.stringify({ status: result.status, signal: result.signal, error: result.error?.message }),
+  );
+  assert.doesNotMatch(result.stdout, /devtools-smoke-ok/);
 });
 
 test("AWS devtools mint wrapper isolates warmup logs from explicit image names", async () => {
   const logDir = await mkdtemp(path.join(os.tmpdir(), "crabbox-aws-image-mint-logs-"));
   for (let i = 0; i < 2; i += 1) {
     const fake = await setupFakeCrabbox();
-    const result = await runScript(["--target", "linux", "--run", "--no-promote", "--name", "shared-devtools", "--prep-script", fake.linuxPrep], {
-      CRABBOX_BIN: fake.fake,
-      CRABBOX_FAKE_LOG: fake.log,
-      CRABBOX_IMAGE_LOG_DIR: logDir,
-      CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
-      CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS: "0",
-      CRABBOX_IMAGE_PREP_WAIT_TIMEOUT: "5s",
-    });
+    const result = await runScript(
+      [
+        "--target",
+        "linux",
+        "--run",
+        "--no-promote",
+        "--name",
+        "shared-devtools",
+        "--prep-script",
+        fake.linuxPrep,
+      ],
+      {
+        CRABBOX_BIN: fake.fake,
+        CRABBOX_FAKE_LOG: fake.log,
+        CRABBOX_IMAGE_LOG_DIR: logDir,
+        CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
+        CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS: "0",
+        CRABBOX_IMAGE_PREP_WAIT_TIMEOUT: "5s",
+      },
+    );
     assert.equal(result.code, 0, result.stderr);
   }
 
-  const files = (await readdir(logDir)).filter((name) => name.startsWith("image-mint-"));
+  const artifacts = (await readdir(logDir)).filter((name) => name.startsWith("image-mint-"));
+  const receipts = artifacts.filter((name) => name.endsWith("-source.json"));
+  assert.equal(receipts.length, 2);
+  assert.equal(new Set(receipts).size, 2);
+  const files = artifacts.filter((name) => name.includes(".log."));
   assert.equal(files.length, 4);
   assert.equal(new Set(files).size, 4);
   for (const file of files) {
@@ -191,14 +1240,110 @@ test("AWS devtools mint wrapper isolates warmup logs from explicit image names",
   }
 });
 
+test("AWS devtools mint wrapper fails when promoted selection is not proved", async () => {
+  const fake = await setupFakeCrabbox();
+  const text = await readFile(fake.fake, "utf8");
+  await writeFile(
+    fake.fake,
+    text.replace(
+      "image selected id=ami-devtools source=promoted",
+      "image selected id=ami-other source=promoted",
+    ),
+  );
+  const result = await runScript(["--target", "linux", "--run", "--prep-script", fake.linuxPrep], {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+  });
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(
+    result.stderr,
+    /warmup did not prove image selection id=ami-devtools source=promoted/,
+  );
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /image promote --json --target linux --restore-receipt \S+ ami-devtools/);
+  assert.match(result.stderr, /restored previous default image=ami-previous/);
+});
+
+test("AWS devtools mint wrapper reports rollback rejection without hiding smoke failure", async () => {
+  const fake = await setupFakeCrabbox();
+  const text = await readFile(fake.fake, "utf8");
+  await writeFile(
+    fake.fake,
+    text.replace(
+      "image selected id=ami-devtools source=promoted",
+      "image selected id=ami-other source=promoted",
+    ),
+  );
+  const result = await runScript(["--target", "linux", "--run", "--prep-script", fake.linuxPrep], {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_FAKE_ROLLBACK_FAIL: "1",
+  });
+
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(
+    result.stderr,
+    /CAS rollback failed or was rejected; a newer default was not overwritten/,
+  );
+});
+
+test("AWS devtools mint wrapper clears a newly introduced default after smoke failure", async () => {
+  const fake = await setupFakeCrabbox();
+  const text = await readFile(fake.fake, "utf8");
+  await writeFile(
+    fake.fake,
+    text.replace(
+      "image selected id=ami-devtools source=promoted",
+      "image selected id=ami-other source=promoted",
+    ),
+  );
+  const result = await runScript(["--target", "linux", "--run", "--prep-script", fake.linuxPrep], {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_FAKE_PREVIOUS_ABSENT: "1",
+  });
+
+  assert.equal(result.code, 1, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /image promote --json --target linux --restore-receipt \S+ ami-devtools/);
+});
+
+test("AWS devtools mint wrapper finishes fallible candidate cleanup before promotion", async () => {
+  const fake = await setupFakeCrabbox();
+  const result = await runScript(["--target", "linux", "--run", "--prep-script", fake.linuxPrep], {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_FAKE_STOP_FAIL_LEASE: "cbx_candidate",
+  });
+
+  assert.equal(result.code, 27, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  assert.doesNotMatch(log, /image promote/);
+});
+
+test("AWS devtools mint wrapper preserves promotion failure while attempting receipt recovery", async () => {
+  const fake = await setupFakeCrabbox();
+  const result = await runScript(["--target", "linux", "--run", "--prep-script", fake.linuxPrep], {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_FAKE_PROMOTION_FAIL: "1",
+  });
+
+  assert.equal(result.code, 55, result.stderr);
+  assert.match(result.stderr, /transactional promotion receipt is unavailable for rollback/);
+});
+
 test("AWS devtools mint wrapper uses sg for first docker group member", async () => {
   const fake = await setupFakeCrabbox();
   const smokeScript = path.join(fake.dir, "smoke.sh");
-  const result = await runScript(["--target", "linux", "--run", "--no-promote", "--prep-script", fake.linuxPrep], {
-    CRABBOX_BIN: fake.fake,
-    CRABBOX_FAKE_LOG: fake.log,
-    CRABBOX_FAKE_CAPTURE_RUN_SCRIPT: smokeScript,
-  });
+  const result = await runScript(
+    ["--target", "linux", "--run", "--no-promote", "--prep-script", fake.linuxPrep],
+    {
+      CRABBOX_BIN: fake.fake,
+      CRABBOX_FAKE_LOG: fake.log,
+      CRABBOX_FAKE_CAPTURE_RUN_SCRIPT: smokeScript,
+    },
+  );
   assert.equal(result.code, 0, result.stderr);
 
   const bin = path.join(fake.dir, "smoke-bin");
@@ -210,12 +1355,33 @@ test("AWS devtools mint wrapper uses sg for first docker group member", async ()
     await writeFile(file, body);
     await chmod(file, 0o755);
   };
-  for (const name of ["git", "gh", "jq", "rg", "fd", "python3", "node", "npm", "corepack", "pnpm"]) {
+  for (const name of [
+    "git",
+    "gh",
+    "jq",
+    "rg",
+    "fd",
+    "python3",
+    "npm",
+    "corepack",
+    "pnpm",
+    "trufflehog",
+  ]) {
     await writeTool(name, "#!/usr/bin/env bash\nexit 0\n");
   }
-  await writeTool("id", "#!/usr/bin/env bash\n[[ \"$*\" == \"-nG\" ]] && printf 'users\\n'\n");
+  await writeTool(
+    "node",
+    '#!/usr/bin/env bash\n[[ "${1:-}" == "--version" ]] && printf \'v24.0.0\\n\'\nexit 0\n',
+  );
+  await writeTool(
+    "id",
+    "#!/usr/bin/env bash\ncase \"$*\" in -nG) printf 'users\\n';; -u) printf '1000\\n';; esac\n",
+  );
   await writeTool("whoami", "#!/usr/bin/env bash\nprintf 'alice\\n'\n");
-  await writeTool("getent", "#!/usr/bin/env bash\n[[ \"$*\" == \"group docker\" ]] && printf 'docker:x:999:alice,bob\\n'\n");
+  await writeTool(
+    "getent",
+    '#!/usr/bin/env bash\n[[ "$*" == "group docker" ]] && printf \'docker:x:999:alice,bob\\n\'\n',
+  );
   await writeTool(
     "docker",
     `#!/usr/bin/env bash
@@ -243,7 +1409,12 @@ exit 80
 `,
   );
 
-  const generated = (await readFile(smokeScript, "utf8")).replace("test -d /var/cache/crabbox/pnpm", "true");
+  const generated = (await readFile(smokeScript, "utf8"))
+    .replace(/smoke_dir="[\s\S]*?(?=docker_group_member\(\))/, "")
+    .replace("test -f /var/lib/crabbox-readiness/linux.json", "true")
+    .replace("test -f /var/lib/crabbox/image-ready", "true")
+    // Artifact consumption has its own real-archive proof; this fixture owns group fallback.
+    .replace(/\noffline_node_pnpm_probe\n/, "\ntrue\n");
   const smoke = await new Promise((resolve, reject) => {
     const child = spawn("bash", ["-c", generated], {
       cwd: repoRoot,
@@ -293,24 +1464,39 @@ test("AWS devtools mint wrapper maps windows flags", async () => {
       CRABBOX_BIN: fake.fake,
       CRABBOX_FAKE_LOG: fake.log,
       CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
+      CRABBOX_OS: "ubuntu:24.04",
     },
   );
   assert.equal(result.code, 0, result.stderr);
   const log = await readFile(fake.log, "utf8");
-  assert.match(log, /env CRABBOX_AWS_REGION=us-east-1 AWS_REGION=us-east-1 CRABBOX_AWS_AMI= args warmup --provider aws --target windows/);
+  assert.match(
+    log,
+    /env CRABBOX_AWS_REGION=us-east-1 AWS_REGION=us-east-1 CRABBOX_AWS_AMI= args warmup --provider aws --target windows/,
+  );
   assert.match(log, /--windows-mode normal/);
   assert.doesNotMatch(log, /--desktop/);
   assert.doesNotMatch(log, /--browser/);
   assert.doesNotMatch(log, /warmup .*--region us-east-1/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- Write-Output "windows-ssh-ready"/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- New-Item/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- Set-Content/);
+  assert.doesNotMatch(log, /--os /);
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- Write-Output "windows-ssh-ready"/,
+  );
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- New-Item/,
+  );
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- Set-Content/,
+  );
   assert.match(log, /FromBase64String/);
   assert.doesNotMatch(log, /image promote/);
 });
 
-test("AWS devtools mint wrapper reboots windows source when prep requires it", async () => {
+test("AWS devtools mint wrapper reboots windows without racing workspace owner release", async (t) => {
   const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
   const result = await runScript(
     [
       "--target",
@@ -328,6 +1514,9 @@ test("AWS devtools mint wrapper reboots windows source when prep requires it", a
       CRABBOX_BIN: fake.fake,
       CRABBOX_FAKE_LOG: fake.log,
       CRABBOX_FAKE_WINDOWS_REBOOT: "1",
+      CRABBOX_FAKE_REBOOT_OWNER_RACE: "1",
+      CRABBOX_IMAGE_LOG_DIR: fake.dir,
+      PATH: `${fake.bin}${path.delimiter}${process.env.PATH}`,
       CRABBOX_IMAGE_REBOOT_SETTLE_SECONDS: "0",
       CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS: "0",
       CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
@@ -336,11 +1525,77 @@ test("AWS devtools mint wrapper reboots windows source when prep requires it", a
   );
   assert.equal(result.code, 0, result.stderr);
   const log = await readFile(fake.log, "utf8");
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- if \(Test-Path/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- shutdown \/r \/t 5 \/f/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- Write-Output "windows-ssh-ready"/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- Set-Content/);
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- if \(Test-Path/,
+  );
+  assert.match(
+    log,
+    /ssh --provider aws --target windows --id cbx_source/,
+  );
+  assert.doesNotMatch(log, /args run .*shutdown \/r/);
+  assert.match(log, /maintenance command .*shutdown \/r/);
+  assert.match(log, /maintenance-ssh .* -i fixture key with spaces -p 2222 fixture@windows/);
+  assert.match(log, /transition still-up[\s\S]*transition down[\s\S]*transition ready[\s\S]*args run .*Set-Content/);
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- Write-Output "windows-ssh-ready"/,
+  );
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- Set-Content/,
+  );
   assert.match(log, /FromBase64String/);
+});
+
+for (const [mode, exitCode, message] of [
+  ["SSH_RESOLVE_FAIL", 41, null],
+  ["REBOOT_FAIL", 42, null],
+  ["REBOOT_NEVER_DOWN", 1, /Windows reboot SSH did not become down within 0s/],
+  ["REBOOT_NEVER_UP", 1, /Windows reboot SSH did not become ready within 0s/],
+]) {
+  test(`Windows reboot fails closed for ${mode} and cleans up before capture`, async (t) => {
+    const fake = await setupFakeCrabbox();
+    t.after(() => rm(fake.dir, { recursive: true, force: true }));
+    const result = await runScript(
+      ["--target", "windows", "--run", "--prep-script", fake.windowsPrep],
+      {
+        CRABBOX_BIN: fake.fake,
+        CRABBOX_FAKE_LOG: fake.log,
+        CRABBOX_IMAGE_LOG_DIR: fake.dir,
+        CRABBOX_FAKE_WINDOWS_REBOOT: "1",
+        [`CRABBOX_FAKE_${mode}`]: "1",
+        PATH: `${fake.bin}${path.delimiter}${process.env.PATH}`,
+        CRABBOX_IMAGE_REBOOT_DOWN_TIMEOUT: mode === "REBOOT_NEVER_DOWN" ? "0s" : "5s",
+        CRABBOX_IMAGE_REBOOT_WAIT_TIMEOUT: "0s",
+        CRABBOX_IMAGE_REBOOT_SETTLE_SECONDS: "0",
+        CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS: "0",
+        CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
+      },
+    );
+    assert.equal(result.code, exitCode, result.stderr);
+    if (message) assert.match(result.stderr, message);
+    const log = await readFile(fake.log, "utf8");
+    assert.match(log, /stop --provider aws --target windows cbx_source/);
+    assert.doesNotMatch(log, /checkpoint create|image promote/);
+    assert.equal((log.match(/args run .*-- Set-Content/g) ?? []).length, 1, "prep must not resume after reboot failure");
+    if (mode === "REBOOT_FAIL") assert.doesNotMatch(log, /transition /);
+  });
+}
+
+test("Windows reboot command preserves shutdown failure instead of printing success", async (t) => {
+  const text = await readFile(script, "utf8");
+  const command = text.match(/windows_maintenance_ssh "\$ssh_command" '(shutdown [^\n]+)'/)[1];
+  for (const exitCode of [0, 42]) {
+    const result = spawnSync(process.platform === "win32" ? "powershell.exe" : "pwsh", [
+      "-NoProfile", "-NonInteractive", "-Command",
+      `function shutdown { $global:LASTEXITCODE = ${exitCode} }; ${command}`,
+    ], { encoding: "utf8", timeout: 30000 });
+    if (result.error?.code === "ENOENT") return t.skip("PowerShell is not installed");
+    assert.equal(result.status, exitCode, result.stderr);
+    if (exitCode === 0) assert.match(result.stdout, /reboot scheduled/);
+    else assert.doesNotMatch(result.stdout, /reboot scheduled/);
+  }
 });
 
 test("AWS devtools mint wrapper retries windows prep upload disconnects", async () => {
@@ -363,6 +1618,7 @@ test("AWS devtools mint wrapper retries windows prep upload disconnects", async 
       CRABBOX_FAKE_LOG: fake.log,
       CRABBOX_FAKE_WINDOWS_PREP_DISCONNECT: "1",
       CRABBOX_FAKE_WINDOWS_REBOOT: "1",
+      PATH: `${fake.bin}${path.delimiter}${process.env.PATH}`,
       CRABBOX_IMAGE_REBOOT_SETTLE_SECONDS: "0",
       CRABBOX_IMAGE_REBOOT_READY_SETTLE_SECONDS: "0",
       CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
@@ -372,10 +1628,155 @@ test("AWS devtools mint wrapper retries windows prep upload disconnects", async 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stderr, /Windows command failed during prep upload image-prep\.part-/);
   const log = await readFile(fake.log, "utf8");
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- Write-Output "windows-ssh-ready"/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- if \(Test-Path/);
-  assert.match(log, /run --provider aws --target windows --id cbx_source --no-sync --shell -- shutdown \/r \/t 5 \/f/);
-  assert.match(log, /image create --id cbx_source --name crabbox-windows-devtools-/);
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- Write-Output "windows-ssh-ready"/,
+  );
+  assert.match(
+    log,
+    /run --provider aws --target windows --id cbx_source --no-sync --shell -- if \(Test-Path/,
+  );
+  assert.match(
+    log,
+    /maintenance command .*shutdown \/r/,
+  );
+  assert.match(
+    log,
+    /checkpoint create --provider aws --target windows --id cbx_source --name crabbox-windows-devtools-/,
+  );
+});
+
+test("AWS mint rejects routed or unproven source regions before prep, even with keep-lease", async (t) => {
+  for (const evidence of ["IMAGE", "LEASE"]) {
+    for (const observed of ["eu-west-2", ""]) {
+      await t.test(`${evidence}=${observed || "missing"}`, async (t) => {
+        const fake = await setupFakeCrabbox();
+        t.after(() => rm(fake.dir, { recursive: true, force: true }));
+        const result = await runScript(
+          ["--region", "eu-west-1", "--stock-source", "--run", "--keep-lease"],
+          {
+            CRABBOX_BIN: fake.fake,
+            CRABBOX_FAKE_LOG: fake.log,
+            CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+            [`CRABBOX_FAKE_${evidence}_REGION`]: observed,
+          },
+        );
+        assert.notEqual(result.code, 0, result.stdout + result.stderr);
+        assert.match(result.stderr, /quota\/capacity in eu-west-1; retry later or choose another region/);
+        const log = await readFile(fake.log, "utf8");
+        assert.match(log, /args stop --provider aws --target linux cbx_source/);
+        assert.doesNotMatch(log, /args (run|checkpoint|image) /);
+      });
+    }
+  }
+});
+
+test("AWS mint deletes only its captured checkpoint after candidate failure and preserves the exit code", async (t) => {
+  for (const deleteExit of [0, 29]) {
+    await t.test(`delete exit ${deleteExit}`, async (t) => {
+      const fake = await setupFakeCrabbox();
+      t.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const logs = path.join(fake.dir, "logs");
+      const result = await runScript(["--region", "eu-west-1", "--run"], {
+        CRABBOX_BIN: fake.fake,
+        CRABBOX_FAKE_LOG: fake.log,
+        CRABBOX_IMAGE_LOG_DIR: logs,
+        CRABBOX_FAKE_WARMUP_FAIL_NUMBER: "2",
+        CRABBOX_FAKE_DELETE_EXIT: String(deleteExit),
+      });
+      assert.equal(result.code, 23, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      assert.match(log, /env CRABBOX_AWS_REGION=eu-west-1 AWS_REGION=eu-west-1 CRABBOX_AWS_AMI= args checkpoint delete chk_devtools --admin/);
+      assert.doesNotMatch(log, /args image (delete|promote)/);
+      assert.ok(log.indexOf("args stop --provider aws --target linux cbx_candidate") < log.indexOf("args checkpoint delete"));
+      const receiptName = (await readdir(logs)).find((name) => name.endsWith("-candidate-cleanup.json"));
+      assert.ok(receiptName);
+      const receipt = JSON.parse(await readFile(path.join(logs, receiptName), "utf8"));
+      assert.deepEqual(receipt, {
+        checkpointId: "chk_devtools", imageId: "ami-devtools", region: "eu-west-1",
+        status: deleteExit === 0 ? "succeeded" : "failed", exitCode: deleteExit,
+      });
+      if (deleteExit) assert.match(result.stderr, /FAILED.*candidate.*ami-devtools.*eu-west-1/);
+    });
+  }
+});
+
+test("AWS mint rejects a captured image in another region and deletes that exact checkpoint", async (t) => {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const result = await runScript(["--region", "eu-west-1", "--run"], {
+    CRABBOX_BIN: fake.fake, CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+    CRABBOX_FAKE_CAPTURE_REGION: "eu-west-2",
+  });
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /captured image region.*eu-west-2.*eu-west-1/);
+  const log = await readFile(fake.log, "utf8");
+  assert.equal((log.match(/args warmup /g) ?? []).length, 1);
+  assert.match(log, /env CRABBOX_AWS_REGION=eu-west-2 AWS_REGION=eu-west-2 CRABBOX_AWS_AMI= args checkpoint delete chk_devtools --admin/);
+});
+
+test("AWS mint preserves promoted images on success and receipt rollback, and successful no-promote candidates", async (t) => {
+  for (const mode of ["success", "rollback", "no-promote"]) {
+    await t.test(mode, async (t) => {
+      const fake = await setupFakeCrabbox();
+      t.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const result = await runScript(
+        ["--region", "eu-west-1", "--run", ...(mode === "no-promote" ? ["--no-promote"] : [])],
+        {
+          CRABBOX_BIN: fake.fake, CRABBOX_FAKE_LOG: fake.log,
+          CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+          CRABBOX_FAKE_SMOKE_FAIL_LEASE: mode === "rollback" ? "cbx_promoted" : "",
+        },
+      );
+      assert.equal(result.code, mode === "rollback" ? 73 : 0, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      assert.doesNotMatch(log, /args (checkpoint|image) delete/);
+      if (mode === "rollback") assert.match(log, /--restore-receipt/);
+    });
+  }
+});
+
+test("AWS mint limits client capacity hints and retains explicit AZ choices", async (t) => {
+  for (const zones of ["", "eu-west-1a"]) {
+    await t.test(zones || "clear defaults", async (t) => {
+      const fake = await setupFakeCrabbox();
+      t.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const result = await runScript(["--region", "eu-west-1", "--run"], {
+        CRABBOX_BIN: fake.fake, CRABBOX_FAKE_LOG: fake.log,
+        CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+        CRABBOX_CAPACITY_REGIONS: "eu-west-2,us-east-1",
+        CRABBOX_CAPACITY_AVAILABILITY_ZONES: zones,
+      });
+      assert.equal(result.code, 0, result.stderr);
+      const hints = (await readFile(fake.log, "utf8")).split("\n").filter((line) => line.startsWith("capacity ") && line.endsWith("command=warmup"));
+      assert.deepEqual(hints, Array(3).fill(`capacity regions=eu-west-1 zones=${zones || ","} command=warmup`));
+    });
+  }
+});
+
+test("AWS mint rejects routed candidate and promoted warmups before smoke", async (t) => {
+  for (const count of [2, 3]) {
+    await t.test(`warmup ${count}`, async (t) => {
+      const fake = await setupFakeCrabbox();
+      t.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const result = await runScript(["--region", "eu-west-1", "--run"], {
+        CRABBOX_BIN: fake.fake, CRABBOX_FAKE_LOG: fake.log,
+        CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+        CRABBOX_FAKE_ROUTED_WARMUP: String(count), CRABBOX_FAKE_IMAGE_REGION: "eu-west-2",
+      });
+      assert.notEqual(result.code, 0);
+      const log = await readFile(fake.log, "utf8");
+      const lease = count === 2 ? "cbx_candidate" : "cbx_promoted";
+      assert.match(log, new RegExp(`args stop --provider aws --target linux ${lease}`));
+      assert.doesNotMatch(log, new RegExp(`args run .*--id ${lease} `));
+      if (count === 2) assert.match(log, /args checkpoint delete chk_devtools --admin/);
+      else {
+        assert.match(log, /--restore-receipt/);
+        assert.doesNotMatch(log, /args checkpoint delete/);
+      }
+    });
+  }
 });
 
 test("AWS devtools mint wrapper cleans up lease when warmup fails after allocation", async () => {
@@ -388,5 +1789,1267 @@ test("AWS devtools mint wrapper cleans up lease when warmup fails after allocati
   assert.equal(result.code, 23, result.stderr);
   const log = await readFile(fake.log, "utf8");
   assert.match(log, /warmup --provider aws --target linux/);
+  assert.match(log, /stop --provider aws --target linux cbx_source/);
+});
+
+async function measuredFixture(t) {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const root = path.join(fake.dir, "source");
+  for (const file of [
+    "scripts/mint-aws-devtools-image.sh",
+    "scripts/devtools-image-proof.mjs",
+    "scripts/devtools-image-contract.mjs",
+    "scripts/devtools-image-smoke-linux.sh",
+    "scripts/devtools-image-smoke-windows.ps1",
+    "scripts/generate-linux-readiness.mjs",
+    "scripts/install-linux-developer-tools.sh",
+    "scripts/linux-readiness.generated.sh",
+    "recipes/devtools/v1/linux-x86_64.json",
+    "recipes/devtools/v1/recipe.schema.json",
+  ]) {
+    await mkdir(path.dirname(path.join(root, file)), { recursive: true });
+    await copyFile(path.join(repoRoot, file), path.join(root, file));
+  }
+  const git = (args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+  git(["init", "--quiet"]);
+  git(["add", "."]);
+  git([
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "--quiet",
+    "-m",
+    "fixture",
+  ]);
+  const mock = path.join(fake.dir, "measurement.mjs");
+  await writeFile(
+    mock,
+    `
+import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
+const args = process.argv.slice(2);
+const option = name => args[args.indexOf(name) + 1];
+const hash = value => "sha256:" + createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const leaseFile = process.env.CRABBOX_FAKE_LOG + ".leases.json";
+const leases = fs.existsSync(leaseFile) ? JSON.parse(fs.readFileSync(leaseFile, "utf8")) : [];
+if (args[0] === "admin") {
+  const mode = process.env.CRABBOX_FAKE_SELECTION_MODE;
+  if (mode === "admin-failure") process.exit(53);
+  if (mode === "missing-selection") leases.pop();
+  if (mode === "duplicate-selection") leases.push(leases.at(-1));
+  fs.writeSync(1, JSON.stringify(leases) + "\\n");
+  process.exit(0);
+}
+const saveLease = (phase, sample, leaseId, index) => {
+  const selection = {
+    id: phase === "baseline" ? "ami-previous" : "ami-devtools",
+    source: phase === "candidate" ? "explicit" : "promoted",
+    region: process.env.CRABBOX_AWS_REGION, kind: "aws-ami",
+    promotedAt: "2026-09-01T00:00:00Z",
+  };
+  if (phase === "baseline") {
+    selection.source = process.env.CRABBOX_FAKE_BASELINE_SOURCE ||
+      (process.env.CRABBOX_FAKE_PREVIOUS_ABSENT === "1" ? "stock" : "promoted");
+  }
+  if (process.env.CRABBOX_AWS_STOCK_IMAGE === "1") {
+    selection.id = "ami-stock";
+    selection.source = "stock";
+  }
+  const mode = process.env.CRABBOX_FAKE_SELECTION_MODE;
+  if (phase === "baseline" && sample === 2 && mode === "baseline-image") selection.id = "ami-other";
+  if (phase === "baseline" && sample === 2 && mode === "baseline-source") selection.source = "stock";
+  if (mode === phase + "-region") selection.region = "us-east-1";
+  if (phase === "candidate" && mode === "candidate-image") selection.id = "ami-other";
+  if (phase === "promoted" && process.env.CRABBOX_FAKE_WARMUP_WRONG_IMAGE === "1") selection.id = "ami-other";
+  if (mode === "coordinator-override") selection.source = "explicit";
+  if (selection.source !== "promoted") delete selection.promotedAt;
+  const row = {id: leaseId, provider: "aws", target: "linux",
+    region: selection.region, serverType: "m7i.large",
+    cloudID: "i-" + index.toString(16).padStart(17, "0"), image: selection,
+    owner: "PRIVATE_OWNER_POISON", host: "PRIVATE_HOST_POISON"};
+  if (phase === "candidate" && mode === "reused-instance") row.cloudID = leases[0].cloudID;
+  if (phase === "candidate" && mode === "image-region") row.image.region = "us-east-1";
+  leases.push(row);
+  fs.writeFileSync(leaseFile, JSON.stringify(leases));
+};
+if (args[0] === "warmup") {
+  const countFile = process.env.CRABBOX_FAKE_LOG + ".count";
+  const count = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, "utf8")) : 0;
+  saveLease(["baseline", "candidate", "promoted"][count], 1,
+    ["cbx_source", "cbx_candidate", "cbx_promoted"][count], 100 + count);
+  process.exit(0);
+}
+const store = option(args[0] === "run" ? "--timing-record" : "--store");
+const phase = path.basename(store, ".jsonl");
+let records = fs.existsSync(store) ? fs.readFileSync(store, "utf8").trim().split("\\n").filter(Boolean).map(JSON.parse) : [];
+if (args[0] === "run") {
+  const offset = {baseline: 0, candidate: 3, promoted: 6}[phase];
+  const sample = records.length + 1;
+  const failed = phase === process.env.CRABBOX_FAKE_RUN_FAIL_PHASE && sample === 2;
+  const leaseId = "cbx_" + (offset + sample).toString(16).padStart(12, "0");
+  const runId = "run_" + (offset + sample);
+  const record = {schemaVersion: 1, source: "run", benchmark: {
+    repoHead: process.env.CRABBOX_FAKE_SOURCE_HEAD, repoFingerprint: hash("fixture"),
+    commandFingerprint: hash(["true"]), coldRun: true
+  }, timing: {provider: "aws", machineType: "m7i.large",
+    leaseId, runId,
+    exitCode: failed ? 41 : 0, runnerTotalMs: 1000, syncMs: 0, syncSkipped: false, leaseStopped: false}};
+  if (args.includes("--lease-output") && !(failed && process.env.CRABBOX_FAKE_FAILED_HANDLE_MISSING === "1")) {
+    fs.writeFileSync(option("--lease-output"), JSON.stringify({
+      provider: "aws", leaseId, runId, reused: false, kept: true,
+      cleanupCommand: "crabbox stop " + leaseId,
+    }));
+  }
+  if (phase === process.env.CRABBOX_FAKE_INTERRUPT_PHASE && sample === 2) {
+    console.log("retained-handle-ready");
+    await new Promise(resolve => setTimeout(resolve, 200));
+    process.exit(0);
+  }
+  if (phase === "candidate") {
+    if (process.env.CRABBOX_FAKE_TIMING_MODE === "missing") delete record.timing.runnerTotalMs;
+    if (process.env.CRABBOX_FAKE_TIMING_MODE === "mixed") record.benchmark.repoHead = "c".repeat(40);
+  }
+  if (!(phase === "candidate" && process.env.CRABBOX_FAKE_TIMING_MODE === "insufficient" && records.length === 2) &&
+      !(failed && process.env.CRABBOX_FAKE_FAILED_RECORD_MISSING === "1")) {
+    fs.appendFileSync(store, JSON.stringify(record) + "\\n");
+  }
+  saveLease(phase, sample, leaseId, offset + sample);
+  console.log("image selected id=ami-requested source=promoted kind=aws-ami region=us-west-2 promoted_at=-");
+  if (failed) process.exit(41);
+} else {
+  const group = {source: "run", provider: "aws", machineType: "m7i.large",
+    commandFingerprint: hash(["true"]), coldRun: true, n: records.length,
+    observationCount: records.length, failureCount: 0, runnerTotalN: records.filter(r => r.timing.runnerTotalMs > 0).length,
+    p95RunnerTotalMs: 1000, medianRunnerTotalMs: 1000, medianSyncMs: 0};
+  if (args[1] === "report") console.log(JSON.stringify({schemaVersion: 1, observationCount: records.length, matchedCount: records.length, groups: [group]}));
+  else {
+    const fail = process.env.CRABBOX_FAKE_CHECK_FAIL_PHASE === phase;
+    console.log(JSON.stringify({schemaVersion: 1, matchedCount: records.length, groupCount: 1,
+      passed: !fail, reasons: [], policy: {minSamples: 3, requiredRunnerTotalSamples: 3, maxFailures: 0, maxP95RunnerTotal: "10m0s"},
+      groups: [{...group, successfulSamples: records.length, passed: !fail, reasons: []}]}));
+    if (fail) process.exit(37);
+  }
+}
+`,
+  );
+  const original = await readFile(fake.fake, "utf8");
+  await writeFile(
+    fake.fake,
+    original.replace(
+      'case "$1" in',
+      `
+if [[ "$1" == config ]]; then
+  printf '{"provider":"aws","aws":{"region":"%s","ami":"%s"},"coordinator":"https://coordinator.example.invalid","brokerMode":"managed","brokerAuth":"configured","brokerAdminAuth":"configured","sshKey":"PRIVATE_CONFIG_POISON"}\\n' "$CRABBOX_AWS_REGION" "\${CRABBOX_FAKE_CONFIG_AMI:-}"
+  exit 0
+fi
+if [[ "$1" == warmup ]]; then
+  node "$CRABBOX_FAKE_MEASUREMENT" "$@"
+fi
+if [[ "$1" == bench || "$1" == admin || " $* " == *" --timing-record "* ]]; then
+  node "$CRABBOX_FAKE_MEASUREMENT" "$@"
+  exit $?
+fi
+case "$1" in`,
+    ),
+  );
+  const env = {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_FAKE_MEASUREMENT: mock,
+    CRABBOX_FAKE_SOURCE_HEAD: git(["rev-parse", "HEAD"]),
+    CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "diagnostics"),
+    CRABBOX_IMAGE_PUBLIC_OUTCOME: path.join(fake.dir, "public", "manifest.json"),
+    CRABBOX_OWNER: "publisher@example.invalid",
+    CRABBOX_ORG: "example-org",
+  };
+  const args = [
+    "--target",
+    "linux",
+    "--region",
+    "us-west-2",
+    "--type",
+    "m7i.large",
+    "--measured",
+    "--max-p95-runner-total-ms",
+    "600000",
+    "--run",
+  ];
+  return {
+    ...fake,
+    root,
+    env,
+    args,
+    script: path.join(root, "scripts/mint-aws-devtools-image.sh"),
+    outcome: env.CRABBOX_IMAGE_PUBLIC_OUTCOME,
+  };
+}
+
+const fleetCapacityError = 'coordinator POST /v1/leases: http 429: {"error":"cost_limit_exceeded","message":"fleet active lease limit exceeded: 21/20"}';
+
+async function capacityFixture(fake, failures, { realSleep = false } = {}) {
+  const wrapper = path.join(fake.dir, "capacity-crabbox.mjs");
+  const attempts = path.join(fake.dir, "capacity-attempts.json");
+  await writeFile(wrapper, `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const option = name => args[args.indexOf(name) + 1];
+let key;
+if (args[0] === "warmup") {
+  const countFile = ${JSON.stringify(fake.log + ".count")};
+  const count = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, "utf8")) : 0;
+  key = ["source", "candidate", "promoted"][count];
+} else if (args[0] === "run" && args.includes("--timing-record")) {
+  key = "measure-" + path.basename(option("--timing-record"), ".jsonl");
+}
+if (key) {
+  const file = ${JSON.stringify(attempts)};
+  const attempts = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+  (attempts[key] ??= []).push(args);
+  fs.writeFileSync(file, JSON.stringify(attempts));
+  const failure = ${JSON.stringify(failures)}[key];
+  if (failure && attempts[key].length <= (failure.count ?? 1)) {
+    console.error(failure.error ?? ${JSON.stringify(fleetCapacityError)});
+    if (failure.leaseId) console.log(JSON.stringify({leaseId: failure.leaseId}));
+    if (args.includes("--timing-record")) {
+      fs.appendFileSync(option("--timing-record"), JSON.stringify({schemaVersion: 1, source: "run",
+        timing: {exitCode: 23, runnerTotalMs: 900000, ...(failure.leaseId ? {leaseId: failure.leaseId} : {})}}) + "\\n");
+      if (failure.leaseId) fs.writeFileSync(option("--lease-output"), JSON.stringify({
+        provider: "aws", leaseId: failure.leaseId, runId: "run_retained", kept: true, reused: false,
+      }));
+    }
+    process.exit(23);
+  }
+}
+const result = spawnSync(${JSON.stringify(fake.fake)}, args, {stdio: "inherit"});
+process.exit(result.status ?? 1);
+`);
+  await chmod(wrapper, 0o755);
+  const bin = path.join(fake.dir, "capacity-bin");
+  await mkdir(bin);
+  await writeFile(path.join(bin, "sleep"), "#!/usr/bin/env bash\nprintf 'sleep %s\\n' \"$*\" >>\"$CRABBOX_FAKE_LOG\"\n");
+  await chmod(path.join(bin, "sleep"), 0o755);
+  return {
+    attempts,
+    env: {
+      CRABBOX_BIN: wrapper,
+      CRABBOX_FAKE_LOG: fake.log,
+      CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+      ...(realSleep ? {} : { PATH: `${bin}:${process.env.PATH}` }),
+    },
+  };
+}
+
+test("capacity wait retries source, candidate and promoted warmups with identical arguments", async (t) => {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const capacity = await capacityFixture(fake, {
+    source: {},
+    candidate: { error: fleetCapacityError.replace("fleet active lease limit exceeded: 21/20", "active lease limit for owner exceeded: 4/3") },
+    promoted: { error: fleetCapacityError.replace("fleet active lease limit exceeded: 21/20", "active lease limit for org exceeded: 7/6") },
+  });
+  const result = await runScript(["--run", "--prep-script", fake.linuxPrep], capacity.env);
+  assert.equal(result.code, 0, result.stderr);
+  const attempts = JSON.parse(await readFile(capacity.attempts, "utf8"));
+  for (const phase of ["source", "candidate", "promoted"]) {
+    assert.equal(attempts[phase].length, 2);
+    assert.deepEqual(attempts[phase][0], attempts[phase][1]);
+    assert.match(result.stderr, new RegExp(`capacity.*${phase}.*retrying in 120s`));
+  }
+  const log = await readFile(fake.log, "utf8");
+  assert.equal((log.match(/^sleep 120$/gm) ?? []).length, 3);
+  assert.equal((log.match(/args stop /g) ?? []).length, 3);
+});
+
+test("capacity wait gives up at its budget and preserves promotion rollback", async (t) => {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const capacity = await capacityFixture(fake, { promoted: { count: 100 } }, { realSleep: true });
+  const result = await runScript(["--run", "--prep-script", fake.linuxPrep], {
+    ...capacity.env, CRABBOX_IMAGE_CAPACITY_WAIT: "1s",
+  });
+  assert.equal(result.code, 23, result.stderr);
+  assert.match(result.stderr, /capacity wait budget exhausted.*promoted.*1s/);
+  const attempts = JSON.parse(await readFile(capacity.attempts, "utf8"));
+  assert.equal(attempts.promoted.length, 2);
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /--restore-receipt/);
+  assert.doesNotMatch(log, /args stop .*cbx_promoted/);
+});
+
+test("capacity wait fails immediately for spend, other HTTP errors, and allocated leases", async (t) => {
+  for (const failure of [
+    { error: fleetCapacityError.replace("fleet active lease limit exceeded: 21/20", "monthly budget exceeded: 21/20") },
+    { error: fleetCapacityError.replace("cost_limit_exceeded", "rate_limited") },
+    { error: fleetCapacityError.replace("http 429", "http 500") },
+    { error: fleetCapacityError.replace("POST /v1/leases", "POST /v1/leases/cbx_source/resume") },
+    { error: "connection reset by peer" },
+    { leaseId: "cbx_source" },
+  ]) {
+    await t.test(failure.error ?? "allocated lease", async (t) => {
+      const fake = await setupFakeCrabbox();
+      t.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const capacity = await capacityFixture(fake, { source: failure });
+      const result = await runScript(["--run", "--prep-script", fake.linuxPrep], capacity.env);
+      assert.equal(result.code, 23, result.stderr);
+      const attempts = JSON.parse(await readFile(capacity.attempts, "utf8"));
+      assert.equal(attempts.source.length, 1);
+      assert.doesNotMatch(result.stderr, /retrying in/);
+      if (failure.leaseId) assert.match(await readFile(fake.log, "utf8"), /args stop .*cbx_source/);
+    });
+  }
+});
+
+test("capacity wait excludes rejected measured attempts from all three cohorts", async (t) => {
+  const fake = await measuredFixture(t);
+  const capacity = await capacityFixture(fake, {
+    "measure-baseline": {}, "measure-candidate": {}, "measure-promoted": {},
+  });
+  const result = await runScript(fake.args, { ...fake.env, ...capacity.env }, fake.script);
+  assert.equal(result.code, 0, result.stderr);
+  const attempts = JSON.parse(await readFile(capacity.attempts, "utf8"));
+  for (const phase of ["baseline", "candidate", "promoted"]) {
+    assert.equal(attempts[`measure-${phase}`].length, 4);
+    assert.deepEqual(attempts[`measure-${phase}`][0], attempts[`measure-${phase}`][1]);
+    const args = attempts[`measure-${phase}`][1];
+    const records = (await readFile(args[args.indexOf("--timing-record") + 1], "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(records.length, 3);
+    assert.ok(records.every(record => record.timing.runnerTotalMs === 1000 && record.timing.exitCode === 0));
+  }
+  const manifest = JSON.parse(await readFile(fake.outcome, "utf8"));
+  assert.equal(manifest.status, "passed");
+  assert.ok(manifest.cohorts.every(cohort => cohort.p95RunnerTotalMs === 1000));
+});
+
+test("capacity wait validates its budget before acquisition and zero disables retries", async (t) => {
+  for (const budget of ["0", "-1", "1.5m", "garbage", "01m"]) {
+    await t.test(budget, async (t) => {
+      const fake = await setupFakeCrabbox();
+      t.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const capacity = await capacityFixture(fake, { source: {} });
+      const result = await runScript(["--run", "--prep-script", fake.linuxPrep], {
+        ...capacity.env, CRABBOX_IMAGE_CAPACITY_WAIT: budget,
+      });
+      if (budget === "0") {
+        assert.equal(result.code, 23, result.stderr);
+        assert.match(result.stderr, /capacity wait budget exhausted/);
+        assert.equal(JSON.parse(await readFile(capacity.attempts, "utf8")).source.length, 1);
+      } else {
+        assert.equal(result.code, 2, result.stderr);
+        assert.match(result.stderr, /CRABBOX_IMAGE_CAPACITY_WAIT must be/);
+        await assert.rejects(readFile(capacity.attempts), { code: "ENOENT" });
+      }
+    });
+  }
+});
+
+test("capacity wait retains measured lease cleanup when a capacity diagnostic accompanies a handle", async (t) => {
+  const fake = await measuredFixture(t);
+  const capacity = await capacityFixture(fake, {
+    "measure-baseline": { leaseId: "cbx_000000000001" },
+  });
+  const result = await runScript(fake.args, { ...fake.env, ...capacity.env }, fake.script);
+  assert.equal(result.code, 23, result.stderr);
+  assert.equal(JSON.parse(await readFile(capacity.attempts, "utf8"))["measure-baseline"].length, 1);
+  assert.doesNotMatch(result.stderr, /retrying in/);
+  assert.match(await readFile(fake.log, "utf8"), /args stop --provider aws --target linux cbx_000000000001/);
+});
+
+for (const failure of [
+  "missing smoke owner",
+  "Node archive probe rendering",
+  "Go archive probe rendering",
+  "Bun archive probe rendering",
+  "Rust archive probe rendering",
+  "uv archive probe rendering",
+]) {
+  test(`AWS mint stops before capture when ${failure} fails`, async (t) => {
+    const fake = await measuredFixture(t);
+    if (failure === "missing smoke owner") {
+      await rm(path.join(fake.root, "scripts/devtools-image-smoke-linux.sh"));
+    } else {
+      const installer = path.join(fake.root, "scripts/install-linux-developer-tools.sh");
+      const renderer = {
+        "Node archive probe rendering":
+          "node_pnpm_smoke_script() { echo partial-node-probe; return 47; }",
+        "Go archive probe rendering": "go_smoke_script() { echo partial-go-probe; return 48; }",
+        "Bun archive probe rendering": "bun_smoke_script() { echo partial-bun-probe; return 49; }",
+        "Rust archive probe rendering":
+          "rust_smoke_script() { echo partial-rust-probe; return 50; }",
+        "uv archive probe rendering": "uv_smoke_script() { echo partial-uv-probe; return 51; }",
+      }[failure];
+      await writeFile(installer, `${await readFile(installer, "utf8")}\n${renderer}\n`);
+    }
+    const result = await runScript(
+      ["--target", "linux", "--run", "--no-promote"],
+      fake.env,
+      fake.script,
+    );
+    const expected = {
+      "missing smoke owner": 1,
+      "Node archive probe rendering": 47,
+      "Go archive probe rendering": 48,
+      "Bun archive probe rendering": 49,
+      "Rust archive probe rendering": 50,
+      "uv archive probe rendering": 51,
+    }[failure];
+    assert.equal(result.code, expected, result.stderr);
+    const log = await readFile(fake.log, "utf8");
+    assert.match(log, /stop --provider aws --target linux cbx_source/);
+    assert.doesNotMatch(
+      log,
+      /checkpoint create|image promote|docker_probe=|partial-(?:node|go|bun|rust|uv)-probe/,
+    );
+  });
+}
+
+test("measured Linux publication runs nine fresh samples and publishes only allowlisted proof", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    {
+      ...fake.env, CRABBOX_AWS_AMI: "ami-ambient",
+      CRABBOX_CAPACITY_REGIONS: "eu-west-2,us-east-1",
+      CRABBOX_CAPACITY_AVAILABILITY_ZONES: "",
+    },
+    fake.script,
+  );
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /12 planned leases/);
+  const log = await readFile(fake.log, "utf8");
+  assert.equal((log.match(/args warmup /g) ?? []).length, 3);
+  assert.equal((log.match(/args run .*--timing-record /g) ?? []).length, 9);
+  assert.equal((log.match(/args bench check /g) ?? []).length, 2);
+  assert.equal(
+    (log.match(/args stop --provider aws --target linux cbx_[0-9a-f]{12}/g) ?? []).length,
+    9,
+  );
+  assert.match(log, /--full-resync --no-hydrate --keep --stop-after never --lease-output/);
+  assert.doesNotMatch(log, /CRABBOX_AWS_AMI=ami-ambient/);
+  const hints = log.split("\n").filter((line) => line.startsWith("capacity "));
+  assert.ok(hints.length >= 12);
+  assert.ok(hints.every((line) => line.startsWith("capacity regions=us-west-2 zones=, ")));
+  assert.doesNotMatch(log, /args (checkpoint|image) delete/);
+  const manifestPath = result.stdout.match(/public measurement proof: (.+)/)?.[1];
+  assert.equal(manifestPath, fake.outcome);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  assert.equal(manifest.schema, "crabbox-devtools-image-proof/v2");
+  assert.equal(manifest.status, "passed");
+  assert.equal(manifest.stage, "complete");
+  assert.equal(manifest.plannedLeaseCount, 12);
+  assert.equal(manifest.cohorts[0].medianSyncMs, 0);
+  assert.equal(manifest.cohorts[0].policyApplied, false);
+  assert.equal(manifest.cohorts[0].policyPassed, null);
+  assert.equal(manifest.cohorts[1].policyPassed, true);
+  assert.equal(manifest.cohorts[2].policyPassed, true);
+  assert.match(manifest.promotionBindingDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.doesNotMatch(JSON.stringify(manifest), /ami-devtools|cbx_|m7i|us-west|diagnostics/);
+  assert.doesNotMatch(result.stdout + result.stderr, /PRIVATE_(OWNER|HOST|CONFIG)_POISON|--owner/);
+  for (const file of await readdir(path.dirname(manifestPath))) {
+    if (file.endsWith(".selection.json")) {
+      assert.doesNotMatch(
+        await readFile(path.join(path.dirname(manifestPath), file), "utf8"),
+        /PRIVATE_/,
+      );
+    }
+  }
+});
+
+test("measured candidate deletion failure is recorded without masking the boot failure", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(fake.args, {
+    ...fake.env, CRABBOX_FAKE_WARMUP_FAIL_NUMBER: "2", CRABBOX_FAKE_DELETE_EXIT: "29",
+  }, fake.script);
+  assert.equal(result.code, 23, result.stderr);
+  const manifest = JSON.parse(await readFile(fake.outcome, "utf8"));
+  assert.equal(manifest.cleanupStatus, "failed");
+  assert.equal(manifest.exitCode, 23);
+  assert.match(result.stderr, /FAILED to delete candidate/);
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /args checkpoint delete chk_devtools --admin/);
+  assert.doesNotMatch(log, /args image promote/);
+});
+
+test("measured baseline is descriptive while candidate and promoted cohorts enforce policy", async (t) => {
+  const baseline = await measuredFixture(t);
+  const baselineResult = await runScript(
+    baseline.args,
+    { ...baseline.env, CRABBOX_FAKE_CHECK_FAIL_PHASE: "baseline" },
+    baseline.script,
+  );
+  assert.equal(baselineResult.code, 0, baselineResult.stderr);
+
+  const candidate = await measuredFixture(t);
+  const candidateResult = await runScript(
+    candidate.args,
+    { ...candidate.env, CRABBOX_FAKE_CHECK_FAIL_PHASE: "candidate" },
+    candidate.script,
+  );
+  assert.equal(candidateResult.code, 37, candidateResult.stderr);
+  const candidateOutcome = JSON.parse(await readFile(candidate.outcome, "utf8"));
+  assert.equal(candidateOutcome.status, "failed");
+  assert.equal(candidateOutcome.stage, "candidate_measure");
+  assert.equal(candidateOutcome.cohorts[0].policyApplied, false);
+  assert.equal(candidateOutcome.cohorts[0].policyPassed, null);
+  assert.equal(candidateOutcome.cohorts[1].policyApplied, true);
+  assert.equal(candidateOutcome.cohorts[1].policyPassed, false);
+  assert.doesNotMatch(await readFile(candidate.log, "utf8"), /image promote/);
+});
+
+test("measured invalid recipe and changed prep fail before any CLI operation", async (t) => {
+  for (const mode of ["recipe", "prep", "override"]) {
+    await t.test(mode, async (t) => {
+      const fake = await measuredFixture(t);
+      if (mode === "recipe")
+        await writeFile(
+          path.join(fake.root, "scripts/install-linux-developer-tools.sh"),
+          "changed",
+        );
+      const args = mode === "prep" ? [...fake.args, "--prep-script", fake.linuxPrep] : fake.args;
+      const env = mode === "override" ? { ...fake.env, CRABBOX_LINUX_NODE_MAJOR: "26" } : fake.env;
+      const result = await runScript(args, env, fake.script);
+      assert.notEqual(result.code, 0);
+      assert.match(
+        result.stderr,
+        mode === "recipe"
+          ? /SHA-256 mismatch/
+          : mode === "prep"
+            ? /measured prep must use the bundled recipe/
+            : /does not permit Linux installer overrides/,
+      );
+      await assert.rejects(readFile(fake.log, "utf8"));
+    });
+  }
+});
+
+test("measured planning makes no CLI calls and rejects incompatible execution inputs", async (t) => {
+  const fake = await measuredFixture(t);
+  const dry = await runScript(
+    fake.args.filter((arg) => arg !== "--run"),
+    fake.env,
+    fake.script,
+  );
+  assert.equal(dry.code, 0, dry.stderr);
+  assert.match(dry.stderr, /12 planned leases/);
+  assert.match(dry.stderr, /no hard attempt or dollar cap is enforced/);
+  await assert.rejects(readFile(fake.log, "utf8"));
+  for (const extra of [
+    ["--max-p95-runner-total-ms", "0"],
+    ["--no-browser"],
+    ["--no-desktop"],
+    ["--keep-lease"],
+    ["--no-promote"],
+    ["--fast-snapshot-restore"],
+    ["--target", "windows"],
+  ]) {
+    const result = await runScript([...fake.args, ...extra], fake.env, fake.script);
+    assert.notEqual(result.code, 0);
+    await assert.rejects(readFile(fake.log, "utf8"));
+  }
+  await writeFile(path.join(fake.root, "untracked-input"), "dirty");
+  const dirty = await runScript(fake.args, fake.env, fake.script);
+  assert.notEqual(dirty.code, 0);
+  assert.match(dirty.stderr, /measured source must be clean/);
+  await assert.rejects(readFile(fake.log, "utf8"));
+});
+
+test("measured incomplete or mixed cohorts block promotion", async (t) => {
+  for (const mode of ["missing", "mixed", "insufficient"]) {
+    await t.test(mode, async (t) => {
+      const fake = await measuredFixture(t);
+      const result = await runScript(
+        fake.args,
+        { ...fake.env, CRABBOX_FAKE_TIMING_MODE: mode },
+        fake.script,
+      );
+      assert.notEqual(result.code, 0);
+      assert.doesNotMatch(await readFile(fake.log, "utf8"), /image promote/);
+      const outcome = JSON.parse(await readFile(fake.outcome, "utf8"));
+      assert.equal(outcome.status, "failed");
+      assert.equal(outcome.stage, "candidate_measure");
+      assert.equal(outcome.cleanupStatus, "succeeded");
+      assert.doesNotMatch(JSON.stringify(outcome), /ami-|cbx_|m7i|us-west|PRIVATE_|diagnostics/);
+    });
+  }
+});
+
+test("measured candidate teardown failure blocks transactional promotion", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    { ...fake.env, CRABBOX_FAKE_STOP_FAIL_LEASE: "cbx_candidate" },
+    fake.script,
+  );
+  assert.equal(result.code, 27, result.stderr);
+  assert.doesNotMatch(await readFile(fake.log, "utf8"), /image promote/);
+});
+
+test("measured pending cleanup must be confirmed before another sample or promotion", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    { ...fake.env, CRABBOX_FAKE_STOP_FAIL_LEASE: "cbx_000000000004" },
+    fake.script,
+  );
+  assert.equal(result.code, 27, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  assert.doesNotMatch(log, /image promote/);
+  assert.equal((log.match(/args run .*--timing-record /g) ?? []).length, 4);
+});
+
+test("measured failed runs recover only the attempted lease and preserve the run failure", async (t) => {
+  for (const mode of [
+    "pending",
+    "stop-failure",
+    "missing-record",
+    "missing-handle",
+    "missing-both",
+  ]) {
+    await t.test(mode, async (t) => {
+      const fake = await measuredFixture(t);
+      const result = await runScript(
+        fake.args,
+        {
+          ...fake.env,
+          CRABBOX_FAKE_RUN_FAIL_PHASE: "baseline",
+          CRABBOX_FAKE_STOP_FAIL_LEASE: mode === "stop-failure" ? "cbx_000000000002" : "",
+          CRABBOX_FAKE_FAILED_RECORD_MISSING: ["missing-record", "missing-both"].includes(mode)
+            ? "1"
+            : "",
+          CRABBOX_FAKE_FAILED_HANDLE_MISSING: ["missing-handle", "missing-both"].includes(mode)
+            ? "1"
+            : "",
+        },
+        fake.script,
+      );
+      assert.equal(result.code, 41, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      assert.equal((log.match(/args run .*--timing-record /g) ?? []).length, 2);
+      assert.doesNotMatch(log, /image promote/);
+      if (mode === "missing-both") {
+        assert.equal((log.match(/args stop /g) ?? []).length, 1);
+        assert.match(result.stderr, /could not recover the attempted measurement lease/);
+      } else {
+        assert.match(log, /args stop --provider aws --target linux cbx_000000000002/);
+        if (mode === "stop-failure")
+          assert.match(result.stderr, /measurement cleanup remains unconfirmed/);
+      }
+    });
+  }
+});
+
+test("measured local image overrides are rejected before paid operations", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    { ...fake.env, CRABBOX_FAKE_CONFIG_AMI: "ami-configured" },
+    fake.script,
+  );
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /effective aws.ami override/);
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /args config show --provider aws --json/);
+  assert.doesNotMatch(log, /args (run|warmup|image|checkpoint) /);
+});
+
+test("measured tee failure still stops the lease and never replaces a run failure", async (t) => {
+  for (const runFails of [false, true]) {
+    await t.test(runFails ? "run and tee fail" : "tee fails", async (t) => {
+      const fake = await measuredFixture(t);
+      const bin = path.join(fake.dir, "bin");
+      await mkdir(bin);
+      const nativeTee = execFileSync("sh", ["-c", "command -v tee"], { encoding: "utf8" }).trim();
+      const tee = path.join(bin, "tee");
+      await writeFile(
+        tee,
+        `#!/usr/bin/env bash
+"${nativeTee}" "$@"
+if [[ "$1" == *baseline-${runFails ? 2 : 1}.log ]]; then exit 61; fi
+`,
+      );
+      await chmod(tee, 0o755);
+      const result = await runScript(
+        fake.args,
+        {
+          ...fake.env,
+          PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+          CRABBOX_FAKE_RUN_FAIL_PHASE: runFails ? "baseline" : "",
+        },
+        fake.script,
+      );
+      assert.equal(result.code, runFails ? 41 : 61, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      assert.match(
+        log,
+        new RegExp(`args stop --provider aws --target linux cbx_00000000000${runFails ? 2 : 1}`),
+      );
+      assert.doesNotMatch(log, /image promote/);
+      const outcome = JSON.parse(await readFile(fake.outcome, "utf8"));
+      assert.equal(outcome.status, "failed");
+      assert.equal(outcome.stage, "baseline");
+      assert.equal(outcome.exitCode, runFails ? 41 : 61);
+      assert.equal(outcome.rollbackStatus, "not_required");
+      assert.equal(outcome.cleanupStatus, "succeeded");
+    });
+  }
+});
+
+test("measured interruption recovers a retained handle without a final timing row", async (t) => {
+  for (const [phase, signal, stopFails] of [
+    ["baseline", "SIGTERM", false],
+    ["baseline", "SIGINT", true],
+    ["promoted", "SIGTERM", false],
+  ]) {
+    await t.test(`${phase} ${signal}`, async (t) => {
+      const fake = await measuredFixture(t);
+      const lease = phase === "baseline" ? "cbx_000000000002" : "cbx_000000000008";
+      let sent = false;
+      const result = await runScript(
+        fake.args,
+        {
+          ...fake.env,
+          CRABBOX_FAKE_INTERRUPT_PHASE: phase,
+          CRABBOX_FAKE_STOP_FAIL_LEASE: stopFails ? lease : "",
+        },
+        fake.script,
+        (chunk, child) => {
+          if (!sent && chunk.includes("retained-handle-ready")) {
+            sent = true;
+            child.kill(signal);
+          }
+        },
+      );
+      assert.equal(sent, true);
+      assert.equal(result.code, signal === "SIGINT" ? 130 : 143, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      assert.match(log, new RegExp(`args stop --provider aws --target linux ${lease}`));
+      const store = log.match(new RegExp(`--timing-record (\\S+/${phase}\\.jsonl)`))[1];
+      assert.equal((await readFile(store, "utf8")).trim().split("\n").length, 1);
+      if (phase === "promoted") assert.match(log, /--restore-receipt \S+ ami-devtools/);
+      else assert.doesNotMatch(log, /image promote/);
+      if (stopFails) assert.match(result.stderr, /stop failed/);
+      const outcome = JSON.parse(await readFile(fake.outcome, "utf8"));
+      assert.equal(outcome.status, "failed");
+      assert.equal(outcome.stage, phase === "promoted" ? "promoted_measure" : "baseline");
+      assert.equal(outcome.exitCode, signal === "SIGINT" ? 130 : 143);
+      assert.equal(outcome.rollbackStatus, phase === "promoted" ? "succeeded" : "not_required");
+      assert.equal(outcome.cleanupStatus, stopFails ? "failed" : "succeeded");
+      assert.doesNotMatch(result.stdout, /public measurement proof:/);
+    });
+  }
+});
+
+test("measured stock and promoted baselines must match prior-default presence", async (t) => {
+  for (const mode of ["stock-no-prior", "stock-unexpected-prior", "promoted-missing-prior"]) {
+    await t.test(mode, async (t) => {
+      const fake = await measuredFixture(t);
+      const result = await runScript(
+        fake.args,
+        {
+          ...fake.env,
+          CRABBOX_FAKE_PREVIOUS_ABSENT: mode === "stock-unexpected-prior" ? "0" : "1",
+          CRABBOX_FAKE_BASELINE_SOURCE: mode === "promoted-missing-prior" ? "promoted" : "stock",
+        },
+        fake.script,
+      );
+      const log = await readFile(fake.log, "utf8");
+      if (mode === "stock-no-prior") {
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /public measurement proof:/);
+        assert.doesNotMatch(log, /--restore-receipt/);
+      } else {
+        assert.notEqual(result.code, 0);
+        assert.match(result.stderr, /baseline differs from the captured previous default/);
+        assert.match(log, /--restore-receipt \S+ ami-devtools/);
+        assert.equal((log.match(/args warmup /g) ?? []).length, 2);
+      }
+    });
+  }
+});
+
+test("measured image and region evidence must be observed and coherent", async (t) => {
+  for (const mode of [
+    "baseline-image",
+    "baseline-source",
+    "baseline-region",
+    "candidate-region",
+    "promoted-region",
+    "candidate-image",
+    "coordinator-override",
+    "missing-selection",
+    "duplicate-selection",
+    "reused-instance",
+    "image-region",
+    "admin-failure",
+  ]) {
+    await t.test(mode, async (t) => {
+      const fake = await measuredFixture(t);
+      const result = await runScript(
+        fake.args,
+        { ...fake.env, CRABBOX_FAKE_SELECTION_MODE: mode },
+        fake.script,
+      );
+      assert.notEqual(result.code, 0);
+      if (mode === "admin-failure") assert.equal(result.code, 53);
+      const log = await readFile(fake.log, "utf8");
+      assert.match(log, /args stop --provider aws --target linux cbx_[0-9a-f]{12}/);
+      if (mode === "promoted-region") assert.match(log, /--restore-receipt/);
+      else assert.doesNotMatch(log, /image promote/);
+      if (
+        [
+          "missing-selection",
+          "duplicate-selection",
+          "coordinator-override",
+          "admin-failure",
+        ].includes(mode)
+      ) {
+        assert.equal((log.match(/args run .*--timing-record /g) ?? []).length, 1);
+      }
+      assert.doesNotMatch(result.stdout, /public measurement proof:/);
+    });
+  }
+});
+
+test("measured baseline must match the default captured by the original promotion receipt", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    { ...fake.env, CRABBOX_FAKE_PREVIOUS_IMAGE: "ami-concurrent" },
+    fake.script,
+  );
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /baseline differs from the captured previous default/);
+  assert.match(await readFile(fake.log, "utf8"), /--restore-receipt \S+ ami-devtools/);
+  const outcome = JSON.parse(await readFile(fake.outcome, "utf8"));
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.stage, "promotion");
+  assert.equal(outcome.rollbackStatus, "succeeded");
+  assert.match(outcome.promotionBindingDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.doesNotMatch(result.stdout, /public measurement proof:/);
+});
+
+test("measured receipt-less promotion failures retain the completed cohorts", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    {
+      ...fake.env,
+      CRABBOX_FAKE_PROMOTION_FAIL: "1",
+    },
+    fake.script,
+  );
+  assert.equal(result.code, 55, result.stderr);
+  assert.match(result.stderr, /transactional promotion receipt is unavailable for rollback/);
+  const outcome = JSON.parse(await readFile(fake.outcome, "utf8"));
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.stage, "promotion");
+  assert.equal(outcome.exitCode, 55);
+  assert.equal(outcome.rollbackStatus, "failed");
+  assert.equal(outcome.promotionBindingDigest, null);
+  assert.deepEqual(
+    outcome.cohorts.map((cohort) => cohort.phase),
+    ["baseline", "candidate"],
+  );
+});
+
+test("measured warmup cleanup failures remain visible to finalization", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    {
+      ...fake.env,
+      CRABBOX_FAKE_WARMUP_FAIL_AFTER_LEASE: "1",
+      CRABBOX_FAKE_STOP_FAIL_LEASE: "cbx_source",
+    },
+    fake.script,
+  );
+  assert.equal(result.code, 23, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  assert.ok((log.match(/stop --provider aws --target linux cbx_source/g) ?? []).length >= 2);
+  const outcome = JSON.parse(await readFile(fake.outcome, "utf8"));
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.stage, "source_prepare");
+  assert.equal(outcome.cleanupStatus, "failed");
+});
+
+test("measured wrong promoted selection stops the allocated lease before rollback", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    fake.args,
+    {
+      ...fake.env,
+      CRABBOX_FAKE_WARMUP_WRONG_IMAGE: "1",
+    },
+    fake.script,
+  );
+  assert.equal(result.code, 1, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  assert.match(log, /args stop --provider aws --target linux cbx_promoted/);
+  assert.match(log, /--restore-receipt \S+ ami-devtools/);
+});
+
+test("measured post-promotion failures preserve the original publisher status", async (t) => {
+  for (const mode of ["benchmark", "outcome", "rollback"]) {
+    await t.test(mode, async (t) => {
+      const fake = await measuredFixture(t);
+      const env = { ...fake.env, CRABBOX_FAKE_CHECK_FAIL_PHASE: "promoted" };
+      if (mode === "rollback") env.CRABBOX_FAKE_ROLLBACK_FAIL = "1";
+      if (mode === "outcome") {
+        delete env.CRABBOX_FAKE_CHECK_FAIL_PHASE;
+        const bin = path.join(fake.dir, "bin");
+        await mkdir(bin);
+        const node = path.join(bin, "node");
+        await writeFile(
+          node,
+          `#!/usr/bin/env bash\nif [[ "$1" == *devtools-image-proof.mjs && "\${2:-}" == finalize ]]; then exit 66; fi\nexec "${process.execPath}" "$@"\n`,
+        );
+        await chmod(node, 0o755);
+        env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
+      }
+      const result = await runScript(fake.args, env, fake.script);
+      assert.equal(result.code, mode === "outcome" ? 66 : 37, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      if (mode === "outcome") {
+        assert.match(
+          log,
+          /image promote --json --target linux .*--restore-receipt \S+ ami-devtools/,
+        );
+      } else {
+        assert.match(
+          log,
+          /image promote --json --target linux .*--restore-receipt \S+ ami-devtools/,
+        );
+      }
+      if (mode === "rollback") assert.match(result.stderr, /newer default was not overwritten/);
+      assert.doesNotMatch(result.stdout, /public measurement proof:/);
+    });
+  }
+});
+
+test("AWS Linux image verification uses trusted source bytes instead of the installed producer", async () => {
+  const source = await readFile(script, "utf8");
+  const smoke = await readFile(path.join(scriptDir, "devtools-image-smoke-linux.sh"), "utf8");
+  assert.match(source, /--script "\$ROOT\/scripts\/linux-readiness\.generated\.sh" -- --install/);
+  assert.equal(
+    (source.match(/--script "\$ROOT\/scripts\/linux-readiness\.generated\.sh"/g) ?? []).length,
+    2,
+  );
+  assert.match(
+    source,
+    /--script "\$ROOT\/scripts\/linux-readiness\.generated\.sh" -- --verify linux-builder/,
+  );
+  assert.doesNotMatch(
+    source,
+    /--shell -- \/usr\/local\/libexec\/crabbox\/linux-readiness\.generated\.sh/,
+  );
+  assert.doesNotMatch(smoke, /test -f \/var\/lib\/crabbox.*(?:linux\.json|image-ready)/);
+  assert.doesNotMatch(source, /sudo tee \/var\/lib\/crabbox\/image-ready/);
+  assert.doesNotMatch(source, /printf 'crabbox-devtools-v1/);
+});
+
+test("publisher checks the builder profile in every Linux lifecycle phase", async (t) => {
+  for (const phase of ["source", "candidate", "promoted"]) {
+    await t.test(phase, async (subtest) => {
+      const fake = await setupFakeCrabbox();
+      subtest.after(() => rm(fake.dir, { recursive: true, force: true }));
+      const result = await runScript(
+        ["--target", "linux", "--run", "--prep-script", fake.linuxPrep],
+        {
+          CRABBOX_BIN: fake.fake,
+          CRABBOX_FAKE_LOG: fake.log,
+          CRABBOX_IMAGE_LOG_DIR: path.join(fake.dir, "logs"),
+          CRABBOX_FAKE_READINESS_FAIL_LEASE: `cbx_${phase}`,
+        },
+      );
+      assert.equal(result.code, 74, result.stderr);
+      const log = await readFile(fake.log, "utf8");
+      assert.match(log, new RegExp(`stop --provider aws --target linux cbx_${phase}`));
+      if (phase === "source") assert.doesNotMatch(log, /checkpoint create/);
+      if (phase === "candidate") assert.doesNotMatch(log, /image promote/);
+      if (phase === "promoted") assert.match(log, /image promote .*--restore-receipt/);
+    });
+  }
+});
+
+async function runLinuxSmoke(t, options = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "crabbox-linux-smoke-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = path.join(root, "bin");
+  const scratch = path.join(root, "scratch");
+  const caches = path.join(root, "caches");
+  const events = path.join(root, "events");
+  for (const directory of [
+    bin,
+    scratch,
+    ...["pnpm", "npm", "corepack", "docker"].map((name) => path.join(caches, name)),
+  ]) {
+    await mkdir(directory, { recursive: true });
+  }
+  if (options.fail === "cache") await rm(path.join(caches, "pnpm"), { recursive: true });
+  const writeTool = async (name, body) => {
+    const file = path.join(bin, name);
+    await writeFile(
+      file,
+      `#!/usr/bin/env bash
+set -eu
+printf '%s %s\\n' '${name}' "$*" >>${JSON.stringify(events)}
+[[ "\${CRABBOX_SMOKE_FAIL:-}" != '${name}' ]] || exit 37
+${body}
+`,
+    );
+    await chmod(file, 0o755);
+  };
+  for (const name of ["git", "gh", "jq", "rg", "fd", "trufflehog"]) {
+    await writeTool(name, "exit 0");
+  }
+  for (const name of ["npm", "corepack", "pnpm"]) {
+    await writeTool(
+      name,
+      `if [[ "${name}" == corepack && "$*" == "pnpm --version" ]]; then
+  [[ "$COREPACK_ENABLE_NETWORK" == 0 && "$PWD" == / ]]
+  echo 11.1.0
+elif [[ "$*" == --version ]]; then
+  if [[ "${name}" == pnpm ]]; then
+    [[ "$COREPACK_ENABLE_NETWORK" == 0 && -z "\${COREPACK_ENABLE_PROJECT_SPEC+x}" ]]
+    echo 11.1.0
+  else
+    [[ "$COREPACK_ENABLE_NETWORK" == 1 && "$npm_config_offline" == false ]]
+  fi
+else
+  [[ "$COREPACK_ENABLE_NETWORK" == 0 && "$npm_config_offline" == true ]]
+fi`,
+    );
+  }
+  await writeTool("node", `exec ${JSON.stringify(process.execPath)} "$@"`);
+  await writeTool("python3", '[[ "$1" != - && "$1" != -c ]] || exec /usr/bin/python3 "$@"');
+  await writeTool(
+    "cc",
+    `[[ "$2" == -o ]]
+printf '#!/bin/sh\\nexit 0\\n' >"$3"
+chmod +x "$3"`,
+  );
+  await writeTool("id", 'case "$*" in -u) echo 1000 ;; -nG) echo users ;; esac');
+  await writeTool("whoami", "echo alice");
+  await writeTool(
+    "getent",
+    `[[ "\${CRABBOX_SMOKE_FAIL:-}" != access ]] || exit 1
+echo 'docker:x:999:alice,bob'`,
+  );
+  await writeTool(
+    "docker",
+    `if [[ "$1" == version && "\${CRABBOX_SMOKE_REFRESH:-0}" == 1 && "\${CRABBOX_FAKE_IN_SG:-0}" != 1 ]]; then exit 1; fi
+if [[ "\${CRABBOX_SMOKE_FAIL:-}" == access && "$1" == version ]]; then exit 1; fi
+if [[ "\${CRABBOX_SMOKE_FAIL:-}" == buildx && "$1 \${2:-}" == "buildx build" ]]; then exit 37; fi
+if [[ "\${CRABBOX_SMOKE_FAIL:-}" == compose && "$*" == *" run --rm "* ]]; then exit 37; fi
+exit 0`,
+  );
+  await writeTool("sg", '[[ "$1 $2" == "docker -c" ]]\nCRABBOX_FAKE_IN_SG=1 sh -c "$3"');
+  await writeTool("sudo", "exit 80");
+  const smoke = path.join(root, "smoke.sh");
+  const source = await readFile(path.join(scriptDir, "devtools-image-smoke-linux.sh"), "utf8");
+  // Archive authentication is covered by the renderer fixtures; this fixture owns runtime capabilities.
+  await writeFile(
+    smoke,
+    `developer_archive_probe() { :; }\n${source.replaceAll("/var/cache/crabbox", caches)}`,
+  );
+  const result = await runScript(
+    [],
+    {
+      PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+      TMPDIR: scratch,
+      DISPLAY: ":99",
+      expected_node_major: "",
+      expected_pnpm_version: "11.1.0",
+      COREPACK_ENABLE_NETWORK: "1",
+      npm_config_offline: "false",
+      CRABBOX_SMOKE_EVENTS: events,
+      CRABBOX_SMOKE_FAIL: options.fail ?? "",
+      CRABBOX_SMOKE_SECRET: "fixture-only-not-a-credential",
+      CRABBOX_SMOKE_REFRESH: options.refresh ? "1" : "0",
+    },
+    smoke,
+  );
+  assert.deepEqual(await readdir(scratch), [], "smoke must remove all disposable fixtures");
+  for (const cache of await readdir(caches)) {
+    assert.deepEqual(
+      await readdir(path.join(caches, cache)),
+      [],
+      "cache write probes must be removed",
+    );
+  }
+  return { ...result, events: await readFile(events, "utf8") };
+}
+
+test("Linux image smoke runs offline functional checks and cleans its fixtures", async (t) => {
+  const result = await runLinuxSmoke(t);
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /devtools-smoke-ok/);
+  assert.match(result.events, /npm --offline run check/);
+  assert.match(result.events, /pnpm run check/);
+  assert.match(result.events, /docker run --rm --pull=never --network=none/);
+  assert.match(result.events, /docker buildx build --builder default --pull=false --network=none/);
+  assert.match(result.events, /docker compose .* run --rm --no-deps --pull never check/);
+  assert.match(result.events, /docker compose .* down --remove-orphans/);
+  assert.match(result.events, /docker image rm crabbox-smoke-/);
+  assert.doesNotMatch(result.events, /sudo |docker pull |apt-get |npm install/);
+});
+
+test("Linux image smoke refreshes the first Docker group member without root execution", async (t) => {
+  const result = await runLinuxSmoke(t, { refresh: true });
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  assert.match(result.events, /sg docker -c/);
+  assert.doesNotMatch(result.events, /sudo /);
+});
+
+for (const fail of ["cc", "npm", "pnpm", "cache", "access", "docker", "buildx", "compose"]) {
+  test(`Linux image smoke rejects ${fail} without success and cleans fixtures`, async (t) => {
+    const result = await runLinuxSmoke(t, { fail });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.doesNotMatch(result.stdout, /devtools-smoke-ok/);
+    assert.doesNotMatch(result.events, /sudo /);
+  });
+}
+
+for (const root of ["16", "40", "400"]) {
+  test(`stock-source plan accepts root ${root}`, async () => {
+    const result = await runScript(["--target", "linux", "--stock-source", "--root-gb", root], {
+      CRABBOX_BIN: "/usr/bin/true",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, new RegExp(`source: stock=1 root_gb=${root}`));
+    assert.match(result.stdout, /dry plan only/);
+  });
+}
+for (const [args, message] of [
+  [["--root-gb", "40"], /requires --stock-source/],
+  [["--stock-source", "--root-gb", ""], /integer.*16.*400/],
+  [["--stock-source", "--root-gb", "15"], /integer.*16.*400/],
+  [["--stock-source", "--root-gb", "401"], /integer.*16.*400/],
+  [["--stock-source", "--root-gb", "040"], /integer.*16.*400/],
+  [["--stock-source", "--root-gb", "1.5"], /integer.*16.*400/],
+  [["--stock-source", "--root-gb", "99999999999999999999999"], /integer.*16.*400/],
+  [["--target", "windows", "--stock-source"], /requires CRABBOX_OS=windows-server:2022 or windows-server:2025/],
+]) {
+  test(`stock-source validation rejects ${args.join(" ")}`, async (t) => {
+    const fake = await setupFakeCrabbox();
+    t.after(() => rm(fake.dir, { recursive: true, force: true }));
+    const result = await runScript([...args, "--run"], {
+      CRABBOX_BIN: fake.fake,
+      CRABBOX_FAKE_LOG: fake.log,
+    });
+    assert.equal(result.code, 2, result.stderr);
+    assert.match(result.stderr, message);
+    assert.equal(await readFile(fake.log, "utf8").catch(() => ""), "");
+  });
+}
+for (const year of ["2022", "2025"]) {
+  test(`Windows ${year} stock-source scopes the selector to source and proves normal promotion`, async (t) => {
+    const fake = await setupFakeCrabbox();
+    t.after(() => rm(fake.dir, { recursive: true, force: true }));
+    const result = await runScript(["--target", "windows", "--stock-source", "--region", "eu-west-1", "--prep-script", fake.windowsPrep, "--run"], {
+      CRABBOX_BIN: fake.fake,
+      CRABBOX_FAKE_LOG: fake.log,
+      CRABBOX_IMAGE_LOG_DIR: fake.dir,
+      CRABBOX_OS: `windows-server:${year}`,
+      CRABBOX_AWS_AMI: undefined,
+      CRABBOX_IMAGE_WINDOWS_WARMUP_SETTLE_SECONDS: "0",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    const log = await readFile(fake.log, "utf8");
+    assert.deepEqual(log.split("\n").filter((line) => /^selection .* command=warmup$/.test(line)), [
+      `selection os=windows-server:${year} ami=unset command=warmup`,
+      "selection os=unset ami=ami-devtools command=warmup",
+      "selection os=unset ami=unset command=warmup",
+    ]);
+    assert.deepEqual(log.split("\n").filter((line) => /^source-options .* command=warmup$/.test(line)), [
+      "source-options stock=1 root=0 command=warmup",
+      "source-options stock=0 root=0 command=warmup",
+      "source-options stock=0 root=0 command=warmup",
+    ]);
+    assert.match(log, new RegExp(`ExpectedWindowsBuild = '${year === "2025" ? "26100" : "20348"}'`));
+    assert.doesNotMatch(log, /image promote .*--os windows/);
+    for (const lease of ["source", "candidate", "promoted"]) {
+      assert.match(log, new RegExp(`stop --provider aws --target windows cbx_${lease}`));
+    }
+    assert.match(result.stdout, /promoted image selection proved: ami-devtools/);
+  });
+}
+
+test("stock-source overrides only the source lease and records requested source metadata", async (t) => {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const result = await runScript(["--stock-source", "--root-gb", "40", "--run"], {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_IMAGE_LOG_DIR: fake.dir,
+    CRABBOX_AWS_STOCK_IMAGE: "1",
+    CRABBOX_AWS_ROOT_GB: "400",
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  assert.deepEqual(
+    log
+      .split("\n")
+      .filter((line) => line.startsWith("source-options") && line.endsWith("command=warmup")),
+    [
+      "source-options stock=1 root=40 command=warmup",
+      "source-options stock=0 root=0 command=warmup",
+      "source-options stock=0 root=0 command=warmup",
+    ],
+  );
+  const sourceFile = (await readdir(fake.dir)).find((name) => name.endsWith("-source.json"));
+  assert.ok(sourceFile);
+  assert.deepEqual(JSON.parse(await readFile(path.join(fake.dir, sourceFile), "utf8")), {
+    stockSource: true,
+    rootGB: 40,
+    leaseId: "cbx_source",
+  });
+});
+
+test("measured stock-source keeps baseline selection and all proof sizing normal", async (t) => {
+  const fake = await measuredFixture(t);
+  const result = await runScript(
+    [...fake.args, "--stock-source", "--root-gb", "40"],
+    {
+      ...fake.env,
+      CRABBOX_AWS_STOCK_IMAGE: "1",
+      CRABBOX_AWS_ROOT_GB: "400",
+    },
+    fake.script,
+  );
+  assert.equal(result.code, 0, result.stderr);
+  const log = await readFile(fake.log, "utf8");
+  const requests = log.split("\n").filter((line) => line.startsWith("source-options"));
+  assert.equal(requests.filter((line) => line.includes("stock=1")).length, 1);
+  assert.equal(requests.filter((line) => line.includes("root=40 ")).length, 1);
+  assert.equal(requests.filter((line) => line.endsWith("command=warmup")).length, 3);
+  assert.doesNotMatch(requests.join("\n"), /root=400/);
+  const manifest = JSON.parse(await readFile(fake.outcome, "utf8"));
+  assert.equal(manifest.status, "passed");
+  assert.deepEqual(manifest.source, { stockSource: true, rootGB: 40 });
+  assert.equal(manifest.candidateSelection, "explicit");
+  assert.equal(manifest.promotedSelection, "promoted");
+});
+
+test("stock-source refuses an ignored stock request before image capture", async (t) => {
+  const fake = await setupFakeCrabbox();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const result = await runScript(["--stock-source", "--root-gb", "40", "--run"], {
+    CRABBOX_BIN: fake.fake,
+    CRABBOX_FAKE_LOG: fake.log,
+    CRABBOX_IMAGE_LOG_DIR: fake.dir,
+    CRABBOX_FAKE_STOCK_SOURCE_IGNORED: "1",
+  });
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stderr, /did not prove stock image selection/);
+  const log = await readFile(fake.log, "utf8");
+  assert.doesNotMatch(log, /checkpoint create|image promote/);
   assert.match(log, /stop --provider aws --target linux cbx_source/);
 });

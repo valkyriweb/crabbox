@@ -2,6 +2,8 @@ package parallels
 
 import (
 	"flag"
+	"path/filepath"
+	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -12,11 +14,14 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return "parallels" }
-func (Provider) Aliases() []string { return nil }
+func (Provider) BackendCapabilities() core.Backend { return &leaseBackend{} }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication: core.ProviderAuthentication{
+			{Route: "local-host", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationLocalContext}, Description: "The local host context runs prlctl on the same Mac."},
+			{Route: "remote-host", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationSSH}, Description: "A configured remote Mac is accessed through SSH; guest/bootstrap credentials are separate."},
+		},
 		Name:   "parallels",
 		Family: "parallels",
 		Kind:   core.ProviderKindSSHLease,
@@ -38,7 +43,8 @@ func (Provider) Spec() core.ProviderSpec {
 			core.FeatureRestore,
 			core.FeatureSnapshot,
 		},
-		Coordinator: core.CoordinatorNever,
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -52,6 +58,7 @@ type flagValues struct {
 	Host             *string
 	HostUser         *string
 	HostKey          *string
+	BootstrapKey     *string
 	VMRoot           *string
 	User             *string
 	WorkRoot         *string
@@ -65,14 +72,15 @@ func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
 		SourceID:         fs.String("parallels-source-id", defaults.Parallels.SourceID, "Parallels source VM UUID"),
 		SourceSnapshot:   fs.String("parallels-source-snapshot", defaults.Parallels.SourceSnapshot, "Parallels source snapshot name"),
 		SourceSnapshotID: fs.String("parallels-source-snapshot-id", defaults.Parallels.SourceSnapshotID, "Parallels source snapshot ID"),
-		CloneMode:        fs.String("parallels-clone-mode", defaults.Parallels.CloneMode, "Parallels clone mode: linked, full, or unlink"),
+		CloneMode:        fs.String("parallels-clone-mode", defaults.Parallels.CloneMode, "Parallels clone mode: linked, full, or unlink (default: linked with a snapshot selector; otherwise full for macOS on Apple silicon, linked elsewhere)"),
 		Host:             fs.String("parallels-host", defaults.Parallels.Host, "remote Mac host running Parallels"),
 		HostUser:         fs.String("parallels-host-user", defaults.Parallels.HostUser, "remote Mac SSH user"),
 		HostKey:          fs.String("parallels-host-key", defaults.Parallels.HostKey, "remote Mac SSH key"),
-		VMRoot:           fs.String("parallels-vm-root", defaults.Parallels.VMRoot, "destination directory for cloned .pvm bundles"),
+		BootstrapKey:     fs.String("parallels-bootstrap-key", defaults.Parallels.BootstrapKey, "absolute guest bootstrap SSH key path on the Parallels host (macOS Tools fallback)"),
+		VMRoot:           fs.String("parallels-vm-root", defaults.Parallels.VMRoot, "destination directory for cloned VM bundles"),
 		User:             fs.String("parallels-user", defaults.Parallels.User, "guest SSH user"),
 		WorkRoot:         fs.String("parallels-work-root", defaults.Parallels.WorkRoot, "remote work root inside Parallels guests"),
-		StartupTimeout:   fs.String("parallels-startup-timeout", defaults.Parallels.StartupTimeout.String(), "Parallels VM startup timeout"),
+		StartupTimeout:   fs.String("parallels-startup-timeout", defaults.Parallels.StartupTimeout.String(), "Parallels IP discovery and guest preparation timeout"),
 	}
 }
 
@@ -85,6 +93,7 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 	windowsModeOverride := cfg.WindowsMode
 	if core.FlagWasSet(fs, "parallels-template") {
 		cfg.Parallels.Template = *v.Template
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 		if err := core.ApplyParallelsTemplateConfig(cfg, *v.Template); err != nil {
 			return err
 		}
@@ -97,63 +106,106 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 	}
 	if core.FlagWasSet(fs, "parallels-source") {
 		cfg.Parallels.Source = *v.Source
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 		cfg.Parallels.SourceID = ""
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-source-id") {
 		cfg.Parallels.SourceID = *v.SourceID
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-source-snapshot") {
 		cfg.Parallels.SourceSnapshot = *v.SourceSnapshot
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 		cfg.Parallels.SourceSnapshotID = ""
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-source-snapshot-id") {
 		cfg.Parallels.SourceSnapshotID = *v.SourceSnapshotID
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-clone-mode") {
 		cfg.Parallels.CloneMode = *v.CloneMode
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-host") {
 		cfg.Parallels.Host = *v.Host
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
+		// An explicit host is a direct-host override, not another fleet hint.
+		// Leaving configured fleet candidates here silently replaces the flag.
+		cfg.Parallels.Hosts = nil
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
+		cfg.Parallels.SelectedHost = ""
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-host-user") {
 		cfg.Parallels.HostUser = *v.HostUser
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-host-key") {
 		cfg.Parallels.HostKey = core.ExpandUserPath(*v.HostKey)
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
+	}
+	if core.FlagWasSet(fs, "parallels-bootstrap-key") {
+		cfg.Parallels.BootstrapKey = *v.BootstrapKey
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-vm-root") {
 		cfg.Parallels.VMRoot = core.ExpandUserPath(*v.VMRoot)
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 	}
 	if core.FlagWasSet(fs, "parallels-user") {
 		cfg.Parallels.User = *v.User
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 		cfg.SSHUser = *v.User
 	}
 	if core.FlagWasSet(fs, "parallels-work-root") {
 		cfg.Parallels.WorkRoot = *v.WorkRoot
+		core.RecordProviderFlagInputs(cfg, true, "parallels")
 		cfg.WorkRoot = *v.WorkRoot
 	}
 	if core.FlagWasSet(fs, "parallels-startup-timeout") {
 		if err := core.ApplyLeaseDuration(&cfg.Parallels.StartupTimeout, *v.StartupTimeout); err != nil {
 			return err
 		}
+		core.RecordProviderFlagInputs(cfg, *v.StartupTimeout != "", "parallels")
 	}
 	return nil
+}
+
+// DesktopCredentials returns the macOS guest account credential used by the
+// local ARD client. There is intentionally no CLI password flag: the secret is
+// accepted only from trusted user config or CRABBOX_PARALLELS_PASSWORD.
+func (Provider) DesktopCredentials(cfg core.Config, target core.SSHTarget) (core.DesktopCredentials, bool) {
+	if cfg.TargetOS != core.TargetMacOS && target.TargetOS != core.TargetMacOS {
+		return core.DesktopCredentials{}, false
+	}
+	if cfg.Parallels.Password == "" {
+		return core.DesktopCredentials{}, false
+	}
+	username := strings.TrimSpace(target.User)
+	if username == "" {
+		username = strings.TrimSpace(cfg.Parallels.User)
+	}
+	return core.DesktopCredentials{Username: username, Password: cfg.Parallels.Password}, true
 }
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
+func (Provider) ValidateConfig(cfg core.Config) error {
+	key := strings.TrimSpace(cfg.Parallels.BootstrapKey)
+	if key == "" {
+		return nil
 	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "parallels doctor backend unavailable")
+	if cfg.TargetOS != core.TargetMacOS {
+		return core.Exit(2, "parallels.bootstrapKey is supported only for macOS guests")
 	}
-	return doctor, nil
+	if !filepath.IsAbs(key) || strings.ContainsAny(key, "\r\n\x00") {
+		return core.Exit(2, "parallels.bootstrapKey must be an absolute path on the Parallels host")
+	}
+	return nil
 }
 
 func (Provider) NativeCheckpointCapability(req core.NativeCheckpointRequest) (core.NativeCheckpointCapability, bool) {

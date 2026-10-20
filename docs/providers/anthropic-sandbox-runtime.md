@@ -95,6 +95,13 @@ Precedence follows the normal Crabbox order:
 flags > env > repo config > user config > defaults
 ```
 
+An omitted, null, or empty YAML `cliPath` keeps the inherited binary path.
+An empty YAML `settings` value clears the inherited settings path, and
+`debug: false` clears an earlier true value. An explicitly empty CLI-path flag
+still overrides earlier layers and fails validation; whitespace-only paths are
+also rejected. These existing distinctions are preserved by the generated
+configuration bindings.
+
 Crabbox validates only its own config shape, such as a non-empty `cliPath`.
 Anthropic Sandbox Runtime owns validation of the settings JSON schema and
 sandbox policy. Keep trusted, machine-specific settings in user config when
@@ -112,6 +119,10 @@ they grant broad local filesystem or network access.
 4. `warmup`, `status`, and `stop` return clear one-shot unsupported messages.
 
 The provider omits `run-session`, so `--lease-output` remains unsupported.
+Command cancellation and deadline causes are retained in run results and timing
+as `canceled` and `timed-out`, rather than being reduced to ordinary command
+failures. Numeric exit codes and diagnostic text remain unchanged; an ordinary
+nonzero command exit is still a `failed` run with `command-exit` error kind.
 Global SSH, sync, desktop, browser, code-server, Tailscale, pool, fresh-PR,
 script upload, downloads, capture stdout/stderr, and remote artifact flags are
 rejected through delegated-provider validation.
@@ -136,11 +147,14 @@ rejected through delegated-provider validation.
 Run the scripted live proof on a host with SRT installed:
 
 ```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=anthropic-sandbox-runtime scripts/live-smoke.sh
 scripts/live-anthropic-sandbox-runtime-smoke.sh
 ```
 
-The script builds `bin/crabbox`, runs `doctor`, verifies a one-shot
-`echo ok`, then creates a temporary SRT settings file that:
+The top-level script dispatches to the provider-specific script. The
+provider-specific script builds `bin/crabbox` unless `CRABBOX_BIN` is set, runs
+`doctor`, verifies a one-shot `echo ok`, then creates a temporary SRT settings
+file that:
 
 - allows writing inside one temporary directory;
 - denies reading a temporary secret file;

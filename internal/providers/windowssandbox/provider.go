@@ -12,20 +12,17 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string {
-	return []string{"wsb", "windows-sandbox-provider"}
-}
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "local-sandbox",
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetWindows, WindowsMode: core.WindowsModeNormal}},
-		Features:    core.FeatureSet{core.FeatureArchiveSync},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"wsb", "windows-sandbox-provider"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationLocalContext),
+		Name:             providerName,
+		Family:           "local-sandbox",
+		Kind:             core.ProviderKindDelegatedRun,
+		Targets:          []core.TargetSpec{{OS: core.TargetWindows, WindowsMode: core.WindowsModeNormal}},
+		Features:         core.FeatureSet{core.FeatureArchiveSync},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -51,14 +48,24 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return newBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
+func (Provider) ConfigDefaultsTargetFinalization() core.ProviderConfigDefaultsTargetFinalization {
+	return core.ProviderConfigDefaultsCallerFinalizes
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	if core.IsTargetExplicit(cfg) && core.NormalizeTargetOS(cfg.TargetOS) != core.TargetWindows {
+		return core.Exit(2, "provider=windows-sandbox supports target=windows only")
 	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
+	if cfg.TargetOS == "" || (!core.IsTargetExplicit(cfg) && cfg.TargetOS == core.TargetLinux) {
+		cfg.TargetOS = core.TargetWindows
 	}
-	return doctor, nil
+	if core.ExplicitWindowsModeValue(*cfg) != "" && core.NormalizeWindowsMode(core.ExplicitWindowsModeValue(*cfg)) != core.WindowsModeNormal {
+		return core.Exit(2, "provider=windows-sandbox supports windows.mode=normal only")
+	}
+	cfg.WindowsMode = core.WindowsModeNormal
+	if cfg.WindowsSandbox.Workdir == "" {
+		cfg.WindowsSandbox.Workdir = `C:\crabbox-work`
+	}
+	cfg.WorkRoot = cfg.WindowsSandbox.Workdir
+	return nil
 }

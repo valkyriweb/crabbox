@@ -37,7 +37,7 @@ operator machine opens the actual internet connections.
 
 Mediated egress is not:
 
-- a public open proxy (it refuses to start without an allowlist);
+- an unauthenticated public proxy (lease tickets and loopback binding remain required);
 - a replacement for provider firewalls or SSH access controls;
 - a transparent VM-wide VPN;
 - a way for the coordinator to become the internet egress point;
@@ -78,8 +78,11 @@ Mediated egress has two long-running agents joined by one coordinator session:
   (both `CONNECT host:port` and absolute-form HTTP) and asks the host agent to
   open each connection.
 - **Host egress agent** runs on the operator machine. It enforces the allowlist
-  and opens the real outbound TCP connections, so remote services see the
-  operator's public IP.
+  and opens the real outbound TCP connections. By default, it resolves each
+  allowed hostname once, rejects non-public results, and dials the validated IP
+  address directly so DNS cannot retarget the connection after the allowlist
+  check. Remote services then see the operator's public IP. An explicitly
+  selected upstream proxy can own the final outbound connection instead.
 - **Coordinator session** consumes one-use tickets, pairs the host and client
   sockets by `leaseID`/`sessionID`, and reports status. Cloudflare bridge
   sockets survive Durable Object hibernation. Node sockets are process-local;
@@ -92,6 +95,37 @@ The bridge multiplexes many TCP connections over a single WebSocket per side
 
 ## Quick start
 
+### Run one job
+
+Use `egress run` on an existing Linux SSH lease you own exclusively. It starts
+the bridge, runs the command, and cleans up its egress session afterward:
+
+```sh
+crabbox egress run --id swift-crab --allow api.ipify.org --no-sync --no-hydrate -- \
+  curl --fail --proxy http://127.0.0.1:3128 https://api.ipify.org
+```
+
+The command explicitly points `curl` at the lease proxy. Other applications
+need their own proxy setting; `egress run` does not inject proxy variables,
+credentials, or CA trust. The example skips source sync and configured Actions
+hydration because it uses an existing tool. Omit those flags to keep normal
+[`crabbox run`](../commands/run.md) defaults for a repository workload.
+
+To run a script without placing its contents on the command line, use
+`--script-stdin` and pass any script arguments after `--`:
+
+```sh
+crabbox egress run --id swift-crab --allow api.example.com \
+  --no-sync --no-hydrate --script-stdin -- smoke < ./scripts/test-live.sh
+```
+
+Crabbox reads the entire script before changing transport state. The script
+must configure its application's lease-local proxy. The lease remains available
+after the job; `egress run` owns the egress session, not lease allocation or
+release. See [session lifecycle and cleanup](#session-lifecycle-and-cleanup).
+
+### Keep a browser session open
+
 Lease a desktop+browser box, start egress, then launch a browser through the
 proxy and watch it in the WebVNC portal:
 
@@ -100,7 +134,7 @@ crabbox warmup --provider hetzner --desktop --browser
 crabbox egress start --id swift-crab --profile discord --daemon
 crabbox desktop launch --id swift-crab \
   --browser \
-  --url https://example.com \
+  --url https://discord.com/login \
   --egress discord \
   --webvnc \
   --open
@@ -109,9 +143,9 @@ crabbox desktop launch --id swift-crab \
 `egress start`:
 
 1. resolves the lease through the coordinator;
-2. copies and starts the lease-side egress client over SSH, listening on the
-   loopback proxy port;
-3. creates a client ticket and waits for the lease proxy to come up;
+2. copies the lease-side egress client over SSH;
+3. creates a client ticket, sends it through SSH stdin to start the client on
+   the loopback proxy port, and waits for the lease proxy to come up;
 4. creates a host ticket and starts the local host agent (in the background
    with `--daemon`, otherwise in the foreground).
 
@@ -120,56 +154,157 @@ the launched browser (default proxy `127.0.0.1:3128`, override with
 `--egress-proxy`). It requires `--browser`. Start `egress start` first so
 something is listening on the lease proxy port.
 
-`egress start` installs and runs a Linux helper over POSIX shell, so it only
-supports Linux lease targets today. For non-Linux boxes, set up the client and
-host pieces manually with the low-level commands.
+`egress run` and `egress start` install a verified Linux runtime-pack helper over
+SSH, selected for the lease architecture (`amd64` or `arm64`). The manifest
+binds exact helper digests to the running CLI digest; invalid packs fail closed
+with an install or local-pack preparation step. Installed CLIs need neither a
+Crabbox checkout nor Go in the caller's project. The caller-repository compiler
+path has been removed. For non-Linux
+boxes, set up the client and host pieces manually with the low-level commands.
 
-## Commands
+### Upstream proxies
+
+Use `--upstream-proxy-env <ENV_NAME>` on `egress run`, `start`, or `host` to
+forward destination connections through a trusted HTTP or HTTPS CONNECT
+proxy. Have your proxy or credential manager populate a dedicated local
+variable, then select it by name:
 
 ```sh
-# Orchestrated: start the lease client over SSH plus the local host agent.
-crabbox egress start --id swift-crab --profile discord [--daemon]
-
-# Low-level pieces (run each side yourself).
-crabbox egress host   --id swift-crab --profile discord
-crabbox egress client --id swift-crab --listen 127.0.0.1:3128
-
-# Inspect and tear down.
-crabbox egress status --id swift-crab
-crabbox egress stop   --id swift-crab
+crabbox egress run --id swift-crab --allow api.example.com \
+  --upstream-proxy-env CRABBOX_EGRESS_UPSTREAM_PROXY --no-sync --no-hydrate -- \
+  curl --fail --proxy http://127.0.0.1:3128 https://api.example.com/health
 ```
 
-Common flags (most accept the lease `--id` or slug, or a positional id):
+The data path becomes:
 
-| Flag | Commands | Notes |
-| --- | --- | --- |
-| `--id` | all | Lease id or slug. |
-| `--provider` | all | Defaults to the configured provider. |
-| `--profile` | start, host | Named allowlist (`discord`, `slack`). |
-| `--allow` | start, host | Comma-separated host patterns; merged with `--profile`. |
-| `--listen` | start, client | Lease-local proxy address; loopback-only (default `127.0.0.1:3128`). |
-| `--daemon` | start | Run the local host agent in the background under a supervisor. |
-| `--coordinator` | start, host, client, status | Broker URL override (see Access note below). |
-| `--ticket` | host, client | Pre-created egress ticket (for manual wiring). |
-| `--session` | host, client | Egress session id to join. |
+```text
+app in lease -> lease proxy -> coordinator bridge -> host agent
+  -> explicitly selected upstream proxy -> destination
+```
 
-`egress host` and `egress start` refuse to run without an allowlist: pass
-`--profile` or `--allow`, otherwise the command exits rather than start an open
-proxy.
+The variable must contain an `http://` or `https://` URL with a host and
+optional port and user information. Paths other than `/`, queries, and
+fragments are rejected. Credentials in the URL use Basic proxy
+authentication. HTTPS proxies use TLS 1.2 or later, hostname verification, and
+the host's system trust roots; Crabbox provides no TLS verification bypass.
+HTTP proxy authentication travels over the connection without TLS, so use it
+only over a trusted transport, such as host loopback.
 
-`egress stop` stops the local host daemon (if any) and kills the remote client
-over SSH. Releasing or expiring the lease also tears down the coordinator-side egress
-session.
+Only the variable name enters arguments. The URL and upstream credentials stay
+on the host, are omitted from Crabbox diagnostics, and are not copied to the
+remote helper. `egress run` also excludes the selected variable from remote
+environment exports, even when an allowlist names it or matches its prefix;
+host and coordinator environments are unchanged. Daemons inherit the host
+environment. A dedicated variable
+keeps destination routing separate from `HTTP_PROXY` and `HTTPS_PROXY`, which
+the coordinator clients also honor. Set those standard variables only if
+coordinator traffic should use them too.
+
+Omitting the flag selects direct destination connections, even when standard
+proxy variables are set. Passing an empty name, an unset or empty variable, or
+an invalid URL fails before setup. Once selected, an upstream connection, TLS,
+or authentication failure never falls back to direct egress.
+
+The host still enforces the allowlist and requires the destination to resolve
+locally to at least one public address. Direct egress dials only those validated
+addresses. With an upstream, the host sends the original hostname in `CONNECT`;
+the trusted proxy owns final DNS resolution, public-address pinning, and any
+credential substitution. The local preflight cannot pin the proxy's connection.
+
+For a proxy that substitutes application credentials, the proxy owner must
+supply the remote application's registered placeholder and any required CA
+bundle. Configure the app to use the lease proxy and trust that CA through its
+normal TLS settings. Crabbox transports the requests; it neither creates
+credential grants nor provisions app credentials or trust. HTTPS proxy trust
+on the host and application TLS trust inside the lease are separate settings.
+
+If a credential grant lasts only as long as an owning subprocess, launch
+`egress run` as that subprocess. It stays in the foreground through the job and
+cleanup, keeping the transport within the grant's lifetime. The external proxy
+still owns grant creation and revocation. With manual `start`, the controller
+must maintain that lifetime and clean up both sides; `--daemon` does not extend
+a grant.
+
+See the [command reference](../commands/egress.md) for all flags and manual
+`host`/`client` setup.
+
+## Session lifecycle and cleanup
+
+There is one active egress session and client per lease. `egress run` checks
+status under the local lease lock and refuses an existing connected host or
+client. Disconnected session metadata permits reuse; when connection details
+are unavailable, `run` uses the coordinator's coarse active state.
+`egress start` replaces the existing session. Both require exclusive lease
+ownership: the status check cannot provide atomic admission across controllers
+on different hosts.
+
+For `egress run`, Crabbox waits for the remote listener and host bridge before
+starting the workload through the existing `run` command. Transport setup goes
+to stderr; workload output and exit status retain their usual behavior. A
+connected bridge does not prove upstream authentication or application readiness.
+
+Completion cancels and joins the host bridge, then stops the matching remote
+helper. Cancellation or bridge failure also cancels the workload operation and
+closes pending and active tunnels. Existing [`run` cancellation
+semantics](../commands/run.md) still apply to the remote workload. Helper cleanup
+gets a fresh 60-second deadline even when the job context has been cancelled.
+A cleanup failure makes the command fail; an existing workload failure keeps
+its exit status. Supervisors should allow at least 75 seconds after SIGTERM
+before forcing termination so cleanup can finish.
+
+`run` and `start` print this line before installing or starting the remote helper
+(`run` writes it to stderr):
+
+```text
+egress session: lease=<lease-id> session=<session-id>
+```
+
+Keep the ID for recovery if automatic cleanup fails. With manual `start`,
+record it as soon as it appears, including daemon runs; it identifies cleanup
+even after failed setup. The line does not mean the bridge is ready. Check
+`egress status` for `host=true client=true`, then verify an application request.
+
+For manual cleanup, stop the owned host process and revoke its credential
+grant, then stop that remote session:
+
+```sh
+crabbox egress stop --id swift-crab --session <session-id>
+```
+
+Scoped stop leaves local host daemons and foreground hosts untouched. It needs
+SSH access, a Linux lease with pidfd support, and the current helper installed
+by `egress run` or `start`. The helper matches the executable and lease/session
+arguments, then signals the exact process through a pidfd, avoiding PID reuse.
+It sends `SIGTERM`, waits up to five seconds, and sends `SIGKILL` if needed.
+No matching client is a successful no-op; an unreachable target or missing
+helper returns an error. Stopping a matching client fails if the kernel lacks
+pidfd support.
+
+Automatic bootstrap and scoped cleanup share a per-lease lock on the worker.
+Before scanning processes, cleanup records a credential-free terminal marker
+in the worker's Crabbox state. Bootstrap refuses that session even if its
+startup arrives after cleanup. The marker lasts for the lease environment's
+lifetime; rerun `egress run` or `start` to get a fresh session ID instead of
+reusing a stopped one. This fence covers automatic startup; manually launched
+low-level clients remain the operator's responsibility.
+
+For an exclusively owned daemon session, `egress stop --id swift-crab` stops
+the local daemon and makes a best-effort attempt to kill the lease client over
+SSH. It has no session filter and is unsuitable for stale per-job cleanup.
+Ordinary [`crabbox stop`](../commands/stop.md) also attempts egress cleanup before
+releasing an SSH lease. Releasing or expiring the lease tears down its
+coordinator session.
 
 ### Access-protected coordinators
 
-`egress start` installs and runs the egress client on the lease, so the lease
-must be able to reach the coordinator. If your local coordinator config carries
-Cloudflare Access credentials (client id/secret/token), `egress start` refuses
-to push those onto the box. Either:
+Automatic setup installs the egress client on the lease, so the lease must be
+able to reach the coordinator. If local configuration carries Cloudflare
+Access credentials (client id/secret/token), `run` and `start` refuse to push
+those onto the box. Either:
 
-- pass `--coordinator https://broker.example.com` to use a public coordinator
-  route the lease can reach without Access credentials; or
+- configure a public coordinator route that the lease can reach without Access
+  credentials; `run` uses that same configuration for bridge and workload;
+- for manual sessions, pass `start --coordinator https://broker.example.com`; or
 - run `egress client` and `egress host` manually with an explicit, safe
   credential plan.
 
@@ -223,12 +358,14 @@ authorization.
 `GET /egress/status` reports the tracked session:
 
 ```text
-leaseID, sessionID, profile, allow, hostConnected, clientConnected,
+leaseID, active, sessionID, profile, allow, hostConnected, clientConnected,
 createdAt, updatedAt
 ```
 
-`hostConnected`/`clientConnected` reflect whether each side's WebSocket is
-currently open.
+All visible callers receive the coarse `active` session state. The detailed
+`hostConnected`/`clientConnected` fields reflect whether each side's WebSocket
+is currently open and are returned only to owners and callers with `manage`
+access.
 
 ## Bridge protocol
 
@@ -255,18 +392,26 @@ Mediated egress defaults closed:
 
 - the lease listener is validated as loopback-only (`127.0.0.1`/`::1`/
   `localhost`); a non-loopback `--listen` is rejected;
-- no allowlist means no proxy &mdash; `host`/`start` refuse to run without
+- no allowlist means no proxy &mdash; `run`, `start`, and `host` refuse to run without
   `--profile` or `--allow`;
 - tickets are one-use, short-lived (120s), and bound to lease, owner/org, role,
   and session;
-- the host agent dials only allowlisted destinations;
+- automatic client startup carries the ticket through SSH stdin, never SSH,
+  shell, or helper arguments, environment variables, or a remote credential
+  file; a foreground helper validates and closes bounded SSH input before
+  handing it through a private pipe to the detached client, failing closed
+  without client startup, login, or ticket-mint fallback on invalid input;
+- destinations must match the allowlist and resolve to at least one public
+  address. Direct egress excludes private, loopback, link-local, multicast, and
+  reserved addresses, including IP literals, and pins the validated address.
+  An explicitly selected upstream proxy owns final resolution and pinning;
 - a fatal bridge setup error (lease forbidden, gone, or conflicting session)
   stops the daemon instead of restarting it;
 - releasing or expiring the lease tears down the session.
 
-The host agent is powerful: it opens internet connections from the operator's
-network. Its startup line names the lease, session, profile, and allowlist so
-the operator can confirm scope before traffic flows.
+The host's startup line names the lease, session, profile, and allowlist so the
+operator can confirm scope before traffic flows. Selecting an upstream does
+not bypass the destination preflight.
 
 ## Portal integration
 
@@ -290,31 +435,55 @@ the local agents run.
   operator machine's internet path, not the coordinator host. The coordinator
   only mediates.
 
+## Troubleshooting
+
+| Symptom | Action |
+| --- | --- |
+| `--upstream-proxy-env requires an environment variable name` | Supply a valid name, not a URL or an empty string. Omit the option only when direct egress is intended. |
+| `upstream proxy environment variable … is empty` or a URL validation error | Have the proxy owner populate the selected variable before launching Crabbox. Use an HTTP(S) URL without a path, query, or fragment; do not print its value while diagnosing. |
+| `connect upstream proxy failed` | Check that the proxy is running and reachable from the host. Requests remain blocked until it recovers; Crabbox will not bypass it. |
+| `upstream proxy CONNECT returned HTTP 407` | Check the URL's Basic credentials and whether the proxy's grant is still active. Restarting or daemonizing Crabbox cannot renew a revoked grant. |
+| `upstream proxy TLS handshake failed` | Check the HTTPS proxy's hostname and certificate chain against the host's system trust store. Install the proxy owner's CA through the host's trust configuration if needed. |
+| The remote app reports a TLS certificate error | If the upstream intercepts application TLS, install its CA in the remote app's trust configuration. Trusting the HTTPS proxy on the host does not configure the app. |
+| Coordinator login or WebSocket setup unexpectedly reaches the upstream | Use a dedicated variable such as `CRABBOX_EGRESS_UPSTREAM_PROXY`; check inherited `HTTP_PROXY` and `HTTPS_PROXY`, which also affect coordinator traffic. |
+| `egress stop --session requires a reachable lease target` or an SSH failure | Restore coordinator/SSH access and retry the scoped stop. Stop the owned host and revoke its grant even when remote cleanup is unavailable. |
+| Scoped stop reports a missing helper or an unsupported cleanup command | The lease must use the current helper installed by `egress run` or `start`. Check local/remote versions; start a fresh session with the updated CLI on an exclusively owned lease. Do not treat failed cleanup as success. |
+| Cleanup reports `Linux pidfd support required` | Use a Linux kernel with pidfd support. Scoped stop deliberately has no PID-only signaling fallback. |
+| `egress client session was stopped` | The terminal marker rejected late bootstrap. Start a fresh session; do not reuse the stopped ID or remove its marker. |
+
+For remote startup failures, inspect `/tmp/crabbox-egress-client.log` over
+[`crabbox ssh`](../commands/ssh.md). `egress status` confirms bridge connections,
+but does not test upstream authentication or the destination application.
+
 ## Verification
 
+On an exclusively owned Linux lease with `curl` installed:
+
 ```sh
-crabbox warmup --provider hetzner --desktop --browser
-crabbox egress start --id swift-crab --profile discord --daemon
-crabbox desktop launch --id swift-crab \
-  --browser \
-  --url https://example.com \
-  --egress discord \
-  --webvnc \
-  --open
+crabbox egress run --id swift-crab --allow api.ipify.org --no-sync --no-hydrate -- \
+  curl --fail --proxy http://127.0.0.1:3128 https://api.ipify.org
 crabbox egress status --id swift-crab
 ```
 
 Expected evidence:
 
-- `egress status` reports `host=true client=true`;
-- a browser IP check inside the box shows the host-side egress IP, not the
-  cloud provider's;
-- the page loads inside the WebVNC desktop;
-- stopping or releasing the lease tears down the bridge and the lease proxy.
+- the request succeeds and reports the host-side egress IP;
+- after `run` exits, `egress status` reports `host=false client=false` and the
+  lease proxy no longer listens;
+- for a manual browser session, status reports `host=true client=true` while
+  the browser runs, and stopping egress removes the proxy.
+
+For an upstream session, add `--upstream-proxy-env` with your populated variable
+and allow a suitable test endpoint. Verify the upstream's observed exit path
+or credential substitution through the remote app, then interrupt or revoke
+the upstream and confirm requests fail. A connected bridge alone does not
+prove the upstream path or fail-closed behavior.
 
 ## Source map
 
 - egress command implementation: `internal/cli/egress.go`
+- upstream CONNECT transport: `internal/cli/egress_upstream.go`
+- scoped Linux client cleanup: `internal/cli/egress_cleanup_linux.go`
 - coordinator ticket/status client: `internal/cli/coordinator.go`
 - desktop/browser launch integration: `internal/cli/desktop.go`
 - command tree: `internal/cli/cli_kong.go`
@@ -324,8 +493,67 @@ Expected evidence:
 
 Related docs:
 
+- [Server-bound egress session identity (design proposal)](../plan/egress-session-identity.md)
 - [Interactive desktop and VNC](interactive-desktop-vnc.md)
 - [Broker auth and routing](broker-auth-routing.md)
 - [Browser portal](portal.md)
 - [Tailscale](tailscale.md)
 - [Configuration](configuration.md)
+
+## Public destinations for setup commands
+
+Use `--allow-public-destinations` on `egress run`, `start`, or `host` when a
+trusted setup command needs arbitrary public package registries and endpoints.
+The default still requires a profile or explicit hostname allowlist, and
+`--allow '*'` does not enable this mode. Status exposes the opt-in as
+`public-destinations=true` with `allow=*`; daemon restarts retain it.
+
+The flag changes only hostname selection. Both direct and upstream connections
+still run the existing public-address preflight: private, loopback, link-local,
+metadata, and reserved destinations remain blocked. Direct connections dial
+validated IPs to prevent DNS retargeting. Upstream DNS trust and limitations
+remain as described under [upstream proxies](#upstream-proxies). Authentication,
+loopback-only listening, one-use tickets, and exclusive lease ownership remain
+required. This broad mode allows a workload to send data to arbitrary public
+services; use an allowlist when that broader authority is unnecessary.
+
+Per-command environment files under `.crabbox/env-<nonce>` have private
+permissions and receive a cancellation-independent cleanup attempt. A cleanup
+failure is a run failure, names the staging directory for manual removal, and
+never echoes remote output or environment values. If the workload also failed,
+its status, error kind, and exit code remain primary. An unreachable lease or lost workspace
+ownership can prevent removal; inspect and clean the named directory before
+reuse, or release the lease.
+
+## Development helper packs
+
+Development and CLI-only installations use the same local artifact verifier as
+release installations. Prepare trusted binaries from the same checkout once;
+commands may then run from any directory without compiling or downloading:
+
+```sh
+go build -trimpath -o /tmp/crabbox-egress-test ./cmd/crabbox
+mkdir -p /tmp/crabbox-egress-runtime
+for arch in amd64 arm64; do
+  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+    -o "/tmp/crabbox-egress-runtime/linux-$arch" ./cmd/crabbox-runtime
+done
+go run ./scripts/runtime-artifacts prepare --egress \
+  --directory /tmp/crabbox-egress-runtime --controller /tmp/crabbox-egress-test \
+  > /tmp/crabbox-egress-runtime/manifest.json
+go run ./scripts/runtime-artifacts verify --egress \
+  --directory /tmp/crabbox-egress-runtime --controller /tmp/crabbox-egress-test
+CRABBOX_RUNTIME_ARTIFACTS=/tmp/crabbox-egress-runtime/manifest.json \
+  /tmp/crabbox-egress-test egress run --id swift-crab \
+  --allow-public-destinations --no-sync --no-hydrate -- \
+  curl --fail --proxy http://127.0.0.1:3128 https://example.com
+```
+
+The Linux pair claims egress and supervisor capabilities for command execution.
+For filesystem operations on all supported targets, combine `--egress` with
+`--filesystem-build-id` and build the six companions described in the
+[runtime artifact tool](../../scripts/runtime-artifacts/README.md). Local
+manifests bind bytes but do not establish source provenance: only use trusted
+packs and keep them immutable during execution. Any controller rebuild or
+signing change requires a new manifest. Invalid explicit or discovered packs
+are authoritative errors, never permission to compile a fallback.

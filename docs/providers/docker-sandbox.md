@@ -151,6 +151,29 @@ CRABBOX_DOCKER_SANDBOX_KIT
 
 ## Lifecycle
 
+For streamed workload execution, ordinary positive native CLI exits remain
+command exits. Returned transport, cancellation, deadline, and I/O errors instead
+produce exit 1 and matching timing/result status, even when the native runner also
+reports a nonzero code. Later cancellation does not replace an already observed
+ordinary exit. A normal CLI diagnostic exit cannot be distinguished from a remote
+workload exit without stronger native protocol evidence.
+
+Run finalization shares Crabbox's terminal error merger while keeping Docker's
+clone retention and native-workspace telemetry provider-specific. A failed
+automatic removal returns exit 1 after command success and leaves the session
+marked kept with its claim available for recovery. After a command or setup
+failure, later removal or timing errors remain visible without replacing the
+primary exit code or cause. `--keep-on-failure` also retains an acquired sandbox
+when command or environment preparation fails before execution.
+
+Clone retention is decided from successful command execution, before timing
+output: a later timing-write failure returns an error but does not discard
+unfetched commits. Failed or unexecuted clone commands are still cleaned up
+unless `--keep` or `--keep-on-failure` applies. Non-clone sandboxes already removed
+before a timing-write failure remain removed; reporting cannot retain them
+retroactively. Timing continues to mark sync skipped because the workspace is
+provider-delegated, not because Crabbox silently applies `--no-sync`.
+
 1. `warmup` or `run` without `--id` creates a Crabbox-owned sandbox name such as
    `crabbox-my-app-1a2b3c`.
 2. Crabbox runs `sbx create --name <name> ... shell <repo-root>` and records a
@@ -259,6 +282,12 @@ Common blockers:
 When the host has a usable Docker Sandbox provider configuration, run:
 
 ```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=docker-sandbox scripts/live-smoke.sh
+```
+
+That top-level smoke dispatches to the provider-specific script:
+
+```sh
 scripts/live-docker-sandbox-smoke.sh
 ```
 
@@ -286,7 +315,7 @@ Use this matrix when proving a fresh install or upgrade:
 | Host/runtime blockers | `crabbox doctor --provider docker-sandbox` | Surfaces virtualization, hypervisor, KVM, control-plane, quota, or capacity blockers without claiming live success. |
 | Clone mode | `crabbox warmup --provider docker-sandbox --docker-sandbox-clone ...` | Requires the main checkout of a normal Git repository workspace before calling `sbx create --clone`; linked Git worktrees are rejected. |
 | Unsupported delegated flags | Docker Sandbox run flags and config validation | Rejects unsupported agent, desktop, Tailscale, `--class`, and `--type` surfaces clearly while allowing create-time MCP passthrough. |
-| Live lifecycle | `scripts/live-docker-sandbox-smoke.sh` | Prints `classification=live_sbx_smoke_passed ... cleanup=complete` only after create, run, list, and stop complete. |
+| Live lifecycle | `CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=docker-sandbox scripts/live-smoke.sh` or `scripts/live-docker-sandbox-smoke.sh` | Prints `classification=live_sbx_smoke_passed ... cleanup=complete` only after create, run, list, and stop complete. |
 | Trust boundary handoff | `scripts/docker-sandbox-trust-boundary-smoke.sh` | Uses a fake `sbx` at the process boundary to prove Crabbox sends the workspace path, user command, and `--env-file`, while the forwarded value stays out of local argv and is present only in the env-file handoff. |
 
 Related docs:

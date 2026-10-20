@@ -7,12 +7,17 @@ Read this when you are:
   Dedicated Hosts;
 - changing `internal/providers/aws` or brokered AWS provisioning in the coordinator.
 
-AWS is the broad managed provider. It is an SSH-lease backend: Crabbox
-provisions an EC2 instance, then owns SSH readiness, sync, command execution,
-results, desktop tunnels, and cleanup. It supports Linux, native Windows,
-Windows under WSL2, and EC2 Mac. AWS is one of the four providers that can run
-through the coordinator (alongside Hetzner, Azure, and GCP); without a broker
-URL configured it runs direct-from-CLI against the EC2 API.
+AWS is the broad managed provider. Its normal CLI path is an SSH-lease backend:
+Crabbox provisions an EC2 instance, then owns SSH readiness, sync, command
+execution, results, desktop tunnels, and cleanup. It supports Linux, native
+Windows, Windows under WSL2, and EC2 Mac. AWS is one of the five providers that
+can run through the coordinator (alongside Azure, Daytona, GCP, and Hetzner);
+without a broker URL configured it runs direct-from-CLI against the EC2 API.
+
+A separate [private AWS workspace service](../features/aws-private-workspaces.md)
+uses the Node/PostgreSQL coordinator, an exact small-instance allowlist, and SSM
+instead of SSH. It is an API-managed deployment shape, not another CLI machine
+class.
 
 ## When to use AWS
 
@@ -33,14 +38,169 @@ crabbox warmup --provider aws --class standard
 crabbox warmup --provider aws --arch arm64 --class fast
 crabbox run --provider aws --class fast -- pnpm test
 crabbox run --provider aws --market on-demand -- pnpm check
+crabbox run --provider aws --id cbx_abcdef123456 --lease-output run.json -- pnpm test
 crabbox warmup --provider aws --target windows --desktop
+crabbox warmup --provider aws --target windows --os windows-server:2025
 crabbox warmup --provider aws --target windows --windows-mode wsl2
 crabbox warmup --provider aws --target macos --desktop --market on-demand
+crabbox warmup --provider aws --lease-id cbx_abcdef123456 --slug operation-display
 ```
 
 `--type` is exact: if EC2 rejects the requested type, Crabbox fails rather than
 silently substituting another instance. Use `--class` when you want capacity
 fallback across instance families.
+
+### Host pinning and retained leases
+
+A new warmup never adopts another lease by host ID or slug. If the pinned host
+carries a live or retained lease, creation returns `409 host_in_use` with its
+lease ID and slug before provisioning or bootstrap. Inspect that lease and use
+its exact ID for subsequent work, or explicitly stop it before requesting a new
+lease. Only `--lease-id` can replay the same fixed create intent; changing its
+ID or intent does not authorize reactivation. The CLI also rejects a different
+ID returned by an older coordinator, without bootstrapping or requesting cleanup.
+
+Host occupancy resolves each stored host association to its exact lease record.
+Missing leases, completed provider cleanup, and expired leases without an instance
+or unresolved launch no longer reserve the host. Create drops stale host references
+under the admission lock and emits a structured `crabbox_host_reservation` log.
+Active and provisioning leases still block, including creates that have not yet
+received an instance ID; retained or uncertain resources also remain protected.
+
+Inspect or repair the coordinator association with admin credentials:
+
+```sh
+crabbox admin mac-hosts reservation h-0123456789abcdef0 --region eu-west-1 --json
+crabbox admin mac-hosts clear h-0123456789abcdef0 --region eu-west-1
+```
+
+Inspection returns storage keys, safe reservation and canonical lease summaries,
+and the stale reason. Clear removes host references while preserving lease history
+and provider cleanup state; it does not terminate an instance or release the billed
+Dedicated Host. It refuses a live or potentially retained association unless
+`--force` is supplied. Inspect provider inventory before forcing: a running create
+can publish its host association again when provisioning finishes.
+
+Authenticated org members can pin an unused Mac Dedicated Host only when an
+exact coordinator allocation record matches the host, requested region, and
+requester's current org identity. New admin allocations record their authenticated
+org. Historical managed leases and EC2 inventory never substitute for that record.
+Hosts allocated by older coordinators without a record remain admin-only; this
+change does not add a claim or backfill command. Missing, ambiguous, and other-org
+allocation records do not grant org-member pin access.
+
+Host allocation, release, inventory, and other AWS resource selectors remain
+admin operations. Pin permission does not grant access to another member's lease.
+
+`crabbox list --provider aws`, including `--json`, shows visible retained leases
+alongside active/provisioning leases. A released lease may still hold a kept
+instance; use the lease ID and `keep`/cleanup fields to distinguish it from a
+confirmed deletion. Listing is read-only.
+
+### Retained lifetime rollout canary
+
+The coordinator's [maximum-age safety net](../features/lifecycle-cleanup.md#maximum-age-safety-net-for-retained-compute)
+defaults off. An administrator can explicitly enroll a new on-demand EBS-root
+lease using `--lifetime-canary 6m --lifetime-retention 5m` on `warmup` or `run`.
+Use `--region eu-west-1 --class tiny --type t3.small --market on-demand` for the
+bounded rollout proof. The visible `admin-canary` policy remains enforced even
+with global mode off or report; other leases are not enrolled.
+
+The first check performs an exact-instance `StopInstances` dry run after
+verifying account, Region, instance ownership and root attachment. Permission
+failure is visible in `lifetimePolicy.readiness`, status, and warnings. AWS
+permissions must include scoped `ec2:StopInstances` and `ec2:DescribeVolumes`;
+the generated admin provider policy and ECS coordinator template include them.
+`crabbox admin lifetime-readback --id <lease-id> --json` reads instance state and
+the original root volume through the coordinator without local AWS credentials.
+Before stopping, an admin may extend the compute deadline with
+`crabbox admin extend-lifetime`; stopping cannot be undone by an extension, and
+the retained root disk is permanently deleted when its separate deadline passes.
+
+### Fixed-ID replay
+
+`warmup --lease-id cbx_<12 lowercase hex>` makes direct AWS acquisition
+idempotent across process restarts. Crabbox writes the normalized create intent
+to the ordinary durable lease claim under its existing cross-process lock
+before any provider mutation. Each resolved launch attempt records its exact
+region or availability zone, subnet, type, market, AMI, security group, keypair,
+stable timestamps, parameter hash, and a deterministic per-attempt EC2 client
+token before `RunInstances`.
+
+An ambiguous response remains pinned to that attempt. Replay first reconciles
+all matching Crabbox-tagged resources, fails closed if more than one exists,
+and fails closed without another `RunInstances` call while the resource is not
+visible. The initial request writes non-secret attempt-attestation tags, and a
+later replay adopts a visible instance only when its provider identity and every
+attempt tag match the persisted region/AZ/subnet/type/market/image/security-group/
+host/key/token tuple. This deliberately
+accepts a false-negative if the process crashes after persisting the attempt but
+before sending the network request, preserving at-most-once launch semantics.
+Capacity fallback advances only after a definite no-resource response clears
+the attempt during the original invocation. A changed create intent returns
+`lease_id_conflict`; a matching slug alone never authorizes adoption. Once
+acquisition is marked complete, a missing bound instance is also a terminal
+conflict rather than permission to call `RunInstances` again.
+
+Once Crabbox observes an instance matching the durable launch attempt, it
+saves the instance identity and cleanup labels before waiting for its public
+IP or SSH readiness. The claim remains prepared until readiness succeeds, so
+an interrupted warmup can be stopped with
+`crabbox stop --provider aws --id cbx_...` without authorizing normal use of the
+unfinished lease. Replay remains bound to that exact instance; readiness cannot
+replace it with another instance carrying copied tags.
+
+EC2 can temporarily report a newly allocated instance as missing. The existing
+readiness wait allows that propagation delay within its ten-minute limit and
+honors cancellation. Cleanup keeps a prepared claim and its keys when instance
+visibility or termination is uncertain. Retry while the exact instance is
+visible; an observed terminal instance permits key recovery. If termination
+was accepted but key cleanup failed and the instance is no longer visible,
+the prepared claim and keys remain for operator recovery. The existing
+already-gone recovery paths for acquired and ordinary leases are unchanged.
+
+Successful stop and exact resource/key cleanup retain a terminal receipt in
+the existing claim fields: the original account, region, canonical lease ID,
+slug, instance ID, repository path, and versioned intent plus its original
+fingerprint label. SSH connectivity, launch attempts, and other active state
+are cleared. After inventory no longer includes the instance, a repeated
+`stop --provider aws --id cbx_...` can acknowledge that receipt without another
+deletion or rewriting it. AWS checks the current caller account and configured
+region scope, expected release identity when supplied, and conflicting visible
+resources. The release owner reloads and revalidates the receipt and inventory
+under the durable claim lock; missing inventory or a terminal provider status
+alone never proves cleanup. The recorded repository path is retained as
+identity evidence, not a requirement to run stop from the original directory.
+
+After saving the receipt, stop and automatic cleanup close canonical per-lease
+SSH control masters and remove the local SSH key and trust files under the same
+claim lock. A local cleanup failure returns an error while preserving the
+terminal receipt. Fix the reported local problem and repeat
+`crabbox stop --provider aws --id cbx_...`; after the same account, region,
+identity, and inventory checks, it retries local cleanup without deleting AWS
+resources again or rewriting the receipt.
+
+This is a forward repair: older compact tombstones discarded instance and
+region binding and cannot prove that scope after upgrading. They remain
+unchanged and fail closed on repeated stop. Definitive launch rejections also
+block reuse but, without an acquired instance identity, are not successful-stop
+receipts. An acquired claim whose instance disappears before successful key
+cleanup still makes stop fail; the existing exact AWS cleanup path may finish
+those obligations separately. Failed key cleanup keeps the acquired claim.
+Receipt replay applies only to canonical fixed-ID stop, not inspect, reuse,
+slug lookup, raw instance lookup, or ordinary non-fixed leases.
+
+Automatic AWS cleanup does not prune terminal claims and there is no time-based
+operation-ID reuse window. Both retained receipts and older compact tombstones
+continue blocking fixed-ID reallocation. Explicit local claim deletion forfeits
+this guarantee; normal automation must always use a new operation ID for a
+later lease.
+
+Fixed claims and tombstones use the local provider discriminator
+`aws-fixed-v1`. Current Crabbox resolves that marker to runtime provider AWS,
+while older clients see an unknown provider and therefore skip or refuse
+destructive AWS claim cleanup instead of erasing fixed identity state. Cloud
+resource provider tags remain `aws`.
 
 ### Instance classes
 
@@ -50,6 +210,8 @@ Linux the classes resolve to (first candidate shown):
 
 | Class | First candidate | vCPUs |
 | --- | --- | --- |
+| `tiny` | `m7a.large` | 2 |
+| `small` | `c7a.2xlarge` | 8 |
 | `standard` | `c7a.8xlarge` | 32 |
 | `fast` | `c7a.16xlarge` | 64 |
 | `large` | `c7a.24xlarge` | 96 |
@@ -59,7 +221,104 @@ Windows and macOS targets use their own candidate lists (Windows WSL2 uses
 nested-virtualization families; macOS uses `mac*.metal` types). The default
 class is `beast`.
 
+Use `--min-vcpus` and `--min-memory-mib` to filter Linux class candidates by an
+explicit workload requirement. Requests without these options keep the existing
+fallback behavior. See [optional resource minimums](../features/capacity-fallback.md#optional-aws-resource-minimums)
+for metadata, coordinator compatibility and supported command semantics.
+
+For coordinator-managed public Linux and Windows runners, a complete
+`RunInstances` error with code `InsufficientInstanceCapacity` goes directly to
+the next configured instance type or permitted On-Demand fallback. The client
+does not spend its HTTP retry budget repeating that capacity rejection first.
+Exact `--type` requests keep the selected type but can hand off to its permitted
+On-Demand market. macOS launches, private workspaces, and attempts with no
+remaining alternative that passes quota preflight retain their normal retries.
+The early handoff checks On-Demand quota only after a capacity rejection needs
+that alternative; the normal pass reuses the quota result and attempt order.
+Other server errors and HTTP 429 still use the SDK's retry budget and backoff;
+an opaque or incomplete response never triggers this early handoff. The lease's
+existing client token and resource-outcome checks remain unchanged.
+
+Each capacity probe reads at most 64 KiB and waits at most one second for the
+complete response body. An oversized, stalled, or unreadable body retains normal
+retries without consuming the original response.
+
+## Provisioning diagnostics
+
+For coordinator-managed groups in the default VPC, VPC discovery and the
+[default-VPC group-name lookup](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeSecurityGroups.html)
+run together. Both reads finish and the returned group scope is checked before
+any ingress change. Subnet-scoped discovery still resolves the subnet's VPC
+first; explicitly configured and private-workspace groups keep their existing
+lookup paths.
+
+Coordinator AWS create logs use the `crabbox_aws_provisioning` component. Each
+fixed operation bucket can include `transport` totals for its signed requests.
+Nested operations own their own totals; concurrent creates and preparation
+branches remain separate. These are bounded log counters, not stored lease
+state or permission decisions.
+
+`requests` counts calls entering credential preparation. `credentialsMs` and
+`credentialFailures` cover that preparation; `requestMs` and `requestFailures`
+cover signing, transport, and HTTP retry handling. A returned HTTP error response
+is not a transport failure. The operation's existing error count records how its
+caller handled that response. Capacity classification before a retry is included
+in `requestMs`; final response-body reading and decoding remain in the outer
+operation duration.
+
+`signInvocations`, `signCompletions`, `signFailures` and `signMs` observe the
+SDK's public signing method. Except for the capacity handoff described above,
+the SDK retry policy is unchanged. Repeated signing invocations on a request
+indicate retry-loop re-entry; a completed signature alone does not prove that a
+server received the request. Signing time is part of `requestMs`, so do not add
+them together. These totals cannot distinguish network latency from SDK retry
+backoff or identify intermediate response status codes. They do not establish
+throttling. Requests outside a measured create operation and
+qualification-authority RPC transport do not add these totals.
+
+These durations use `Date.now()`. In deployed Cloudflare Workers,
+[timers advance only after I/O](https://developers.cloudflare.com/workers/runtime-apis/performance/).
+A `0` in `credentialsMs` or `signMs` therefore does not establish zero CPU work
+or zero elapsed time. Local Node fixtures use different timer behavior; their
+timings validate attribution, not deployed CPU cost. Invocation, completion and
+failure counters remain observations independent of this timer limitation.
+
 ## Configuration
+
+### Windows images
+
+Use `--target windows --os windows-server:2022` or
+`--target windows --os windows-server:2025` to select Amazon's latest English
+Full Base Windows Server AMI for that release in the requested region. The same
+selector works with native Windows and `--windows-mode wsl2`; WSL2 still requires
+a nested-virtualization instance type. These selectors require AWS and an amd64
+Windows target, and work in both direct and brokered mode. Upgrade both the CLI
+and coordinator for brokered selection.
+
+The stock fallback defaults to Windows Server 2025. Without a Windows selector, a promoted
+Windows AMI still wins in brokered mode. An explicit Windows selector bypasses
+unversioned promoted Windows images and selects the stock Amazon image instead;
+image capability requirements cannot be combined with that stock selection.
+Windows promotions use target/architecture/region keys, so an explicit 2022
+request keeps selecting stock 2022 even after the default promotion is 2025.
+The guarded developer-image publisher accepts `windows_os=windows-server:2025`
+to bake a fresh stock 2025 source, prove the captured candidate, and prove
+normal promoted selection. Its default 2022 input preserves the existing
+promoted-source rebuild. See the [Windows 2025 bake runbook](../features/image-bake-runbook.md#bake-windows-server-2025-from-stock).
+Explicit `aws.ami` / `CRABBOX_AWS_AMI` overrides (including coordinator overrides)
+still win over `--os`. Remove a global AMI override before using different OS
+selectors for Linux and Windows runs.
+
+Set the top-level `os: windows-server:2025` or `CRABBOX_OS=windows-server:2025`
+with `target: windows` or a command's `--target windows` flag; compatibility is
+checked after all overrides. You can also select the OS for each command:
+
+```sh
+crabbox run --provider aws --target linux --os ubuntu:26.04 -- uname -a
+crabbox run --provider aws --target windows --os windows-server:2025 -- cmd /c ver
+```
+
+### Provider settings
 
 ```yaml
 provider: aws
@@ -73,15 +332,70 @@ aws:
   securityGroupId: ""      # reuse an existing security group
   subnetId: ""             # pin a subnet (and its VPC)
   instanceProfile: ""      # IAM instance profile name to attach
-  rootGB: 400              # default 400
+  rootGB: 0                # automatic: class default, at least the AMI minimum
   sshCIDRs: []             # allowed SSH source ranges
   macHostId: ""            # pin an EC2 Mac Dedicated Host
 ```
+
+Root volumes default to 40 GB (`tiny`), 80 GB (`small`), 150 GB (`standard`
+and `fast`), 250 GB (`large`), or 400 GB (`beast`). An unset or zero `aws.rootGB`
+selects this policy in both direct and brokered creates. Crabbox reads the AMI's
+root block-device mapping and raises only the automatic default to its minimum,
+including AMIs registered from checkpoint snapshots. The promoted Linux
+developer image has a 32 GB root, so brokered leases get the class sizes above
+(a `tiny` lease has about 38 GB of usable root filesystem). An image with a
+larger root snapshot raises every class to that size, and rebuilding from such
+an image cannot shrink it. The guarded publisher bakes small-root images from
+stock Ubuntu with `--stock-source --root-gb N` (workflow input `linux_root_gb`); see the
+[small-root image bake](../features/image-bake-runbook.md#bake-a-smaller-linux-root-disk-from-stock-ubuntu).
+
+Set `aws.rootGB: 400` or `CRABBOX_AWS_ROOT_GB=400` to retain the previous size.
+Positive explicit requests win and EC2 rejects requests below the source minimum;
+Crabbox does not silently increase them. The coordinator's
+`CRABBOX_AWS_ROOT_GB` remains an operator override when the client leaves the
+size unset. Older clients that send `awsRootGB=400` continue receiving 400 GB.
+Upgrade both client and coordinator to use automatic class sizing. Config output
+reports `rootGB: 0` for automatic sizing, since the image minimum is resolved
+only during provisioning. The independent private-workspace root policy is unchanged.
+
+Fixed AWS intents retain their size binding. Direct retries recognize the old
+implicit 400 GB fingerprint only when the complete intent matches. Brokered
+fixed-ID retries must repeat the original request (including an explicit 400 GB
+size for requests made by older clients); mismatches fail closed. Ready-pool
+borrows reuse the existing disk, and newly provisioned pool members follow this
+same sizing policy.
 
 Set `architecture: arm64` or pass `--arch arm64` for Linux Graviton leases.
 Crabbox switches class fallback to C7g/M7g/R7g families and resolves Canonical
 Ubuntu ARM64 AMIs unless `aws.ami` is pinned. ARM64 is not supported for managed
 Windows or WSL2 targets.
+
+For fresh, automatically selected Canonical Ubuntu 26.04 amd64 images, direct
+CLI and public broker provisioning use cloud-init's APT policy to select
+`https://archive.ubuntu.com/ubuntu/` as the primary archive. Security updates
+retain the separate `http://security.ubuntu.com/ubuntu/` archive. This avoids
+relying on the regional EC2 HTTP archive for the normal bootstrap. Suite,
+component, signing-key, and source-preservation policies remain image-owned.
+Explicit AMIs (including `CRABBOX_AWS_AMI`), promoted images, checkpoint forks,
+ARM64, and Ubuntu 24.04 retain their existing source policy. The private AWS
+workspace service keeps its separate SSM bootstrap and HTTPS-only source policy.
+
+For brokered SSH access, the coordinator validates the combined lease and global
+source ranges, then removes exact duplicates before reconciling each SSH port.
+Whitespace is trimmed; distinct IPv4 and IPv6 ranges keep their order. This does
+not reuse observed permissions: each unique desired range is still authorized,
+and stale-rule pruning and world-access revocation keep their existing policy.
+For each port, up to four authorization requests run together after revocation
+finishes. Every batch settles before recovery, another batch or the next port;
+rule-limit recovery compacts once and retries each affected rule. Diagnostic
+request-duration totals include overlapping requests and can exceed wall time.
+
+Access refresh indexes the current and retained leases once. Ports share a
+security-group lookup only when their group, allowed source ranges and
+reconciliation mode match; different policies remain separate. Runner and
+workspace default groups retain distinct identities when stored group names
+are absent. Refresh uses the recorded ingress fields directly rather than
+rebuilding machine provisioning settings.
 
 ### Environment variables (direct mode)
 
@@ -93,12 +407,13 @@ AWS_SESSION_TOKEN
 AWS_REGION
 CRABBOX_AWS_REGION                  # overrides AWS_REGION / aws.region
 CRABBOX_AWS_AMI
+CRABBOX_AWS_STOCK_IMAGE             # aws.stockImage; brokered AWS, admin-only
 CRABBOX_AWS_SECURITY_GROUP_ID
 CRABBOX_AWS_SUBNET_ID
 CRABBOX_AWS_INSTANCE_PROFILE
 CRABBOX_AWS_ROOT_GB
 CRABBOX_AWS_SSH_CIDRS               # comma-separated
-CRABBOX_HOST_ID                     # pin a Dedicated Host (EC2 Mac)
+CRABBOX_HOST_ID                     # brokered pin requires an exact org allocation record or admin auth
 CRABBOX_AWS_MAC_HOST_ID             # legacy alias for the Mac host id
 CRABBOX_CAPACITY_REGIONS            # comma-separated fallback regions
 CRABBOX_CAPACITY_AVAILABILITY_ZONES
@@ -112,20 +427,120 @@ Notes:
   attached to the launched instance, not the local AWS CLI profile.
 - `CRABBOX_AWS_REGION` wins over `AWS_REGION` and `aws.region`; the built-in
   default region is `eu-west-1`.
-- For brokered AWS, the cloud credentials live in the Worker, not on developer
-  machines. See `crabbox config set-broker --provider aws` and the brokered
-  IAM policy from `crabbox admin aws-policy`.
+- Region values are trimmed, lowercased, and must match an AWS region name such
+  as `eu-west-1`. Broker readiness, lease `awsRegion`, and
+  `capacity.regions` reject malformed request values before constructing a
+  SigV4 endpoint; invalid environment/config fallback candidates are skipped.
+- For brokered AWS, cloud credentials live in the coordinator, not on developer
+  machines. Existing Worker deployments can inject static credentials; the
+  Node runtime also supports the AWS default credential chain. The dedicated
+  ECS private-workspace deployment requires its task role and rejects static
+  access keys. See `crabbox config set-broker --provider aws`, the brokered IAM
+  policy from `crabbox admin aws-policy`, and
+  [Private AWS Workspaces](../features/aws-private-workspaces.md).
+- In brokered mode, explicit `aws.ami`, `aws.securityGroupId`, `aws.subnetId`,
+  and `aws.instanceProfile` selectors require admin-token authentication.
+  Normal broker users receive the coordinator-managed image, network, and
+  instance identity. Direct mode keeps these local configuration overrides.
+
+## Private workspace service
+
+Use the dedicated private mode when a service client needs create/status/delete
+workspaces in one isolated AWS account and Region without public addresses or
+SSH. Its placement is entirely server-side:
+
+- exact expected account and Region, verified through ECS metadata and STS;
+- explicit x86_64 instance allowlist and vCPU/memory ceilings, with
+  `t3a.small,t3.small` as the recommended starting set;
+- 20 GiB encrypted gp3 root volume by default;
+- private subnet, no public IP or key pair, IMDSv2, no ingress, TCP 443 egress;
+- SSM managed-node readiness, SSM command bootstrap, and CloudWatch log output;
+- task-role credentials refreshed through the Node AWS default chain;
+- ownership-tagged, generation-fenced, idempotent termination.
+
+The client selects this placement by using the dedicated service URL and
+route-scoped bearer. Client target labels or Region-shaped metadata are not
+placement controls. The full deployment template, environment contract,
+readiness preflight, API, AWS-GO gate, and live canary are in
+[Private AWS Workspaces](../features/aws-private-workspaces.md).
 
 ## Targets
 
 | Target | Notes |
 | --- | --- |
 | Linux | Ubuntu bootstrap, SSH, rsync sync, optional desktop/browser/code, Tailscale, Actions hydration. |
-| Windows native | EC2Launch bootstrap, OpenSSH, Git for Windows, archive sync; optional desktop with `--desktop`. |
-| Windows WSL2 | `--windows-mode wsl2`; launches on nested-virtualization families (`c8i`/`m8i`/`m8i-flex`/`r8i`); POSIX sync and commands run inside WSL. |
-| macOS | Requires an available EC2 Mac Dedicated Host in the region; On-Demand only. Pin a host with `CRABBOX_HOST_ID` / `aws.macHostId` (`CRABBOX_AWS_MAC_HOST_ID` is a legacy alias). |
+| Windows native | EC2Launch bootstrap, OpenSSH, Git for Windows, Node/npm baseline, archive sync; explicit `Start-CrabboxDetachedProcess.ps1` launcher for lease-lifetime daemons; optional desktop with `--desktop`. |
+| Windows WSL2 | `--windows-mode wsl2`; launches on nested-virtualization families (`c8i`/`m8i`/`m8i-flex`/`r8i`); POSIX sync and commands run inside WSL with the Linux image Node/npm baseline. |
+| macOS | Non-root SSH commands, portable workspace ownership, and Node/npm baseline. Requires an available EC2 Mac Dedicated Host in the region; On-Demand only. Admin-authenticated broker requests can pin any host with `CRABBOX_HOST_ID` / `aws.macHostId` (`CRABBOX_AWS_MAC_HOST_ID` is a legacy alias); normal broker users can pin a host with an exact coordinator allocation record for that host, their current org, and the requested region. See the host ownership rules below. |
 
-## Lifecycle
+Managed macOS commands use the image's SSH user (normally `ec2-user`) and its
+writable work root. Bootstrap installs Node 24.19.0, matching the Linux developer
+recipe's LTS baseline, when Node or npm is missing. Both Intel and Apple Silicon
+use checksum-pinned official `nodejs.org` archives, with versioned installations
+under `/usr/local/lib/crabbox` and command links in `/usr/local/bin`; Homebrew is
+not required. Healthy existing Node/npm installations are retained. Readiness
+requires both commands to execute successfully. Warmup also completes this
+baseline over SSH when an older coordinator's bootstrap omitted it.
+Managed SSH enables PAM session setup so commands enter the SSH user's launchd
+Background context; the stock macOS `nohup` needs that context to detach.
+Password and keyboard-interactive authentication remain disabled. Bootstrap
+uses fresh SSH connections so a pre-setup control master cannot retain the old
+System context.
+
+Managed WSL2 commands run as the non-root `crabbox` Linux user, with
+`HOME=/home/crabbox`, Bash, passwordless sudo, and membership in the `sudo` and
+`docker` groups. This user owns the work root and `/var/cache/crabbox`.
+Bootstrap sets `[user] default=crabbox` in `/etc/wsl.conf`, preserving other
+distro settings, so staged commands, WSL sessions, sync/copy, readiness, and
+workspace ownership share one identity. Root is used only for distro setup;
+the Windows SSH transport account is unchanged. Existing leases need
+reprovisioning to receive this setup.
+
+Managed native Windows bootstrap installs checksum-pinned Node 24.19.0 and npm
+in `C:\Program Files\nodejs` on the machine PATH when either is missing or
+broken, retaining healthy installations. Bootstrap restarts OpenSSH after the
+machine PATH updates, and client-side completion waits for stable readiness on
+fresh SSH connections. Native PowerShell commands and readiness probes refresh
+PATH from the machine and user registry values so they also work when an SSH
+session inherited an older environment. Readiness verifies both tools. No
+admin broker token or host pin is needed. For daemons across fixed-ID `run`
+invocations, use `Start-CrabboxDetachedProcess.ps1`; ordinary hidden
+`Start-Process` children remain in OpenSSH's session job. See the
+[Windows detach pattern](../commands/run.md#native-windows-background-processes) for arguments,
+logging, and lifetime. Lease destruction terminates detached processes.
+
+Managed WSL2 bootstrap runs the Node-only entrypoint of
+`scripts/install-linux-developer-tools.sh`, bundled in the CLI/coordinator rather
+than downloaded at boot. It uses the same Node major policy and, on the managed
+amd64 distro, the same checksum-pinned Node 24.19.0 archive as Linux developer
+images. Node and npm are on the default command PATH and required by readiness.
+Re-bootstrap verifies the cached archive and reinstalls the owned version slot.
+The installer logs the Node step's elapsed seconds during warmup.
+
+WSL2 installs this subset to keep warmup bounded: it does not install the full
+Linux image's Docker, browser/desktop tools, Go, or offline pnpm archive set.
+Projects needing those tools should use their setup scripts or Actions hydration.
+
+Managed WSL2 distributions disable cloud-init because Crabbox owns their setup.
+This avoids WSL datasource discovery blocking systemd and root login during
+later command invocations. Bootstrap restarts the distro and verifies its Linux
+ready check before publishing the setup marker; warmup also checks the WSL SSH
+runtime. `inspect` and `status` allow a 30-second WSL2 readiness probe.
+
+Managed WSL2 leases set `[general] instanceIdleTimeout=-1` in the Windows SSH
+user's `.wslconfig` so detached Linux daemons survive between commands until
+lease cleanup. Command deadlines and lease expiration still apply.
+
+Headless managed WSL2 leases also disable WSLg with `guiApplications=false` in
+the Windows SSH user's `.wslconfig`, preserving other settings. The GUI/RDP
+compositor is unnecessary for these leases and can crash in a Windows service
+session, blocking later Linux commands and workspace-owner renewal. Explicit
+desktop or browser requests retain their existing GUI configuration. Bootstrap
+applies a changed WSL configuration before starting the distro; existing leases
+need reprovisioning to receive this policy. Command execution and owner-control
+timeout budgets are unchanged.
+
+## Normal SSH lifecycle
 
 1. Import or reuse the per-lease SSH key (RSA for native Windows, ed25519
    otherwise).
@@ -137,9 +552,32 @@ Notes:
 6. Hand off to core for sync and command execution over SSH.
 7. Terminate on release, cleanup, or broker expiry.
 
+Linux guests with `crabbox-workspace-ready.service` must have the per-boot
+`/run/crabbox/workspace-ready` marker and pass `crabbox-ready`. The marker lives
+in tmpfs and is written after bootstrap, so an image's stale bootstrapped marker
+cannot satisfy readiness. Minimal leases can become ready before cloud-final;
+desktop, browser, and other optional setup keeps workspace-ready ordered after
+cloud-final. Guests without the unit retain the existing bounded
+`cloud-init status --wait` check before `crabbox-ready`.
+
 Brokered cleanup is owned by the Worker (lease expiry plus an AWS orphan
 sweep). Direct cleanup is best-effort via provider labels and
 `crabbox cleanup --provider aws`.
+
+Direct lease release deletes the SSH key registration only when its current
+immutable key-pair ID matches the ID retained in the local lease claim and the
+registration still has canonical Crabbox ownership tags. Deletion uses that ID,
+so reusing the key name cannot redirect cleanup to a replacement. A mismatched
+registration or a legacy claim without a retained key ID produces a skip message;
+the original instance is still terminated and the lease is released.
+
+AWS also supports the provider-neutral retained run handle. Add
+`--lease-output <file>` to a retained run to record the exact lease ID, slug,
+coordinator run ID when brokered, and cleanup command before sync or command
+execution begins. A reused `--id` lease is retained by default; a newly created
+lease also requires `--keep`. The handle remains useful after a later command
+failure, but only a coordinator-backed run ID can be used to retrieve a signed
+terminal receipt.
 
 ## Checkpoints
 
@@ -149,6 +587,16 @@ AWS supports provider-native checkpoints in addition to workspace archives:
   (`checkpoint --kind native`, kind `aws-ami`).
 - Linux disk-snapshot strategy → EBS snapshot (`aws-ebs-snapshot`).
 - Native Windows targets do not support native checkpoints.
+
+New brokered native checkpoints are coordinator-owned and manually retained by
+default. Opt into inactivity expiry with
+`checkpoint create --expire-unused-after 7d` or `checkpoint policy`. Ownership
+binds the exact AWS account, region, AMI/EBS snapshot identity, and source
+lease. AMI deletion durably retains every owned backing snapshot ID before
+deregistration and is complete only after the exact AMI and all backing
+snapshots are gone. Promoted defaults, scoped catalog roles, and catalog-only
+variants pin managed AMIs against expiry/deletion. Direct AWS checkpoints and
+historical images remain local/operator-managed.
 
 In brokered mode you can promote and warm AMIs:
 
@@ -162,6 +610,7 @@ In brokered mode you can promote and warm AMIs:
 - Desktop / browser / code: yes, target-dependent.
 - Tailscale: Linux managed leases.
 - Actions hydration: Linux SSH leases only.
+- Retained run-session handle: yes.
 - Coordinator (broker): supported.
 
 ## Gotchas
@@ -170,8 +619,21 @@ In brokered mode you can promote and warm AMIs:
   `--type` when you want fallback.
 - Run `crabbox doctor --provider aws` before the first warmup in a new or
   unfunded account. Doctor reads EC2 vCPU Service Quotas for the effective
-  class/type and recommends a smaller class/type when `beast` would exceed the
-  account cap.
+  class/type and `ec2:DescribeInstanceTypes` for its default vCPU count, including
+  bare-metal types. It recommends only smaller types with known metadata when
+  `beast` would exceed the account cap. Missing, invalid, or denied metadata stays
+  unknown; it never counts as zero-vCPU capacity. Grant `ec2:DescribeInstanceTypes`
+  and `servicequotas:GetServiceQuota` to the caller (the coordinator in brokered
+  mode), as included in `crabbox admin providers policy --provider aws`.
+  Ordinary launches can still let EC2 decide when these advisory reads fail;
+  private workspace resource caps require successful metadata inspection.
+  These checks cover Standard-instance quotas (A, C, D, H, I, M, R, T, and Z
+  families). Types using separate buckets, such as GPU and HPC instances, report
+  `unsupported_instance_quota` and leave launch quota enforcement to EC2.
+  A sufficient quota ceiling reports `capacity=unknown` and
+  `quota_limit=sufficient usage=unchecked`. Doctor does not measure account-wide
+  usage or available regional headroom. See
+  [quota troubleshooting](../troubleshooting.md#provider-not-configured-or-capacity-quota-fails).
 - `beast` starts at 48xlarge candidates and can consume up to 192 vCPUs per
   request. Under capacity pressure, prefer `standard` or `fast` plus several
   `CRABBOX_CAPACITY_REGIONS`.
@@ -187,6 +649,35 @@ In brokered mode you can promote and warm AMIs:
 ## Related docs
 
 - [AWS feature notes](../features/aws.md)
+- [Private AWS workspaces](../features/aws-private-workspaces.md)
 - [Windows VNC](../features/vnc-windows.md)
 - [macOS VNC](../features/vnc-macos.md)
 - [Provider backends](../provider-backends.md)
+
+## Brokered address readiness
+
+The coordinator checks the instance address immediately, then waits 250 ms,
+500 ms, 1 s, 2 s, 4 s, and at most 5 s between reads. The existing ten-minute
+address deadline is unchanged; the last wait is clipped and no new read starts
+at the deadline. A response arriving after the deadline is not accepted as ready.
+In-flight calls retain the provider client's existing transport/retry behavior.
+Provider errors, including exhausted throttling responses, propagate unchanged;
+the polling loop does not add rapid retries or override provider backoff.
+This reduces the observation delay for an early address, not the VM's boot time.
+
+## Coordinator preparation timings
+
+`aws.ingress_wait` measures waiting for the coordinator's ingress-operation
+lock, including queued create and access-refresh work. The lock covers a fresh
+lease-access snapshot and security-group reconciliation; it does not cover
+image lookup, instance creation, or address readiness. Reconciliation reads the
+current permissions, revokes observed legacy world SSH rules in either address
+family unless explicitly desired, and authorizes only missing exact port/CIDR
+pairs. Duplicate-rule responses still handle external races. Pinned CIDRs and
+the detected IPv4 plus authenticated request-source policy are unchanged.
+
+The coordinator caches VPC discovery for five minutes by verified AWS account,
+region, and subnet (or default VPC). Each create still reads the security group;
+missing VPC, subnet, or group responses invalidate the hint, as does a default
+VPC/group mismatch. This removes redundant preparation calls without expanding
+the ingress lock or parallelizing additional AWS work.

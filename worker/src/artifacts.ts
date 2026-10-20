@@ -1,5 +1,6 @@
 import { AwsClient } from "aws4fetch";
 
+import { base64URL } from "./encoding";
 import type { Env } from "./types";
 
 export interface ArtifactUploadRequest {
@@ -24,6 +25,7 @@ export interface ArtifactUploadGrant {
     expiresAt: string;
   };
   url: string;
+  accessPolicy: "signed-url" | "public";
 }
 
 export interface ArtifactUploadResponse {
@@ -31,7 +33,13 @@ export interface ArtifactUploadResponse {
   bucket: string;
   prefix: string;
   expiresAt: string;
+  accessPolicy: "signed-url" | "public";
   files: ArtifactUploadGrant[];
+}
+
+export interface ArtifactUploadScope {
+  org: string;
+  owner: string;
 }
 
 interface ArtifactConfig {
@@ -39,6 +47,7 @@ interface ArtifactConfig {
   bucket: string;
   prefix: string;
   baseURL: string;
+  publicReads: boolean;
   endpointURL: string;
   region: string;
   accessKeyID: string;
@@ -57,14 +66,22 @@ const maxArtifactBatchBytes = 5 * 1024 * 1024 * 1024;
 export async function artifactUploadResponse(
   env: Env,
   request: ArtifactUploadRequest,
-  owner: string,
+  scope: ArtifactUploadScope,
 ): Promise<ArtifactUploadResponse> {
   const config = artifactConfig(env);
+  const org = artifactIdentity(scope.org, "organization");
+  const owner = artifactIdentity(scope.owner, "owner");
   const files = normalizeArtifactFiles(request.files ?? []);
   if (files.length === 0) {
     throw new Error("artifacts upload request requires at least one file");
   }
-  const prefix = artifactPrefix(config.prefix, owner, request.prefix);
+  const prefix = artifactPrefix(
+    config.prefix,
+    org,
+    owner,
+    request.prefix,
+    config.publicReads ? randomArtifactCapability() : "",
+  );
   const now = new Date();
   const uploadExpiresAt = new Date(
     now.getTime() + config.uploadExpiresSeconds * 1000,
@@ -83,6 +100,7 @@ export async function artifactUploadResponse(
           expiresAt: uploadExpiresAt,
         },
         url: await artifactReadURL(config, key),
+        accessPolicy: config.publicReads ? ("public" as const) : ("signed-url" as const),
       };
     }),
   );
@@ -91,6 +109,7 @@ export async function artifactUploadResponse(
     bucket: config.bucket,
     prefix,
     expiresAt: uploadExpiresAt,
+    accessPolicy: config.publicReads ? "public" : "signed-url",
     files: grants,
   };
 }
@@ -110,11 +129,17 @@ function artifactConfig(env: Env): ArtifactConfig {
     throw new Error("artifact broker r2 backend requires CRABBOX_ARTIFACTS_ENDPOINT_URL");
   }
   const region = trimmed(env.CRABBOX_ARTIFACTS_REGION) || (backend === "r2" ? "auto" : "us-east-1");
+  const baseURL = stripTrailingSlash(env.CRABBOX_ARTIFACTS_BASE_URL);
+  const publicReads = enabled(env.CRABBOX_ARTIFACTS_PUBLIC_READS);
+  if (publicReads && !baseURL) {
+    throw new Error("artifact broker public reads require CRABBOX_ARTIFACTS_BASE_URL");
+  }
   return {
     backend,
     bucket,
     prefix: trimmed(env.CRABBOX_ARTIFACTS_PREFIX) || "crabbox-artifacts",
-    baseURL: stripTrailingSlash(env.CRABBOX_ARTIFACTS_BASE_URL),
+    baseURL,
+    publicReads,
     endpointURL,
     region,
     accessKeyID,
@@ -161,7 +186,7 @@ function normalizeArtifactFiles(files: ArtifactUploadFile[]): Required<ArtifactU
       name,
       size,
       contentType: normalizeContentType(file.contentType),
-      sha256: normalizeHash(file.sha256),
+      sha256: normalizeHash(file.sha256, name),
     };
   });
   if (totalSize > maxArtifactBatchBytes) {
@@ -183,22 +208,49 @@ function normalizeContentType(value: string | undefined): string {
   return trimmed(value).slice(0, 200);
 }
 
-function normalizeHash(value: string | undefined): string {
-  const hash = trimmed(value).toLowerCase();
-  return /^[a-f0-9]{64}$/.test(hash) ? hash : "";
+function normalizeHash(value: string | undefined, name: string): string {
+  if (value === undefined || (typeof value === "string" && !value.trim())) {
+    return "";
+  }
+  if (typeof value !== "string" || !/^[a-fA-F0-9]{64}$/.test(value)) {
+    throw new Error(`invalid artifact sha256 for ${name}`);
+  }
+  return value.toLowerCase();
 }
 
 function artifactPrefix(
   configPrefix: string,
+  org: string,
   owner: string,
   requestPrefix: string | undefined,
+  publicCapability: string,
 ): string {
   const parts = [
     normalizePrefixPart(configPrefix),
-    normalizePrefixPart(owner),
+    "v2",
+    "org",
+    opaqueArtifactIdentity(org),
+    "owner",
+    opaqueArtifactIdentity(owner),
+    ...(publicCapability ? ["public", publicCapability] : []),
     normalizePrefixPart(requestPrefix),
   ].filter(Boolean);
   return parts.join("/");
+}
+
+function randomArtifactCapability(): string {
+  return base64URL(crypto.getRandomValues(new Uint8Array(16)));
+}
+
+function opaqueArtifactIdentity(value: string): string {
+  return base64URL(new TextEncoder().encode(value));
+}
+
+function artifactIdentity(value: string, label: string): string {
+  if (!value.trim()) {
+    throw new Error(`artifact upload ${label} identity is required`);
+  }
+  return value;
 }
 
 function normalizePrefixPart(value: string | undefined): string {
@@ -216,12 +268,24 @@ function artifactObjectKey(prefix: string, name: string): string {
 function artifactUploadHeaders(file: Required<ArtifactUploadFile>): Record<string, string> {
   return {
     ...(file.contentType ? { "content-type": file.contentType } : {}),
+    // Signed alongside content-length so the store rejects a body that does not match the
+    // declared digest. Without this the caller-supplied sha256 would assure nothing.
+    ...(file.sha256 ? { "x-amz-checksum-sha256": base64FromHex(file.sha256) } : {}),
     "content-length": String(file.size),
   };
 }
 
+/** normalizeHash guarantees 64 lowercase hex characters, so this always yields 32 bytes. */
+function base64FromHex(value: string): string {
+  let binary = "";
+  for (let index = 0; index < value.length; index += 2) {
+    binary += String.fromCharCode(Number.parseInt(value.slice(index, index + 2), 16));
+  }
+  return btoa(binary);
+}
+
 async function artifactReadURL(config: ArtifactConfig, key: string): Promise<string> {
-  if (config.baseURL) {
+  if (config.publicReads) {
     return joinURLPath(config.baseURL, pathEscapeSegments(key));
   }
   return presignArtifactURL(config, "GET", key, config.urlExpiresSeconds);
@@ -281,4 +345,8 @@ function positiveInt(value: string | undefined, fallback: number): number {
 
 function trimmed(value: string | undefined): string {
   return (value ?? "").trim();
+}
+
+function enabled(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes(trimmed(value).toLowerCase());
 }

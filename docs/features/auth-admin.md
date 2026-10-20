@@ -11,11 +11,11 @@ privilege levels:
 
 | Credential | How it is obtained | Privilege |
 | --- | --- | --- |
-| **GitHub user token** | `crabbox login` (browser OAuth) | Own and shared leases/runs only |
+| **GitHub user token** | `crabbox login` (browser OAuth) | Own and shared leases/runs; optional immutable-owner admin grant |
 | **Shared bearer token** | `crabbox login --token-stdin` or `config set-broker --token-stdin` | All non-admin routes, acting as one shared identity |
 | **Admin token** | `config set-broker --admin-token-stdin` or `CRABBOX_COORDINATOR_ADMIN_TOKEN` | Fleet-wide admin routes |
 
-The broker only authorizes brokered providers (`aws`, `azure`, `gcp`,
+The broker only authorizes brokered providers (`aws`, `azure`, `daytona`, `gcp`,
 `hetzner`); all other providers run direct from the CLI and never see these
 tokens. For the route and Cloudflare Access model, see
 [Broker Auth And Routing](broker-auth-routing.md).
@@ -27,21 +27,71 @@ exchanges the OAuth code, then verifies the user is an **active member of an
 allowed GitHub org** (`CRABBOX_GITHUB_ALLOWED_ORGS`, or the singular
 `CRABBOX_GITHUB_ALLOWED_ORG`) and, if any **allowed teams** are configured
 (`CRABBOX_GITHUB_ALLOWED_TEAMS` / `CRABBOX_GITHUB_ALLOWED_TEAM`), a member of one
-of them. On success the broker issues a signed user token (prefix `cbxu_`,
-HMAC-SHA256, default 180-day expiry) and the CLI stores it in the user config.
+of them. The account must also expose a verified email through GitHub's
+`user:email` scope as an eligibility check; ownership uses GitHub's immutable
+numeric account ID, never an email or login. On success the broker issues a
+signed user token (prefix `cbxu_`, HMAC-SHA256, default 180-day expiry) for CLI
+login, while portal login receives a distinct `cbwp_` browser-session token in a
+host-only cookie. Normal API Bearer authentication accepts `cbxu_` but rejects
+`cbwp_`; browser-only authority is never inferred from a caller-supplied Cookie
+header. The token carries the GitHub OAuth credential
+encrypted under the independent session secret. The broker revalidates that
+credential's account ID and current org/team membership on requests, caching
+successful checks for five minutes and failing closed when GitHub can no longer
+confirm identity or membership. Legacy email-owned sessions are rejected, so
+users must log in again after upgrading the broker with this security fix.
+
+Set `CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS` to tune the positive cache from 0
+to 3600 seconds. `CRABBOX_GITHUB_REVOKED_USERS` immediately denies listed
+immutable `github:<numeric-id>` owners; an optional `owner:` prefix is accepted.
+An email, login, or other invalid selector makes GitHub login and existing
+GitHub sessions fail closed until an operator replaces it. This prevents a
+renamed or reassigned mutable identity from silently escaping an old revocation.
 
 ```sh
 crabbox login --url https://broker.example.com
-crabbox login --url https://broker.example.com --no-browser   # print the URL instead of opening it
+crabbox login --url https://broker.example.com --no-browser   # print the URL; open it on this device
 crabbox login --url https://broker.example.com --provider aws # also set the default brokered provider
 ```
 
-`--provider` accepts `hetzner`, `aws`, `azure`, or `gcp`. With no `--url`,
+`--provider` accepts `hetzner`, `aws`, `azure`, `daytona`, or `gcp`. With no `--url`,
 `login` reuses the broker URL already in config. After storing the token, the
 CLI calls `whoami` to confirm the credential works.
 
-GitHub user tokens can create and use **normal leases only**. They cannot reach
-admin routes, and the token payload can never carry an `admin` claim.
+GitHub user tokens create and use normal leases by default. The token payload
+can never carry an `admin` claim; deployments may grant admin at request time by
+listing immutable `github:<numeric-id>` values in
+`CRABBOX_GITHUB_ADMIN_OWNERS`.
+
+### Upgrading legacy email-owned resources
+
+The immutable-owner upgrade intentionally does not infer a GitHub account from
+an email address. Before deployment, replace email entries in
+`CRABBOX_GITHUB_REVOKED_USERS` with the affected account's
+`github:<numeric-id>` owner. Replace mutable GitHub admin grants with
+`CRABBOX_GITHUB_ADMIN_OWNERS` entries, and replace email values in
+`CRABBOX_CAPACITY_ADMIN_OWNERS` for GitHub users with their immutable owners.
+Shared-token capacity owners may retain their configured stable service owner.
+GitHub auth remains fail closed while an email or login revocation entry is
+present.
+
+Existing email-owned leases, runs, and explicit shares remain under their
+recorded owner for auditability; a new GitHub login does not inherit them even
+when the account presents the same verified email. For an active lease that a
+specific account must recover, an operator should authenticate with the admin
+token, inspect the legacy record, and explicitly grant `manage` access to that
+account's immutable owner:
+
+```sh
+CRABBOX_COORDINATOR_TOKEN="$CRABBOX_COORDINATOR_ADMIN_TOKEN" \
+  crabbox share --id cbx_000000000001 --user github:12345 --role manage
+```
+
+Replace legacy email entries in explicit share lists the same way. If the
+ownership itself must change, create a replacement lease under the new login
+and release the legacy lease after preserving any required artifacts. Do not
+bulk-map email owners to account IDs: a renamed or reassigned address is exactly
+the security boundary this upgrade protects.
 
 ## Shared and admin tokens (automation, operators)
 
@@ -64,8 +114,11 @@ The broker matches an incoming bearer token in this precedence:
 On the CLI side the admin token is read from `broker.adminToken` in config or
 the `CRABBOX_COORDINATOR_ADMIN_TOKEN` / `CRABBOX_ADMIN_TOKEN` environment
 variable; the normal broker token comes from `broker.token` or
-`CRABBOX_COORDINATOR_TOKEN`. Admin commands fail fast if no admin token is
-configured.
+`CRABBOX_COORDINATOR_TOKEN`. Admin commands prefer the explicit admin token,
+disabling the normal token command when it is present. Otherwise they use the
+normal configured authentication, including a GitHub session with an existing
+immutable-owner admin grant. Authorization remains with the broker, and a denied
+explicit admin token does not trigger a retry with the normal credential.
 
 Never distribute the shared or admin token to untrusted users. Keep the admin
 token narrower and more closely held than the shared automation token.
@@ -77,7 +130,8 @@ the effective owner and org and re-injects them as trusted headers
 (`x-crabbox-owner`, `-org`, `-auth`, `-admin`, `-github-login`) before handling
 the request:
 
-- GitHub user token -> `owner`/`org`/`login` come from the signed token.
+- GitHub user token -> immutable `github:<numeric-id>` `owner` plus `org` and
+  display `login` come from the signed token.
 - Admin or shared token -> `owner` from `X-Crabbox-Owner` (CLI sends
   `CRABBOX_OWNER`, a Git email env var, or `git config user.email`) or, for the
   shared token, `CRABBOX_SHARED_OWNER`; `org` from `X-Crabbox-Org`
@@ -85,6 +139,12 @@ the request:
 - A verified Cloudflare Access JWT (`cf-access-jwt-assertion`), when the broker
   has `CRABBOX_ACCESS_TEAM_DOMAIN` and `CRABBOX_ACCESS_AUD` set, overrides the
   `owner` with the email from the assertion.
+
+Cloudflare Access signing-key loads share a 15-second deadline across response
+headers and body consumption. A timeout aborts the request and uses the existing
+short failure cache and one-refresh allowance for key rotation. Access identity
+is optional enrichment: a failed key lookup preserves normal shared/admin bearer
+authentication and its owner fallback, without trusting unverified Access headers.
 
 ## Identity commands
 
@@ -108,17 +168,54 @@ GET  /v1/leases/{id-or-slug}     resolves only if visible to the caller
 POST /v1/leases/{id}/heartbeat   owner, manage share, or admin
 POST /v1/leases/{id}/release     owner, manage share, or admin
 POST /v1/leases/{id}/tailscale   owner, manage share, or admin
-PUT/DELETE /v1/leases/{id}/share owner, manage share, or admin
+GET/PUT/DELETE /v1/leases/{id}/share owner, manage share, or admin
 GET  /v1/runs and logs/events    own runs only
 GET  /v1/usage                   own usage only
-GET  /v1/pool                    admin token only
-/v1/admin/*                      admin token only
+GET  /v1/capacity                self-owner admission aggregate across months/orgs
+GET  /v1/pool                    admin authorization
+POST /v1/leases with hostId      admin, or matching org-owned Mac allocation
+/v1/admin/*                      admin authorization
 ```
 
-A lease is **visible** to a caller who is the owner (matching owner email and
-org), an admin, or a share recipient. It is **manageable** by the owner, an
+A lease is **visible** to a caller who is the owner (matching immutable owner
+and org), an admin, or a share recipient. It is **manageable** by the owner, an
 admin, or a `manage` share recipient. Non-admin admin-route requests are
 rejected with `403 admin token required`.
+
+[`capacity`](../commands/capacity.md) is a narrow aggregate exception to owner/org
+visibility. It uses normal authentication, remains self-owner only even for
+admins, rejects all query parameters, and exposes only owner, active admission
+count, effective owner limit, and observed time. It grants no additional lease
+visibility or monthly-report access; admin authentication alone does not grant
+an elevated owner limit.
+
+Provider host inventory is also capacity administration. Normal portal users
+see a Dedicated Host only when it backs an active lease already visible to
+them; unattached host inventory remains admin-only. Pinning an unused AWS Mac
+Dedicated Host also permits authenticated members only when an exact coordinator
+allocation record matches that host, the requested region, and their current org
+identity. New admin allocations persist that org. Missing or ambiguous records,
+other-org records, and historical managed leases do not grant permission. Hosts
+allocated by older coordinators without a record remain admin-only; no claim or
+backfill command is added by this change.
+Other provider pins and other AWS resource selectors remain admin-only; existing
+checkpoint grants retain their exact host scope.
+
+Host permission never authorizes adopting an occupying lease. A create request
+fails with `host_in_use` while that host has a live or retained instance. Exact
+fixed-ID replay preserves its existing owner and intent checks. Kept leases
+remain visible to their owners and share recipients in ordinary CLI listing,
+even when released with the instance retained.
+
+Host reservation inspection and repair are admin-only, including the legacy
+Mac-host route: `GET` or `POST /v1/admin/hosts/<host-id>/reservation`
+(and `/v1/admin/mac-hosts/<host-id>/reservation`). Pass `region` and optionally
+`provider=aws&target=macos`. POST rejects live or potentially retained leases
+with `409 host_in_use` unless `force=true`; missing leases and safely ended
+associations can be cleared without force. The response includes safe summaries,
+not lease credentials. Neither operation changes EC2 resources or allocation
+ownership. Use `crabbox admin mac-hosts reservation <host-id>` to inspect and
+`crabbox admin mac-hosts clear <host-id> [--force]` to repair.
 
 ## Lease sharing
 
@@ -129,12 +226,16 @@ shared bearer or admin token. Roles:
 - **manage** — everything `use` allows, plus heartbeat/touch the lease, update
   non-secret Tailscale metadata, change sharing, and stop the lease.
 
+Ordinary lease detail and list responses omit the sharing roster for `use`
+recipients. Listing or changing the roster requires owner, admin, or `manage`
+access.
+
 ```sh
-crabbox share --id swift-crab --user alice@example.com           # default role: use
-crabbox share --id swift-crab --user alice@example.com --role manage
+crabbox share --id swift-crab --user github:12345                # default role: use
+crabbox share --id swift-crab --user github:12345 --role manage
 crabbox share --id swift-crab --org                              # share with the lease org
 crabbox share --id swift-crab --list                             # show current sharing
-crabbox unshare --id swift-crab --user alice@example.com
+crabbox unshare --id swift-crab --user github:12345
 crabbox unshare --id swift-crab --org
 crabbox unshare --id swift-crab --all
 ```
@@ -146,7 +247,7 @@ keys between users.
 
 ## Trusted-operator and admin commands
 
-These require the admin token:
+These require admin authorization:
 
 ```sh
 crabbox admin leases --state active

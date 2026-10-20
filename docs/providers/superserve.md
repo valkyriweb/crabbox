@@ -125,7 +125,9 @@ CRABBOX_SUPERSERVE_FORGET_MISSING
 Defaults: API URL `https://api.superserve.ai`, template `superserve/base`,
 workdir `/workspace/crabbox`, command timeout `600` seconds, and a sandbox
 lifetime derived from Crabbox's TTL. Superserve caps sandbox lifetimes at
-`604800` seconds (7 days).
+`604800` seconds (7 days). When `timeoutSecs` is zero, TTL is checked against
+that cap before rounding fractional seconds up; a nonzero `timeoutSecs` takes
+precedence over TTL.
 
 The base URL must be absolute, must not include userinfo, query parameters, or
 a fragment, and must use HTTPS except for loopback development endpoints.
@@ -149,6 +151,21 @@ sandbox data plane.
 7. One-shot sandboxes are deleted after successful `run` unless `--keep` is set.
    Retained sandboxes can be reused with `--id` and later removed with `stop`.
 
+`run --lease-output` records the Superserve lease, reuse/retention state, and
+matching `crabbox stop --provider superserve --id ...` cleanup command for
+orchestrators that need to inspect or clean up retained sandboxes later.
+
+Run finalization makes one retention/deletion decision before the final timing
+record. A failed deletion retains the claim and session for recovery and fails
+an otherwise successful run with exit code 1. An earlier command exit or
+cancellation remains the primary outcome if cleanup or timing output also fails.
+`--keep-on-failure` also covers command-preparation failures after allocation.
+If a reused sandbox cannot activate, its authorized retained session is still
+returned, but no post-run activity refresh or automatic deletion is attempted.
+
+If initial metadata setup fails or returns a conflicting sandbox ID, rollback
+targets only the original create-response ID; no reusable claim is published.
+
 ## Capabilities
 
 - SSH: no.
@@ -163,6 +180,15 @@ sandbox data plane.
 
 Run the guarded hosted lifecycle smoke only when you intend to create a real
 short-lived Superserve sandbox:
+
+```sh
+CRABBOX_LIVE=1 \
+CRABBOX_LIVE_PROVIDERS=superserve \
+CRABBOX_SUPERSERVE_API_KEY=ss_live_... \
+scripts/live-smoke.sh
+```
+
+The top-level smoke dispatches to the provider-specific script:
 
 ```sh
 CRABBOX_LIVE=1 \
@@ -200,7 +226,15 @@ successful live proof prints `classification=live_superserve_smoke_passed`.
 - IDs must be a Crabbox slug, an `ssbx_...` lease ID, or a raw Superserve
   sandbox ID that has matching Crabbox ownership metadata.
 
+## Execution timeout limits
+
+Positive `execTimeoutSecs` values must fit the local command-duration budget,
+including the five-second transport grace. Unrepresentable values fail before
+run acquisition or reuse and before HTTP exec dispatch. Zero retains the service
+default with caller cancellation; the timeout payload never includes the grace.
+Inspection and stop do not consume this command budget.
+
 ## Related Docs
 
 - [Provider backends](../provider-backends.md)
-- [Provider feature overview](../features/providers.md)
+- [Provider Reference](README.md)

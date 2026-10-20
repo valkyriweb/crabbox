@@ -53,23 +53,26 @@ hydration, Tailscale, or the normal SSH/rsync data plane.
 - A sandbox image that provides `/bin/sh`, `bash`, `tar`, `cp`, and a writable
   workdir. Crabbox uses `/bin/sh` for transport scripts and `bash -lc` for
   user shell-mode and auto-shell commands.
+  Quoted and interpolated profile arguments remain literal through the stdin
+  transport; workspace setup and environment export share the same command wrapper
+  as Nomad without sharing Kubernetes lifecycle or execution machinery.
 
 ## Supported Agent Sandbox Version
 
-Crabbox currently targets the Agent Sandbox `v0.5.0rc1` prerelease API:
+Crabbox uses the Agent Sandbox beta API:
 
 - `agents.x-k8s.io/v1beta1`
 - `extensions.agents.x-k8s.io/v1beta1`
 
-This is intentional because `v0.5.0` is expected to promote the same beta API
-soon. Crabbox does not carry `v1alpha1` compatibility. Until stable `v0.5.0`
-ships, pin the controller and CRDs to `v0.5.0rc1` or a newer release that still
-serves these `v1beta1` resources.
+The fixed lease-ID lifecycle is natively qualified against Agent Sandbox
+`v1.0.0`. Pin the controller and CRDs together to that release. Merely serving
+the same resource versions does not qualify another controller's foreground
+deletion behavior. Crabbox does not carry `v1alpha1` compatibility.
 
 Official project and release references:
 
 - [Agent Sandbox project](https://github.com/kubernetes-sigs/agent-sandbox)
-- [Agent Sandbox v0.5.0rc1 release](https://github.com/kubernetes-sigs/agent-sandbox/releases/tag/v0.5.0rc1)
+- [Agent Sandbox v1.0.0 release](https://github.com/kubernetes-sigs/agent-sandbox/releases/tag/v1.0.0)
 
 ## Commands
 
@@ -85,11 +88,34 @@ crabbox stop --provider agent-sandbox linux-pool-smoke
 crabbox cleanup --provider agent-sandbox --dry-run
 ```
 
+## Live Smoke
+
+The provider-specific live smoke is guarded by `CRABBOX_LIVE=1` and an explicit
+provider selection. It builds `bin/crabbox` unless `CRABBOX_BIN` points at an
+existing binary, verifies `doctor`, creates a short-lived `SandboxClaim`,
+proves archive sync and env forwarding with a tiny Git fixture, reuses the
+retained claim for a replacement-sync proof, checks status/list, then deletes
+the claim.
+
+```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=agent-sandbox CRABBOX_LIVE_COORDINATOR=0 scripts/live-smoke.sh
+# or, directly:
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=agent-sandbox scripts/live-agent-sandbox-smoke.sh
+```
+
+The script emits one machine-readable classification:
+`live_agent_sandbox_smoke_passed`, `environment_blocked`, `quota_blocked`, or
+`diagnostic_only`. Missing kubeconfig, context, warm pool, RBAC, cluster
+connectivity, and API readiness issues are reported without pretending a live
+mutation succeeded.
+
 `warmup` keeps the sandbox available until explicit `stop` or the configured
 Crabbox TTL expires. At expiry, the controller tears down the sandbox workload
 but retains the `SandboxClaim` as an exact cleanup handle.
 A `run` without `--id` creates a claim and deletes it after the command unless
 `--keep` or `--keep-on-failure` retains it. The provider is Linux-only.
+`run --lease-output <path>` writes the Agent Sandbox lease ID, slug,
+reuse/retention state, and exact cleanup command for orchestration handoff.
 
 ## Config
 
@@ -212,6 +238,39 @@ Retained claims whose pinned TTL elapsed, or whose controller condition reports
 `ClaimExpired` or `SandboxExpired`, return the terminal `expired` state without
 waiting for missing downstream resources.
 
+### Bound run outcomes
+
+Once a fresh claim is ready, or reuse has positively matched the live claim's
+identity, one finalization path reports its final code, status, retention and
+timing. Reuse that fails readiness retains the bound handle without a final
+activity refresh or keep-on-failure rerun hint. Explicit missing-root forgetting
+removes only local recovery state; it is not proof of controller or pod deletion.
+Creation/readiness rollback before a fresh run binds remains part of acquisition.
+
+Readiness deadlines and cancellation determine the reported run outcome even
+when the last probe returned a different error. The last diagnostic and its
+public exit code remain available; a stage timeout alone does not authorize
+TTL cleanup or missing-root forgetting.
+
+TTL expiry still forces one UID-checked release attempt even for reused or kept
+claims and when `deleteOnRelease` is false. Expiry before command admission keeps
+exit 4. Expiry after a successful command fails with code 1; an earlier command
+exit or cancellation remains primary, with expiry and cleanup errors added as
+diagnostics. Ordinary cleanup failure keeps a recovery handle and fails the run;
+it does not refresh an expired or already-released claim. A failed local claim
+removal after Kubernetes accepted deletion also retains the local recovery handle.
+
+Requested timing is attempted once for every positively bound outcome, including
+early readiness/setup failures, after resource finalization while the operation
+lock is held. Result and timing share the same primary classification and include
+release duration. A timing-writer error is terminal: its first nonzero typed code
+(or fallback 1) is retained, while an earlier primary error wins. The failed
+record is not retried or claimed as emitted, and reporting failure does not
+retroactively retain an otherwise released one-shot claim. Typed setup/transport
+errors retain the public CLI error code without being labeled workload exits. A first
+activity-refresh failure after an ordinary command also retains its nonzero typed
+public code; sync-only activity failures retain their existing exit-1 contract.
+
 ## Claim Scope And Cleanup Safety
 
 Local claim IDs use the `asbx_` prefix. The provider scope includes the
@@ -249,6 +308,72 @@ successful cleanup removes that recovery lease.
 `cleanup` uses Crabbox's local idle-time policy. It deletes due live claims
 after ownership validation, skips missing claims unless `forgetMissing` is
 enabled, and reports every skipped or removed claim.
+
+## Fixed lease IDs
+
+Agent Sandbox supports `warmup --lease-id cbx_<12 lowercase hex characters>` through
+its explicit delegated fixed-acquisition capability. Ordinary generated `asbx_`
+leases retain their existing behavior. A fixed lease records its intent, recovery
+identity, deterministic claim name, original absolute TTL and selected warm-pool
+UID before creating a Kubernetes resource. Repeating the same request, including
+after restarting the CLI, resolves that same attempt instead of allocating a
+replacement. Changed intent or unresolved creation fails without replacement.
+
+```sh
+crabbox warmup --provider agent-sandbox --lease-id cbx_0123456789ab --slug my-build
+crabbox status --provider agent-sandbox --id cbx_0123456789ab
+crabbox run --provider agent-sandbox --id cbx_0123456789ab --keep -- echo ready
+crabbox stop --provider agent-sandbox --id cbx_0123456789ab
+```
+
+For fixed leases, the resource identity reported by status is the immutable
+`SandboxClaim` UID; the reusable Kubernetes name is retained separately as
+`claim`. Acquisition reports that exact identity only after recording it durably,
+and before readiness/completion. An acknowledgment or readiness failure retains
+the fixed handle for replay or explicit stop.
+Status and list also check the recorded Sandbox and Pod UIDs before reporting
+readiness; a replacement workload cannot silently become the fixed lease.
+
+Fixed stop and run-triggered TTL cleanup use UID-preconditioned **Foreground**
+deletion with a two-minute budget for completion, including normal pod termination.
+An earlier caller deadline or cancellation still ends the wait. If confirmation
+does not finish, the fixed handle remains available for a later stop retry.
+It retains local custody until the original claim disappears under the verified
+scope and warm-pool incarnation, and checks already-known Sandbox/Pod handles.
+The supported controller's normal foreground contract is the completion signal;
+this is not an unconditional guarantee under unavailable garbage-collection
+discovery or modified controllers. Unknown creation/deletion outcomes remain
+unresolved. `forgetMissing` is not a fixed-lease completion mechanism.
+A run against a missing fixed claim fails and retains its recovery state even
+when `forgetMissing` is enabled.
+
+The warm-pool UID is a conservative object-incarnation anchor, not a universal
+cluster ID. A missing or replaced pool does not authorize using a different
+cluster or finalizing an uncertain claim. The existing warm-pool GET permission
+is sufficient for this anchor; no new Namespace GET permission is required.
+Acquisition rechecks that UID after creation or reconciliation and before
+publishing readiness, so replacement during either phase retains unresolved intent.
+
+Completed fixed leases retain a terminal tombstone. Repeated stop and terminal
+status validate the local receipt and original configured scope without requiring
+the pool or transport to remain available. A released fixed ID cannot allocate
+again. A new lease needs a new ID. Validated terminal receipts are excluded from
+active `list` inventory; live and unresolved fixed claims remain visible or return
+an inventory error. Runtime adapters can therefore confirm absence after a normal
+fixed stop. Their confirmed-absence cleanup validates the full expected lease ID,
+attempt ID, slug, resource UID and original scope, then retains the unchanged
+terminal receipt under the claim lock across coordinator deregistration. This
+local completion step does not call Kubernetes or delete the receipt.
+
+Once creation has been submitted, this implementation does not automatically
+resubmit the same attempt, even after a definite create rejection. The recorded
+attempt remains available for diagnosis; use a new fixed ID for a new allocation
+only after resolving the previous outcome. Ambiguous creation never allocates a
+replacement. Replaying acquired readiness also preserves recorded Sandbox/Pod
+UIDs and the selected container rather than silently adopting a replacement.
+Ordinary `asbx_` Background deletion and the configured TTL `Retain` policy are
+unchanged. Fixed leases use a distinct versioned claim kind; older ordinary
+readers cannot mutate them as ordinary `asbx_` leases.
 
 ## Capabilities
 
@@ -290,8 +415,8 @@ The guarded live smoke is opt-in and creates one short-lived Crabbox-owned
 `SandboxClaim` only when explicit live configuration is present. Because the
 smoke forces replacement sync and verifies that a remote-only stale file is
 removed on retained reuse, it accepts cluster access, workload selectors, and
-`workdir` only from environment variables or an explicit `CRABBOX_CONFIG` file,
-not repository-local config:
+`workdir` only from environment variables or an explicit `CRABBOX_CONFIG` file
+outside the active repository, not repository-local config:
 
 ```sh
 CRABBOX_LIVE=1 \
@@ -329,6 +454,13 @@ CRABBOX_LIVE_COORDINATOR=0 \
 CRABBOX_LIVE_PROVIDERS=agent-sandbox \
 scripts/live-smoke.sh
 ```
+
+## Execution timeout limits
+
+Positive `execTimeoutSecs` values must fit the local command-duration budget.
+Unrepresentable values fail before run acquisition or reuse and before exec
+dispatch. Zero still adds no provider deadline; caller cancellation remains
+active. Inspection and stop do not consume this command budget.
 
 ## Related Docs
 

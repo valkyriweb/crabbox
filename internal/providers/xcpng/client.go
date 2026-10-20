@@ -23,6 +23,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type xapiClient struct {
@@ -61,7 +62,7 @@ var (
 	}
 )
 
-func newXAPIClient(ctx context.Context, cfg Config) (*xapiClient, error) {
+func newXAPIClient(ctx context.Context, cfg core.Config) (*xapiClient, error) {
 	xcfg := xcpNgProviderConfig(cfg)
 	if err := validateXCPNgConfig(xcfg); err != nil {
 		return nil, err
@@ -129,17 +130,17 @@ func (c *xapiClient) Close(ctx context.Context) error {
 	return nil
 }
 
-func (c *xapiClient) DoctorInventory(ctx context.Context, cfg xcpNgConfig) ([]Server, error) {
+func (c *xapiClient) DoctorInventory(ctx context.Context, cfg xcpNgConfig) ([]core.Server, error) {
 	_ = cfg
 	return c.ListCrabboxServers(ctx)
 }
 
-func (c *xapiClient) ListCrabboxServers(ctx context.Context) ([]Server, error) {
+func (c *xapiClient) ListCrabboxServers(ctx context.Context) ([]core.Server, error) {
 	vms, err := c.vmRecords(ctx)
 	if err != nil {
 		return nil, err
 	}
-	servers := make([]Server, 0, len(vms))
+	servers := make([]core.Server, 0, len(vms))
 	for _, vm := range vms {
 		server := xcpNgVMToServer(vm, vm.Labels, "")
 		if isCrabboxLease(server) {
@@ -170,7 +171,7 @@ func (c *xapiClient) ResolveTemplate(ctx context.Context, cfg xcpNgConfig) (xapi
 		return "", fmt.Errorf("validate xcp-ng template: %w", err)
 	}
 	if isTemplate != "true" {
-		return "", exit(4, "xcp-ng VM is not a template: %s", firstNonBlank(cfg.TemplateUUID, cfg.Template))
+		return "", exit(4, "xcp-ng VM is not a template: %s", shared.FirstNonBlank(cfg.TemplateUUID, cfg.Template))
 	}
 	return ref, nil
 }
@@ -471,10 +472,10 @@ func (c *xapiClient) CreateFreshVM(ctx context.Context, req xcpNgFreshVMRequest)
 	labeled = true
 	if req.Network != nil && req.Network.NetworkRef != "" {
 		vifRef, err := c.callString(ctx, "VIF.create", c.session, map[string]any{
-			"device":               firstNonBlank(req.Network.Device, "0"),
+			"device":               shared.FirstNonBlank(req.Network.Device, "0"),
 			"network":              req.Network.NetworkRef.value(),
 			"VM":                   ref,
-			"MAC":                  firstNonBlank(req.Network.MAC, ""),
+			"MAC":                  shared.FirstNonBlank(req.Network.MAC, ""),
 			"MTU":                  req.Network.MTU,
 			"other_config":         req.Network.Labels,
 			"currently_attached":   false,
@@ -544,8 +545,8 @@ func (c *xapiClient) ImportISO(ctx context.Context, req xcpNgImportISORequest) (
 		return xcpNgConfigDrive{}, exit(4, "xcp-ng ISO path must be a file: %s", path)
 	}
 	labels := isoMediaLabels(req.Labels)
-	name := firstNonBlank(strings.TrimSpace(req.Name), filepath.Base(path))
-	description := firstNonBlank(strings.TrimSpace(req.Description), "Crabbox imported installer media")
+	name := shared.FirstNonBlank(strings.TrimSpace(req.Name), filepath.Base(path))
+	description := shared.FirstNonBlank(strings.TrimSpace(req.Description), "Crabbox imported installer media")
 	vdiRef, err := c.callString(ctx, "VDI.create", c.session, map[string]any{
 		"name_label":       name,
 		"name_description": description,
@@ -588,8 +589,8 @@ func (c *xapiClient) AttachDisk(ctx context.Context, req xcpNgDiskAttachRequest)
 		sizeBytes = 20 * 1024 * 1024 * 1024
 	}
 	labels := vmDiskLabels(req.Labels)
-	name := firstNonBlank(strings.TrimSpace(req.Name), "crabbox-iso-install-disk")
-	description := firstNonBlank(strings.TrimSpace(req.Description), "Crabbox ISO install disk")
+	name := shared.FirstNonBlank(strings.TrimSpace(req.Name), "crabbox-iso-install-disk")
+	description := shared.FirstNonBlank(strings.TrimSpace(req.Description), "Crabbox ISO install disk")
 	vdiRef, err := c.callString(ctx, "VDI.create", c.session, map[string]any{
 		"name_label":       name,
 		"name_description": description,
@@ -610,7 +611,7 @@ func (c *xapiClient) AttachDisk(ctx context.Context, req xcpNgDiskAttachRequest)
 	vbdRef, err := c.callString(ctx, "VBD.create", c.session, map[string]any{
 		"VM":                       req.VMRef.value(),
 		"VDI":                      vdiRef,
-		"userdevice":               firstNonBlank(req.UserDevice, "0"),
+		"userdevice":               shared.FirstNonBlank(req.UserDevice, "0"),
 		"bootable":                 true,
 		"mode":                     "RW",
 		"type":                     "Disk",
@@ -690,7 +691,7 @@ func (c *xapiClient) AttachISO(ctx context.Context, req xcpNgISOAttachRequest) (
 	vbdRef, err := c.callString(ctx, "VBD.create", c.session, map[string]any{
 		"VM":                       req.VMRef.value(),
 		"VDI":                      vdiRef,
-		"userdevice":               firstNonBlank(req.UserDevice, "3"),
+		"userdevice":               shared.FirstNonBlank(req.UserDevice, "3"),
 		"bootable":                 req.Bootable,
 		"mode":                     "RO",
 		"type":                     "CD",
@@ -811,14 +812,14 @@ func (c *xapiClient) GuestIPv4ForID(ctx context.Context, id string) (string, err
 	return c.GuestIPv4(ctx, xapiRef(ref))
 }
 
-func (c *xapiClient) GetServer(ctx context.Context, id string) (Server, error) {
+func (c *xapiClient) GetServer(ctx context.Context, id string) (core.Server, error) {
 	ref, err := c.vmRefForID(ctx, id)
 	if err != nil {
-		return Server{}, err
+		return core.Server{}, err
 	}
 	record, err := c.vmRecord(ctx, ref)
 	if err != nil {
-		return Server{}, err
+		return core.Server{}, err
 	}
 	return xcpNgVMToServer(record, record.Labels, ""), nil
 }
@@ -1257,45 +1258,45 @@ func (c *xapiClient) shutdownVM(ctx context.Context, ref string) error {
 
 func (c *xapiClient) waitForPowerState(ctx context.Context, ref, want string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	for {
-		state, err := c.callString(ctx, "VM.get_power_state", c.session, ref)
-		if err != nil {
-			return err
-		}
-		if strings.EqualFold(state, want) {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return exit(5, "timed out waiting for xcp-ng VM %s power_state=%s", ref, want)
-		}
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-time.After(xcpNgShutdownPollInterval):
-		}
-	}
+	_, err := shared.Poll(ctx, 0, xcpNgShutdownPollInterval, shared.SleepContext,
+		func(ctx context.Context) (string, error) {
+			return c.callString(ctx, "VM.get_power_state", c.session, ref)
+		},
+		func(_ context.Context, state string, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			if strings.EqualFold(state, want) {
+				return true, nil
+			}
+			if time.Now().After(deadline) {
+				return false, exit(5, "timed out waiting for xcp-ng VM %s power_state=%s", ref, want)
+			}
+			return false, nil
+		}, nil)
+	return err
 }
 
 func (c *xapiClient) waitForDomID(ctx context.Context, ref string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	for {
-		domid, err := c.callString(ctx, "VM.get_domid", c.session, ref)
-		if err != nil {
-			return err
-		}
-		domid = strings.TrimSpace(domid)
-		if domid != "" && domid != "-1" {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return exit(5, "timed out waiting for xcp-ng VM %s domid assignment", ref)
-		}
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-time.After(xcpNgStartPollInterval):
-		}
-	}
+	_, err := shared.Poll(ctx, 0, xcpNgStartPollInterval, shared.SleepContext,
+		func(ctx context.Context) (string, error) {
+			return c.callString(ctx, "VM.get_domid", c.session, ref)
+		},
+		func(_ context.Context, domid string, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			domid = strings.TrimSpace(domid)
+			if domid != "" && domid != "-1" {
+				return true, nil
+			}
+			if time.Now().After(deadline) {
+				return false, exit(5, "timed out waiting for xcp-ng VM %s domid assignment", ref)
+			}
+			return false, nil
+		}, nil)
+	return err
 }
 
 func (c *xapiClient) DeleteConfigDrive(ctx context.Context, drive xcpNgConfigDrive) error {
@@ -1535,7 +1536,7 @@ func (c *xapiClient) importFileVDI(ctx context.Context, vdiRef, path string, siz
 }
 
 func (c *xapiClient) importReaderVDI(ctx context.Context, vdiRef string, reader io.Reader, size int64, taskName, taskDescription string) error {
-	taskRef, err := c.callString(ctx, "task.create", c.session, firstNonBlank(taskName, "crabbox import config drive"), firstNonBlank(taskDescription, "Import Crabbox cloud-init config drive"))
+	taskRef, err := c.callString(ctx, "task.create", c.session, shared.FirstNonBlank(taskName, "crabbox import config drive"), shared.FirstNonBlank(taskDescription, "Import Crabbox cloud-init config drive"))
 	if err != nil {
 		return err
 	}
@@ -1582,35 +1583,35 @@ func (c *xapiClient) importReaderVDI(ctx context.Context, vdiRef string, reader 
 
 func (c *xapiClient) waitForTaskSuccess(ctx context.Context, taskRef string) error {
 	deadline := time.Now().Add(xcpNgTaskTimeout)
-	for {
-		status, err := c.callString(ctx, "task.get_status", c.session, taskRef)
-		if err != nil {
-			return err
-		}
-		switch status {
-		case "success":
-			return nil
-		case "failure", "cancelled":
-			value, err := c.call(ctx, "task.get_error_info", c.session, taskRef)
-			if err != nil {
-				return fmt.Errorf("xcp-ng upload task %s: %s", taskRef, status)
+	_, err := shared.Poll(ctx, 0, xcpNgTaskPollInterval, shared.SleepContext,
+		func(ctx context.Context) (string, error) {
+			return c.callString(ctx, "task.get_status", c.session, taskRef)
+		},
+		func(ctx context.Context, status string, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
 			}
-			info := strings.Join(xmlValueToStrings(value), ": ")
-			if info == "" {
-				info = xmlValueToString(value)
+			switch status {
+			case "success":
+				return true, nil
+			case "failure", "cancelled":
+				value, err := c.call(ctx, "task.get_error_info", c.session, taskRef)
+				if err != nil {
+					return false, fmt.Errorf("xcp-ng upload task %s: %s", taskRef, status)
+				}
+				info := strings.Join(xmlValueToStrings(value), ": ")
+				if info == "" {
+					info = xmlValueToString(value)
+				}
+				info = redactXAPISensitiveText(info, c.xapiSecrets("task.get_error_info", c.session, taskRef)...)
+				return false, fmt.Errorf("xcp-ng upload task %s: %s %s", taskRef, status, info)
 			}
-			info = redactXAPISensitiveText(info, c.xapiSecrets("task.get_error_info", c.session, taskRef)...)
-			return fmt.Errorf("xcp-ng upload task %s: %s %s", taskRef, status, info)
-		}
-		if time.Now().After(deadline) {
-			return exit(5, "timed out waiting for xcp-ng upload task %s", taskRef)
-		}
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-time.After(xcpNgTaskPollInterval):
-		}
-	}
+			if time.Now().After(deadline) {
+				return false, exit(5, "timed out waiting for xcp-ng upload task %s", taskRef)
+			}
+			return false, nil
+		}, nil)
+	return err
 }
 
 func (c *xapiClient) getByUUID(ctx context.Context, class, uuid string) (xapiRef, error) {

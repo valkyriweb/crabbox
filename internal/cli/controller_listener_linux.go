@@ -14,6 +14,14 @@ import (
 
 func controllerListenerOwnershipSupported() bool { return true }
 
+func sshForwardRootListenerReady(port string, pid int) error {
+	owners, err := controllerLinuxLoopbackListenerOwnerPIDs(port)
+	if err != nil {
+		return err
+	}
+	return verifySSHForwardRootOwners(owners, pid)
+}
+
 func controllerVerifyDaemonOwnedListener(port string, supervisorPID int) error {
 	owners, err := controllerLinuxLoopbackListenerOwnerPIDs(port)
 	if err != nil {
@@ -29,6 +37,10 @@ func controllerVerifyDaemonOwnedListener(port string, supervisorPID int) error {
 		}
 	}
 	return nil
+}
+
+func controllerVerifyDaemonOwnedListenerWithEnvironment(port string, supervisorPID int, _ []string) error {
+	return controllerVerifyDaemonOwnedListener(port, supervisorPID)
 }
 
 func localWebVNCListenerIdentity(port string) (localWebVNCSourceIdentity, error) {
@@ -47,7 +59,7 @@ func localWebVNCListenerIdentity(port string) (localWebVNCSourceIdentity, error)
 	if stat.Uid != uint32(os.Geteuid()) {
 		return localWebVNCSourceIdentity{}, fmt.Errorf("IPv4 loopback listener process %d is not owned by the current user", pid)
 	}
-	started, err := webVNCDaemonProcessStartIdentity(pid)
+	started, err := LocalProcessStartIdentity(pid)
 	if err != nil {
 		return localWebVNCSourceIdentity{}, fmt.Errorf("inspect listener process %d start identity: %w", pid, err)
 	}

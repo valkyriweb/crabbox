@@ -10,6 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type morphAPI interface {
@@ -26,23 +30,24 @@ type morphAPI interface {
 	DeleteInstance(ctx context.Context, instanceID string) error
 }
 
-var newMorphClient = func(cfg Config, rt Runtime) (morphAPI, error) {
+var newMorphClient = func(cfg core.Config, rt core.Runtime) (morphAPI, error) {
 	apiURL, err := normalizeMorphAPIURL(cfg.Morph.APIURL)
 	if err != nil {
-		return nil, exit(2, "provider=morph has invalid apiUrl %q: %v", cfg.Morph.APIURL, err)
+		return nil, core.Exit(2, "provider=morph has invalid apiUrl %q: %v", cfg.Morph.APIURL, err)
 	}
 	apiKey := strings.TrimSpace(cfg.Morph.APIKey)
 	if apiKey == "" {
-		return nil, exit(2, "provider=morph requires CRABBOX_MORPH_API_KEY, MORPH_API_KEY, or morph.apiKey")
+		return nil, core.Exit(2, "provider=morph requires CRABBOX_MORPH_API_KEY, MORPH_API_KEY, or morph.apiKey")
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
+	trusted, _ := url.Parse(apiURL)
 	return &morphClient{
 		apiURL:     apiURL,
 		apiKey:     apiKey,
-		httpClient: httpClient,
+		httpClient: shared.SecureHTTPClient(httpClient, trusted, newMorphRedirectError),
 	}, nil
 }
 
@@ -50,6 +55,25 @@ type morphClient struct {
 	apiURL     string
 	apiKey     string
 	httpClient *http.Client
+}
+
+func newMorphRedirectError(destination *url.URL) error {
+	return &morphRedirectError{origin: morphRedirectOrigin(destination)}
+}
+
+type morphRedirectError struct {
+	origin string
+}
+
+func (e *morphRedirectError) Error() string {
+	return fmt.Sprintf("%s refused cross-origin redirect to %s", providerName, e.origin)
+}
+
+func morphRedirectOrigin(value *url.URL) string {
+	if value == nil || value.Scheme == "" || value.Host == "" {
+		return "<redacted>"
+	}
+	return value.Scheme + "://" + value.Host
 }
 
 type morphAPIError struct {
@@ -273,15 +297,7 @@ func (c *morphClient) doRaw(ctx context.Context, method, path string, query url.
 	if len(query) > 0 {
 		endpoint.RawQuery = query.Encode()
 	}
-	var payload io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		payload = bytes.NewReader(data)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), payload)
+	req, err := shared.NewCompactJSONRequest(ctx, method, endpoint.String(), body)
 	if err != nil {
 		return nil, err
 	}
@@ -291,6 +307,11 @@ func (c *morphClient) doRaw(ctx context.Context, method, path string, query url.
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// net/http wraps CheckRedirect failures with the untrusted Location URL.
+		var redirectErr *morphRedirectError
+		if errors.As(err, &redirectErr) {
+			return nil, redirectErr
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -302,7 +323,7 @@ func (c *morphClient) doRaw(ctx context.Context, method, path string, query url.
 		return nil, &morphAPIError{
 			StatusCode: resp.StatusCode,
 			Status:     resp.Status,
-			Body:       summarizeMorphResponse(data),
+			Body:       shared.RedactErrorSecrets(summarizeMorphResponse(data), c.apiKey),
 		}
 	}
 	return data, nil
@@ -311,7 +332,7 @@ func (c *morphClient) doRaw(ctx context.Context, method, path string, query url.
 func normalizeMorphAPIURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		raw = "https://cloud.morph.so"
+		raw = core.MorphConfigDefaultAPIURL
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {

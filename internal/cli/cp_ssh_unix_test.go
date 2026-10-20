@@ -1,0 +1,244 @@
+//go:build !windows
+
+package cli
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// assertDescendantReaped polls until the process is gone (ESRCH). Descendant
+// teardown after context cancellation is asynchronous at the OS level and can
+// still be in flight when the cancelled command returns, so a single immediate
+// Kill(pid, 0) check is racy under load (observed as CI flakes). Poll within a
+// bounded deadline instead.
+func assertDescendantReaped(t *testing.T, label string, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s descendant %d survived cancellation: %v", label, pid, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestResolvedSSHRemoteSecludedArgsProbeHonorsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	pidPath := filepath.Join(dir, "child-pid")
+	script := "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s' \"$child\" > \"$CRABBOX_TEST_SSH_CHILD_PID\"\nwait \"$child\"\n"
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_TEST_SSH_CHILD_PID", pidPath)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- probeResolvedSSHRemoteSecludedArgs(ctx, &sshTransportSession{configPath: "/private/config"}, SSHTarget{}, "")
+	}()
+	childPID := waitForPIDFile(t, pidPath)
+	cancel()
+	err := <-result
+	if err == nil {
+		t.Fatal("expected probe error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("probe error=%v", err)
+	}
+	assertDescendantReaped(t, "probe", childPID)
+}
+
+func TestResolvedSSHCopyHelpersApplyTargetEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+test "$CRABBOX_TEST_COPY_OVERRIDE" = target-value && test -z "$CRABBOX_TEST_COPY_DENIED"
+`
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_TEST_COPY_OVERRIDE", "ambient-value")
+	t.Setenv("CRABBOX_TEST_COPY_DENIED", "ambient-denied")
+	target := SSHTarget{
+		ChildEnv:         map[string]string{"CRABBOX_TEST_COPY_OVERRIDE": "target-value"},
+		ChildEnvDenylist: []string{"CRABBOX_TEST_COPY_DENIED"},
+	}
+	session := &sshTransportSession{configPath: filepath.Join(dir, "config")}
+	if err := probeResolvedSSHRemoteSecludedArgs(t.Context(), session, target, ""); err != nil {
+		t.Errorf("capability probe lost target environment: %v", err)
+	}
+	if _, err := runFilesystemCommand(t.Context(), target, func(int64) string { return "true" }, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Errorf("archive command lost target environment: %v", err)
+	}
+}
+
+func TestOwnedSSHTransportCommandReapsDescendants(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	pidPath := filepath.Join(dir, "owned-child-pid")
+	script := "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s' \"$child\" > \"$CRABBOX_TEST_OWNED_SSH_CHILD_PID\"\nwait \"$child\"\n"
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_TEST_OWNED_SSH_CHILD_PID", pidPath)
+	if resolved, err := exec.LookPath("ssh"); err != nil || resolved != sshPath {
+		t.Fatalf("fake ssh resolution=%q err=%v", resolved, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- runOwnedSSHTransportCommand(ctx, SSHTarget{}, []string{"-G", "example.test"}, &bytes.Buffer{}, &bytes.Buffer{})
+	}()
+	childPID := waitForPIDFile(t, pidPath)
+	cancel()
+	err := <-result
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("owned command err=%v", err)
+	}
+	assertDescendantReaped(t, "owned SSH", childPID)
+}
+
+func TestRsyncRemoteShellRoundTripsApostrophePath(t *testing.T) {
+	rsyncPath, err := exec.LookPath("rsync")
+	if err != nil {
+		t.Skip("rsync is required")
+	}
+	dir := filepath.Join(t.TempDir(), "O'Brien")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capturePath := filepath.Join(dir, "args")
+	sshPath := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CRABBOX_TEST_SSH_ARGS\"\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(dir, "source")
+	if err := os.WriteFile(sourcePath, []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_TEST_SSH_ARGS", capturePath)
+	session := &sshTransportSession{configPath: filepath.Join(dir, "ssh config")}
+	cmd := exec.Command(rsyncPath, "-e", session.rsyncRemoteShell(), "--", sourcePath, sshTransportHostAlias+":/tmp/destination")
+	cmd.Env = os.Environ()
+	_ = cmd.Run()
+	data, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(data)), "\n")
+	wantPrefix := []string{"-F", session.configPath, sshTransportHostAlias}
+	if len(args) < len(wantPrefix) {
+		t.Fatalf("ssh args=%#v", args)
+	}
+	for index, want := range wantPrefix {
+		if args[index] != want {
+			t.Fatalf("ssh arg %d=%q, want %q; all=%#v", index, args[index], want, args)
+		}
+	}
+}
+
+func TestCopyOverResolvedSSHCancellationReapsProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "child-pid")
+	rsyncPath := filepath.Join(dir, "rsync")
+	script := `#!/bin/sh
+set -eu
+case " $* " in
+  *" --version "*) printf 'rsync  version 3.4.4  protocol version 32\n'; exit 0 ;;
+esac
+sleep 30 &
+child=$!
+printf '%s' "$child" > "$CRABBOX_TEST_RSYNC_CHILD_PID"
+wait "$child"
+`
+	if err := os.WriteFile(rsyncPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CRABBOX_TEST_RSYNC_CHILD_PID", pidPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- copyOverResolvedSSH(ctx, SSHTarget{User: "alice", Host: "example.test", Port: "22"}, "./input", "SANDBOX:/tmp/input", false, &bytes.Buffer{}, &bytes.Buffer{})
+	}()
+	childPID := waitForPIDFile(t, pidPath)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled copy err=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled copy did not return")
+	}
+	assertDescendantReaped(t, "rsync", childPID)
+}
+
+func TestFilesystemCommandRetirementEvidence(t *testing.T) {
+	for _, tt := range []struct {
+		name            string
+		script          string
+		cancel          bool
+		wantUnconfirmed bool
+	}{
+		{name: "ordinary helper failure", script: "exit 1"},
+		{name: "missing target", script: "test -e /definitely-missing-crabbox-test-target"},
+		{name: "lost transport", script: "exit 255", wantUnconfirmed: true},
+		{name: "cancel before dispatch", script: "exit 0", cancel: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\n"+tt.script+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancel {
+				cancel()
+			}
+			unconfirmed, err := runFilesystemCommand(ctx, SSHTarget{NoControlMaster: true}, func(int64) string { return "exit 1" }, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+			if err == nil {
+				t.Fatal("expected command error")
+			}
+			if unconfirmed != tt.wantUnconfirmed {
+				t.Fatalf("retirement unconfirmed=%v, want %v: %v", unconfirmed, tt.wantUnconfirmed, err)
+			}
+		})
+	}
+}
+
+func TestFilesystemCommandCancellationAfterDispatchRetains(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nprintf ready\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	output := writerFunc(func(data []byte) (int, error) { cancel(); return len(data), nil })
+	unconfirmed, err := runFilesystemCommand(ctx, SSHTarget{NoControlMaster: true}, func(int64) string { return "true" }, strings.NewReader(""), output, &bytes.Buffer{})
+	if err == nil || !unconfirmed {
+		t.Fatalf("canceled dispatched command: unconfirmed=%v err=%v", unconfirmed, err)
+	}
+}

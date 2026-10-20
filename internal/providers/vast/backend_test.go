@@ -1,0 +1,1591 @@
+package vast
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"maps"
+	"net/http"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
+)
+
+type fakeVastAPI struct {
+	user                    vastUser
+	offers                  []vastOffer
+	instances               []vastInstance
+	authErr                 error
+	authFn                  func()
+	listErr                 error
+	createErr               error
+	getErr                  error
+	getFn                   func(context.Context, int) (vastInstance, error)
+	manageErr               error
+	destroyErr              error
+	destroyFn               func()
+	attachErr               error
+	detachErr               error
+	listKeysErr             error
+	attachWithoutKeyID      bool
+	createDespiteError      bool
+	createWithoutInstanceID bool
+
+	searches []vastOfferSearchInput
+	creates  []struct {
+		offerID int
+		input   vastCreateInstanceInput
+	}
+	managed []struct {
+		id    int
+		input vastManageInstanceInput
+	}
+	destroyed []int
+	attached  []struct {
+		id        int
+		publicKey string
+	}
+	detached []struct {
+		id    int
+		keyID string
+	}
+	events []string
+	nextID int
+}
+
+func (f *fakeVastAPI) CheckAuth(context.Context) (vastUser, error) {
+	if f.authFn != nil {
+		f.authFn()
+	}
+	if f.authErr != nil {
+		return vastUser{}, f.authErr
+	}
+	if f.user.ID == 0 {
+		return vastUser{ID: 7, Username: "alice"}, nil
+	}
+	return f.user, nil
+}
+
+func (f *fakeVastAPI) SearchOffers(_ context.Context, input vastOfferSearchInput) ([]vastOffer, error) {
+	f.searches = append(f.searches, input)
+	return append([]vastOffer(nil), f.offers...), nil
+}
+
+func (f *fakeVastAPI) CreateInstance(_ context.Context, offerID int, input vastCreateInstanceInput) (vastCreateInstanceResponse, error) {
+	f.creates = append(f.creates, struct {
+		offerID int
+		input   vastCreateInstanceInput
+	}{offerID: offerID, input: input})
+	if f.createErr != nil && !f.createDespiteError {
+		return vastCreateInstanceResponse{}, f.createErr
+	}
+	if f.nextID == 0 {
+		f.nextID = 100
+	}
+	item := vastInstance{
+		ID:       f.nextID,
+		Label:    input.Label,
+		Status:   "running",
+		SSHHost:  "203.0.113.24",
+		SSHPort:  2201,
+		GPUName:  "RTX 4090",
+		GPUCount: 1,
+		DphTotal: 0.75,
+	}
+	f.instances = append(f.instances, item)
+	f.nextID++
+	if f.createErr != nil {
+		return vastCreateInstanceResponse{}, f.createErr
+	}
+	if f.createWithoutInstanceID {
+		return vastCreateInstanceResponse{Success: true}, nil
+	}
+	return vastCreateInstanceResponse{Success: true, NewContract: item.ID, Instance: item}, nil
+}
+
+func (f *fakeVastAPI) GetInstance(ctx context.Context, id int) (vastInstance, error) {
+	if f.getFn != nil {
+		return f.getFn(ctx, id)
+	}
+	if f.getErr != nil {
+		return vastInstance{}, f.getErr
+	}
+	for _, item := range f.instances {
+		if item.ID == id {
+			return item, nil
+		}
+	}
+	return vastInstance{}, &vastAPIError{StatusCode: 404, Status: "404 Not Found"}
+}
+
+func (f *fakeVastAPI) ListInstances(context.Context) ([]vastInstance, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return append([]vastInstance(nil), f.instances...), nil
+}
+
+func (f *fakeVastAPI) ManageInstance(_ context.Context, id int, input vastManageInstanceInput) (vastInstance, error) {
+	f.managed = append(f.managed, struct {
+		id    int
+		input vastManageInstanceInput
+	}{id: id, input: input})
+	if f.manageErr != nil {
+		return vastInstance{}, f.manageErr
+	}
+	for i := range f.instances {
+		if f.instances[i].ID == id {
+			if input.Label != "" {
+				f.instances[i].Label = input.Label
+			}
+			if input.State != "" {
+				f.instances[i].Status = input.State
+			} else if f.instances[i].Status == "starting" {
+				f.instances[i].Status = "running"
+			}
+			return f.instances[i], nil
+		}
+	}
+	return vastInstance{}, &vastAPIError{StatusCode: 404, Status: "404 Not Found"}
+}
+
+func (f *fakeVastAPI) DestroyInstance(_ context.Context, id int) error {
+	f.destroyed = append(f.destroyed, id)
+	f.events = append(f.events, "destroy:"+strconv.Itoa(id))
+	if f.destroyFn != nil {
+		f.destroyFn()
+	}
+	if f.destroyErr != nil {
+		return f.destroyErr
+	}
+	out := f.instances[:0]
+	for _, item := range f.instances {
+		if item.ID != id {
+			out = append(out, item)
+		}
+	}
+	f.instances = out
+	return nil
+}
+
+func (f *fakeVastAPI) ListInstanceSSHKeys(_ context.Context, id int) ([]vastInstanceSSHKey, error) {
+	if f.listKeysErr != nil {
+		return nil, f.listKeysErr
+	}
+	for i := len(f.attached) - 1; i >= 0; i-- {
+		if f.attached[i].id == id {
+			return []vastInstanceSSHKey{{ID: "key-" + strconv.Itoa(id), PublicKey: f.attached[i].publicKey}}, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeVastAPI) AttachInstanceSSHKey(_ context.Context, id int, publicKey string) (vastAttachSSHKeyResponse, error) {
+	f.attached = append(f.attached, struct {
+		id        int
+		publicKey string
+	}{id: id, publicKey: publicKey})
+	if f.attachErr != nil {
+		return vastAttachSSHKeyResponse{}, f.attachErr
+	}
+	if f.attachWithoutKeyID {
+		return vastAttachSSHKeyResponse{Success: true, Key: vastInstanceSSHKey{PublicKey: publicKey}}, nil
+	}
+	return vastAttachSSHKeyResponse{Success: true, Key: vastInstanceSSHKey{ID: "key-" + strconv.Itoa(id), PublicKey: publicKey}}, nil
+}
+
+func (f *fakeVastAPI) DetachInstanceSSHKey(_ context.Context, id int, keyID string) error {
+	f.detached = append(f.detached, struct {
+		id    int
+		keyID string
+	}{id: id, keyID: keyID})
+	f.events = append(f.events, "detach:"+strconv.Itoa(id)+":"+keyID)
+	return f.detachErr
+}
+
+func newTestBackend(t *testing.T, api vastAPI) *backend {
+	t.Helper()
+	testutil.IsolateUserDirs(t)
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	cfg.TargetOS = core.TargetLinux
+	cfg.SSHUser = "root"
+	cfg.SSHPort = "22"
+	cfg.WorkRoot = "/work/crabbox"
+	cfg.Vast.APIURL = "https://console.vast.ai/api/v0"
+	cfg.Vast.APIKey = "test-key"
+	cfg.Vast.User = "root"
+	cfg.Vast.WorkRoot = "/work/crabbox"
+	cfg.Vast.InstanceType = "ondemand"
+	cfg.Vast.Runtype = "ssh_direct"
+	cfg.Vast.Image = "nvidia/cuda:12"
+	cfg.Vast.Order = "dlperf_per_dphtotal desc"
+	cfg.Vast.ReleaseAction = "destroy"
+	b := newBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard})
+	b.apiFactory = func(core.Runtime) (vastAPI, error) { return api, nil }
+	b.waitSSH = func(context.Context, *core.SSHTarget, string, time.Duration) error { return nil }
+	b.runSSH = func(context.Context, core.SSHTarget, string) error { return nil }
+	b.sleep = func(context.Context, time.Duration) error { return nil }
+	return b
+}
+
+func TestWaitForInstanceReadyStopsBeforeCanceledRead(t *testing.T) {
+	cause := errors.New("caller stopped")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(cause)
+	api := &fakeVastAPI{getFn: func(context.Context, int) (vastInstance, error) {
+		t.Fatal("canceled readiness initiated a read")
+		return vastInstance{}, nil
+	}}
+	b := newTestBackend(t, api)
+	_, err := b.waitForInstanceReady(ctx, api, 100)
+	if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want caller cause and cancellation", err)
+	}
+}
+
+func TestWaitForInstanceReadyBoundsObservationsAndSleep(t *testing.T) {
+	for _, phase := range []string{"read Err", "read Cause", "sleep"} {
+		t.Run(phase, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				api := &fakeVastAPI{getFn: func(ctx context.Context, _ int) (vastInstance, error) {
+					if phase == "sleep" {
+						return vastInstance{Status: "loading"}, nil
+					}
+					<-ctx.Done()
+					if phase == "read Cause" {
+						return vastInstance{}, context.Cause(ctx)
+					}
+					return vastInstance{}, ctx.Err()
+				}}
+				b := newTestBackend(t, api)
+				b.pollTimeout = 20 * time.Millisecond
+				b.rt.Clock = &lifecycleClock{current: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+				b.sleep = func(ctx context.Context, _ time.Duration) error {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				_, err := b.waitForInstanceReady(ctx, api, 100)
+				var exit core.ExitError
+				if !core.AsExitError(err, &exit) || exit.Code != 5 || !strings.Contains(err.Error(), "timed out waiting for Vast instance 100 to expose SSH") || !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("err=%v, want bounded readiness timeout with deadline identity", err)
+				}
+				if ctx.Err() != nil {
+					t.Fatalf("parent guard expired before readiness budget: %v", ctx.Err())
+				}
+			})
+		})
+	}
+}
+
+func TestWaitForInstanceReadyPreservesCallerCause(t *testing.T) {
+	for _, phase := range []string{"read", "sleep"} {
+		t.Run(phase, func(t *testing.T) {
+			cause := errors.New("private caller cancellation")
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			api := &fakeVastAPI{getFn: func(ctx context.Context, _ int) (vastInstance, error) {
+				if phase == "read" {
+					cancel(cause)
+					return vastInstance{}, ctx.Err()
+				}
+				return vastInstance{Status: "loading"}, nil
+			}}
+			b := newTestBackend(t, api)
+			b.sleep = func(ctx context.Context, _ time.Duration) error {
+				cancel(cause)
+				return ctx.Err()
+			}
+			_, err := b.waitForInstanceReady(ctx, api, 100)
+			if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) {
+				t.Fatalf("err=%v, want custom cause and context cancellation", err)
+			}
+			if strings.Contains(err.Error(), cause.Error()) {
+				t.Fatalf("diagnostic exposed private context cause: %v", err)
+			}
+		})
+	}
+}
+
+func TestWaitForInstanceReadyPreservesCompletedObservation(t *testing.T) {
+	for _, outcome := range []string{"ready", "terminal", "API failure", "client deadline"} {
+		t.Run(outcome, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			apiErr := &vastAPIError{StatusCode: 403, Status: "403 Forbidden"}
+			api := &fakeVastAPI{getFn: func(context.Context, int) (vastInstance, error) {
+				if outcome != "client deadline" {
+					cancel()
+				}
+				switch outcome {
+				case "ready":
+					return vastInstance{ID: 100, Status: "running", SSHHost: "203.0.113.1", SSHPort: 2222}, nil
+				case "terminal":
+					return vastInstance{ID: 100, Status: "exited"}, nil
+				case "API failure":
+					return vastInstance{}, apiErr
+				default:
+					return vastInstance{}, context.DeadlineExceeded
+				}
+			}}
+			b := newTestBackend(t, api)
+			got, err := b.waitForInstanceReady(ctx, api, 100)
+			switch outcome {
+			case "ready":
+				if err != nil || got.ID != 100 {
+					t.Fatalf("got=%+v err=%v", got, err)
+				}
+			case "terminal":
+				if err == nil || !strings.Contains(err.Error(), "reached terminal status exited") {
+					t.Fatalf("err=%v", err)
+				}
+			case "API failure":
+				if err != apiErr {
+					t.Fatalf("err=%v, want original API response", err)
+				}
+			case "client deadline":
+				if err != context.DeadlineExceeded {
+					t.Fatalf("err=%v, want independent client deadline", err)
+				}
+			}
+		})
+	}
+}
+
+func TestNewBackendPreservesExplicitGenericSSHUser(t *testing.T) {
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	cfg.SSHUser = "ubuntu"
+	core.MarkSSHUserExplicit(&cfg)
+	cfg.Vast.User = "root"
+
+	b := newBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard})
+	if b.cfg.SSHUser != "ubuntu" {
+		t.Fatalf("backend SSHUser=%q want explicit generic user", b.cfg.SSHUser)
+	}
+	if b.DirectSSHBackend.Cfg.SSHUser != "ubuntu" {
+		t.Fatalf("direct SSH backend SSHUser=%q want explicit generic user", b.DirectSSHBackend.Cfg.SSHUser)
+	}
+}
+
+func TestDoctorIsReadOnlyAndCountsOwnedInventory(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{
+		{ID: 1, Label: encodeVastOwnershipLabel("cbx_owned", "owned", "ready"), Status: "running"},
+		{ID: 2, Label: "manual", Status: "running"},
+	}}
+	result, err := newTestBackend(t, api).Doctor(context.Background(), core.DoctorRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result.Message, "leases=1") || !strings.Contains(result.Message, "mutation=false") {
+		t.Fatalf("doctor result=%#v", result)
+	}
+	if len(api.creates) != 0 || len(api.destroyed) != 0 || len(api.managed) != 0 {
+		t.Fatalf("doctor mutated api: creates=%v destroyed=%v managed=%v", api.creates, api.destroyed, api.managed)
+	}
+}
+
+func TestListFiltersOwnedByDefaultAndAllShowsManual(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{
+		{ID: 1, Label: encodeVastOwnershipLabel("cbx_owned", "owned", "ready"), Status: "running"},
+		{ID: 2, Label: "manual", Status: "running"},
+	}}
+	b := newTestBackend(t, api)
+	owned, err := b.List(context.Background(), core.ListRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owned) != 1 || owned[0].CloudID != "1" {
+		t.Fatalf("owned=%#v", owned)
+	}
+	all, err := b.List(context.Background(), core.ListRequest{All: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all=%#v", all)
+	}
+}
+
+func TestAcquireCreatesAttachesPollsReadinessAndClaims(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, AskID: 84, GPUName: "RTX 4090", GPUCount: 1, Rentable: true}}}
+	b := newTestBackend(t, api)
+	var waitedTargets []core.SSHTarget
+	b.waitSSH = func(_ context.Context, target *core.SSHTarget, _ string, _ time.Duration) error {
+		waitedTargets = append(waitedTargets, *target)
+		return nil
+	}
+	lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "gpu-box", Keep: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID == "" || lease.Server.CloudID != "100" || lease.SSH.Host != "203.0.113.24" || lease.SSH.Port != "2201" || lease.SSH.User != "root" || lease.SSH.Key == "" {
+		t.Fatalf("lease=%#v", lease)
+	}
+	if lease.SSH.ReadyCheck != vastReadyCheck || strings.Contains(lease.SSH.ReadyCheck, "crabbox-ready") {
+		t.Fatalf("lease ready check=%q", lease.SSH.ReadyCheck)
+	}
+	if len(waitedTargets) != 2 || waitedTargets[0].ReadyCheck != "true" || waitedTargets[1].ReadyCheck != vastReadyCheck {
+		t.Fatalf("waitSSH targets=%#v", waitedTargets)
+	}
+	if len(api.searches) != 1 || api.searches[0].Config.Order != "dlperf_per_dphtotal desc" {
+		t.Fatalf("searches=%#v", api.searches)
+	}
+	if len(api.creates) != 1 || api.creates[0].offerID != 84 || api.creates[0].input.Config.Runtype != "ssh_direct" || api.creates[0].input.Environment["CRABBOX"] != "1" {
+		t.Fatalf("creates=%#v", api.creates)
+	}
+	if !isVastCrabboxOwnedLabel(api.creates[0].input.Label) || api.creates[0].input.SSHKey == "" {
+		t.Fatalf("create input=%#v", api.creates[0].input)
+	}
+	if len(api.attached) != 1 || api.attached[0].id != 100 || api.attached[0].publicKey == "" {
+		t.Fatalf("attached=%#v", api.attached)
+	}
+	if len(api.managed) != 1 || !strings.Contains(api.managed[0].input.Label, "|ready") {
+		t.Fatalf("managed=%#v", api.managed)
+	}
+	claim, ok, err := core.ResolveLeaseClaimForProvider("gpu-box", providerName)
+	if err != nil || !ok || claim.CloudID != "100" || claim.Labels[vastOfferIDLabel] != "84" || claim.Labels[vastAccountIDLabel] != "7" || claim.Labels[vastAPIURLLabel] != "https://console.vast.ai/api/v0" || claim.Labels[vastKeyIDLabel] != "key-100" || claim.Labels[vastReleaseActionLabel] != "destroy" {
+		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+	}
+}
+
+func TestAcquireCreateFailuresPreserveOnlyAmbiguousRecovery(t *testing.T) {
+	tests := []struct {
+		name                    string
+		createErr               error
+		createWithoutInstanceID bool
+		wantRecovery            bool
+	}{
+		{name: "transport failure", createErr: errors.New("request timed out"), wantRecovery: true},
+		{name: "server failure", createErr: &vastAPIError{StatusCode: http.StatusBadGateway, Status: "502 Bad Gateway"}, wantRecovery: true},
+		{name: "request timeout", createErr: &vastAPIError{StatusCode: http.StatusRequestTimeout, Status: "408 Request Timeout"}, wantRecovery: true},
+		{name: "conflict", createErr: &vastAPIError{StatusCode: http.StatusConflict, Status: "409 Conflict"}, wantRecovery: true},
+		{name: "too early", createErr: &vastAPIError{StatusCode: http.StatusTooEarly, Status: "425 Too Early"}, wantRecovery: true},
+		{name: "rate limited", createErr: &vastAPIError{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests"}, wantRecovery: true},
+		{name: "missing instance id", createWithoutInstanceID: true, wantRecovery: true},
+		{name: "validation failure", createErr: &vastAPIError{StatusCode: http.StatusBadRequest, Status: "400 Bad Request"}},
+		{name: "authentication failure", createErr: &vastAPIError{StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized"}},
+		{name: "offer missing", createErr: &vastAPIError{StatusCode: http.StatusNotFound, Status: "404 Not Found"}},
+		{name: "unprocessable request", createErr: &vastAPIError{StatusCode: http.StatusUnprocessableEntity, Status: "422 Unprocessable Entity"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &fakeVastAPI{
+				offers:                  []vastOffer{{ID: 42, Rentable: true}},
+				createErr:               tt.createErr,
+				createWithoutInstanceID: tt.createWithoutInstanceID,
+			}
+			b := newTestBackend(t, api)
+			_, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "create-failed"})
+			if err == nil {
+				t.Fatal("Acquire unexpectedly succeeded")
+			}
+			if len(api.creates) != 1 || len(api.destroyed) != 0 {
+				t.Fatalf("creates=%d destroyed=%v", len(api.creates), api.destroyed)
+			}
+			owner, ok := decodeVastOwnershipLabel(api.creates[0].input.Label)
+			if !ok {
+				t.Fatalf("invalid create label %q", api.creates[0].input.Label)
+			}
+			claim, claimExists, claimErr := core.ResolveLeaseClaimForProvider("create-failed", providerName)
+			if claimErr != nil || claimExists != tt.wantRecovery {
+				t.Fatalf("claim=%#v exists=%v err=%v wantRecovery=%v", claim, claimExists, claimErr, tt.wantRecovery)
+			}
+			if tt.wantRecovery && (claim.LeaseID != owner.LeaseID || claim.CloudID != "" || claim.Labels["recovery"] != "ambiguous-create" || claim.Labels[vastAccountIDLabel] != "7" || claim.Labels[vastAPIURLLabel] != b.cfg.Vast.APIURL) {
+				t.Fatalf("recovery claim=%#v", claim)
+			}
+			keyPath, pathErr := core.TestboxKeyPath(owner.LeaseID)
+			if pathErr != nil {
+				t.Fatal(pathErr)
+			}
+			_, statErr := os.Stat(keyPath)
+			if tt.wantRecovery && statErr != nil {
+				t.Fatalf("recovery key not retained: %v", statErr)
+			}
+			if !tt.wantRecovery && !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("definite failure key stat error=%v, want not exist", statErr)
+			}
+		})
+	}
+}
+
+func TestAcquireAmbiguousCreateWithoutRepositoryStillPersistsRecovery(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}, createErr: errors.New("response lost")}
+	b := newTestBackend(t, api)
+	if _, err := b.Acquire(context.Background(), core.AcquireRequest{RequestedSlug: "no-repository"}); err == nil {
+		t.Fatal("Acquire unexpectedly succeeded")
+	}
+	claim, ok, err := core.ResolveLeaseClaimForProvider("no-repository", providerName)
+	if err != nil || !ok || claim.CloudID != "" || claim.Labels["recovery"] != "ambiguous-create" {
+		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+	}
+}
+
+func TestResolveAmbiguousCreateBindsExactInstanceBeforeRelease(t *testing.T) {
+	api := &fakeVastAPI{
+		offers:             []vastOffer{{ID: 42, Rentable: true}},
+		createErr:          errors.New("response lost"),
+		createDespiteError: true,
+	}
+	b := newTestBackend(t, api)
+	if _, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "recover-exact"}); err == nil {
+		t.Fatal("Acquire unexpectedly succeeded")
+	}
+	claim, ok, err := core.ResolveLeaseClaimForProvider("recover-exact", providerName)
+	if err != nil || !ok || claim.CloudID != "" {
+		t.Fatalf("pending claim=%#v ok=%v err=%v", claim, ok, err)
+	}
+
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "recover-exact", ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID != claim.LeaseID || lease.Server.CloudID != "100" {
+		t.Fatalf("recovered lease=%#v", lease)
+	}
+	bound, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID)
+	if err != nil || !exists || bound.CloudID != "100" || bound.Revision == claim.Revision {
+		t.Fatalf("bound claim=%#v exists=%v err=%v", bound, exists, err)
+	}
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.destroyed) != 1 || api.destroyed[0] != 100 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID); err != nil || exists {
+		t.Fatalf("claim exists=%v err=%v", exists, err)
+	}
+	keyPath, err := core.TestboxKeyPath(claim.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released key stat error=%v, want not exist", err)
+	}
+}
+
+func TestResolveAmbiguousCreateRejectsUnsafeRecovery(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*backend, *fakeVastAPI)
+		wantErr string
+	}{
+		{
+			name: "instance not visible",
+			mutate: func(_ *backend, api *fakeVastAPI) {
+				api.instances = nil
+			},
+			wantErr: "remains indeterminate",
+		},
+		{
+			name: "duplicate exact identity",
+			mutate: func(_ *backend, api *fakeVastAPI) {
+				duplicate := api.instances[0]
+				duplicate.ID = 101
+				api.instances = append(api.instances, duplicate)
+			},
+			wantErr: "matched 2 instances",
+		},
+		{
+			name: "different account",
+			mutate: func(_ *backend, api *fakeVastAPI) {
+				api.user.ID = 8
+			},
+			wantErr: "account identity does not match",
+		},
+		{
+			name: "different endpoint",
+			mutate: func(b *backend, _ *fakeVastAPI) {
+				b.cfg.Vast.APIURL = "https://another.example.test/api/v0"
+			},
+			wantErr: "endpoint identity does not match",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &fakeVastAPI{
+				offers:             []vastOffer{{ID: 42, Rentable: true}},
+				createErr:          errors.New("response lost"),
+				createDespiteError: true,
+			}
+			b := newTestBackend(t, api)
+			if _, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "recover-safely"}); err == nil {
+				t.Fatal("Acquire unexpectedly succeeded")
+			}
+			claim, ok, err := core.ResolveLeaseClaimForProvider("recover-safely", providerName)
+			if err != nil || !ok {
+				t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+			}
+			tt.mutate(b, api)
+			if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "recover-safely", ReleaseOnly: true}); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Resolve err=%v, want %q", err, tt.wantErr)
+			}
+			retained, exists, err := core.ReadLeaseClaimWithPresence(claim.LeaseID)
+			if err != nil || !exists || retained.CloudID != "" || retained.Revision != claim.Revision {
+				t.Fatalf("retained claim=%#v exists=%v err=%v", retained, exists, err)
+			}
+			if len(api.destroyed) != 0 {
+				t.Fatalf("destroyed=%v", api.destroyed)
+			}
+		})
+	}
+}
+
+func TestAcquireResolvesStringAttachKeyViaInventory(t *testing.T) {
+	api := &fakeVastAPI{
+		offers:             []vastOffer{{ID: 42, Rentable: true}},
+		attachWithoutKeyID: true,
+	}
+	b := newTestBackend(t, api)
+	repoRoot := t.TempDir()
+	if _, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: repoRoot}, RequestedSlug: "string-key", Keep: true}); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := core.ResolveLeaseClaimForProvider("string-key", providerName)
+	if err != nil || !ok || claim.Labels[vastKeyIDLabel] != "key-100" || claim.Labels[vastKeyOwnedLabel] != "true" {
+		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+	}
+}
+
+func TestAttachedKeyIDRequiresExactPublicKey(t *testing.T) {
+	response := vastAttachSSHKeyResponse{Keys: []vastInstanceSSHKey{
+		{ID: "unrelated", PublicKey: "ssh-ed25519 other"},
+		{ID: "wanted", PublicKey: "ssh-ed25519 exact"},
+	}}
+	if got := vastAttachedKeyID(response, "ssh-ed25519 exact"); got != "wanted" {
+		t.Fatalf("key id=%q want wanted", got)
+	}
+	if got := vastAttachedKeyID(vastAttachSSHKeyResponse{Key: vastInstanceSSHKey{ID: "ambiguous"}}, "ssh-ed25519 exact"); got != "" {
+		t.Fatalf("ambiguous key id=%q want empty", got)
+	}
+	response.Keys = append(response.Keys, vastInstanceSSHKey{ID: "duplicate", PublicKey: "ssh-ed25519 exact"})
+	if got := vastAttachedKeyID(response, "ssh-ed25519 exact"); got != "" {
+		t.Fatalf("duplicate key id=%q want empty", got)
+	}
+}
+
+func TestAcquireRollsBackWhenAttachedKeyIDCannotBeListed(t *testing.T) {
+	api := &fakeVastAPI{
+		offers:             []vastOffer{{ID: 42, Rentable: true}},
+		attachWithoutKeyID: true,
+		listKeysErr:        errors.New("key inventory unavailable"),
+	}
+	b := newTestBackend(t, api)
+	_, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "key-list-fail"})
+	if err == nil || !strings.Contains(err.Error(), "confirm attached SSH key") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(api.destroyed) != 1 || api.destroyed[0] != 100 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+}
+
+func TestVastBootstrapToolsCommand(t *testing.T) {
+	command := vastBootstrapToolsCommand()
+	for _, want := range []string{
+		"command -v git",
+		"command -v rsync",
+		"command -v tar",
+		"command -v python3",
+		"apt-get install -y --no-install-recommends git rsync tar python3",
+		"dnf install -y git rsync tar python3",
+		"yum install -y git rsync tar python3",
+		"apk add --no-cache git rsync tar python3",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("bootstrap command missing %q: %s", want, command)
+		}
+	}
+}
+
+func TestAcquireRollsBackWhenToolBootstrapFails(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	b.runSSH = func(context.Context, core.SSHTarget, string) error { return errors.New("package manager failed") }
+	_, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "bootstrap-fail"})
+	if err == nil || !strings.Contains(err.Error(), "vast instance tool bootstrap failed") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(api.destroyed) != 1 || len(api.detached) != 1 {
+		t.Fatalf("destroyed=%v detached=%v", api.destroyed, api.detached)
+	}
+}
+
+func TestResolvePreservesPersistedVastClaimMetadata(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	repoRoot := t.TempDir()
+	b.cfg.Vast.ReleaseAction = "stop"
+	b.DirectSSHBackend.Cfg = b.cfg
+	acquired, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: repoRoot}, RequestedSlug: "preserve-meta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b.cfg.Vast.ReleaseAction = "destroy"
+	b.DirectSSHBackend.Cfg = b.cfg
+	resolved, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "preserve-meta", Repo: core.Repo{Root: repoRoot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Server.Labels[vastReleaseActionLabel] != "stop" || resolved.Server.Labels[vastKeyIDLabel] != "key-100" || resolved.Server.Labels[vastKeyOwnedLabel] != "true" {
+		t.Fatalf("resolved labels=%#v", resolved.Server.Labels)
+	}
+	if resolved.SSH.Key != acquired.SSH.Key {
+		t.Fatalf("resolved SSH key=%q want %q", resolved.SSH.Key, acquired.SSH.Key)
+	}
+	claim, ok, claimErr := core.ResolveLeaseClaimForProvider("preserve-meta", providerName)
+	if claimErr != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, claimErr)
+	}
+	if claim.Labels[vastReleaseActionLabel] != "stop" || claim.Labels[vastKeyIDLabel] != "key-100" || claim.Labels[vastKeyOwnedLabel] != "true" {
+		t.Fatalf("claim labels=%#v", claim.Labels)
+	}
+}
+
+func TestResolveNumericIDRequiresReclaimForUnclaimedProviderLabel(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{{
+		ID:      8,
+		Label:   encodeVastOwnershipLabel("cbx_orphan", "orphan", "ready"),
+		Status:  "running",
+		SSHHost: "203.0.113.8",
+		SSHPort: 22,
+	}}}
+	b := newTestBackend(t, api)
+
+	_, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "8", Repo: core.Repo{Root: t.TempDir()}})
+	if err == nil || !strings.Contains(err.Error(), "vast lease=cbx_orphan is unclaimed; use --reclaim") {
+		t.Fatalf("err=%v", err)
+	}
+	if claim, exists, readErr := core.ReadLeaseClaimWithPresence("cbx_orphan"); readErr != nil || exists {
+		t.Fatalf("claim=%#v exists=%v err=%v", claim, exists, readErr)
+	}
+}
+
+func TestResolveNumericIDReclaimCreatesClaimForProviderLabel(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{{
+		ID:      8,
+		Label:   encodeVastOwnershipLabel("cbx_orphan", "orphan", "ready"),
+		Status:  "running",
+		SSHHost: "203.0.113.8",
+		SSHPort: 22,
+	}}}
+	b := newTestBackend(t, api)
+	clock := &lifecycleClock{current: time.Now().UTC().Truncate(time.Second)}
+	b.rt.Clock = clock
+	b.cfg.IdleTimeout, b.cfg.TTL = 5*time.Minute, time.Hour
+
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "8", Repo: core.Repo{Root: t.TempDir()}, Reclaim: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID != "cbx_orphan" || lease.Server.CloudID != "8" || lease.SSH.Host != "203.0.113.8" {
+		t.Fatalf("lease=%#v", lease)
+	}
+	claim, exists, readErr := core.ReadLeaseClaimWithPresence("cbx_orphan")
+	if readErr != nil || !exists || claim.Provider != providerName || claim.CloudID != "8" || claim.Slug != "orphan" || claim.Labels[vastAccountIDLabel] != "7" || claim.Labels[vastAPIURLLabel] != "https://console.vast.ai/api/v0" {
+		t.Fatalf("claim=%#v exists=%v err=%v", claim, exists, readErr)
+	}
+	if claim.IdleTimeoutSeconds != 300 || claim.Labels["created_at"] != core.LeaseLabelTime(clock.current) || claim.Labels["ttl_secs"] != "3600" || claim.Labels["keep"] != "false" {
+		t.Fatalf("adoption did not initialize policy: %+v", claim)
+	}
+	snapshot, present, set := core.ServerLeaseClaimSnapshot(lease.Server)
+	if !set || !present || !reflect.DeepEqual(snapshot, claim) {
+		t.Fatal("adoption did not return committed snapshot")
+	}
+}
+
+func TestResolveRejectsTerminalStatusForRunButAllowsRelease(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{{ID: 9, Label: encodeVastOwnershipLabel("cbx_failed", "failed", "ready"), Status: "failed", SSHHost: "203.0.113.9", SSHPort: 22}}}
+	b := newTestBackend(t, api)
+	_, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "failed"})
+	if err == nil || !strings.Contains(err.Error(), "terminal status failed") {
+		t.Fatalf("err=%v", err)
+	}
+	server := serverFromInstance(api.instances[0], b.cfg)
+	server.Labels[vastAccountIDLabel] = "7"
+	server.Labels[vastAPIURLLabel] = "https://console.vast.ai/api/v0"
+	if err := core.ClaimLeaseTargetForRepoConfig("cbx_failed", "failed", b.cfg, server, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "failed", ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID != "cbx_failed" || lease.Server.CloudID != "9" {
+		t.Fatalf("lease=%#v", lease)
+	}
+}
+
+func TestResolveStatusOnlyAllowsInstanceWithoutSSHEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name, host string
+		port       int
+	}{
+		{"absent", "", 0},
+		{"host only", "203.0.113.10", 0},
+		{"port only", "", 2201},
+		{"blank host", " \t", 2201},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeVastAPI{instances: []vastInstance{{ID: 10, Label: encodeVastOwnershipLabel("cbx_status", "status-me", "stopped"), Status: "stopped", SSHHost: tc.host, SSHPort: tc.port}}}
+			b := newTestBackend(t, api)
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-me", StatusOnly: true, NoLocalStateMutations: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lease.LeaseID != "cbx_status" || lease.SSH.Host != "" {
+				t.Fatalf("lease=%#v", lease)
+			}
+			for _, key := range []string{"created_at", "last_touched_at", "expires_at", "idle_timeout", "idle_timeout_secs", "ttl_secs", "keep"} {
+				if _, exists := lease.Server.Labels[key]; exists {
+					t.Errorf("unclaimed observation invented %s", key)
+				}
+			}
+			if _, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID); err != nil || exists {
+				t.Fatalf("observation wrote claim: exists=%v err=%v", exists, err)
+			}
+		})
+	}
+}
+
+func TestResolveStatusOnlyIncludesSSHTarget(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	acquired, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "status-wait", Keep: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := core.ReadLeaseClaim(acquired.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, readyProbe := range []bool{false, true} {
+		t.Run(strconv.FormatBool(readyProbe), func(t *testing.T) {
+			lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-wait", StatusOnly: true, ReadyProbe: readyProbe, NoLocalStateMutations: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lease.LeaseID != acquired.LeaseID || lease.SSH.Host != acquired.SSH.Host || lease.SSH.Port != acquired.SSH.Port || lease.SSH.User != acquired.SSH.User || lease.SSH.Key != acquired.SSH.Key {
+				t.Fatalf("status target differs from acquired target: leaseMatches=%t host=%q port=%q user=%q keyMatches=%t", lease.LeaseID == acquired.LeaseID, lease.SSH.Host, lease.SSH.Port, lease.SSH.User, lease.SSH.Key == acquired.SSH.Key)
+			}
+			if lease.SSH.ReadyCheck != vastReadyCheck {
+				t.Fatalf("ready check=%q", lease.SSH.ReadyCheck)
+			}
+			after, err := core.ReadLeaseClaim(acquired.LeaseID)
+			if err != nil || !reflect.DeepEqual(after, before) {
+				t.Fatalf("status observation changed claim: %v", err)
+			}
+		})
+	}
+}
+
+func TestResolvePrefersNumericSlugOverInstanceID(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{
+		{ID: 123, Label: encodeVastOwnershipLabel("cbx_other", "other", "ready"), Status: "running", SSHHost: "203.0.113.123", SSHPort: 22},
+		{ID: 100, Label: encodeVastOwnershipLabel("cbx_numeric", "123", "ready"), Status: "running", SSHHost: "203.0.113.100", SSHPort: 2200},
+	}}
+	b := newTestBackend(t, api)
+	server := serverFromInstance(api.instances[1], b.cfg)
+	server.Labels[vastAccountIDLabel] = "7"
+	server.Labels[vastAPIURLLabel] = "https://console.vast.ai/api/v0"
+	if err := core.ClaimLeaseTargetForRepoConfig("cbx_numeric", "123", b.cfg, server, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID != "cbx_numeric" || lease.Server.CloudID != "100" || lease.SSH.Host != "203.0.113.100" {
+		t.Fatalf("lease=%#v", lease)
+	}
+}
+
+func TestAcquireRollsBackOnCallbackFailure(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	_, err := b.Acquire(context.Background(), core.AcquireRequest{
+		Repo:          core.Repo{Root: t.TempDir()},
+		RequestedSlug: "rollback",
+		OnAcquired: func(core.LeaseTarget) error {
+			return errors.New("controller unavailable")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "controller unavailable") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(api.destroyed) != 1 || api.destroyed[0] != 100 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	if len(api.detached) != 1 || api.detached[0].keyID != "key-100" {
+		t.Fatalf("detached=%v", api.detached)
+	}
+	if _, ok, claimErr := core.ResolveLeaseClaimForProvider("rollback", providerName); claimErr != nil || ok {
+		t.Fatalf("claim ok=%v err=%v", ok, claimErr)
+	}
+}
+
+func TestAcquirePreservesRecoveryClaimWhenRollbackCleanupFails(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}, destroyErr: errors.New("destroy uncertain")}
+	b := newTestBackend(t, api)
+	_, err := b.Acquire(context.Background(), core.AcquireRequest{
+		Repo:          core.Repo{Root: t.TempDir()},
+		RequestedSlug: "recover-me",
+		OnAcquired: func(core.LeaseTarget) error {
+			return errors.New("controller unavailable")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "vast cleanup failed") {
+		t.Fatalf("err=%v", err)
+	}
+	claim, ok, claimErr := core.ResolveLeaseClaimForProvider("recover-me", providerName)
+	if claimErr != nil || !ok || claim.Labels["recovery"] != "rollback-cleanup" || claim.Labels[vastAccountIDLabel] != "7" || claim.Labels[vastAPIURLLabel] != "https://console.vast.ai/api/v0" || claim.CloudID != "100" {
+		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, claimErr)
+	}
+}
+
+func TestAcquireReportsRollbackClaimPersistenceAndDestroyFailures(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}, destroyErr: errors.New("destroy uncertain")}
+	b := newTestBackend(t, api)
+	var stderr bytes.Buffer
+	b.rt.Stderr = &stderr
+	repoRoot := t.TempDir()
+	var leaseID string
+	_, err := b.Acquire(context.Background(), core.AcquireRequest{
+		Repo:          core.Repo{Root: repoRoot},
+		RequestedSlug: "claim-write-failed",
+		OnAcquired: func(target core.LeaseTarget) error {
+			leaseID = target.LeaseID
+			conflicting := target.Server
+			conflicting.CloudID = "999"
+			if err := core.ClaimLeaseTargetForRepoConfig(leaseID, "claim-write-failed", b.cfg, conflicting, core.SSHTarget{}, repoRoot, b.cfg.IdleTimeout, false); err != nil {
+				t.Fatalf("install conflicting claim: %v", err)
+			}
+			return errors.New("controller unavailable")
+		},
+	})
+	if err == nil {
+		t.Fatal("Acquire unexpectedly succeeded")
+	}
+	for _, want := range []string{"controller unavailable", "persist vast rollback recovery claim for instance 100", "stale instance identity", "vast cleanup failed for instance 100", "destroy uncertain"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Acquire err=%v, want %q", err, want)
+		}
+	}
+	if !strings.Contains(stderr.String(), "warning: persist vast rollback recovery claim for instance 100") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	if len(api.destroyed) != 1 || api.destroyed[0] != 100 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	claim, exists, claimErr := core.ReadLeaseClaimWithPresence(leaseID)
+	if claimErr != nil || !exists || claim.CloudID != "999" {
+		t.Fatalf("conflicting claim=%#v exists=%v err=%v", claim, exists, claimErr)
+	}
+	keyPath, pathErr := core.TestboxKeyPath(leaseID)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if _, statErr := os.Stat(keyPath); statErr != nil {
+		t.Fatalf("orphan recovery key not retained: %v", statErr)
+	}
+}
+
+func TestReleaseDestroysWithMatchingCustomEndpointAndRemovesClaim(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	b.cfg.Vast.APIURL = "https://vast.example.test/api/v0"
+	lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "destroy-me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, claimErr := core.ResolveLeaseClaimForProvider("destroy-me", providerName)
+	if claimErr != nil || !ok || claim.Labels[vastAPIURLLabel] != b.cfg.Vast.APIURL {
+		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, claimErr)
+	}
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.destroyed) != 1 || api.destroyed[0] != 100 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	if len(api.detached) != 1 || api.detached[0].id != 100 || api.detached[0].keyID != "key-100" {
+		t.Fatalf("detached=%v", api.detached)
+	}
+	if got, want := strings.Join(api.events, ","), "detach:100:key-100,destroy:100"; got != want {
+		t.Fatalf("events=%q want %q", got, want)
+	}
+	if _, ok, claimErr := core.ResolveLeaseClaimForProvider("destroy-me", providerName); claimErr != nil || ok {
+		t.Fatalf("claim ok=%v err=%v", ok, claimErr)
+	}
+}
+
+func TestReleaseRejectsMismatchedVastCleanupIdentity(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "identity-bound"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api.user = vastUser{ID: 8, Username: "other"}
+	err = b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease})
+	if err == nil || !strings.Contains(err.Error(), "account identity does not match") {
+		t.Fatalf("account mismatch err=%v", err)
+	}
+	if len(api.detached) != 0 || len(api.destroyed) != 0 {
+		t.Fatalf("account mismatch detached=%v destroyed=%v", api.detached, api.destroyed)
+	}
+
+	api.user = vastUser{ID: 7, Username: "alice"}
+	b.cfg.Vast.APIURL = "https://other.example.test/api/v0"
+	err = b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease})
+	if err == nil || !strings.Contains(err.Error(), "API endpoint identity does not match") {
+		t.Fatalf("API mismatch err=%v", err)
+	}
+	if len(api.detached) != 0 || len(api.destroyed) != 0 {
+		t.Fatalf("API mismatch detached=%v destroyed=%v", api.detached, api.destroyed)
+	}
+	if _, ok, claimErr := core.ResolveLeaseClaimForProvider("identity-bound", providerName); claimErr != nil || !ok {
+		t.Fatalf("claim after mismatch ok=%v err=%v", ok, claimErr)
+	}
+}
+
+func TestVastDestructionFencesConcurrentClaimMutation(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "fenced-destroy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	updated := make(chan error, 1)
+	api.destroyFn = func() {
+		go func() {
+			close(started)
+			labels := maps.Clone(claim.Labels)
+			labels["state"] = "renewed"
+			_, updateErr := core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, claim, labels)
+			updated <- updateErr
+		}()
+		<-started
+		select {
+		case err := <-updated:
+			t.Errorf("claim mutation escaped Vast destruction fence: %v", err)
+		default:
+		}
+	}
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-updated; err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("claim mutation after Vast destruction err=%v", err)
+	}
+}
+
+func TestReleaseHonorsExplicitReleaseActionOverride(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "keep-me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Server.Labels[vastReleaseActionLabel] != "destroy" {
+		t.Fatalf("lease labels=%#v", lease.Server.Labels)
+	}
+
+	b.cfg.Vast.ReleaseAction = "keep"
+	core.MarkDeleteOnReleaseExplicit(&b.cfg, providerName)
+	if outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil || outcome.Terminal {
+		t.Fatalf("keep outcome=%+v err=%v", outcome, err)
+	}
+	if len(api.destroyed) != 0 || len(api.detached) != 0 {
+		t.Fatalf("destroyed=%v detached=%v", api.destroyed, api.detached)
+	}
+	msg := b.ReleaseLeaseMessage(lease)
+	if !strings.Contains(msg, "keep lease=") || strings.Contains(msg, "destroyed") {
+		t.Fatalf("message=%q", msg)
+	}
+	if _, ok, claimErr := core.ResolveLeaseClaimForProvider("keep-me", providerName); claimErr != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, claimErr)
+	}
+}
+
+func TestReleaseStopIsExplicitAndTested(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	b.cfg.Vast.ReleaseAction = "stop"
+	b.DirectSSHBackend.Cfg = b.cfg
+	lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "stop-me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.destroyed) != 0 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	if len(api.managed) < 2 || api.managed[len(api.managed)-1].input.State != "stopped" {
+		t.Fatalf("managed=%#v", api.managed)
+	}
+	claim, ok, claimErr := core.ResolveLeaseClaimForProvider("stop-me", providerName)
+	if claimErr != nil || !ok {
+		t.Fatalf("claim ok=%v err=%v", ok, claimErr)
+	}
+	if claim.Labels["state"] != "stopped" || claim.Labels[vastReleaseActionLabel] != "stop" || claim.Labels[vastKeyIDLabel] != "key-100" {
+		t.Fatalf("claim labels=%#v", claim.Labels)
+	}
+
+	b.cfg.Vast.ReleaseAction = "destroy"
+	core.MarkDeleteOnReleaseExplicit(&b.cfg, providerName)
+	lease, err = b.Resolve(context.Background(), core.ResolveRequest{ID: "stop-me", ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome, err := b.ReleaseLeaseWithOutcome(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil || !outcome.Terminal {
+		t.Fatalf("destroy outcome=%+v err=%v", outcome, err)
+	}
+	if len(api.detached) != 1 || api.detached[0].id != 100 || api.detached[0].keyID != "key-100" {
+		t.Fatalf("detached=%v", api.detached)
+	}
+	if len(api.destroyed) != 1 || api.destroyed[0] != 100 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	if _, ok, claimErr := core.ResolveLeaseClaimForProvider("stop-me", providerName); claimErr != nil || ok {
+		t.Fatalf("claim after destroy ok=%v err=%v", ok, claimErr)
+	}
+}
+
+func TestReleaseLeaseMessageUsesPersistedReleaseAction(t *testing.T) {
+	b := newTestBackend(t, &fakeVastAPI{})
+	b.cfg.Vast.ReleaseAction = "destroy"
+	lease := core.LeaseTarget{
+		LeaseID: "cbx_message",
+		Server: core.Server{
+			CloudID:  "100",
+			Name:     "message-me",
+			Provider: providerName,
+			Labels: map[string]string{
+				vastReleaseActionLabel: "stop",
+			},
+		},
+	}
+
+	msg := b.ReleaseLeaseMessage(lease)
+	if !strings.Contains(msg, "stop lease=cbx_message") || strings.Contains(msg, "destroyed") {
+		t.Fatalf("message=%q", msg)
+	}
+}
+
+func TestCleanupDryRunDoesNotDestroyExpiredOwnedInstance(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{{ID: 8, Label: encodeVastOwnershipLabel("cbx_old", "old", "ready"), Status: "running"}}}
+	b := newTestBackend(t, api)
+	server := serverFromInstance(api.instances[0], b.cfg)
+	server.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	if err := core.ClaimLeaseTargetForRepoConfig("cbx_old", "old", b.cfg, server, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	b.rt.Stderr = &stderr
+	b.DirectSSHBackend.RT = b.rt
+	if err := b.Cleanup(context.Background(), core.CleanupRequest{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.destroyed) != 0 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	if !strings.Contains(stderr.String(), "delete server id=8") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestCleanupReportsMissingClaimForOwnedInstance(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{{ID: 9, Label: encodeVastOwnershipLabel("cbx_orphan", "orphan", "ready"), Status: "running"}}}
+	b := newTestBackend(t, api)
+	var stderr bytes.Buffer
+	b.rt.Stderr = &stderr
+	b.DirectSSHBackend.RT = b.rt
+
+	if err := b.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatalf("cleanup err=%v", err)
+	}
+	if len(api.destroyed) != 0 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+	if !strings.Contains(stderr.String(), "reason=no-exact-local-claim") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestManualUnownedCleanupIsRejected(t *testing.T) {
+	api := &fakeVastAPI{instances: []vastInstance{{ID: 5, Label: "manual-instance", Status: "running", SSHHost: "203.0.113.5", SSHPort: 22}}}
+	b := newTestBackend(t, api)
+	manual := serverFromInstance(api.instances[0], b.cfg)
+	err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: "manual", Server: manual}})
+	if err == nil || !strings.Contains(err.Error(), "non-Crabbox Vast instance") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(api.destroyed) != 0 {
+		t.Fatalf("destroyed=%v", api.destroyed)
+	}
+}
+
+type lifecycleClock struct{ current time.Time }
+
+func (c *lifecycleClock) Now() time.Time { return c.current }
+
+func TestHeartbeatLifecycleSurvivesFreshReads(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(strconv.FormatBool(legacy), func(t *testing.T) {
+			api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+			b := newTestBackend(t, api)
+			clock := &lifecycleClock{current: time.Now().UTC().Truncate(time.Second)}
+			b.rt.Clock = clock
+			b.cfg.IdleTimeout, b.cfg.TTL = 5*time.Minute, 2*time.Hour
+			repo := core.Repo{Root: t.TempDir()}
+			lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: repo, RequestedSlug: "policy", Keep: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			initial, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, exists, set := core.ServerLeaseClaimSnapshot(lease.Server)
+			if !set || !exists || !reflect.DeepEqual(snapshot, initial) {
+				t.Error("acquisition did not return its committed snapshot")
+			}
+			wantIdle := 300
+			if legacy {
+				// Reproduce v0.63.0 Resolve -> label-only Touch persistence.
+				oldConfig := b.cfg
+				oldConfig.IdleTimeout = 2 * time.Hour
+				old := core.Server{Labels: vastLeaseLabels(oldConfig, lease.LeaseID, "policy", "ready", false, clock.current)}
+				old.Labels = preserveVastClaimMetadata(old.Labels, initial.Labels)
+				clock.current = clock.current.Add(10 * time.Minute)
+				old.Labels = core.TouchDirectLeaseLabels(old.Labels, oldConfig, "busy", clock.current)
+				initial, err = core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, initial, old.Labels)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if initial.IdleTimeoutSeconds != 300 || initial.Labels["idle_timeout_secs"] != "7200" {
+					t.Fatal("released writer fixture is not the expected mixed-format record")
+				}
+				wantIdle = 7200
+			}
+			freshConfig := b.cfg
+			freshConfig.IdleTimeout, freshConfig.TTL = time.Minute, 15*time.Minute
+			fresh := newBackend(Provider{}.Spec(), freshConfig, b.rt)
+			fresh.apiFactory = b.apiFactory
+			assertPolicy := func(labels map[string]string, idle int) {
+				t.Helper()
+				if labels["idle_timeout_secs"] != strconv.Itoa(idle) || labels["idle_timeout"] != strconv.Itoa(idle) {
+					t.Errorf("idle policy=%q/%q want%d", labels["idle_timeout_secs"], labels["idle_timeout"], idle)
+				}
+				for _, key := range []string{"created_at", "ttl_secs", "keep", vastAccountIDLabel, vastAPIURLLabel, vastKeyIDLabel, vastKeyOwnedLabel, vastOfferIDLabel, vastReleaseActionLabel} {
+					if labels[key] != initial.Labels[key] {
+						t.Errorf("%s changed from %q to %q", key, initial.Labels[key], labels[key])
+					}
+				}
+			}
+			for _, req := range []core.ResolveRequest{
+				{Repo: repo, StatusOnly: true, NoLocalStateMutations: true},
+				{Repo: repo, StatusOnly: true, ReadyProbe: true, NoLocalStateMutations: true},
+				{Repo: repo, StatusOnly: true},
+				{Repo: repo, NoLocalStateMutations: true},
+				{Repo: repo, ReleaseOnly: true, NoLocalStateMutations: true},
+				{Repo: repo, ReleaseOnly: true},
+				{},
+			} {
+				req.ID = lease.LeaseID
+				observed, resolveErr := fresh.Resolve(t.Context(), req)
+				if resolveErr != nil {
+					t.Fatal(resolveErr)
+				}
+				assertPolicy(observed.Server.Labels, wantIdle)
+				if observed.Server.Labels["last_touched_at"] != initial.Labels["last_touched_at"] || observed.Server.Labels["expires_at"] != initial.Labels["expires_at"] {
+					t.Error("observation reset stored activity or expiry")
+				}
+				after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+				if readErr != nil || !reflect.DeepEqual(after, initial) {
+					t.Fatal("observation changed the durable claim")
+				}
+			}
+			views, err := fresh.List(context.Background(), core.ListRequest{})
+			if err != nil || len(views) != 1 {
+				t.Fatalf("list: err=%v count=%d", err, len(views))
+			}
+			assertPolicy(views[0].Labels, wantIdle)
+			reused, err := fresh.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertPolicy(reused.Server.Labels, wantIdle)
+			admitted, readErr := core.ReadLeaseClaim(lease.LeaseID)
+			snapshot, exists, set = core.ServerLeaseClaimSnapshot(reused.Server)
+			if readErr != nil || admitted.IdleTimeoutSeconds != wantIdle || !exists || !set || !reflect.DeepEqual(snapshot, admitted) {
+				t.Fatal("admission did not return committed legacy-aware idle policy")
+			}
+			for _, explicit := range []bool{false, true, false} {
+				clock.current = clock.current.Add(time.Minute)
+				req := core.TouchRequest{Lease: reused, State: "busy", IdleTimeout: time.Minute}
+				if explicit {
+					override := 90 * time.Minute
+					req.IdleTimeoutOverride, wantIdle = &override, 5400
+				}
+				reused.Server, err = fresh.Touch(context.Background(), req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				assertPolicy(after.Labels, wantIdle)
+				if after.IdleTimeoutSeconds != wantIdle || after.LastUsedAt != clock.current.Format(time.RFC3339) || after.Labels["last_touched_at"] != core.LeaseLabelTime(clock.current) {
+					t.Error("touch did not atomically commit activity and idle policy")
+				}
+				created, _ := strconv.ParseInt(initial.Labels["created_at"], 10, 64)
+				expires := min(created+7200, clock.current.Unix()+int64(wantIdle))
+				if after.Labels["expires_at"] != strconv.FormatInt(expires, 10) {
+					t.Error("touch lost creation-based TTL cap")
+				}
+				snapshot, exists, set = core.ServerLeaseClaimSnapshot(reused.Server)
+				if !exists || !set || !reflect.DeepEqual(snapshot, after) {
+					t.Error("touch did not return the committed snapshot")
+				}
+			}
+			api.instances[0].Status = "stopped"
+			stopped, err := fresh.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+			if err != nil || stopped.Server.Labels["state"] != "stopped" {
+				t.Fatalf("stored activity hid physical stopped state: err=%v state=%s", err, stopped.Server.Labels["state"])
+			}
+		})
+	}
+}
+
+func TestRunningObservationClearsOnlyStoredRuntimeState(t *testing.T) {
+	for _, tc := range []struct{ state, want string }{
+		{"provisioning", "ready"}, {"stopped", "ready"}, {"failed", "ready"}, {"exited", "ready"},
+		{"busy", "busy"}, {"ready", "ready"}, {"deleting", "deleting"}, {"expired", "expired"},
+		{"FAILED", "ready"}, {" FAILED ", "ready"}, {"PROVISIONING", "PROVISIONING"},
+		{"stopped_with_code", "stopped_with_code"}, {"error", "ready"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+			b := newTestBackend(t, api)
+			lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "restart-policy", Keep: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			labels := make(map[string]string, len(claim.Labels))
+			for key, value := range claim.Labels {
+				labels[key] = value
+			}
+			labels["state"] = tc.state
+			stored, err := core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, claim, labels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if observed.Server.Labels["state"] != tc.want {
+				t.Errorf("native running projected as %q, want %q", observed.Server.Labels["state"], tc.want)
+			}
+			after, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil || !reflect.DeepEqual(after, stored) {
+				t.Errorf("read-only observation changed claim: %v", err)
+			}
+		})
+	}
+}
+
+func TestClaimObservationPreservesAbsentActivity(t *testing.T) {
+	for _, state := range []string{"", "unknown", "ready"} {
+		t.Run(state, func(t *testing.T) {
+			claim := core.LeaseClaim{LeaseID: "cbx_abcdef123456", Provider: providerName}
+			observed := projectVastClaim(core.Server{Status: state}, claim)
+			if _, exists := observed.Labels["state"]; exists {
+				t.Fatalf("observation invented recorded activity: %v", observed.Labels)
+			}
+		})
+	}
+}
+
+func TestLogicalActivityHoldsSurviveNativeTransitions(t *testing.T) {
+	for _, nativeState := range []string{"running", "loading", "stopped"} {
+		for _, hold := range []string{"cleanup", "deleting", "expired", "released"} {
+			t.Run(nativeState+"/"+hold, func(t *testing.T) {
+				api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+				b := newTestBackend(t, api)
+				repo := core.Repo{Root: t.TempDir()}
+				lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: repo, RequestedSlug: "held", Keep: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				claim, err := core.ReadLeaseClaim(lease.LeaseID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				labels := make(map[string]string, len(claim.Labels))
+				for key, value := range claim.Labels {
+					labels[key] = value
+				}
+				labels["state"] = hold
+				stored, err := core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, claim, labels)
+				if err != nil {
+					t.Fatal(err)
+				}
+				api.instances[0].Status = nativeState
+				observed, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, StatusOnly: true, NoLocalStateMutations: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if observed.Server.Labels["state"] != hold {
+					t.Errorf("native %s erased %s hold", nativeState, hold)
+				}
+				if updated, err := b.Touch(t.Context(), core.TouchRequest{Lease: observed, State: "busy"}); err == nil || !reflect.DeepEqual(updated, core.Server{}) {
+					t.Errorf("held claim accepted activity: err=%v", err)
+				}
+				if _, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo}); err == nil {
+					t.Error("held claim accepted repository admission")
+				}
+				after, err := core.ReadLeaseClaim(lease.LeaseID)
+				if err != nil || !reflect.DeepEqual(after, stored) {
+					t.Errorf("held claim changed: err=%v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestResolveRejectsClaimChangedDuringAuth(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	repo := core.Repo{Root: t.TempDir()}
+	lease, err := b.Acquire(t.Context(), core.AcquireRequest{Repo: repo, RequestedSlug: "admission-policy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := core.ReadLeaseClaim(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacement core.LeaseClaim
+	api.authFn = func() {
+		api.authFn = nil
+		labels := maps.Clone(before.Labels)
+		labels["profile"] = "newer"
+		var updateErr error
+		replacement, updateErr = core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, before, labels)
+		if updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	}
+	got, err := b.Resolve(t.Context(), core.ResolveRequest{ID: lease.LeaseID, Repo: repo})
+	after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+	if err == nil || !reflect.DeepEqual(got, core.LeaseTarget{}) || readErr != nil || !reflect.DeepEqual(after, replacement) {
+		t.Fatalf("stale admission published success or changed claim: resolve=%v read=%v", err, readErr)
+	}
+}
+
+func TestTouchRefusesUncommittableClaim(t *testing.T) {
+	for _, scenario := range []string{"missing snapshot", "stale", "canceled", "invalid override", "account", "endpoint", "during auth"} {
+		t.Run(scenario, func(t *testing.T) {
+			api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+			b := newTestBackend(t, api)
+			lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "touch-policy"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := core.ReadLeaseClaim(lease.LeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req := core.TouchRequest{Lease: lease, State: "busy"}
+			changeClaim := func() {
+				labels := maps.Clone(before.Labels)
+				labels["profile"] = "newer"
+				before, err = core.UpdateLeaseClaimLabelsIfUnchanged(lease.LeaseID, before, labels)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch scenario {
+			case "missing snapshot":
+				core.SetServerLeaseClaimSnapshot(&req.Lease.Server, core.LeaseClaim{}, false)
+			case "stale":
+				changeClaim()
+			case "canceled":
+				cancel()
+			case "invalid override":
+				zero := time.Duration(0)
+				req.IdleTimeoutOverride = &zero
+			case "account":
+				api.user.ID = 8
+			case "endpoint":
+				b.cfg.Vast.APIURL = "https://other.example.test/api/v0"
+			case "during auth":
+				api.authFn = changeClaim
+			}
+			got, touchErr := b.Touch(ctx, req)
+			after, readErr := core.ReadLeaseClaim(lease.LeaseID)
+			if touchErr == nil || !reflect.DeepEqual(got, core.Server{}) || readErr != nil || !reflect.DeepEqual(after, before) {
+				t.Fatal("uncommittable touch published success or changed the claim")
+			}
+		})
+	}
+}
+
+func TestTouchUpdatesLocalClaimLabels(t *testing.T) {
+	api := &fakeVastAPI{offers: []vastOffer{{ID: 42, Rentable: true}}}
+	b := newTestBackend(t, api)
+	b.cfg.Vast.APIURL = "https://vast.example.test/custom/api/v0"
+	lease, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}, RequestedSlug: "touch-me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := b.Touch(context.Background(), core.TouchRequest{Lease: lease, State: "busy", IdleTimeout: 2 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Labels["state"] != "busy" || updated.Labels[vastAPIURLLabel] != b.cfg.Vast.APIURL {
+		t.Fatalf("updated=%#v", updated.Labels)
+	}
+	claim, ok, err := core.ResolveLeaseClaimForProvider("touch-me", providerName)
+	if err != nil || !ok || claim.Labels["state"] != "busy" || claim.Labels[vastAPIURLLabel] != b.cfg.Vast.APIURL {
+		t.Fatalf("claim=%#v ok=%v err=%v", claim, ok, err)
+	}
+	lease.Server = updated
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,18 +1,4 @@
 {
-  "anthropic-sandbox-runtime": {
-    "status": "built-in",
-    "category": "local-sandbox",
-    "substrate": "Anthropic Sandbox Runtime process sandbox",
-    "location": "local",
-    "ssh": "no",
-    "sync": "provider-owned",
-    "gpu": "no",
-    "lifecycle": "local runtime",
-    "cleanup": "one-shot process exit",
-    "bestFit": "Local policy-constrained command execution",
-    "caveat": "No persistent lease, remote box, or SSH access",
-    "docs": "anthropic-sandbox-runtime.md"
-  },
   "agent-sandbox": {
     "status": "built-in",
     "category": "delegated-sandbox",
@@ -26,6 +12,20 @@
     "bestFit": "Kubernetes-hosted delegated Linux execution",
     "caveat": "Requires kubectl, Agent Sandbox v0.5.0rc1 v1beta1 CRDs, a warm pool, explicit context, and RBAC",
     "docs": "agent-sandbox.md"
+  },
+  "anthropic-sandbox-runtime": {
+    "status": "built-in",
+    "category": "local-sandbox",
+    "substrate": "Anthropic Sandbox Runtime process sandbox",
+    "location": "local",
+    "ssh": "no",
+    "sync": "provider-owned",
+    "gpu": "no",
+    "lifecycle": "local runtime",
+    "cleanup": "one-shot process exit",
+    "bestFit": "Local policy-constrained command execution",
+    "caveat": "No persistent lease, remote box, or SSH access",
+    "docs": "anthropic-sandbox-runtime.md"
   },
   "apple-container": {
     "status": "built-in",
@@ -55,7 +55,7 @@
     "caveat": "Delegated execution, not a normal SSH lease",
     "docs": "apple-machine.md"
   },
-  "apple-vz": {
+  "apple-vm": {
     "status": "built-in",
     "category": "local-vm",
     "substrate": "Apple Virtualization.framework VM",
@@ -67,20 +67,21 @@
     "cleanup": "VM delete",
     "bestFit": "Headless Linux ARM64 VM on Apple silicon",
     "caveat": "Apple silicon macOS only",
-    "docs": "apple-vz.md"
+    "docs": "apple-vm.md"
   },
   "ascii-box": {
     "status": "built-in",
     "category": "direct-cloud",
-    "substrate": "ASCII Box managed Linux box",
+    "substrate": "Boat (formerly ASCII Box) managed Linux box",
     "location": "provider-managed",
     "ssh": "crabbox-managed",
     "sync": "crabbox-sync",
     "gpu": "unknown",
-    "lifecycle": "provider CLI",
+    "lifecycle": "provider CLI; keyed API fixed lease IDs",
     "cleanup": "provider delete",
-    "bestFit": "Managed Linux box over SSH",
-    "caveat": "Requires the ASCII Box CLI and account",
+    "bestFit": "Managed Linux box over SSH, selectable as boat",
+    "caveat": "Requires Boat/Box CLI; fixed IDs allow one keyed recovery within 24h; no account attestation",
+    "auth": "API key via ASCII_BOX_API_KEY or CRABBOX_ASCII_BOX_API_KEY; Boat/Box CLI config; direct remote SSH lease",
     "docs": "ascii-box.md"
   },
   "aws": {
@@ -95,7 +96,23 @@
     "cleanup": "instance termination",
     "bestFit": "Broad Linux, Windows, WSL2, and macOS cloud coverage",
     "caveat": "Largest configuration, quota, and cost surface",
+    "auth": "Broker-owned credentials through coordinator, or AWS SDK credential chain in direct mode; AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN",
     "docs": "aws.md"
+  },
+  "aws-lambda-microvm": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "AWS Lambda Firecracker MicroVM",
+    "location": "cloud",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "no",
+    "lifecycle": "Crabbox and Lambda MicroVM API",
+    "cleanup": "MicroVM termination",
+    "bestFit": "Isolated stateful ARM64 command execution",
+    "caveat": "Requires a compatible Crabbox runner image; launch Regions and lifetime are limited",
+    "auth": "AWS SDK credential chain plus short-lived MicroVM auth token; delegated remote sandbox",
+    "docs": "aws-lambda-microvm.md"
   },
   "azure": {
     "status": "built-in",
@@ -109,6 +126,7 @@
     "cleanup": "VM and owned resource delete",
     "bestFit": "Linux or Windows workloads in Azure",
     "caveat": "Shared resource and identity setup is substantial",
+    "auth": "Broker-owned credentials through coordinator, or Azure DefaultAzureCredential, az login, service principal env credentials",
     "docs": "azure.md"
   },
   "azure-dynamic-sessions": {
@@ -123,7 +141,23 @@
     "cleanup": "provider session expiry",
     "bestFit": "Short delegated container sessions in Azure",
     "caveat": "No Crabbox-managed SSH lease",
+    "auth": "Bearer token via CRABBOX_AZURE_DYNAMIC_SESSIONS_TOKEN or az account get-access-token; delegated remote sandbox",
     "docs": "azure-dynamic-sessions.md"
+  },
+  "azure-sandbox": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Azure Container Apps Sandbox",
+    "location": "cloud",
+    "ssh": "no",
+    "sync": "none",
+    "gpu": "no",
+    "lifecycle": "Crabbox fixed lease and ACA Sandbox API",
+    "cleanup": "exact owned Sandbox delete",
+    "bestFit": "Kept Linux shell workloads with explicit file uploads",
+    "caveat": "Requires an existing Sandbox group; runs require --keep --no-sync; one 2-CPU/4-GiB shape",
+    "auth": "Azure CLI credential or explicitly selected managed identity; direct delegated sandbox",
+    "docs": "azure-sandbox.md"
   },
   "blacksmith-testbox": {
     "status": "built-in",
@@ -139,6 +173,51 @@
     "caveat": "Execution and artifacts follow the Testbox contract",
     "docs": "blacksmith-testbox.md"
   },
+  "blaxel": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Blaxel managed Linux sandbox",
+    "location": "provider-managed",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "unknown",
+    "lifecycle": "Blaxel",
+    "cleanup": "owned sandbox delete",
+    "bestFit": "Managed delegated Linux sandbox execution",
+    "caveat": "Requires Blaxel API credentials and workspace access",
+    "auth": "API key via CRABBOX_BLAXEL_API_KEY or BL_API_KEY; env-only remote sandbox auth",
+    "docs": "blaxel.md"
+  },
+  "boxd": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "boxd KVM microVM (Ubuntu 24.04)",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "no",
+    "lifecycle": "TLS gRPC API + exec bootstrap",
+    "cleanup": "machine destroy (claim-gated)",
+    "bestFit": "Experimental isolated Linux microVM SSH leases",
+    "caveat": "2026-09-01: isolated creation verified over the gRPC API; guest port 8000 is publicly proxied without authentication",
+    "auth": "CRABBOX_BOXD_API_KEY or BOXD_API_KEY bxd_ key, exchanged over HTTPS for short-lived JWTs",
+    "docs": "boxd.md"
+  },
+  "cloud-run-sandbox": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Google Cloud Run sandbox",
+    "location": "cloud",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "no",
+    "lifecycle": "Cloud Run sandbox CLI or ComputeSDK gateway",
+    "cleanup": "sandbox delete",
+    "bestFit": "Isolated untrusted command execution on Cloud Run",
+    "caveat": "Requires a Cloud Run service with --sandbox-launcher, or a remote gateway URL and secret",
+    "auth": "Remote mode: CLOUD_RUN_SANDBOX_SECRET (+ optional CLOUD_RUN_AUTH_TOKEN); direct mode uses in-container sandbox CLI",
+    "docs": "cloud-run-sandbox.md"
+  },
   "cloudflare": {
     "status": "built-in",
     "category": "delegated-sandbox",
@@ -150,7 +229,8 @@
     "lifecycle": "Cloudflare Worker",
     "cleanup": "container delete",
     "bestFit": "Fast delegated Linux container execution",
-    "caveat": "Requires Worker deployment and container availability",
+    "caveat": "Requires Worker deployment and container availability; container snapshots cannot be deleted and expire after 30 days",
+    "auth": "Runner bearer token via CRABBOX_CLOUDFLARE_RUNNER_TOKEN plus runner URL; delegated remote container",
     "docs": "cloudflare.md"
   },
   "cloudflare-dynamic-workers": {
@@ -165,7 +245,37 @@
     "cleanup": "terminal metadata and local claim removal",
     "bestFit": "Hosted Worker module execution",
     "caveat": "No shell, SSH, or filesystem sync; Dynamic Workers must be enabled",
+    "auth": "Loader bearer token via CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_TOKEN; Wrangler or CLOUDFLARE_API_TOKEN for deployment",
     "docs": "cloudflare-dynamic-workers.md"
+  },
+  "cloudflare-sandbox": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Cloudflare Sandbox bridge",
+    "location": "cloud",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "no",
+    "lifecycle": "Cloudflare Sandbox bridge",
+    "cleanup": "sandbox delete",
+    "bestFit": "Cloudflare Sandbox Linux command execution through a bridge",
+    "caveat": "Requires a configured bridge URL; no SSH, browser, Tailscale, URL sessions, mounts, or checkpoints",
+    "auth": "Bridge bearer token via CRABBOX_CLOUDFLARE_SANDBOX_TOKEN plus bridge URL; delegated remote sandbox",
+    "docs": "cloudflare-sandbox.md"
+  },
+  "coder": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Coder workspace",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "unknown",
+    "lifecycle": "Coder CLI",
+    "cleanup": "workspace stop or delete",
+    "bestFit": "Coder-backed Linux workspace over SSH proxy",
+    "caveat": "Requires the coder CLI, login, template access, and workspace quota",
+    "docs": "coder.md"
   },
   "codesandbox": {
     "status": "built-in",
@@ -179,11 +289,57 @@
     "cleanup": "sandbox delete",
     "bestFit": "Managed CodeSandbox Linux development environments",
     "caveat": "Requires env-only SDK auth and a local Node bridge",
+    "auth": "API key via CRABBOX_CODESANDBOX_API_KEY or CodeSandbox env auth; env-only remote sandbox auth",
     "docs": "codesandbox.md"
+  },
+  "crownest": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Crownest Workspace Run sandbox",
+    "location": "cloud",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "no",
+    "lifecycle": "Crownest",
+    "cleanup": "sandbox delete",
+    "bestFit": "Hosted agent-ready Workspace Runs with archive sync and durable evidence",
+    "caveat": "No SSH, env forwarding, artifacts, proof, downloads, or custom Dockerfile templates yet",
+    "auth": "API key via CRABBOX_CROWNEST_API_KEY or CROWNEST_API_KEY; bearer token remote sandbox auth",
+    "docs": "crownest.md"
+  },
+  "cua": {
+    "status": "built-in",
+    "category": "service-control",
+    "substrate": "CUA cloud sandbox inventory",
+    "location": "provider-managed",
+    "ssh": "no",
+    "sync": "none",
+    "gpu": "unknown",
+    "lifecycle": "CUA read-only inventory",
+    "cleanup": "not exposed",
+    "bestFit": "Experimental CUA diagnostics and existing-sandbox inspection",
+    "caveat": "Experimental and read-only; all remote lifecycle mutations fail closed until upstream exposes safe creation and deletion ownership primitives",
+    "docs": "cua.md"
+  },
+  "cubesandbox": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "CubeSandbox KVM MicroVM",
+    "location": "self-hosted",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "unknown",
+    "lifecycle": "Crabbox and Cube API",
+    "cleanup": "claimed sandbox delete",
+    "bestFit": "Self-hosted E2B-compatible MicroVM command execution",
+    "caveat": "Requires a CubeSandbox deployment, ready template ID, and reachable CubeProxy data plane",
+    "auth": "API key via CUBE_API_KEY plus Cube API endpoint; self-hosted remote delegated sandbox",
+    "docs": "cubesandbox.md"
   },
   "daytona": {
     "status": "built-in",
     "category": "direct-cloud",
+    "coordinator": true,
     "substrate": "Daytona sandbox",
     "location": "provider-managed",
     "ssh": "crabbox-managed",
@@ -191,8 +347,9 @@
     "gpu": "unknown",
     "lifecycle": "Daytona",
     "cleanup": "sandbox delete",
-    "bestFit": "Managed development sandbox with delegated archive sync and execution",
-    "caveat": "SSH access is short-lived; run and sync use Daytona toolbox APIs",
+    "bestFit": "Managed development sandbox with direct toolbox execution or brokered SSH",
+    "caveat": "SSH access is short-lived; direct run uses Daytona toolbox APIs while brokered run uses SSH",
+    "auth": "Broker-owned API key through coordinator, or DAYTONA_API_KEY / DAYTONA_JWT_TOKEN in direct mode",
     "docs": "daytona.md"
   },
   "digitalocean": {
@@ -207,6 +364,7 @@
     "cleanup": "Droplet and key delete",
     "bestFit": "Simple direct Linux VM",
     "caveat": "Direct-only; no coordinator scheduling",
+    "auth": "API token via DIGITALOCEAN_TOKEN; direct remote Linux Droplet provider",
     "docs": "digitalocean.md"
   },
   "docker-sandbox": {
@@ -235,6 +393,7 @@
     "cleanup": "sandbox kill or expiry",
     "bestFit": "Hosted ephemeral code sandbox",
     "caveat": "URL bridge is provider-specific; no normal SSH lease",
+    "auth": "API key via E2B_API_KEY; delegated remote sandbox auth",
     "docs": "e2b.md"
   },
   "exe-dev": {
@@ -265,6 +424,35 @@
     "caveat": "Safety and semantics depend on the configured executable",
     "docs": "external.md"
   },
+  "fastapi-cloud": {
+    "status": "specialized",
+    "category": "service-control",
+    "substrate": "FastAPI Cloud app",
+    "location": "cloud",
+    "ssh": "not-applicable",
+    "sync": "none",
+    "gpu": "unknown",
+    "lifecycle": "FastAPI Cloud",
+    "cleanup": "not exposed",
+    "bestFit": "Inspecting FastAPI Cloud app deployment readiness",
+    "caveat": "Cannot execute arbitrary Crabbox run commands or stop apps",
+    "auth": "Bearer token via FASTAPI_CLOUD_TOKEN; service-control auth",
+    "docs": "fastapi-cloud.md"
+  },
+  "firecracker": {
+    "status": "built-in",
+    "category": "self-hosted-virtualization",
+    "substrate": "Firecracker microVM",
+    "location": "self-hosted",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "no",
+    "lifecycle": "Crabbox direct lifecycle",
+    "cleanup": "microVM and local artifact cleanup",
+    "bestFit": "Self-hosted Linux KVM host with prepared Firecracker kernel, rootfs, and CNI",
+    "caveat": "Requires Linux, /dev/kvm, Firecracker assets, and a working CNI setup on the host",
+    "docs": "firecracker.md"
+  },
   "freestyle": {
     "status": "built-in",
     "category": "delegated-sandbox",
@@ -277,6 +465,7 @@
     "cleanup": "provider VM cleanup",
     "bestFit": "Hosted delegated Linux VM execution",
     "caveat": "No Crabbox-managed SSH path",
+    "auth": "API key via FREESTYLE_API_KEY; delegated remote VM auth",
     "docs": "freestyle.md"
   },
   "gcp": {
@@ -291,7 +480,22 @@
     "cleanup": "instance and firewall cleanup",
     "bestFit": "Linux compute with broad machine selection",
     "caveat": "Project, IAM, quota, and firewall setup required",
+    "auth": "Broker-owned credentials through coordinator, or Google ADC / gcloud / GOOGLE_APPLICATION_CREDENTIALS in direct mode",
     "docs": "gcp.md"
+  },
+  "github-codespaces": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "GitHub Codespace",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "no",
+    "lifecycle": "GitHub Codespaces",
+    "cleanup": "delete or stop claim-owned Codespace",
+    "bestFit": "Repository-backed Linux devcontainer over SSH",
+    "caveat": "Requires gh auth, Codespaces quota, and an SSH-enabled devcontainer",
+    "docs": "github-codespaces.md"
   },
   "hetzner": {
     "status": "built-in",
@@ -305,6 +509,7 @@
     "cleanup": "server delete",
     "bestFit": "Cost-effective high-CPU Linux VM",
     "caveat": "Linux-only and capacity varies by location",
+    "auth": "Broker-owned API token through coordinator, or HCLOUD_TOKEN in direct mode",
     "docs": "hetzner.md"
   },
   "hostinger": {
@@ -319,6 +524,7 @@
     "cleanup": "stop only",
     "bestFit": "Direct Linux VPS with persistent subscription",
     "caveat": "Purchase needs opt-in and release does not cancel billing",
+    "auth": "API token via CRABBOX_HOSTINGER_API_TOKEN or HOSTINGER_API_TOKEN; direct remote VPS provider",
     "docs": "hostinger.md"
   },
   "hyperv": {
@@ -346,7 +552,7 @@
     "lifecycle": "Crabbox",
     "cleanup": "instance delete",
     "bestFit": "Self-hosted Linux containers or VMs",
-    "caveat": "Requires an accessible Incus environment",
+    "caveat": "Accessible Incus daemon required; native checkpoints capture container root disks only",
     "docs": "incus.md"
   },
   "islo": {
@@ -361,6 +567,7 @@
     "cleanup": "sandbox delete",
     "bestFit": "Hosted delegated execution with keep, pause, and SSH helper",
     "caveat": "SSH feature is not Crabbox-managed sync/run",
+    "auth": "API key via ISLO_API_KEY; provider-specific SSH helper and delegated remote auth",
     "docs": "islo.md"
   },
   "kubevirt": {
@@ -377,6 +584,21 @@
     "caveat": "Needs KubeVirt, virtctl, and an SSH-ready template",
     "docs": "kubevirt.md"
   },
+  "lambda": {
+    "status": "built-in",
+    "category": "gpu-cloud",
+    "substrate": "Lambda Cloud on-demand instance",
+    "location": "cloud",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "yes",
+    "lifecycle": "Crabbox",
+    "cleanup": "instance and key termination",
+    "bestFit": "Direct GPU-backed Linux workload over SSH",
+    "caveat": "Direct-only; billing, quota, and capacity are account-owned",
+    "auth": "API key via LAMBDA_API_KEY; direct remote GPU cloud provider",
+    "docs": "lambda.md"
+  },
   "linode": {
     "status": "built-in",
     "category": "direct-cloud",
@@ -389,21 +611,8 @@
     "cleanup": "instance and key delete",
     "bestFit": "Straightforward direct Linux VM",
     "caveat": "Direct-only; optional firewall must already exist",
+    "auth": "API token via LINODE_TOKEN; direct remote Linux instance provider",
     "docs": "linode.md"
-  },
-  "ovh": {
-    "status": "built-in",
-    "category": "direct-cloud",
-    "substrate": "OVHcloud Public Cloud instance",
-    "location": "cloud",
-    "ssh": "crabbox-managed",
-    "sync": "crabbox-sync",
-    "gpu": "optional",
-    "lifecycle": "Crabbox",
-    "cleanup": "instance, key, and local claim delete",
-    "bestFit": "OVHcloud Public Cloud Linux VM",
-    "caveat": "Direct-only; credentials use OVH signed requests and local claims",
-    "docs": "ovh.md"
   },
   "local-container": {
     "status": "built-in",
@@ -419,6 +628,35 @@
     "caveat": "Isolation follows the local container runtime",
     "docs": "local-container.md"
   },
+  "lume": {
+    "status": "built-in",
+    "category": "local-vm",
+    "substrate": "Lume Apple silicon macOS VM",
+    "location": "local",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "no",
+    "lifecycle": "Crabbox",
+    "cleanup": "verified VM stop and delete",
+    "bestFit": "Layered local macOS VM development sessions",
+    "caveat": "Apple silicon host, stopped prepared base, and Lume bootstrap account required",
+    "docs": "lume.md"
+  },
+  "machine0": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Machine0 persistent Linux KVM VM",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Machine0 CLI",
+    "cleanup": "VM destroy by default; explicit suspend optional",
+    "bestFit": "Persistent Linux VM workflows with live CPU and GPU sizing",
+    "caveat": "Stopping preserves the VM but does not avoid compute cost; suspend retains billed snapshot storage",
+    "auth": "Machine0 CLI login or MACHINE0_API_TOKEN; Crabbox never reads or stores the token",
+    "docs": "machine0.md"
+  },
   "modal": {
     "status": "built-in",
     "category": "delegated-sandbox",
@@ -431,6 +669,7 @@
     "cleanup": "sandbox termination",
     "bestFit": "Hosted Python or GPU-oriented delegated workloads",
     "caveat": "Provider owns execution; no normal SSH lease",
+    "auth": "Modal token via MODAL_TOKEN_ID and MODAL_TOKEN_SECRET, or modal CLI login; delegated remote sandbox",
     "docs": "modal.md"
   },
   "morph": {
@@ -445,6 +684,7 @@
     "cleanup": "pause by default; optional delete",
     "bestFit": "Managed Linux VM over SSH",
     "caveat": "Release retains the paused instance unless deleteOnRelease is enabled",
+    "auth": "API key via MORPH_API_KEY or CRABBOX_MORPH_API_KEY; direct remote VM provider",
     "docs": "morph.md"
   },
   "multipass": {
@@ -475,20 +715,6 @@
     "caveat": "Windows host and execution-container support required",
     "docs": "mxc.md"
   },
-  "nvidia-brev": {
-    "status": "built-in",
-    "category": "gpu-cloud",
-    "substrate": "NVIDIA Brev GPU workspace",
-    "location": "provider-managed",
-    "ssh": "crabbox-managed",
-    "sync": "crabbox-sync",
-    "gpu": "yes",
-    "lifecycle": "NVIDIA Brev CLI",
-    "cleanup": "delete by default; optional stop",
-    "bestFit": "Managed NVIDIA GPU workspace over SSH",
-    "caveat": "Requires Brev CLI auth, quota, and available GPU capacity",
-    "docs": "nvidia-brev.md"
-  },
   "namespace-devbox": {
     "status": "built-in",
     "category": "direct-cloud",
@@ -517,6 +743,50 @@
     "caveat": "Requires the nsc CLI and direct provider credentials",
     "docs": "namespace-instance.md"
   },
+  "nebius": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Nebius Compute VM",
+    "location": "cloud",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Nebius CLI",
+    "cleanup": "owned VM delete",
+    "bestFit": "Direct Linux VM lease with optional GPU selection",
+    "caveat": "Requires Nebius CLI auth, project/subnet setup, quota, and public SSH",
+    "auth": "Nebius CLI auth and project/subnet config; direct remote cloud provider; secrets stay in CLI store",
+    "docs": "nebius.md"
+  },
+  "nomad": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "HashiCorp Nomad allocation",
+    "location": "self-hosted",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "unknown",
+    "lifecycle": "Nomad job",
+    "cleanup": "owned job deregister",
+    "bestFit": "Self-hosted delegated Linux execution on an existing Nomad cluster",
+    "caveat": "Requires Nomad HTTP API access, allocation exec privileges, and an env-only token when ACLs are enabled",
+    "auth": "Nomad HTTP API token via NOMAD_TOKEN when ACLs are enabled; self-hosted delegated remote execution",
+    "docs": "nomad.md"
+  },
+  "nvidia-brev": {
+    "status": "built-in",
+    "category": "gpu-cloud",
+    "substrate": "NVIDIA Brev GPU workspace",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "yes",
+    "lifecycle": "NVIDIA Brev CLI",
+    "cleanup": "delete by default; optional stop",
+    "bestFit": "Managed NVIDIA GPU workspace over SSH",
+    "caveat": "Requires Brev CLI auth, quota, and available GPU capacity",
+    "docs": "nvidia-brev.md"
+  },
   "opencomputer": {
     "status": "built-in",
     "category": "delegated-sandbox",
@@ -529,6 +799,7 @@
     "cleanup": "VM delete",
     "bestFit": "Hosted delegated Linux VM execution",
     "caveat": "REST execution contract, not an SSH lease",
+    "auth": "API key via CRABBOX_OPENCOMPUTER_API_KEY, OPENCOMPUTER_API_KEY, or oc CLI config; sent only as X-API-Key",
     "docs": "opencomputer.md"
   },
   "opensandbox": {
@@ -543,7 +814,38 @@
     "cleanup": "sandbox delete",
     "bestFit": "Hosted delegated sandbox through an open SDK",
     "caveat": "Requires compatible OpenSandbox control and exec endpoints",
+    "auth": "API key via CRABBOX_OPENSANDBOX_API_KEY plus CRABBOX_OPENSANDBOX_API_URL; remote sandbox auth",
     "docs": "opensandbox.md"
+  },
+  "orgo": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Orgo cloud computer",
+    "location": "provider-managed",
+    "ssh": "no",
+    "sync": "provider-owned",
+    "gpu": "unknown",
+    "lifecycle": "Orgo",
+    "cleanup": "computer and temporary workspace delete",
+    "bestFit": "Managed Linux computer execution through an HTTP API",
+    "caveat": "No normal SSH lease or Crabbox workspace sync",
+    "auth": "API key via CRABBOX_ORGO_API_KEY or ORGO_API_KEY; delegated remote computer auth",
+    "docs": "orgo.md"
+  },
+  "ovh": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "OVHcloud Public Cloud instance",
+    "location": "cloud",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Crabbox",
+    "cleanup": "instance, key, and local claim delete",
+    "bestFit": "OVHcloud Public Cloud Linux VM",
+    "caveat": "Direct-only; credentials use OVH signed requests and local claims",
+    "auth": "OVH signed request credentials via OVH_APPLICATION_KEY, OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY; direct remote cloud provider",
+    "docs": "ovh.md"
   },
   "parallels": {
     "status": "built-in",
@@ -556,8 +858,23 @@
     "lifecycle": "Crabbox",
     "cleanup": "clone delete",
     "bestFit": "Local macOS, Linux, or Windows VM with snapshots",
-    "caveat": "Requires prepared Parallels source VMs and SSH",
+    "caveat": "Requires prepared source VMs and SSH; fixed lease IDs bind attested host and clone identity and remain single-use",
     "docs": "parallels.md"
+  },
+  "phala": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Phala Cloud confidential Intel TDX CVM",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "no",
+    "lifecycle": "Phala phala CLI",
+    "cleanup": "CVM delete",
+    "bestFit": "Short-lived confidential Linux compute over SSH",
+    "caveat": "Requires the phala CLI and its stored auth; verifies Intel TDX attestation by default (needs outbound Intel PCS network; --phala-skip-attestation to opt out)",
+    "auth": "Phala CLI auth or PHALA_CLOUD_API_KEY; direct remote confidential VM provider",
+    "docs": "phala.md"
   },
   "proxmox": {
     "status": "built-in",
@@ -570,7 +887,7 @@
     "lifecycle": "Crabbox",
     "cleanup": "VM delete",
     "bestFit": "Self-hosted Linux VM fleet",
-    "caveat": "Needs a prepared template, guest agent, and network",
+    "caveat": "Needs a prepared template, guest agent, and network; fixed lease IDs bind VMID and generation and retain uncertain attempts",
     "docs": "proxmox.md"
   },
   "railway": {
@@ -585,6 +902,7 @@
     "cleanup": "service stop only",
     "bestFit": "Inspecting or stopping an existing Railway service",
     "caveat": "Cannot execute arbitrary Crabbox run commands",
+    "auth": "API token via RAILWAY_API_TOKEN; service-control auth",
     "docs": "railway.md"
   },
   "runpod": {
@@ -599,7 +917,37 @@
     "cleanup": "pod release",
     "bestFit": "GPU-backed Linux workload over public SSH",
     "caveat": "Capacity, GPU pricing, and public SSH vary",
+    "auth": "API key via RUNPOD_API_KEY; direct remote GPU pod provider",
     "docs": "runpod.md"
+  },
+  "scaleway": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Scaleway Instance",
+    "location": "cloud",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Crabbox",
+    "cleanup": "instance and managed key delete",
+    "bestFit": "Direct Linux VM on Scaleway Instances",
+    "caveat": "Direct-only; security groups must already allow SSH",
+    "auth": "Scaleway SDK credentials and project/zone config; direct remote cloud provider",
+    "docs": "scaleway.md"
+  },
+  "sealos-devbox": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Sealos DevBox CRD",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "unknown",
+    "lifecycle": "Sealos DevBox CRD",
+    "cleanup": "pause or DevBox delete",
+    "bestFit": "Sealos DevBox Linux workspace over SSHGate or NodePort",
+    "caveat": "Requires kubectl, explicit context, DevBox CRD/RBAC, image, and SSHGate or NodePort route configuration",
+    "docs": "sealos-devbox.md"
   },
   "semaphore": {
     "status": "built-in",
@@ -613,6 +961,7 @@
     "cleanup": "job stop",
     "bestFit": "Debugging in the same image and secret plane as CI",
     "caveat": "Depends on debug SSH metadata from the job",
+    "auth": "API token via CRABBOX_SEMAPHORE_TOKEN or SEMAPHORE_API_TOKEN; CI remote proof runner",
     "docs": "semaphore.md"
   },
   "smolvm": {
@@ -627,6 +976,7 @@
     "cleanup": "microVM delete",
     "bestFit": "Lightweight hosted microVM execution",
     "caveat": "Delegated execution through smolfleet",
+    "auth": "API key via SMOLMACHINES_API_KEY, CRABBOX_SMOLVM_API_KEY, or SMK_API_KEY; delegated remote microVM auth",
     "docs": "smolvm.md"
   },
   "sprites": {
@@ -641,6 +991,7 @@
     "cleanup": "sprite delete",
     "bestFit": "Fast Linux microVM over provider SSH proxy",
     "caveat": "SSH transport depends on sprite proxy",
+    "auth": "API token via CRABBOX_SPRITES_TOKEN, SPRITES_TOKEN, SPRITE_TOKEN, or SETUP_SPRITE_TOKEN; direct remote microVM provider",
     "docs": "sprites.md"
   },
   "ssh": {
@@ -669,21 +1020,8 @@
     "cleanup": "sandbox delete",
     "bestFit": "Hosted delegated Linux sandbox",
     "caveat": "Requires both control-plane and data-plane access",
+    "auth": "API key via CRABBOX_SUPERSERVE_API_KEY or SUPERSERVE_API_KEY; delegated remote sandbox auth",
     "docs": "superserve.md"
-  },
-  "vercel-sandbox": {
-    "status": "built-in",
-    "category": "delegated-sandbox",
-    "substrate": "Vercel Sandbox microVM",
-    "location": "provider-managed",
-    "ssh": "no",
-    "sync": "archive-sync",
-    "gpu": "no",
-    "lifecycle": "Vercel Sandbox",
-    "cleanup": "sandbox delete",
-    "bestFit": "Hosted delegated Linux microVM execution",
-    "caveat": "Requires SDK bridge support and Vercel Sandbox auth",
-    "docs": "vercel-sandbox.md"
   },
   "tart": {
     "status": "built-in",
@@ -699,6 +1037,21 @@
     "caveat": "Apple silicon host and prepared Tart image required",
     "docs": "tart.md"
   },
+  "tencentcloud": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Tencent Cloud CVM instance",
+    "location": "cloud",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Crabbox",
+    "cleanup": "instance termination",
+    "bestFit": "Linux SSH leases on Tencent Cloud CVM",
+    "caveat": "Direct-only; requires CVM image, VPC/subnet/security-group planning, and Tencent Cloud API credentials",
+    "auth": "Tencent Cloud API credentials; direct remote CVM provider",
+    "docs": "tencentcloud.md"
+  },
   "tenki": {
     "status": "built-in",
     "category": "direct-cloud",
@@ -711,6 +1064,7 @@
     "cleanup": "sandbox release",
     "bestFit": "Managed Linux sandbox with SSH proxy",
     "caveat": "Gateway auth uses Tenki-managed key and certificate files",
+    "auth": "Tenki CLI browser auth and Tenki-managed SSH key/cert files; managed remote sandbox provider",
     "docs": "tenki.md"
   },
   "tensorlake": {
@@ -725,7 +1079,23 @@
     "cleanup": "provider sandbox cleanup",
     "bestFit": "Hosted Firecracker-backed delegated execution",
     "caveat": "Does not expose raw Firecracker provisioning",
+    "auth": "API key via TENSORLAKE_API_KEY; delegated remote Firecracker sandbox auth",
     "docs": "tensorlake.md"
+  },
+  "unikraft-cloud": {
+    "status": "built-in",
+    "category": "service-control",
+    "substrate": "Unikraft Cloud microVM service",
+    "location": "provider-managed",
+    "ssh": "no",
+    "sync": "none",
+    "gpu": "unknown",
+    "lifecycle": "Crabbox claim plus Unikraft Cloud instance",
+    "cleanup": "claimed instance stop and delete",
+    "bestFit": "Running a prebuilt OCI image as a cloud microVM service",
+    "caveat": "No SSH, workspace sync, or arbitrary command execution; package the app as an OCI image first",
+    "auth": "API key via CRABBOX_UNIKRAFT_CLOUD_API_KEY, UNIKRAFT_CLOUD_API_KEY, UKC_API_KEY, or UKC_TOKEN; remote service-control auth",
+    "docs": "unikraft-cloud.md"
   },
   "upstash-box": {
     "status": "built-in",
@@ -739,7 +1109,53 @@
     "cleanup": "sandbox cleanup",
     "bestFit": "Hosted short-lived delegated sandbox",
     "caveat": "No normal SSH access or coordinator routing",
+    "auth": "API key via UPSTASH_BOX_API_KEY or CRABBOX_UPSTASH_BOX_API_KEY; delegated remote sandbox auth",
     "docs": "upstash-box.md"
+  },
+  "vast": {
+    "status": "built-in",
+    "category": "gpu-cloud",
+    "substrate": "Vast.ai direct GPU instance",
+    "location": "provider-managed",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "yes",
+    "lifecycle": "Crabbox",
+    "cleanup": "destroy by default; optional stop or keep",
+    "bestFit": "Direct Linux GPU lease from the Vast.ai offer market",
+    "caveat": "Direct-only and billable; capacity, quota, and offer availability vary",
+    "auth": "API key via CRABBOX_VAST_API_KEY or VAST_API_KEY; direct remote GPU instance provider",
+    "docs": "vast.md"
+  },
+  "vercel-sandbox": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "Vercel Sandbox microVM",
+    "location": "provider-managed",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "no",
+    "lifecycle": "Vercel Sandbox",
+    "cleanup": "sandbox delete",
+    "bestFit": "Hosted delegated Linux microVM execution",
+    "caveat": "Requires SDK bridge support and Vercel Sandbox auth",
+    "auth": "OIDC or access token via VERCEL_OIDC_TOKEN, VERCEL_TOKEN, VERCEL_AUTH_TOKEN, or CRABBOX_VERCEL_SANDBOX_* vars; delegated remote sandbox",
+    "docs": "vercel-sandbox.md"
+  },
+  "vultr": {
+    "status": "built-in",
+    "category": "direct-cloud",
+    "substrate": "Vultr instance",
+    "location": "cloud",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Crabbox",
+    "cleanup": "instance and key delete",
+    "bestFit": "Direct Linux VM on Vultr",
+    "caveat": "Direct-only; firewall groups and VPCs must already exist",
+    "auth": "API key via VULTR_API_KEY; direct remote Linux instance provider",
+    "docs": "vultr.md"
   },
   "wandb": {
     "status": "built-in",
@@ -753,6 +1169,7 @@
     "cleanup": "run termination",
     "bestFit": "Delegated ML or GPU run environment",
     "caveat": "Execution follows the W&B run contract",
+    "auth": "API key via CRABBOX_WANDB_API_KEY or WANDB_API_KEY; delegated remote GPU/ML run auth",
     "docs": "wandb.md"
   },
   "windows-sandbox": {
@@ -782,5 +1199,19 @@
     "bestFit": "Self-hosted Linux VM pool over XAPI",
     "caveat": "Normal leases require prepared Linux templates",
     "docs": "xcp-ng.md"
+  },
+  "serve": {
+    "status": "built-in",
+    "category": "self-hosted-virtualization",
+    "substrate": "Donated Docker or Podman containers",
+    "location": "self-hosted",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "no",
+    "lifecycle": "Crabbox coordinator and outbound agent",
+    "cleanup": "agent-confirmed container removal",
+    "bestFit": "Trusted owner workloads on spare machine capacity",
+    "caveat": "Brokered only; clients must reach the advertised SSH address; containers are not hostile-tenant isolation",
+    "docs": "serve.md"
   }
 }

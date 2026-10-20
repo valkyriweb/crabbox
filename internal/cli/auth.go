@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"net/url"
-	"os/exec"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -30,6 +30,8 @@ func (a App) login(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	markSynthesizedFlagInputs(&cfg, a.synthesizedFlagInputs)
+	recordConfigInput(&cfg, configInputGeneric, configInputFlag, urlWasExplicit && flagWasSet(fs, "url"))
 	brokerMode := cfg.BrokerMode
 	if *brokerURL == "" {
 		*brokerURL = cfg.Coordinator
@@ -50,22 +52,22 @@ func (a App) login(ctx context.Context, args []string) error {
 		}
 	}
 	if *brokerURL == "" {
-		return exit(2, "crabbox login requires --url <broker-url> or a configured broker URL")
+		return Exit(2, "crabbox login requires --url <broker-url> or a configured broker URL")
 	}
 	if *tokenStdin {
 		return a.loginWithToken(ctx, *brokerURL, *provider, brokerMode, *jsonOut)
 	}
-	return a.loginWithGitHub(ctx, *brokerURL, *provider, brokerMode, *noBrowser, *jsonOut)
+	return a.loginWithGitHub(ctx, cfg, *provider, *noBrowser, *jsonOut)
 }
 
 func (a App) loginWithToken(ctx context.Context, brokerURL, provider string, brokerMode BrokerMode, jsonOut bool) error {
 	data, err := io.ReadAll(a.input())
 	if err != nil {
-		return exit(2, "read broker token: %v", err)
+		return Exit(2, "read broker token: %v", err)
 	}
 	token := strings.TrimSpace(string(data))
 	if token == "" {
-		return exit(2, "broker token from stdin is empty")
+		return Exit(2, "broker token from stdin is empty")
 	}
 	path, cfg, err := writeBrokerLogin(brokerURL, token, provider, brokerMode)
 	if err != nil {
@@ -76,46 +78,70 @@ func (a App) loginWithToken(ctx context.Context, brokerURL, provider string, bro
 		return err
 	}
 	if !ok {
-		return exit(2, "login wrote config but broker is not configured")
+		return Exit(2, "login wrote config but broker is not configured")
 	}
 	return a.finishLogin(ctx, coord, path, cfg, jsonOut)
 }
 
-func (a App) loginWithGitHub(ctx context.Context, brokerURL, provider string, brokerMode BrokerMode, noBrowser, jsonOut bool) error {
+func (a App) loginWithGitHub(ctx context.Context, cfg Config, provider string, noBrowser, jsonOut bool) error {
+	client, cfg, err := coordinatorClientConfigForLogin(cfg, provider)
+	if err != nil {
+		return err
+	}
+	brokerURL, brokerMode := cfg.Coordinator, cfg.BrokerMode
+	loopback, err := startGitHubLoginLoopback()
+	if err != nil {
+		return Exit(3, "start local GitHub login callback: %v", err)
+	}
+	defer loopback.Close()
+
 	pollSecret, err := randomHex(32)
 	if err != nil {
 		return err
 	}
 	pollSecretHash := sha256Hex(pollSecret)
-	client, err := coordinatorClientForLogin(brokerURL, provider)
-	if err != nil {
-		return err
-	}
-	start, err := client.StartGitHubLogin(ctx, pollSecretHash, provider)
+	start, err := client.StartGitHubLogin(ctx, pollSecretHash, provider, loopback.URL())
 	if err != nil {
 		return err
 	}
 	if err := validateGitHubLoginURL(start.URL); err != nil {
-		return exit(3, "GitHub login returned an invalid authorization URL: %v", err)
+		return Exit(3, "GitHub login returned an invalid authorization URL: %v", err)
 	}
 	if canonicalBrokerURL, ok := canonicalBrokerURLFromLoginURL(start.URL); ok && !sameBrokerURL(brokerURL, canonicalBrokerURL) {
+		if !brokerLoginRedirectOriginAllowed(cfg, canonicalBrokerURL) {
+			return Exit(
+				3,
+				"GitHub login redirect_uri broker origin %s does not match selected broker %s; add it to broker.loginRedirectOrigins only if this is an intended same-deployment alias",
+				canonicalBrokerURL,
+				normalizedBrokerURL(brokerURL),
+			)
+		}
 		brokerURL = canonicalBrokerURL
-		client, err = coordinatorClientForLogin(brokerURL, provider)
+		cfg.Coordinator = brokerURL
+		client, cfg, err = coordinatorClientConfigForLogin(cfg, provider)
 		if err != nil {
 			return err
 		}
-		start, err = client.StartGitHubLogin(ctx, pollSecretHash, provider)
+		start, err = client.StartGitHubLogin(ctx, pollSecretHash, provider, loopback.URL())
 		if err != nil {
 			return err
 		}
 		if err := validateGitHubLoginURL(start.URL); err != nil {
-			return exit(3, "GitHub login returned an invalid authorization URL: %v", err)
+			return Exit(3, "GitHub login returned an invalid authorization URL: %v", err)
+		}
+		if nextBrokerURL, ok := canonicalBrokerURLFromLoginURL(start.URL); ok && !sameBrokerURL(brokerURL, nextBrokerURL) {
+			return Exit(
+				3,
+				"GitHub login redirect_uri broker origin %s does not match approved broker %s; check CRABBOX_PUBLIC_URL",
+				nextBrokerURL,
+				normalizedBrokerURL(brokerURL),
+			)
 		}
 	}
 	if noBrowser {
-		fmt.Fprintf(a.Stderr, "open this GitHub login URL:\n%s\n", start.URL)
-	} else if err := openBrowser(start.URL); err != nil {
-		fmt.Fprintf(a.Stderr, "could not open browser: %v\nopen this GitHub login URL:\n%s\n", err, start.URL)
+		fmt.Fprintf(a.Stderr, "open this GitHub login URL in a browser on this device:\n%s\n", start.URL)
+	} else if err := openLoginBrowser(start.URL, cfg); err != nil {
+		fmt.Fprintf(a.Stderr, "could not open browser: %v\nopen this GitHub login URL in a browser on this device:\n%s\n", err, start.URL)
 	} else {
 		fmt.Fprintln(a.Stderr, "opened GitHub login in your browser")
 	}
@@ -125,19 +151,27 @@ func (a App) loginWithGitHub(ctx context.Context, brokerURL, provider string, br
 			deadline = parsed
 		}
 	}
+	browserConfirmation := ""
 	for {
 		if time.Now().After(deadline) {
-			return exit(3, "GitHub login expired")
+			return Exit(3, "GitHub login expired")
 		}
-		poll, err := client.PollGitHubLogin(ctx, start.LoginID, pollSecret)
+		select {
+		case browserConfirmation = <-loopback.confirmations:
+		default:
+		}
+		poll, err := client.PollGitHubLogin(ctx, start.LoginID, pollSecret, browserConfirmation)
 		if err != nil {
 			return err
 		}
 		switch poll.Status {
-		case "pending":
+		case "pending", "confirmation_required":
 		case "complete":
+			if browserConfirmation == "" {
+				return Exit(3, "GitHub login completed before this device received the browser confirmation")
+			}
 			if poll.Token == "" {
-				return exit(3, "GitHub login completed without a broker token")
+				return Exit(3, "GitHub login completed without a broker token")
 			}
 			if provider == "" {
 				provider = poll.Provider
@@ -151,15 +185,15 @@ func (a App) loginWithGitHub(ctx context.Context, brokerURL, provider string, br
 				return err
 			}
 			if !ok {
-				return exit(2, "login wrote config but broker is not configured")
+				return Exit(2, "login wrote config but broker is not configured")
 			}
 			return a.finishLogin(ctx, coord, path, cfg, jsonOut)
 		case "expired":
-			return exit(3, "GitHub login expired")
+			return Exit(3, "GitHub login expired")
 		case "failed":
-			return exit(3, "GitHub login failed: %s", blank(poll.Error, "unknown error"))
+			return Exit(3, "GitHub login failed: %s", blank(poll.Error, "unknown error"))
 		default:
-			return exit(3, "GitHub login returned unexpected status %q", poll.Status)
+			return Exit(3, "GitHub login returned unexpected status %q", poll.Status)
 		}
 		timer := time.NewTimer(2 * time.Second)
 		select {
@@ -171,6 +205,79 @@ func (a App) loginWithGitHub(ctx context.Context, brokerURL, provider string, br
 	}
 }
 
+type githubLoginLoopback struct {
+	listener      net.Listener
+	server        *http.Server
+	path          string
+	confirmations chan string
+}
+
+func startGitHubLoginLoopback() (*githubLoginLoopback, error) {
+	pathToken, err := randomHex(32)
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	loopback := &githubLoginLoopback{
+		listener:      listener,
+		path:          "/crabbox/oauth/" + pathToken,
+		confirmations: make(chan string, 1),
+	}
+	loopback.server = &http.Server{
+		Handler:           http.HandlerFunc(loopback.handle),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       5 * time.Second,
+	}
+	go func() {
+		_ = loopback.server.Serve(listener)
+	}()
+	return loopback, nil
+}
+
+func (l *githubLoginLoopback) URL() string {
+	return "http://" + l.listener.Addr().String() + l.path
+}
+
+func (l *githubLoginLoopback) Close() {
+	_ = l.server.Close()
+}
+
+func (l *githubLoginLoopback) handle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || r.URL.Path != l.path {
+		http.NotFound(w, r)
+		return
+	}
+	confirmation := r.URL.Query().Get("confirmation")
+	if !validBrowserConfirmation(confirmation) {
+		http.Error(w, "invalid login confirmation", http.StatusBadRequest)
+		return
+	}
+	select {
+	case l.confirmations <- confirmation:
+	default:
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	// Palette: vendored carapace v0.6.1 neutral product tokens (see
+	// worker/public/portal/assets/carapace/VENDORED.md); page stays self-contained.
+	_, _ = io.WriteString(w, "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Crabbox login complete</title><style>:root{color-scheme:dark light}body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;max-width:42rem;margin:5rem auto;padding:0 1rem;line-height:1.5;background:#0d0b0b;color:#f4f1ef}h1{font-size:1.25rem}p{color:#aaa19d}@media (prefers-color-scheme:light){body{background:#fbfaf7;color:#171514}p{color:#716a66}}</style></head><body><h1>Crabbox login complete</h1><p>You can close this tab and return to the terminal.</p></body></html>")
+}
+
+func validBrowserConfirmation(value string) bool {
+	if !strings.HasPrefix(value, "confirm_") || len(value) != len("confirm_")+32 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "confirm_"))
+	return err == nil
+}
+
 func (a App) finishLogin(ctx context.Context, coord *CoordinatorClient, path string, cfg Config, jsonOut bool) error {
 	who, err := coord.Whoami(ctx)
 	if err != nil {
@@ -179,7 +286,7 @@ func (a App) finishLogin(ctx context.Context, coord *CoordinatorClient, path str
 	if jsonOut {
 		view := map[string]any{
 			"config":   path,
-			"broker":   cfg.Coordinator,
+			"broker":   redactedConfigURL(cfg.Coordinator),
 			"provider": cfg.Provider,
 			"identity": who,
 		}
@@ -192,24 +299,25 @@ func (a App) finishLogin(ctx context.Context, coord *CoordinatorClient, path str
 	if who.TokenExpiresAt != "" {
 		expires = " token_expires=" + who.TokenExpiresAt
 	}
-	fmt.Fprintf(a.Stdout, "logged in broker=%s provider=%s user=%s org=%s%s config=%s\n", cfg.Coordinator, cfg.Provider, who.Owner, who.Org, expires, path)
+	fmt.Fprintf(a.Stdout, "logged in broker=%s provider=%s user=%s org=%s%s config=%s\n", redactedConfigURL(cfg.Coordinator), cfg.Provider, who.Owner, who.Org, expires, path)
 	return nil
 }
 
-func coordinatorClientForLogin(brokerURL, provider string) (*CoordinatorClient, error) {
-	cfg, err := loadConfigWithOverrides(brokerURL, provider)
+func coordinatorClientConfigForLogin(cfg Config, provider string) (*CoordinatorClient, Config, error) {
+	// Resolve the provider without treating the configured broker as a URL flag.
+	cfg, err := resolveLoadedConfig(cfg, "", provider)
 	if err != nil {
-		return nil, err
+		return nil, Config{}, err
 	}
 	cfg.CoordToken = ""
 	coord, ok, err := newCoordinatorClient(cfg)
 	if err != nil {
-		return nil, err
+		return nil, Config{}, err
 	}
 	if !ok {
-		return nil, exit(2, "login requires a broker URL")
+		return nil, Config{}, Exit(2, "login requires a broker URL")
 	}
-	return coord, nil
+	return coord, cfg, nil
 }
 
 func validateGitHubLoginURL(loginURL string) error {
@@ -264,10 +372,35 @@ func sameBrokerURL(left, right string) bool {
 	return normalizedBrokerURL(left) == normalizedBrokerURL(right)
 }
 
+func brokerLoginRedirectOriginAllowed(cfg Config, brokerURL string) bool {
+	for _, origin := range cfg.BrokerLoginRedirectOrigins {
+		if sameBrokerURL(origin, brokerURL) {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizedBrokerURL(value string) string {
 	u, err := url.Parse(value)
 	if err != nil {
 		return strings.TrimRight(value, "/")
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	hostname := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if hostname != "" {
+		switch {
+		case port != "":
+			u.Host = net.JoinHostPort(hostname, port)
+		case strings.Contains(hostname, ":"):
+			u.Host = "[" + hostname + "]"
+		default:
+			u.Host = hostname
+		}
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	u.RawQuery = ""
@@ -275,15 +408,11 @@ func normalizedBrokerURL(value string) string {
 	return strings.TrimRight(u.String(), "/")
 }
 
-func openBrowser(target string) error {
-	switch runtime.GOOS {
-	case "darwin":
-		return exec.Command("open", target).Start()
-	case "windows":
-		return exec.Command("rundll32", "url.dll,FileProtocolHandler", target).Start()
-	default:
-		return exec.Command("xdg-open", target).Start()
+func openLoginBrowser(target string, cfg Config) error {
+	if err := ValidateProviderCredentialDestination(cfg); err != nil {
+		return err
 	}
+	return openLocalURLWithEnvironment(target, externalDesktopChildEnvDenylist(cfg, cfg.TargetOS)...)
 }
 
 func randomHex(size int) (string, error) {
@@ -307,7 +436,7 @@ func (a App) logout(_ context.Context, args []string) error {
 	}
 	path := writableConfigPath()
 	if path == "" {
-		return exit(2, "user config directory is unavailable")
+		return Exit(2, "user config directory is unavailable")
 	}
 	file, err := readFileConfig(path)
 	if err != nil {
@@ -343,7 +472,7 @@ func (a App) whoami(ctx context.Context, args []string) error {
 		return err
 	}
 	if !ok {
-		return exit(2, "whoami requires a configured coordinator")
+		return Exit(2, "whoami requires a configured coordinator")
 	}
 	who, err := coord.Whoami(ctx)
 	if err != nil {
@@ -352,14 +481,14 @@ func (a App) whoami(ctx context.Context, args []string) error {
 	if *jsonOut {
 		return json.NewEncoder(a.Stdout).Encode(who)
 	}
-	fmt.Fprintf(a.Stdout, "user=%s org=%s auth=%s broker=%s\n", who.Owner, who.Org, who.Auth, cfg.Coordinator)
+	fmt.Fprintf(a.Stdout, "user=%s org=%s auth=%s broker=%s\n", who.Owner, who.Org, who.Auth, redactedConfigURL(cfg.Coordinator))
 	return nil
 }
 
 func writeBrokerLogin(brokerURL, token, provider string, brokerMode BrokerMode) (string, Config, error) {
 	path := writableConfigPath()
 	if path == "" {
-		return "", Config{}, exit(2, "user config directory is unavailable")
+		return "", Config{}, Exit(2, "user config directory is unavailable")
 	}
 	file, err := readFileConfig(path)
 	if err != nil {
@@ -384,5 +513,17 @@ func writeBrokerLogin(brokerURL, token, provider string, brokerMode BrokerMode) 
 		return "", Config{}, err
 	}
 	cfg, err := loadConfig()
-	return written, cfg, err
+	if err != nil {
+		return written, Config{}, err
+	}
+	// Verify the login against the broker and credential just written. Ambient
+	// coordinator overrides still apply to later commands, but must not redirect
+	// this one-shot verification away from an explicit login destination.
+	cfg.Coordinator = brokerURL
+	cfg.CoordToken = token
+	cfg.CoordTokenCommand = nil
+	cfg.BrokerMode = brokerMode
+	cfg.Provider = brokerProvider
+	cfg.brokerProvider = brokerProvider
+	return written, cfg, nil
 }

@@ -26,6 +26,7 @@ Per run, on the command line:
 crabbox run --id cbx_... --junit junit.xml -- go test ./...
 crabbox run --id cbx_... --junit junit.xml,reports/junit.xml -- go test ./...
 crabbox run --id cbx_... --results-auto -- go test ./...
+crabbox run --id cbx_... --junit junit.xml --fail-on-test-failures -- ./test-wrapper
 ```
 
 Per repo, in any [config file](configuration.md):
@@ -33,23 +34,37 @@ Per repo, in any [config file](configuration.md):
 ```yaml
 results:
   auto: true
+  failOnFailures: true
   junit:
     - junit.xml
     - reports/junit.xml
 ```
 
-Or through the environment: `CRABBOX_RESULTS_JUNIT` (comma-separated paths) and
-`CRABBOX_RESULTS_AUTO` (boolean). The `--junit` path also flows through
+Or through the environment: `CRABBOX_RESULTS_JUNIT` (comma-separated paths),
+`CRABBOX_RESULTS_AUTO` (boolean), and `CRABBOX_RESULTS_FAIL_ON_FAILURES`
+(boolean). The `--junit` path also flows through
 [`crabbox job run`](jobs.md) (from a job's `junit:` list) and
 [`crabbox capsule replay`](capsules.md).
+
+In layered YAML, omitting `results.junit` inherits the lower layer's paths,
+`results: {junit: []}` clears them, and a nonempty list replaces them. Clearing
+the list removes old explicit collection paths but does not disable independent
+`results.auto: true` discovery. Set `auto: false` too to stop both forms of
+collection. A higher `CRABBOX_RESULTS_JUNIT` override or explicit `--junit` can
+select paths again after a YAML clear.
 
 ## What happens after the command exits
 
 `crabbox run` collects results only when `--results-auto` is set or at least one
 explicit `--junit` path is configured.
 
-For explicit `--junit` paths, the CLI reads each listed file from the workdir
-(Windows-native targets use a PowerShell variant) and parses it.
+For explicit `--junit` paths, the CLI resolves each listed file and reads it
+only when its final target remains inside the workdir, then parses it. Relative
+paths, absolute paths within the workdir, and symlinks that stay within the
+workdir remain supported. Windows-native targets apply the same rule while
+resolving directory junctions and symbolic links. Collection validates the
+opened file and reads from the same descriptor or stream, so a background
+process cannot swap a checked path before the read.
 
 Auto discovery (`--results-auto`) is freshness-aware so it never reports stale
 reports from an earlier run:
@@ -62,13 +77,28 @@ reports from an earlier run:
 3. Each candidate must be newer than the marker, must sniff as JUnit XML (the
    leading bytes contain `<testsuite`/`<testsuites`), and reports that contain
    failures or errors are prioritized over passing ones.
-4. Reads are capped before parsing: at most 50 files, each truncated to 1 MiB.
+4. Collection considers at most 50 files, accepts reports up to 16 MiB each,
+   and transfers at most 64 MiB total. Reports outside those bounds are skipped
+   with a warning naming the file; accepted reports are never truncated.
 
-Explicit `--junit` files and auto-discovered files are merged (de-duplicated by
-normalized workdir-relative path), so a multi-report setup still produces one
-result record. The CLI prints a one-line summary to stderr and includes the
-parsed summary in the run's `finish` payload; a collection failure is a
-non-fatal warning and does not fail the run.
+Explicit `--junit` files and auto-discovered files are merged into one result
+record. Native filesystem collection deduplicates by the opened file's identity,
+so relative and absolute paths, symlinks, and hard links to the same report count
+once across explicit and automatic collection. The first readable explicit
+spelling is retained. Separate files with identical contents remain separate
+reports. Provider-native result APIs retain their provider contract.
+
+A malformed, partial, or oversized report emits a named warning without
+discarding summaries parsed from other valid files. The CLI prints a one-line
+summary to stderr and includes every valid parsed summary in the run's `finish`
+payload.
+
+Result collection warnings remain non-fatal. To make parsed test failures affect
+the run status, opt in with `--fail-on-test-failures`,
+`results.failOnFailures: true`, or `CRABBOX_RESULTS_FAIL_ON_FAILURES=true`.
+When the wrapped command exits zero and a valid report contains failures or
+errors, Crabbox records and exits with code 1 after collecting requested
+artifacts. An existing non-zero command exit remains authoritative.
 
 ## The parsed summary
 
@@ -78,8 +108,20 @@ failures, errors, skipped, total time in seconds), and a `failed` list of
 individual failing cases. Each `TestFailure` records its suite, test name,
 optional classname/file, the first failure or error message, the JUnit `type`,
 and a `kind` of `failure` or `error`. The parser accepts both `<testsuites>` and
-a bare `<testsuite>` root and derives counts from case elements when suite
-attributes are absent.
+a bare `<testsuite>` root, including nested `<testsuite>` children. Failed cases
+retain the name of their owning suite, not an enclosing aggregate suite. The
+suite count includes every visited `<testsuite>` element, including empty and
+aggregate suites; the `<testsuites>` wrapper itself does not count as a suite.
+
+Each suite combines its direct cases and child-suite summaries before applying
+its own counters. A nonzero reported test count is retained; a missing or zero
+count is derived. Failures, errors, and skips are at least the corresponding
+direct-case plus child-summary totals, so a reported zero cannot hide a failed
+case. Parent aggregate counters are not added again to their descendants.
+As with flat reports, a positive suite time is used when the suite reports a
+positive counter; otherwise time is derived from direct cases and child
+summaries, never added on top of them. A `<testsuites>` wrapper uses its child
+summaries when present, or its own aggregate attributes when it has no suites.
 
 ## Coordinator storage limits
 
@@ -104,6 +146,10 @@ crabbox results run_...
 recorded run, so a coordinator must be configured. It is distinct from
 [`crabbox logs`](history-logs.md): `results` is the structured pass/fail
 summary, `logs` is the retained command output.
+
+Human result lines, shard failure summaries, and failure digests visibly escape
+terminal controls and Unicode formatting characters in stored failure fields.
+Machine-readable JSON preserves the stored values unchanged.
 
 ## Supported formats
 

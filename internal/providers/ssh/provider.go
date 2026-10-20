@@ -12,41 +12,48 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return "ssh" }
-func (Provider) Aliases() []string {
-	return []string{"static", "static-ssh"}
+func (Provider) SupportsArchitecture(cfg core.Config, architecture string) bool {
+	if architecture != core.ArchitectureAMD64 && architecture != core.ArchitectureARM64 {
+		return false
+	}
+	switch cfg.TargetOS {
+	case core.TargetLinux, core.TargetMacOS:
+		return cfg.WindowsMode == "" || cfg.WindowsMode == core.WindowsModeNormal
+	case core.TargetWindows:
+		return cfg.WindowsMode == "normal" || cfg.WindowsMode == "wsl2"
+	default:
+		return false
+	}
 }
+
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:   "ssh",
-		Family: "ssh",
-		Kind:   core.ProviderKindSSHLease,
+		Aliases:        []string{"static", "static-ssh"},
+		Authentication: core.DirectProviderAuthentication(core.ProviderAuthenticationSSH),
+		Name:           "ssh",
+		Family:         "ssh",
+		Kind:           core.ProviderKindSSHLease,
 		Targets: []core.TargetSpec{
 			{OS: core.TargetLinux},
 			{OS: core.TargetWindows, WindowsMode: "normal"},
 			{OS: core.TargetWindows, WindowsMode: "wsl2"},
 			{OS: core.TargetMacOS},
 		},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureDesktop, core.FeatureBrowser, core.FeatureCode},
-		Coordinator: core.CoordinatorNever,
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureDesktop, core.FeatureBrowser, core.FeatureCode},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
-func (Provider) RegisterFlags(*flag.FlagSet, core.Config) any { return core.NoProviderFlags() }
-func (Provider) ApplyFlags(*core.Config, *flag.FlagSet, any) error {
+func (Provider) RegisterFlags(fs *flag.FlagSet, _ core.Config) any {
+	return fs.Bool("static-power-acknowledge-stop", false, "acknowledge retrying the dedicated static host stop hook during forced recovery")
+}
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	if ack, ok := values.(*bool); ok && ack != nil && core.FlagWasSet(fs, "static-power-acknowledge-stop") {
+		cfg.Static.PowerAcknowledgeStop = *ack
+		core.RecordProviderFlagInputs(cfg, true, staticProvider)
+	}
 	return nil
 }
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewStaticSSHLeaseBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "ssh doctor backend unavailable")
-	}
-	return doctor, nil
 }

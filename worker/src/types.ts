@@ -1,10 +1,65 @@
+import type { AWSQualificationTransportBinding } from "./aws-qualification-contract";
+import type { LeaseLifetimePolicy } from "./lease-lifetime";
+import type { ServeRelayBackend } from "./serve-relay";
+
+export interface AWSCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  expiration?: Date;
+}
+
+export type AWSCredentialProvider = () => Promise<AWSCredentials>;
+
 export interface Env {
+  CRABBOX_LEASE_DEFAULT_TTL_SECONDS?: string;
+  CRABBOX_LEASE_DEFAULT_IDLE_TIMEOUT_SECONDS?: string;
+  CRABBOX_LEASE_MAX_TTL_SECONDS?: string;
+  CRABBOX_LEASE_EXTENSION?: string;
+  CRABBOX_LEASE_AUTO_EXTEND?: string;
+  CRABBOX_LEASE_POLICY_OVERRIDES?: string;
+  CRABBOX_RETAINED_RECONCILE?: string;
+  CRABBOX_RETAINED_RECONCILE_DELETE?: string;
+  CRABBOX_RETAINED_RECONCILE_GRACE_SECONDS?: string;
+  CRABBOX_RETAINED_RECONCILE_BUDGET?: string;
+  CRABBOX_RETAINED_RECONCILE_LOOKUP_BUDGET?: string;
+  CRABBOX_RETAINED_RECONCILE_INTERVAL_SECONDS?: string;
+  CRABBOX_RETAINED_RECONCILE_AWS_LEGACY_ACCOUNT?: string;
+
+  CRABBOX_LEASE_LIFETIME_MODE?: string;
+  CRABBOX_BATCH_MAX_AGE_SECONDS?: string;
+  CRABBOX_INTERACTIVE_MAX_AGE_SECONDS?: string;
+  CRABBOX_STOPPED_RETENTION_SECONDS?: string;
+  CRABBOX_PORTABLE_POOLS_ENABLED?: string;
   FLEET: DurableObjectNamespace;
+  SERVE_RELAY?: DurableObjectNamespace;
+  serveRelayBackend?: ServeRelayBackend;
+  CF_VERSION_METADATA?: {
+    id: string;
+    tag?: string;
+    timestamp: string;
+  };
   HETZNER_TOKEN: string;
+  CRABBOX_AWS_QUALIFICATION_TRANSPORT?: AWSQualificationTransportBinding;
+  awsCredentialProvider?: AWSCredentialProvider;
   AWS_ACCESS_KEY_ID?: string;
   AWS_SECRET_ACCESS_KEY?: string;
   AWS_SESSION_TOKEN?: string;
+  AWS_PROFILE?: string;
+  AWS_CONFIG_FILE?: string;
+  AWS_SHARED_CREDENTIALS_FILE?: string;
+  AWS_ROLE_ARN?: string;
+  AWS_WEB_IDENTITY_TOKEN_FILE?: string;
+  AWS_REGION?: string;
+  AWS_DEFAULT_REGION?: string;
+  AWS_CONTAINER_CREDENTIALS_RELATIVE_URI?: string;
+  AWS_CONTAINER_CREDENTIALS_FULL_URI?: string;
+  ECS_CONTAINER_METADATA_URI_V4?: string;
   CRABBOX_AWS_REGION?: string;
+  CRABBOX_AWS_EXPECTED_ACCOUNT_ID?: string;
+  CRABBOX_AWS_EXPECTED_REGION?: string;
+  CRABBOX_AWS_EXPECTED_TASK_ROLE_NAME?: string;
+  CRABBOX_AWS_REQUIRE_ECS_TASK?: string;
   CRABBOX_AWS_AMI?: string;
   CRABBOX_AWS_SECURITY_GROUP_ID?: string;
   CRABBOX_AWS_SUBNET_ID?: string;
@@ -53,27 +108,55 @@ export interface Env {
   CRABBOX_GCP_SSH_CIDRS?: string;
   CRABBOX_GCP_ROOT_GB?: string;
   CRABBOX_GCP_SERVICE_ACCOUNT?: string;
+  CRABBOX_GCP_CREDENTIAL_SOURCE?: string;
+  DAYTONA_CRABBOX_KEY?: string;
+  CRABBOX_DAYTONA_API_URL?: string;
+  CRABBOX_DAYTONA_ORGANIZATION_ID?: string;
+  CRABBOX_DAYTONA_SNAPSHOT?: string;
+  CRABBOX_DAYTONA_TARGET?: string;
+  CRABBOX_DAYTONA_USER?: string;
+  CRABBOX_DAYTONA_WORK_ROOT?: string;
+  CRABBOX_DAYTONA_SSH_GATEWAY_HOST?: string;
+  CRABBOX_DAYTONA_SSH_ACCESS_MINUTES?: string;
   CRABBOX_RUNTIME_ADAPTER_TOKEN?: string;
   CRABBOX_SHARED_TOKEN?: string;
   CRABBOX_SHARED_OWNER?: string;
+  CRABBOX_SERVE_ALLOWED_OWNERS?: string;
   CRABBOX_ADMIN_TOKEN?: string;
   CRABBOX_SESSION_SECRET?: string;
+  CRABBOX_DURABLE_PROVISIONING_ADMISSION?: string;
   CRABBOX_USER_TOKEN_TTL_SECONDS?: string;
+  CRABBOX_RUN_RETENTION_DAYS?: string;
   CRABBOX_GITHUB_CLIENT_ID?: string;
   CRABBOX_GITHUB_CLIENT_SECRET?: string;
   CRABBOX_GITHUB_ALLOWED_ORG?: string;
   CRABBOX_GITHUB_ALLOWED_ORGS?: string;
   CRABBOX_GITHUB_ALLOWED_TEAM?: string;
   CRABBOX_GITHUB_ALLOWED_TEAMS?: string;
+  CRABBOX_GITHUB_REVOKED_USERS?: string;
+  CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS?: string;
   CRABBOX_GITHUB_ADMIN_OWNERS?: string;
-  CRABBOX_GITHUB_ADMIN_LOGINS?: string;
   CRABBOX_PUBLIC_URL?: string;
   CRABBOX_CODE_ORIGIN_TEMPLATE?: string;
+  CRABBOX_ALLOW_QUERY_BRIDGE_TICKETS?: string;
   CRABBOX_WORKSPACE_PROVIDER?: string;
   CRABBOX_WORKSPACE_CLASS?: string;
   CRABBOX_WORKSPACE_PREWARM_COUNT?: string;
   CRABBOX_WORKSPACE_SSH_PUBLIC_KEY?: string;
   CRABBOX_WORKSPACE_SSH_PRIVATE_KEY?: string;
+  CRABBOX_WORKSPACE_AWS_PRIVATE?: string;
+  CRABBOX_WORKSPACE_AWS_INSTANCE_TYPES?: string;
+  CRABBOX_WORKSPACE_AWS_MAX_VCPUS?: string;
+  CRABBOX_WORKSPACE_AWS_MAX_MEMORY_MIB?: string;
+  CRABBOX_WORKSPACE_AWS_ROOT_GB?: string;
+  CRABBOX_WORKSPACE_AWS_SUBNET_ID?: string;
+  CRABBOX_WORKSPACE_AWS_SECURITY_GROUP_ID?: string;
+  CRABBOX_WORKSPACE_AWS_CONTROLLER_SECURITY_GROUP_ID?: string;
+  CRABBOX_WORKSPACE_AWS_INSTANCE_PROFILE?: string;
+  CRABBOX_WORKSPACE_AWS_MARKET?: string;
+  CRABBOX_WORKSPACE_AWS_SSM_LOG_GROUP?: string;
+  CRABBOX_RUNTIME_ADAPTER_OWNER?: string;
+  CRABBOX_RUNTIME_ADAPTER_ORG?: string;
   CRABBOX_DEFAULT_ORG?: string;
   CRABBOX_ACCESS_TEAM_DOMAIN?: string;
   CRABBOX_ACCESS_AUD?: string;
@@ -83,10 +166,26 @@ export interface Env {
   CRABBOX_TRUSTED_PROXY_SECRET?: string;
   CRABBOX_COST_RATES_JSON?: string;
   CRABBOX_EUR_TO_USD?: string;
+  CRABBOX_MARKETPLACE_ENABLED?: string;
+  CRABBOX_MARKETPLACE_REQUIRE_CREDITS?: string;
+  CRABBOX_MARKETPLACE_ALLOWED_PROVIDERS?: string;
+  CRABBOX_MARKETPLACE_RATE_CARD_JSON?: string;
+  CRABBOX_MARKETPLACE_MARKUP_BPS?: string;
+  CRABBOX_MARKETPLACE_BIDDING_ENABLED?: string;
+  CRABBOX_MARKETPLACE_PAYMENT_PROVIDER?: string;
+  CRABBOX_MARKETPLACE_LEDGER_PROVIDER?: string;
   CRABBOX_MAX_ACTIVE_LEASES?: string;
   CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER?: string;
   CRABBOX_MAX_ACTIVE_LEASES_PER_ORG?: string;
+  CRABBOX_MAX_CHECKPOINTS?: string;
+  CRABBOX_MAX_CHECKPOINTS_PER_OWNER?: string;
+  CRABBOX_MAX_CHECKPOINTS_PER_ORG?: string;
+  CRABBOX_MAX_CHECKPOINT_USE_CLAIMS?: string;
+  CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER?: string;
+  CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL?: string;
   CRABBOX_CAPACITY_ADMIN_OWNERS?: string;
+  CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS?: string;
+  CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS?: string;
   CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN?: string;
   CRABBOX_MAX_MONTHLY_USD?: string;
   CRABBOX_MAX_MONTHLY_USD_PER_OWNER?: string;
@@ -104,6 +203,7 @@ export interface Env {
   CRABBOX_ARTIFACTS_BUCKET?: string;
   CRABBOX_ARTIFACTS_PREFIX?: string;
   CRABBOX_ARTIFACTS_BASE_URL?: string;
+  CRABBOX_ARTIFACTS_PUBLIC_READS?: string;
   CRABBOX_ARTIFACTS_REGION?: string;
   CRABBOX_ARTIFACTS_ENDPOINT_URL?: string;
   CRABBOX_ARTIFACTS_ACCESS_KEY_ID?: string;
@@ -113,8 +213,16 @@ export interface Env {
   CRABBOX_ARTIFACTS_URL_EXPIRES_SECONDS?: string;
 }
 
+export interface CapacityRequirements {
+  minVCPUs?: number;
+  minMemoryMiB?: number;
+}
+
 export interface LeaseRequest {
+  serveMachine?: string;
+  lifetimePolicy?: import("./lease-lifetime").LeaseLifetimeRequest;
   leaseID?: string;
+  createAttemptID?: string;
   slug?: string;
   requestedSlug?: string;
   provider?: Provider;
@@ -126,6 +234,7 @@ export interface LeaseRequest {
   desktop?: boolean;
   desktopEnv?: string;
   browser?: boolean;
+  imageRequirements?: ImageRequirements;
   code?: boolean;
   tailscale?: boolean;
   tailscaleTags?: string[];
@@ -142,12 +251,19 @@ export interface LeaseRequest {
   image?: string;
   awsRegion?: string;
   awsAMI?: string;
+  awsUseStockImage?: boolean;
   awsSnapshot?: string;
   awsSGID?: string;
   awsSubnetID?: string;
   awsProfile?: string;
   awsRootGB?: number;
+  awsInstanceTypes?: string[];
+  awsPrivate?: boolean;
+  awsRequireSSM?: boolean;
+  awsSSMBootstrapCommand?: string;
+  awsSSMLogGroup?: string;
   awsSSHCIDRs?: string[];
+  awsSSHCIDRsPinned?: boolean;
   awsMacHostID?: string;
   azureLocation?: string;
   azureImage?: string;
@@ -165,6 +281,8 @@ export interface LeaseRequest {
   gcpRootGB?: number;
   gcpServiceAccount?: string;
   capacity?: {
+    minVCPUs?: number;
+    minMemoryMiB?: number;
     market?: "spot" | "on-demand";
     strategy?: "most-available" | "price-capacity-optimized" | "capacity-optimized" | "sequential";
     fallback?: string;
@@ -183,6 +301,54 @@ export interface LeaseRequest {
   sshPublicKey?: string;
   pond?: string;
   exposedPorts?: string[];
+  checkpointID?: string;
+  checkpointUseClaim?: string;
+}
+
+export interface FixedLeaseCreateIntent {
+  version: number;
+  hash: string;
+  provider: Provider;
+}
+
+export interface CreateAttemptRecord {
+  version: 1 | 2;
+  requestedLeaseID: string;
+  token: string;
+  owner: string;
+  org: string;
+  state: "pending" | "canceled";
+  fixedCreate?: FixedLeaseCreateIntent;
+  canonicalLeaseID?: string;
+  cloudID?: string;
+  generation?: string;
+  checkpointID?: string;
+  checkpointUseClaimHash?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ImageCapabilities {
+  osVersion?: string;
+  sdks?: Record<string, string>;
+  runtimes?: Record<string, string>;
+  browser?: boolean;
+  webview2?: boolean;
+  desktop?: boolean;
+}
+
+export interface ImageVariantSelectors {
+  sdks?: Record<string, string>;
+  runtimes?: Record<string, string>;
+}
+
+export interface ImageRequirements {
+  minOS?: string;
+  sdks?: Record<string, string>;
+  runtimes?: Record<string, string>;
+  browser?: boolean;
+  webview2?: boolean;
+  desktop?: boolean;
 }
 
 export interface LeaseRegistrationRequest {
@@ -216,18 +382,31 @@ export interface LeaseRegistrationRequest {
 
 export const coordinatorProviderRegistry = [
   {
+    runtimeExtension: true,
+    provider: "serve",
+    label: "Served machines",
+    requiredSecrets: [],
+    adminAudit: false,
+    supportsCapacityMarket: false,
+  },
+  {
+    runtimeExtension: true,
     provider: "hetzner",
     label: "Hetzner",
     requiredSecrets: ["HETZNER_TOKEN"],
     adminAudit: false,
+    supportsCapacityMarket: false,
   },
   {
+    runtimeExtension: true,
     provider: "aws",
     label: "AWS",
     requiredSecrets: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
     adminAudit: true,
+    supportsCapacityMarket: true,
   },
   {
+    runtimeExtension: true,
     provider: "azure",
     label: "Azure",
     requiredSecrets: [
@@ -237,18 +416,31 @@ export const coordinatorProviderRegistry = [
       "AZURE_SUBSCRIPTION_ID",
     ],
     adminAudit: true,
+    supportsCapacityMarket: true,
   },
   {
+    runtimeExtension: true,
     provider: "gcp",
     label: "GCP",
     requiredSecrets: ["GCP_CLIENT_EMAIL", "GCP_PRIVATE_KEY"],
     adminAudit: false,
+    supportsCapacityMarket: true,
+  },
+  {
+    runtimeExtension: false,
+    provider: "daytona",
+    label: "Daytona",
+    requiredSecrets: ["DAYTONA_CRABBOX_KEY"],
+    adminAudit: false,
+    supportsCapacityMarket: false,
   },
 ] as const satisfies readonly {
+  runtimeExtension: boolean;
   provider: string;
   label: string;
   requiredSecrets: readonly (keyof Env)[];
   adminAudit: boolean;
+  supportsCapacityMarket: boolean;
 }[];
 
 export type CoordinatorProviderSpec = (typeof coordinatorProviderRegistry)[number];
@@ -256,7 +448,6 @@ export type Provider = CoordinatorProviderSpec["provider"];
 export const coordinatorProviders = coordinatorProviderRegistry.map(
   (spec) => spec.provider,
 ) as Provider[];
-export const providers = coordinatorProviders;
 
 export function isCoordinatorProvider(provider: string): provider is Provider {
   return coordinatorProviders.includes(provider as Provider);
@@ -276,6 +467,7 @@ export interface LeaseTelemetry {
   load1?: number;
   load5?: number;
   load15?: number;
+  cpuCount?: number;
   memoryUsedBytes?: number;
   memoryTotalBytes?: number;
   memoryPercent?: number;
@@ -291,9 +483,64 @@ export interface RunTelemetrySummary {
   samples?: LeaseTelemetry[];
 }
 
+export interface HetznerCleanupEvidence {
+  version: 1;
+  provider: "hetzner";
+  leaseID: string;
+  serverID: number;
+  dispatchStartedAt?: string;
+  deleteNotFoundAt?: string;
+  action?: { id: number; status: "running" | "success" | "error" };
+  confirmation?: {
+    method:
+      | "delete-action-success-and-server-absent"
+      | "already-absent"
+      | "delete-not-found-and-server-absent";
+    at: string;
+  };
+}
+
+export type ProviderCleanupEvidence = HetznerCleanupEvidence;
+
 export interface LeaseRecord {
+  leasePolicy?: import("./config").LeasePolicy;
+  policyNotice?: string;
+  extensionHistory?: {
+    at: string;
+    actor: string;
+    fromTTL: number;
+    toTTL: number;
+    reason?: string;
+  }[];
+  retainedReconcileDeleteClaim?: string;
+  retainedReconcileDeleteCredentialFingerprint?: string;
+  retainedReconcileObservation?: {
+    fingerprint: string;
+    credentialFingerprint: string;
+    firstAbsentAt: string;
+    lastAbsentAt: string;
+  };
+  cleanupConfirmedBy?: "retained-reconcile" | "retained-reconcile-legacy-attested";
+  serve?: import("./serve").ServeAssignment;
+  serveIntent?: string;
+  serveUsageRecordedAt?: string;
+  sshHostKeyFingerprint?: string;
+  imageEvidence?: {
+    configuredReference: string;
+    runtimeImageId: string;
+    repositoryDigests: string[];
+    repositoryDigestStatus: string;
+  };
+  capacityRequirements?: CapacityRequirements;
+  creationEvents?: CreationEvent[];
+  portablePoolAccess?: true;
   id: string;
   slug?: string;
+  fixedCreateIntentVersion?: number;
+  fixedCreateIntentHash?: string;
+  createAttemptID?: string;
+  createAttemptGeneration?: string;
+  checkpointID?: string;
   workspaceID?: string;
   provider: string;
   lifecycle?: LeaseLifecycle;
@@ -307,6 +554,7 @@ export interface LeaseRecord {
   runtimeAdapterDeleteAttempts?: number;
   runtimeAdapterDeleteError?: string;
   target: TargetOS;
+  architecture?: string;
   os?: string;
   windowsMode?: WindowsMode;
   desktop?: boolean;
@@ -317,6 +565,8 @@ export interface LeaseRecord {
   cloudID: string;
   region?: string;
   providerProject?: string;
+  providerScope?: string;
+  providerOwner?: string;
   network?: LeaseNetworkState;
   owner: string;
   org: string;
@@ -331,17 +581,38 @@ export interface LeaseRecord {
   hostID?: string;
   market?: string;
   provisioningAttempts?: ProvisioningAttempt[];
+  image?: LeaseImageIdentity;
+  provisioningTiming?: LeaseProvisioningTiming;
+  awsSSMCommandID?: string;
+  awsSSMCommandStatus?: string;
+  awsSSMLogGroup?: string;
   capacityHints?: CapacityHint[];
   serverID: number;
+  providerResourceID?: string;
   serverName: string;
   providerKey: string;
+  providerKeyCleanupOwned?: boolean;
+  providerKeyCleanupPending?: boolean;
+  providerKeyCleanupID?: string;
   host: string;
   sshUser: string;
   sshPort: string;
   sshFallbackPorts?: string[];
+  serveRelaySessions?: string[];
+  sshJump?: {
+    host: string;
+    port: number;
+    hostKey: string;
+    fingerprint: string;
+    candidates?: { host: string; port: number }[];
+    relay?: boolean;
+  };
+  sshHostKey?: string;
+  providerAccessExpiresAt?: string;
   workRoot: string;
   keep: boolean;
   ttlSeconds: number;
+  lifetimePolicy?: LeaseLifetimePolicy | undefined;
   idleTimeoutSeconds?: number;
   estimatedHourlyUSD: number;
   maxEstimatedUSD: number;
@@ -353,24 +624,45 @@ export interface LeaseRecord {
   telemetry?: LeaseTelemetry;
   telemetryHistory?: LeaseTelemetry[];
   cleanupAttempts?: number;
+  providerCleanup?: ProviderCleanupEvidence;
   cleanupError?: string;
   cleanupFailedAt?: string;
   cleanupRetryAt?: string;
   cleanupStartedAt?: string;
   cleanupClaimExpiresAt?: string;
+  cleanupCompletedAt?: string;
   failureError?: string;
   provisioningResourceMayExist?: boolean;
   provisioningFailureRetryable?: boolean;
   provisioningRequestStartedAt?: string;
+  provisioningRequestSettledAt?: string;
+  provisioningCoordinatorVersion?: string;
+  provisioningRecoveryObservedAt?: string;
+  provisioningRecoveryMissingSince?: string;
   releaseDeletesServer?: boolean;
   releasedAt?: string;
   endedAt?: string;
   registeredAt?: string;
 }
 
-export type ReadyPoolEntryState = "ready" | "busy" | "draining" | "stale";
+export type ReadyPoolEntryState = "ready" | "busy" | "draining" | "quarantined" | "stale";
+
+export interface ReadyPoolImageIdentity {
+  provider: string;
+  scope: string;
+  id: string;
+}
+
+export interface ReadyPoolIdentityV1 {
+  schema: "crabbox-ready-pool-identity/v1";
+  image: ReadyPoolImageIdentity;
+  architecture: string;
+  seedDigest: string;
+  cacheCompatibility: string;
+}
 
 export interface ReadyPoolEntry {
+  portableAccess?: true;
   key: string;
   leaseID: string;
   state: ReadyPoolEntryState;
@@ -380,6 +672,8 @@ export interface ReadyPoolEntry {
   ref?: string;
   commit?: string;
   fingerprint?: string;
+  compatibilityKey?: string;
+  identity?: ReadyPoolIdentityV1;
   image?: string;
   provider?: string;
   target?: TargetOS;
@@ -392,6 +686,10 @@ export interface ReadyPoolEntry {
   workRoot?: string;
   borrowedBy?: string;
   borrowedAt?: string;
+  borrowHeartbeatRequired?: boolean;
+  borrowHeartbeatAt?: string;
+  borrowExpiresAt?: string;
+  borrowHardDeadline?: string;
   borrowToken?: string;
   lastReadyAt?: string;
   lastUsedAt?: string;
@@ -408,6 +706,9 @@ export interface ReadyPoolRegisterRequest {
   ref?: string;
   commit?: string;
   fingerprint?: string;
+  compatibilityKey?: string;
+  identity?: ReadyPoolIdentityV1;
+  fillClaimToken?: string;
   image?: string;
   sshHost?: string;
   sshUser?: string;
@@ -416,11 +717,16 @@ export interface ReadyPoolRegisterRequest {
 }
 
 export interface ReadyPoolBorrowRequest {
+  class?: string;
+  serverType?: string;
   repo?: string;
   ref?: string;
   commit?: string;
   allowMissingCommit?: boolean;
   fingerprint?: string;
+  compatibilityKey?: string;
+  identity?: ReadyPoolIdentityV1;
+  heartbeat?: boolean;
   provider?: Provider;
   target?: TargetOS;
 }
@@ -430,14 +736,86 @@ export interface ReadyPoolReturnRequest {
   result?: "ready" | "drain" | "release";
   reason?: string;
   borrowToken?: string;
+  identity?: ReadyPoolIdentityV1;
+}
+
+export interface ReadyPoolBorrowHeartbeatRequest {
+  leaseID?: string;
+  borrowToken?: string;
+}
+
+export interface ReadyPoolReconcileRequest extends ReadyPoolBorrowRequest {
+  minReady?: number;
+  maxReady?: number;
+  claim?: boolean;
+}
+
+export interface ReadyPoolFillClaim {
+  token: string;
+  key: string;
+  compatibilityKey?: string;
+  owner: string;
+  org: string;
+  criteria: ReadyPoolBorrowRequest;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface ReadyPoolCapacityCounts {
+  ready: number;
+  busy: number;
+  draining: number;
+  quarantined: number;
+  stale: number;
+  inFlight: number;
+}
+
+export interface ReadyPoolCounters {
+  borrowLatencyMsTotal?: number;
+  readyAgeMsTotal?: number;
+  completionReports?: number;
+  firstCommandMsTotal?: number;
+  scrubMsTotal?: number;
+  scrubFailures?: number;
+  ttlRotations?: number;
+  grantsIssued?: number;
+  grantsAcknowledged?: number;
+  grantsRevoked?: number;
+  grantsFenced?: number;
+  grantsExpired?: number;
+  fencingFailures?: number;
+  borrowRequests: number;
+  warmHits: number;
+  warmMisses: number;
+  fillClaimsCreated: number;
+  fillClaimsCompleted: number;
+  borrowHeartbeats: number;
+  quarantined: number;
+  stalePruned: number;
+  updatedAt: string;
+}
+
+export interface ReadyPoolDesiredCapacity {
+  key: string;
+  owner: string;
+  org: string;
+  criteria: ReadyPoolBorrowRequest;
+  identity?: ReadyPoolIdentityV1;
+  compatibilityKey?: string;
+  minReady: number;
+  maxReady: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface LeaseNetworkState {
   sshSourceCIDRs?: string[];
+  sshPinnedSourceCIDRs?: string[];
   sshSourceCIDRsComplete?: boolean;
   awsSecurityGroupID?: string;
   awsSecurityGroupName?: string;
   awsSubnetID?: string;
+  awsPrivate?: boolean;
 }
 
 export type LeaseShareRole = "use" | "manage";
@@ -464,11 +842,69 @@ export interface TailscaleMetadata {
 }
 
 export interface ProvisioningAttempt {
+  durationMs?: number;
   region?: string;
   serverType: string;
   market?: string;
   category?: string;
   message: string;
+}
+
+export type ProviderImageSource =
+  | "promoted"
+  | "explicit"
+  | "snapshot"
+  | "stock"
+  | "provider-default";
+
+export interface LeaseImageIdentity {
+  id: string;
+  source: ProviderImageSource;
+  provider?: Provider;
+  kind?: string;
+  region?: string;
+  sourceID?: string;
+  promotedAt?: string;
+  revision?: string;
+}
+
+// Request-local observations; never persisted or used to authorize provider access.
+export type ProviderAccessTimingObserver = (
+  step: "ingress_wait" | "lifecycle_wait" | "access_snapshot",
+  durationMs: number,
+) => void;
+
+export interface CreationEvent {
+  phase:
+    | "coordinator_step"
+    | "admission_started"
+    | "admission_complete"
+    | "provider_create_request"
+    | "provider_create_response"
+    | "instance_running"
+    | "ssh_tcp_accept"
+    | "ssh_authenticated"
+    | "bootstrap_complete"
+    | "workspace_ready";
+  at: string;
+  source: "coordinator" | "provider_observation" | "client" | "guest";
+  step?: string;
+  durationMs?: number;
+  count?: number;
+  errors?: number;
+}
+
+export interface LeaseProvisioningTiming {
+  requestMs: number;
+  networkReadyMs?: number;
+  bootstrapMs?: number;
+  totalMs: number;
+  phases?: LeaseProvisioningPhase[];
+}
+
+export interface LeaseProvisioningPhase {
+  name: "request" | "network_ready" | "bootstrap" | "unattributed";
+  ms: number;
 }
 
 export interface CapacityHint {
@@ -496,8 +932,165 @@ export interface ProviderImage {
   architecture?: string;
   project?: string;
   resourceID?: string;
+  immutableID?: string;
+  accountID?: string;
+  checkpointOwnershipHash?: string;
+  checkpointSourceLeaseID?: string;
   snapshots?: string[];
   fastSnapshotRestores?: ProviderFastSnapshotRestore[];
+  capabilities?: ImageCapabilities;
+}
+
+export interface ProviderCheckpointOwnership {
+  checkpointID: string;
+  tokenHash: string;
+  sourceLeaseID: string;
+}
+
+export type CoordinatorCheckpointProvider = "aws" | "azure" | "gcp";
+
+export type CoordinatorCheckpointRetention =
+  | { mode: "manual" }
+  | { mode: "expire-unused"; unusedForSeconds: number };
+
+export interface CoordinatorCheckpointScope {
+  region: string;
+  accountID?: string;
+  subscriptionID?: string;
+  resourceGroup?: string;
+  project?: string;
+}
+
+export interface CoordinatorCheckpointImage {
+  id: string;
+  resourceID: string;
+  kind: string;
+  immutableID: string;
+  snapshotIDs: string[];
+  state: string;
+  architecture?: string;
+}
+
+export interface CoordinatorCheckpointCreateClaim {
+  tokenHash: string;
+  resourceName: string;
+  expiresAt: string;
+  coordinatorGeneration: string;
+  definitiveRefusal?: boolean;
+  providerMutationPhase?: "reserved" | "started";
+  providerMutationStartedAt?: string;
+  providerAbsenceFirstObservedAt?: string;
+  providerAbsenceLastObservedAt?: string;
+  providerAbsenceVerifiedAt?: string;
+}
+
+export interface CoordinatorCheckpointDeleteClaim {
+  tokenHash: string;
+  generation: number;
+  expiresAt: string;
+  reason: "manual" | "unused-expiry" | "create-recovery";
+  phase: "claimed" | "provider-deleted";
+}
+
+export interface CoordinatorCheckpointRecord {
+  version: 1;
+  id: string;
+  owner: string;
+  org: string;
+  leaseID: string;
+  provider: CoordinatorCheckpointProvider;
+  scope: CoordinatorCheckpointScope;
+  name: string;
+  strategy: "image" | "disk-snapshot";
+  noReboot: boolean;
+  image?: CoordinatorCheckpointImage;
+  state: "creating" | "ready" | "delete-pending" | "deleting" | "deleted" | "failed";
+  retention: CoordinatorCheckpointRetention;
+  generation: number;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string;
+  nextSweepAt?: string;
+  createClaim?: CoordinatorCheckpointCreateClaim;
+  deleteClaim?: CoordinatorCheckpointDeleteClaim;
+  deleteRequestedAt?: string;
+  deletedAt?: string;
+  attempts: number;
+  retryAt?: string;
+  lastError?: string;
+  pinCount: number;
+  activeUseCount: number;
+  eventSequence: number;
+  target: TargetOS;
+  windowsMode?: WindowsMode;
+  desktop?: boolean;
+  serverType?: string;
+  hostID?: string;
+  workdir?: string;
+  slug?: string;
+  repo?: { name?: string; head?: string; baseRef?: string; remoteURL?: string };
+}
+
+export interface CoordinatorCheckpointUseClaim {
+  checkpointID: string;
+  tokenHash: string;
+  owner: string;
+  org: string;
+  generation: number;
+  createdAt: string;
+  expiresAt: string;
+  state: "available" | "provisioning";
+  attemptID?: string;
+  leaseID?: string;
+}
+
+export interface CoordinatorCheckpointResourceIntent {
+  checkpointID: string;
+  provider: CoordinatorCheckpointProvider;
+  scope: CoordinatorCheckpointScope;
+  kind: string;
+  resourceName: string;
+  resourceID?: string;
+  generation: number;
+}
+
+export interface CoordinatorCheckpointDueIndex {
+  checkpointID: string;
+  generation: number;
+  revision: number;
+  nextSweepAt: string;
+}
+
+export interface CoordinatorCheckpointResourceClaim {
+  checkpointID: string;
+  provider: CoordinatorCheckpointProvider;
+  scope: CoordinatorCheckpointScope;
+  kind: string;
+  resourceID: string;
+  immutableID: string;
+  generation: number;
+}
+
+export interface CoordinatorCheckpointPin {
+  checkpointID: string;
+  generation: number;
+  catalogKey: string;
+  createdAt: string;
+}
+
+export interface CoordinatorCheckpointEvent {
+  checkpointID: string;
+  sequence: number;
+  type: string;
+  createdAt: string;
+  actor: string;
+  provider: CoordinatorCheckpointProvider;
+  scope: CoordinatorCheckpointScope;
+  generation: number;
+  reason?: string;
+  error?: string;
+  retryAt?: string;
 }
 
 export interface ProviderFastSnapshotRestore {
@@ -509,9 +1102,13 @@ export interface ProviderFastSnapshotRestore {
 
 export interface PromotedImageRecord extends ProviderImage {
   promotedAt: string;
+  revision?: string;
+  catalogOnly?: boolean;
+  variantSelectors?: ImageVariantSelectors;
 }
 
 export interface RunRecord {
+  eventAppendIdempotent?: boolean;
   id: string;
   leaseID: string;
   leaseIDs?: string[];
@@ -542,6 +1139,34 @@ export interface RunRecord {
   lastEventAt?: string;
   eventCount?: number;
   endedAt?: string;
+  terminalReceipt?: TerminalRunReceipt;
+  terminalFinishSHA256?: string;
+  terminalLogPrefix?: string;
+  createRequestSHA256?: string;
+  admissionFailedBeforeWork?: boolean;
+}
+
+export interface TerminalRunReceipt {
+  schema_version: 2;
+  receipt_type: "terminal";
+  started_at: string;
+  ended_at: string;
+  provider: string;
+  lease_id?: string;
+  slug?: string;
+  run_id: string;
+  command: string;
+  command_sha256: string;
+  exit_code: number;
+  sync_ms: number;
+  command_ms: number;
+  duration_ms: number;
+  log_sha256: string;
+  retained_log_sha256: string;
+  log_truncated: boolean;
+  public_key: string;
+  signer: string;
+  signature: string;
 }
 
 export interface RunCreateRequest {
@@ -555,6 +1180,12 @@ export interface RunCreateRequest {
   label?: string;
 }
 
+export interface RunAdmissionFailureRequest {
+  admission: RunCreateRequest;
+  exitCode: number;
+  message: string;
+}
+
 export interface RunFinishRequest {
   exitCode: number;
   syncMs?: number;
@@ -566,6 +1197,7 @@ export interface RunFinishRequest {
   retryLikely?: string;
   results?: TestResultSummary;
   telemetry?: RunTelemetrySummary;
+  receipt?: TerminalRunReceipt;
 }
 
 export interface RunTelemetryRequest {
@@ -592,6 +1224,7 @@ export interface ExternalRunnerInput {
 
 export interface ExternalRunnerSyncRequest {
   provider?: string;
+  inventoryScope?: "org";
   runners?: ExternalRunnerInput[];
 }
 
@@ -639,6 +1272,7 @@ export interface RunEventRecord {
 }
 
 export interface RunEventRequest {
+  id?: string;
   type?: string;
   phase?: string;
   stream?: "stdout" | "stderr";
@@ -677,6 +1311,7 @@ export interface TestFailure {
 }
 
 export interface HetznerServer {
+  creationEvents?: CreationEvent[];
   id: number;
   name: string;
   status: string;
@@ -696,23 +1331,14 @@ export interface HetznerSSHKey {
   name: string;
   fingerprint: string;
   public_key: string;
-}
-
-export interface MachineView {
-  id: string;
-  provider: Provider;
-  cloudID: string;
-  name: string;
-  status: string;
-  serverType: string;
-  hostId?: string;
-  host: string;
-  labels: Record<string, string>;
+  labels?: Record<string, string>;
 }
 
 export interface ProviderMachine {
+  creationEvents?: CreationEvent[];
   provider: Provider;
   id: number;
+  providerResourceID?: string;
   cloudID: string;
   region?: string;
   name: string;
@@ -720,5 +1346,25 @@ export interface ProviderMachine {
   serverType: string;
   hostID?: string;
   host: string;
+  privateHost?: string;
+  awsIPv6Addresses?: string[];
+  awsKeyName?: string;
+  awsSpotInstanceRequestID?: string;
+  awsStateReasonCode?: string;
+  awsStateReasonMessage?: string;
+  awsSubnetID?: string;
+  awsSecurityGroupIDs?: string[];
+  awsInstanceProfileAttached?: boolean;
+  awsInstanceProfileARN?: string;
+  awsMetadataHttpEndpoint?: string;
+  awsMetadataHttpTokens?: string;
+  awsMetadataHttpPutResponseHopLimit?: number;
+  awsMetadataInstanceTags?: string;
+  awsRootVolumeID?: string;
+  awsRootDeleteOnTermination?: boolean;
   labels: Record<string, string>;
+  resourceIdentity?: string;
+  providerKey?: string;
+  awsSSMCommandID?: string;
+  awsSSMCommandStatus?: string;
 }

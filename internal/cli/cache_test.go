@@ -1,8 +1,12 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseCacheStats(t *testing.T) {
@@ -15,6 +19,40 @@ func TestParseCacheStats(t *testing.T) {
 	}
 	if entries[1].Kind != "docker" || entries[1].Note == "" {
 		t.Fatalf("docker entry=%#v", entries[1])
+	}
+}
+
+func TestCacheTargetRoutesOrdinaryLeaseClaim(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("CRABBOX_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	repo, err := findRepo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ClaimLeaseForRepoProvider("cbx_1335_cache01", "Cache Claimed", "run-prepare-test", repo.Root, time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	runPrepareTestResolveRequests = nil
+	_, cfg, _, err := (App{}).cacheTarget(context.Background(), "cache-claimed", false)
+	var exitErr ExitError
+	if !AsExitError(err, &exitErr) || exitErr.Code != 9 || !strings.Contains(exitErr.Message, "resolve captured") {
+		t.Fatalf("cacheTarget error=%v", err)
+	}
+	if cfg.Provider != "run-prepare-test" || cfg.providerSelectionSource != providerSelectionLeaseContext || !providerSelectionIsActionable(cfg) {
+		t.Fatalf("provider=%q source=%q", cfg.Provider, cfg.providerSelectionSource)
+	}
+	if len(runPrepareTestResolveRequests) != 1 || runPrepareTestResolveRequests[0].ID != "cache-claimed" {
+		t.Fatalf("resolve requests=%#v", runPrepareTestResolveRequests)
+	}
+}
+
+func TestCacheStatsJSONEmptyResultIsArray(t *testing.T) {
+	var stdout bytes.Buffer
+	if err := writeCacheStatsJSON(&stdout, parseCacheStats("")); err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.String(); got != "[]\n" {
+		t.Fatalf("cache stats JSON=%q, want empty array", got)
 	}
 }
 
@@ -47,7 +85,7 @@ func TestRemoteCachePurgeHonorsEnabledKinds(t *testing.T) {
 }
 
 func TestRemoteCacheWarmCommandSourcesHydrationEnvFile(t *testing.T) {
-	got := remoteCacheWarmCommand("/home/runner/work/repo/repo", map[string]string{"CI": "1"}, "/home/runner/.crabbox/actions/cbx.env.sh", []string{"pnpm", "install"})
+	got := remoteCommandWithEnvFiles("/home/runner/work/repo/repo", map[string]string{"CI": "1"}, []string{"/home/runner/.crabbox/actions/cbx.env.sh"}, []string{"pnpm", "install"})
 	for _, want := range []string{
 		"cd '/home/runner/work/repo/repo'",
 		". '/home/runner/.crabbox/actions/cbx.env.sh'",
@@ -57,6 +95,28 @@ func TestRemoteCacheWarmCommandSourcesHydrationEnvFile(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("cache warm command missing %q in %q", want, got)
 		}
+	}
+}
+
+func TestAllowedRemoteEnvExcludesExternalDesktopPasswordForAnyTarget(t *testing.T) {
+	t.Setenv("SCREEN_SHARING_PASSWORD", "operator-secret")
+	t.Setenv("SCREEN_SAFE_VALUE", "preserved")
+	for _, targetOS := range []string{targetLinux, targetMacOS, targetWindows} {
+		t.Run(targetOS, func(t *testing.T) {
+			cfg := Config{Provider: "external", TargetOS: targetOS, EnvAllow: []string{"SCREEN_*"}}
+			cfg.External.Connection.Desktop.PasswordEnv = "SCREEN_SHARING_PASSWORD"
+			env := allowedRemoteEnv(cfg)
+			if _, found := env["SCREEN_SHARING_PASSWORD"]; found {
+				t.Fatalf("remote environment retained desktop password: %#v", env)
+			}
+			if env["SCREEN_SAFE_VALUE"] != "preserved" {
+				t.Fatalf("unrelated remote environment lost: %#v", env)
+			}
+			command := remoteCommandWithEnvFiles("/work/repo", env, nil, []string{"true"})
+			if strings.Contains(command, "operator-secret") || strings.Contains(command, "SCREEN_SHARING_PASSWORD") {
+				t.Fatalf("cache command exposed desktop password: %s", command)
+			}
+		})
 	}
 }
 

@@ -12,18 +12,16 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return "islo" }
-func (Provider) Aliases() []string {
-	return nil
-}
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
+		Authentication:      core.DirectProviderAuthentication(core.ProviderAuthenticationAPIKey),
 		Name:                "islo",
 		Family:              "islo",
 		Kind:                core.ProviderKindDelegatedRun,
 		Targets:             []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:            core.FeatureSet{core.FeatureSSH, core.FeatureURLBridge, core.FeatureRunSession, core.FeatureTailscale, core.FeaturePauseResume, core.FeatureRunDownloads},
+		Features:            core.FeatureSet{core.FeatureSSH, core.FeatureURLBridge, core.FeatureRunSession, core.FeatureTailscale, core.FeaturePauseResume, core.FeatureRunDownloads, core.FeatureLeaseHeartbeat},
 		Coordinator:         core.CoordinatorNever,
+		ClassDisposition:    core.ProviderClassDispositionUnmapped,
 		TailscaleEgressOnly: true,
 	}
 }
@@ -33,18 +31,12 @@ func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
 func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
 	return ApplyIsloProviderFlags(cfg, fs, values)
 }
+
+// ClaimScope contributes the API endpoint identity to every claim core writes
+// for this provider, the same way the other sandbox providers do, so a claim
+// created against one endpoint is never matched against another.
+func (Provider) ClaimScope(cfg core.Config) string { return isloClaimScope(cfg) }
+
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewIsloBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "islo doctor backend unavailable")
-	}
-	return doctor, nil
 }

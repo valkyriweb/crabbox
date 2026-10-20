@@ -4,10 +4,12 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/windows"
@@ -46,9 +48,31 @@ func inheritWebVNCDaemonPortReservation(cmd *exec.Cmd, listener *net.TCPListener
 	return strconv.FormatUint(uint64(handle), 10), nil, nil
 }
 
-func lockWebVNCDaemonFile(file *os.File) error {
+func forwardInheritedWebVNCDaemonPortReservation(cmd *exec.Cmd) (func(), error) {
+	port := strings.TrimSpace(os.Getenv(webVNCDaemonPortReservationEnv))
+	descriptor := strings.TrimSpace(os.Getenv(webVNCDaemonPortReservationFDEnv))
+	if port == "" && descriptor == "" {
+		return func() {}, nil
+	}
+	handleValue, err := strconv.ParseUint(descriptor, 10, 64)
+	if err != nil || handleValue == 0 {
+		return nil, fmt.Errorf("inherited WebVNC daemon TCP listener handle is invalid")
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.AdditionalInheritedHandles = append(cmd.SysProcAttr.AdditionalInheritedHandles, syscall.Handle(handleValue))
+	cmd.Env = webVNCDaemonPortReservationEnvironment(cmd.Env, port, descriptor)
+	return func() {}, nil
+}
+
+func tryLockWebVNCDaemonFile(file *os.File) (bool, error) {
 	var overlapped windows.Overlapped
-	return windows.LockFileEx(windows.Handle(file.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped)
+	err := windows.LockFileEx(windows.Handle(file.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlapped)
+	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func unlockWebVNCDaemonFile(file *os.File) error {

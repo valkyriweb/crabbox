@@ -1,21 +1,20 @@
 package digitalocean
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const apiBaseURL = "https://api.digitalocean.com/v2"
@@ -148,15 +147,7 @@ func newDigitalOceanClient(rt core.Runtime) (*digitalOceanClient, error) {
 }
 
 func (c *digitalOceanClient) do(ctx context.Context, method, path string, body any, out any) error {
-	var reader io.Reader
-	if body != nil {
-		var buf bytes.Buffer
-		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			return err
-		}
-		reader = &buf
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
+	req, err := shared.NewJSONRequest(ctx, method, c.baseURL+path, body)
 	if err != nil {
 		return err
 	}
@@ -168,30 +159,10 @@ func (c *digitalOceanClient) do(ctx context.Context, method, path string, body a
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if len(data) > 400 {
-			data = data[:400]
-		}
-		body := strings.TrimSpace(string(data))
-		if readErr != nil {
-			if body != "" {
-				body += "; "
-			}
-			body += "response body read failed: " + readErr.Error()
-		}
-		return &digitalOceanAPIError{Operation: method + " " + path, Status: resp.StatusCode, Body: body}
-	}
-	if readErr != nil {
-		return fmt.Errorf("digitalocean %s %s response body: %w", method, path, readErr)
-	}
-	if out == nil || len(data) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("digitalocean %s %s decode: %w", method, path, err)
-	}
-	return nil
+	return shared.DecodeStatusFirstJSONResponse(resp, out, "digitalocean "+method+" "+path, func(status int, data []byte, readErr error) error {
+		body := shared.RedactedResponseBody(data, readErr, 400, func(value string) string { return shared.RedactErrorSecrets(value, c.token) })
+		return &digitalOceanAPIError{Operation: method + " " + path, Status: status, Body: body}
+	})
 }
 
 func (c *digitalOceanClient) ListCrabboxDroplets(ctx context.Context) ([]droplet, error) {
@@ -293,11 +264,78 @@ func (c *digitalOceanClient) AccountID(ctx context.Context) (string, error) {
 	return "", core.Exit(3, "digitalocean account API returned no account identity")
 }
 
+var preferredRegions = []string{"sfo3", "sfo2", "sfo1", "tor1", "nyc3", "nyc1", "nyc2", "lon1", "ams3", "fra1", "sgp1", "blr1", "syd1"}
+
+func (c *digitalOceanClient) ResolveSizeRegion(ctx context.Context, cfg core.Config) (string, error) {
+	region := cfg.DigitalOcean.Region
+	var regions []string
+	for page := 1; ; page++ {
+		var res struct {
+			Sizes []struct {
+				Slug      string   `json:"slug"`
+				Available bool     `json:"available"`
+				Regions   []string `json:"regions"`
+			} `json:"sizes"`
+			Links struct {
+				Pages struct {
+					Next string `json:"next"`
+				} `json:"pages"`
+			} `json:"links"`
+		}
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/sizes?page=%d&per_page=200", page), nil, &res); err != nil {
+			return "", err
+		}
+		found := false
+		for _, size := range res.Sizes {
+			if size.Slug != cfg.ServerType {
+				continue
+			}
+			if size.Available {
+				if region != "" && slices.Contains(size.Regions, region) {
+					return region, nil
+				}
+				if region == "" {
+					for _, preferred := range preferredRegions {
+						if slices.Contains(size.Regions, preferred) {
+							return preferred, nil
+						}
+					}
+				}
+			}
+			regions, found = size.Regions, true
+			break
+		}
+		if found || res.Links.Pages.Next == "" {
+			break
+		}
+	}
+	slices.Sort(regions)
+	available := strings.Join(regions, ", ")
+	if available == "" {
+		available = "none listed"
+	}
+	if region == "" {
+		region = "automatic (near San Francisco)"
+	}
+	return "", core.Exit(2, "digitalocean_size_unavailable_in_region: size %q is unavailable in region %q; available regions: %s; choose digitalocean.region or CRABBOX_DIGITALOCEAN_REGION explicitly", cfg.ServerType, region, available)
+}
+
 func (c *digitalOceanClient) CreateDroplet(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, now time.Time) (droplet, error) {
+	return c.createDroplet(ctx, cfg, publicKey, leaseID, slug, keep, now, nil)
+}
+
+func (c *digitalOceanClient) CreateFixedDroplet(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, now time.Time, labels map[string]string) (droplet, error) {
+	return c.createDroplet(ctx, cfg, publicKey, leaseID, slug, keep, now, labels)
+}
+
+func (c *digitalOceanClient) createDroplet(ctx context.Context, cfg core.Config, publicKey, leaseID, slug string, keep bool, now time.Time, labels map[string]string) (droplet, error) {
 	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
 		cfg.Tailscale.Hostname = core.RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
 	tags := leaseTags(cfg, leaseID, slug, "provisioning", keep, now)
+	if labels != nil {
+		tags = tagsFromLabels(labels)
+	}
 	leaseTag := encodeTagKV("lease", leaseID)
 	leaseTagResolved := false
 	keyName := providerKeyForLease(leaseID)
@@ -306,10 +344,14 @@ func (c *digitalOceanClient) CreateDroplet(ctx context.Context, cfg core.Config,
 		return droplet{}, err
 	}
 	rollbackKey := func(cause error) error {
-		if !createdKey {
-			return cause
+		if createdKey {
+			cause = c.rollbackCreatedSSHKey(key, cause)
 		}
-		return c.rollbackCreatedSSHKey(key, cause)
+		var cleanup *sshKeyCleanupError
+		if !errors.As(cause, &cleanup) && !shouldReconcileMutation(cause) {
+			return &core.FixedCreateRejected{Err: cause}
+		}
+		return cause
 	}
 	withKeyIdentity := func(item droplet) droplet {
 		item.SSHKeyID = key.ID
@@ -324,7 +366,7 @@ func (c *digitalOceanClient) CreateDroplet(ctx context.Context, cfg core.Config,
 		"image":     digitalOceanImage(cfg),
 		"ssh_keys":  []any{key.ID},
 		"tags":      tags,
-		"user_data": core.CloudInitUserData(cfg, publicKey),
+		"user_data": core.CloudInitUserData(core.WithGuestLeaseExpiry(cfg, labelsFromTags(tags)), publicKey),
 		"ipv6":      false,
 	}
 	if cfg.DigitalOcean.VPCUUID != "" {
@@ -365,7 +407,7 @@ func (c *digitalOceanClient) CreateDroplet(ctx context.Context, cfg core.Config,
 		incomplete := fmt.Errorf(
 			"digitalocean create returned incomplete droplet identity: id=%d name=%q, want name=%q",
 			res.Droplet.ID,
-			res.Droplet.Name,
+			shared.RedactErrorSecrets(res.Droplet.Name, c.token),
 			name,
 		)
 		if item, reconcileErr := c.reconcileDropletCreate(leaseTag, leaseTagResolved, leaseID, name); reconcileErr == nil {
@@ -384,12 +426,38 @@ func (c *digitalOceanClient) CreateDroplet(ctx context.Context, cfg core.Config,
 
 func shouldReconcileMutation(err error) bool {
 	var apiErr *digitalOceanAPIError
-	return !errors.As(err, &apiErr) || apiErr.Status >= http.StatusInternalServerError
+	return !errors.As(err, &apiErr) || apiErr.Status < 400 || apiErr.Status >= 500 ||
+		apiErr.Status == http.StatusRequestTimeout || apiErr.Status == http.StatusConflict || apiErr.Status == http.StatusTooManyRequests
 }
 
 func isDigitalOceanUnprocessable(err error) bool {
 	var apiErr *digitalOceanAPIError
 	return errors.As(err, &apiErr) && apiErr.Status == http.StatusUnprocessableEntity
+}
+
+func pollReconciliation[T any](
+	ctx context.Context, interval time.Duration,
+	fetch func(context.Context) ([]T, error),
+	selectOne func([]T) (T, bool, error),
+	notFound error,
+) (T, error) {
+	var selected T
+	result, err := shared.Poll(ctx, 0, interval, shared.SleepContext, fetch, func(_ context.Context, values []T, fetchErr error) (bool, error) {
+		if fetchErr != nil {
+			return false, nil
+		}
+		var found bool
+		var selectErr error
+		selected, found, selectErr = selectOne(values)
+		return found, selectErr
+	}, nil)
+	if err == nil || context.Cause(ctx) == nil || !errors.Is(err, context.Cause(ctx)) {
+		return selected, err
+	}
+	if result.Err != nil {
+		notFound = result.Err
+	}
+	return selected, errors.Join(notFound, err)
 }
 
 func (c *digitalOceanClient) reconcileDropletCreate(leaseTag string, leaseTagResolved bool, leaseID, name string) (droplet, error) {
@@ -411,36 +479,26 @@ func (c *digitalOceanClient) reconcileDropletCreate(leaseTag string, leaseTagRes
 		}
 		leaseTag = canonical
 	}
-	var lastErr error
-	for {
-		droplets, err := c.listDropletsByTag(ctx, leaseTag)
-		if err == nil {
-			var matches []droplet
-			for _, item := range droplets {
-				if item.Name == name && isOwnedDroplet(item) && labelsFromTags(item.Tags)["lease"] == leaseID {
-					matches = append(matches, item)
-				}
+	return pollReconciliation(ctx, interval,
+		func(observeCtx context.Context) ([]droplet, error) {
+			droplets, err := c.listDropletsByTag(observeCtx, leaseTag)
+			if err != nil {
+				return nil, err
 			}
+			return slices.DeleteFunc(droplets, func(item droplet) bool {
+				return item.Name != name || !isOwnedDroplet(item) || labelsFromTags(item.Tags)["lease"] != leaseID
+			}), nil
+		},
+		func(matches []droplet) (droplet, bool, error) {
 			switch len(matches) {
 			case 1:
-				return matches[0], nil
+				return matches[0], true, nil
 			case 0:
-				lastErr = core.Exit(4, "digitalocean create reconciliation did not find lease=%s", leaseID)
+				return droplet{}, false, nil
 			default:
-				return droplet{}, core.Exit(2, "digitalocean create reconciliation found multiple droplets for lease=%s", leaseID)
+				return droplet{}, false, core.Exit(2, "digitalocean create reconciliation found multiple droplets for lease=%s", leaseID)
 			}
-		} else {
-			lastErr = err
-		}
-
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return droplet{}, errors.Join(lastErr, ctx.Err())
-		case <-timer.C:
-		}
-	}
+		}, core.Exit(4, "digitalocean create reconciliation did not find lease=%s", leaseID))
 }
 
 func (c *digitalOceanClient) rollbackCreatedSSHKey(key sshKey, cause error) error {
@@ -526,7 +584,7 @@ func (c *digitalOceanClient) EnsureSSHKey(ctx context.Context, name, publicKey s
 				return sshKey{}, false, conflict
 			}
 			return sshKey{}, false, &ambiguousSSHKeyCreateError{err: errors.Join(
-				fmt.Errorf("digitalocean ssh key creation returned incomplete identity: id=%d name=%q", res.SSHKey.ID, res.SSHKey.Name),
+				fmt.Errorf("digitalocean ssh key creation returned incomplete identity: id=%d name=%q", res.SSHKey.ID, shared.RedactErrorSecrets(res.SSHKey.Name, c.token)),
 				reconcileErr,
 			)}
 		}
@@ -551,28 +609,9 @@ func (c *digitalOceanClient) reconcileSSHKey(name, publicKey string) (sshKey, er
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	var lastErr error
-	for {
-		keys, err := c.ListSSHKeys(ctx)
-		if err == nil {
-			if key, found, selectErr := selectSSHKey(keys, name, publicKey); selectErr != nil {
-				return sshKey{}, selectErr
-			} else if found {
-				return key, nil
-			}
-			lastErr = core.Exit(4, "digitalocean ssh key reconciliation did not find %q", name)
-		} else {
-			lastErr = err
-		}
-
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return sshKey{}, errors.Join(lastErr, ctx.Err())
-		case <-timer.C:
-		}
-	}
+	return pollReconciliation(ctx, interval, c.ListSSHKeys, func(keys []sshKey) (sshKey, bool, error) {
+		return selectSSHKey(keys, name, publicKey)
+	}, core.Exit(4, "digitalocean ssh key reconciliation did not find %q", name))
 }
 
 func selectSSHKey(keys []sshKey, name, publicKey string) (sshKey, bool, error) {
@@ -614,6 +653,39 @@ func (c *digitalOceanClient) FindSSHKey(ctx context.Context, name, publicKey str
 		return sshKey{}, false, err
 	}
 	return selectSSHKey(keys, name, publicKey)
+}
+
+func (c *digitalOceanClient) FindSSHKeyByID(ctx context.Context, id int64) (sshKey, bool, error) {
+	var res struct {
+		SSHKey sshKey `json:"ssh_key"`
+	}
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/account/keys/%d", id), nil, &res)
+	if isDigitalOceanNotFound(err) {
+		return sshKey{}, false, nil
+	}
+	if err != nil {
+		return sshKey{}, false, err
+	}
+	return res.SSHKey, true, nil
+}
+
+func (c *digitalOceanClient) FindSSHKeyByPublicKey(ctx context.Context, publicKey string) (sshKey, bool, error) {
+	keys, err := c.ListSSHKeys(ctx)
+	if err != nil {
+		return sshKey{}, false, err
+	}
+	publicKey = strings.TrimSpace(publicKey)
+	var match sshKey
+	matches := 0
+	for _, key := range keys {
+		if strings.TrimSpace(key.PublicKey) == publicKey {
+			match, matches = key, matches+1
+		}
+	}
+	if matches > 1 {
+		return sshKey{}, false, core.Exit(4, "digitalocean SSH key has multiple entries matching the retained public key")
+	}
+	return match, matches == 1, nil
 }
 
 func (c *digitalOceanClient) DeleteSSHKey(ctx context.Context, id int64) error {
@@ -670,7 +742,7 @@ func (c *digitalOceanClient) resolveCreateTagConflict(ctx context.Context, tags 
 	for _, tag := range tags {
 		name := tag
 		if existingName := known[strings.ToLower(tag)]; existingName != "" {
-			name, err = canonicalTagName(tag, existingName)
+			name, err = canonicalTagName(tag, existingName, c.token)
 			if err != nil {
 				return nil, "", false, err
 			}
@@ -681,7 +753,7 @@ func (c *digitalOceanClient) resolveCreateTagConflict(ctx context.Context, tags 
 		}
 		canonical = append(canonical, name)
 	}
-	return normalizeTags(canonical), leaseTag, changed, nil
+	return shared.NormalizeTags(canonical), leaseTag, changed, nil
 }
 
 func (c *digitalOceanClient) resolveCanonicalLeaseTag(ctx context.Context, leaseID string) (string, error) {
@@ -691,19 +763,20 @@ func (c *digitalOceanClient) resolveCanonicalLeaseTag(ctx context.Context, lease
 		return "", err
 	}
 	if existing := canonicalTagNames(tags)[strings.ToLower(requested)]; existing != "" {
-		return canonicalTagName(requested, existing)
+		return canonicalTagName(requested, existing, c.token)
 	}
 	return requested, nil
 }
 
-func canonicalTagName(requested, existing string) (string, error) {
+func canonicalTagName(requested, existing string, secrets ...string) (string, error) {
 	existing = strings.TrimSpace(existing)
 	if existing == "" {
 		existing = requested
 	}
 	requestedLabels := labelsFromTags([]string{requested})
 	if len(requestedLabels) == 0 || !maps.Equal(requestedLabels, labelsFromTags([]string{existing})) {
-		return "", core.Exit(2, "digitalocean tag %q conflicts with existing account tag %q", requested, existing)
+		safeExisting := shared.RedactErrorSecrets(existing, secrets...)
+		return "", core.Exit(2, "digitalocean tag %q conflicts with existing account tag %q", requested, safeExisting)
 	}
 	return existing, nil
 }
@@ -725,12 +798,12 @@ func (c *digitalOceanClient) GetTag(ctx context.Context, name string) (digitalOc
 func (c *digitalOceanClient) EnsureTag(ctx context.Context, tag string, known map[string]string) (string, error) {
 	key := strings.ToLower(tag)
 	if canonical := known[key]; canonical != "" {
-		return canonicalTagName(tag, canonical)
+		return canonicalTagName(tag, canonical, c.token)
 	}
 	if existing, ok, err := c.GetTag(ctx, tag); err != nil {
 		return "", err
 	} else if ok {
-		canonical, canonicalErr := canonicalTagName(tag, existing.Name)
+		canonical, canonicalErr := canonicalTagName(tag, existing.Name, c.token)
 		if canonicalErr != nil {
 			return "", canonicalErr
 		}
@@ -742,7 +815,7 @@ func (c *digitalOceanClient) EnsureTag(ctx context.Context, tag string, known ma
 	}
 	err := c.do(ctx, http.MethodPost, "/tags", map[string]any{"name": tag}, &res)
 	if err == nil {
-		canonical, canonicalErr := canonicalTagName(tag, res.Tag.Name)
+		canonical, canonicalErr := canonicalTagName(tag, res.Tag.Name, c.token)
 		if canonicalErr != nil {
 			return "", canonicalErr
 		}
@@ -761,14 +834,14 @@ func (c *digitalOceanClient) EnsureTag(ctx context.Context, tag string, known ma
 		known[folded] = canonical
 	}
 	if canonical := known[key]; canonical != "" {
-		return canonicalTagName(tag, canonical)
+		return canonicalTagName(tag, canonical, c.token)
 	}
 	return "", err
 }
 
 func (c *digitalOceanClient) ReplaceDropletTags(ctx context.Context, id int64, currentTags, desiredTags []string) error {
-	currentTags = normalizeTags(currentTags)
-	desiredTags = normalizeTags(desiredTags)
+	currentTags = shared.NormalizeTags(currentTags)
+	desiredTags = shared.NormalizeTags(desiredTags)
 	current := make(map[string]bool, len(currentTags))
 	for _, tag := range currentTags {
 		current[strings.ToLower(tag)] = true
@@ -818,7 +891,7 @@ func digitalOceanRegion(cfg core.Config) string {
 	if cfg.Location != "" {
 		return cfg.Location
 	}
-	return "nyc3"
+	return core.DigitalOceanRegionFallback
 }
 
 func digitalOceanImage(cfg core.Config) string {
@@ -828,7 +901,7 @@ func digitalOceanImage(cfg core.Config) string {
 	if cfg.Image != "" {
 		return cfg.Image
 	}
-	return "ubuntu-24-04-x64"
+	return core.DigitalOceanImageFallback
 }
 
 func providerKeyForLease(leaseID string) string {

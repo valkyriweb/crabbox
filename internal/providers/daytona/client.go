@@ -5,17 +5,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
-	daytona "github.com/daytonaio/daytona/libs/api-client-go"
-	sdkdaytona "github.com/daytonaio/daytona/libs/sdk-go/pkg/daytona"
-	sdktypes "github.com/daytonaio/daytona/libs/sdk-go/pkg/types"
+	daytona "github.com/daytona/clients/api-client-go"
+	sdkdaytona "github.com/daytona/clients/sdk-go/pkg/daytona"
+	sdktypes "github.com/daytona/clients/sdk-go/pkg/types"
+	toolbox "github.com/daytona/clients/toolbox-api-client-go"
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type daytonaAPI interface {
+	GetSnapshot(context.Context, string) (*daytona.SnapshotDto, error)
 	CreateSandbox(context.Context, daytona.CreateSandbox) (*daytona.Sandbox, error)
 	GetSandbox(context.Context, string) (*daytona.Sandbox, error)
 	ListCrabboxSandboxes(context.Context) ([]daytona.Sandbox, error)
@@ -23,6 +30,7 @@ type daytonaAPI interface {
 	DeleteSandbox(context.Context, string) error
 	ReplaceLabels(context.Context, string, map[string]string) error
 	UpdateLastActivity(context.Context, string) error
+	SetAutoStopInterval(context.Context, string, time.Duration) error
 	CreateSSHAccess(context.Context, string, time.Duration) (daytonaSSHAccess, error)
 }
 
@@ -32,14 +40,17 @@ type daytonaSSHAccess struct {
 }
 
 type daytonaSDKClient struct {
-	api   *daytona.APIClient
-	token string
-	orgID string
+	api    *daytona.APIClient
+	token  string
+	orgID  string
+	apiURL string
+	apiKey bool
 }
 
 const defaultDaytonaAPIURL = "https://app.daytona.io/api"
+const daytonaControlTimeout = 60 * time.Second
 
-var newDaytonaClient = func(cfg Config, rt Runtime) (daytonaAPI, error) {
+var newDaytonaClient = func(cfg core.Config, rt core.Runtime) (daytonaAPI, error) {
 	auth, err := daytonaAuthConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -47,10 +58,51 @@ var newDaytonaClient = func(cfg Config, rt Runtime) (daytonaAPI, error) {
 	apiURL := daytonaAPIURL(cfg, auth)
 	apiCfg := daytona.NewConfiguration()
 	apiCfg.Servers = daytona.ServerConfigurations{{URL: apiURL}}
-	if rt.HTTP != nil {
-		apiCfg.HTTPClient = rt.HTTP
+	// Request builders own this header. A default adds a second literal-key
+	// copy beside Go's canonical key, which Daytona rejects for OAuth profiles.
+	controlClient := rt.HTTP
+	if controlClient == nil {
+		controlClient = &http.Client{Timeout: daytonaControlTimeout}
 	}
-	return &daytonaSDKClient{api: daytona.NewAPIClient(apiCfg), token: auth.token(), orgID: auth.OrganizationID}, nil
+	apiCfg.HTTPClient, err = daytonaHTTPClient(controlClient, apiURL)
+	if err != nil {
+		return nil, err
+	}
+	return &daytonaSDKClient{api: daytona.NewAPIClient(apiCfg), token: auth.token(), orgID: auth.OrganizationID, apiURL: apiURL, apiKey: auth.APIKey != ""}, nil
+}
+
+// Resolve native organization identity using the same authenticated client.
+// An API key's optional organization header is not an attestation: Daytona
+// derives its organization from the key and ignores that header.
+func (c *daytonaSDKClient) fixedOrganization(ctx context.Context) (string, string, error) {
+	if !c.apiKey {
+		if c.orgID == "" {
+			return "", "", core.Exit(4, "Daytona account binding requires a selected organization")
+		}
+		organization, _, err := c.api.OrganizationsAPI.GetOrganization(c.ctx(ctx), c.orgID).Execute()
+		if err != nil {
+			return "", "", c.redactError(err)
+		}
+		if organization == nil || organization.GetId() != c.orgID {
+			return "", "", core.Exit(4, "Daytona authenticated organization does not match the selected organization")
+		}
+		return c.apiURL, organization.GetId(), nil
+	}
+	key, _, err := c.api.ApiKeysAPI.GetCurrentApiKey(c.ctx(ctx)).Execute()
+	if err != nil {
+		return "", "", c.redactError(err)
+	}
+	if key == nil {
+		return "", "", core.Exit(4, "Daytona current API-key response is missing its identity")
+	}
+	organization := key.GetOrganizationId()
+	if strings.TrimSpace(organization) == "" || organization != strings.TrimSpace(organization) {
+		return "", "", core.Exit(4, "Daytona current API-key response has an invalid organization identity")
+	}
+	if c.orgID != "" && c.orgID != organization {
+		return "", "", core.Exit(4, "Daytona authenticated API-key organization differs from the selected organization")
+	}
+	return c.apiURL, organization, nil
 }
 
 type daytonaAuth struct {
@@ -67,7 +119,7 @@ func (a daytonaAuth) token() string {
 	return a.JWTToken
 }
 
-func daytonaAuthConfig(cfg Config) (daytonaAuth, error) {
+func daytonaAuthConfig(cfg core.Config) (daytonaAuth, error) {
 	auth := daytonaAuth{
 		APIKey:         strings.TrimSpace(cfg.Daytona.APIKey),
 		JWTToken:       strings.TrimSpace(cfg.Daytona.JWTToken),
@@ -82,10 +134,10 @@ func daytonaAuthConfig(cfg Config) (daytonaAuth, error) {
 		}
 	}
 	if auth.APIKey == "" && auth.JWTToken == "" {
-		return daytonaAuth{}, exit(3, "provider=daytona requires DAYTONA_API_KEY, DAYTONA_JWT_TOKEN, or an authenticated Daytona CLI profile")
+		return daytonaAuth{}, core.Exit(3, "provider=daytona requires DAYTONA_API_KEY, DAYTONA_JWT_TOKEN, or an authenticated Daytona CLI profile")
 	}
 	if auth.APIKey == "" && auth.JWTToken != "" && auth.OrganizationID == "" {
-		return daytonaAuth{}, exit(3, "provider=daytona with DAYTONA_JWT_TOKEN requires DAYTONA_ORGANIZATION_ID")
+		return daytonaAuth{}, core.Exit(3, "provider=daytona with DAYTONA_JWT_TOKEN requires DAYTONA_ORGANIZATION_ID")
 	}
 	if err := validateNativeCredentialDestination(cfg); err != nil {
 		return daytonaAuth{}, err
@@ -93,7 +145,7 @@ func daytonaAuthConfig(cfg Config) (daytonaAuth, error) {
 	return auth, nil
 }
 
-func daytonaAPIURL(cfg Config, auth daytonaAuth) string {
+func daytonaAPIURL(cfg core.Config, auth daytonaAuth) string {
 	configured := strings.TrimSpace(cfg.Daytona.APIURL)
 	if configured != "" && configured != defaultDaytonaAPIURL {
 		return strings.TrimRight(configured, "/")
@@ -101,21 +153,43 @@ func daytonaAPIURL(cfg Config, auth daytonaAuth) string {
 	if auth.APIURL != "" {
 		return strings.TrimRight(auth.APIURL, "/")
 	}
-	return strings.TrimRight(blank(configured, defaultDaytonaAPIURL), "/")
+	return strings.TrimRight(core.Blank(configured, defaultDaytonaAPIURL), "/")
 }
 
-func newDaytonaToolboxClient(cfg Config) (*sdkdaytona.Client, error) {
-	auth, err := daytonaAuthConfig(cfg)
+func daytonaHTTPClient(source *http.Client, endpoint string) (*http.Client, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid Daytona HTTP endpoint")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")) {
+		return nil, fmt.Errorf("Daytona HTTP endpoint must use HTTPS except for loopback tests")
+	}
+	if source == nil {
+		source = http.DefaultClient
+	}
+	return shared.SecureHTTPClient(source, u, func(*url.URL) error {
+		return fmt.Errorf("daytona refused cross-origin HTTP redirect")
+	}), nil
+}
+
+// The adapter owns allocation and HTTP policy; SDK services own only toolbox operations.
+func newDaytonaToolboxSandbox(cfg core.Config, rt core.Runtime, sandbox *daytona.Sandbox) (*sdkdaytona.Sandbox, error) {
+	headers, err := daytonaToolboxHeaders(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return sdkdaytona.NewClientWithConfig(&sdktypes.DaytonaConfig{
-		APIKey:         auth.APIKey,
-		JWTToken:       auth.JWTToken,
-		OrganizationID: auth.OrganizationID,
-		APIUrl:         daytonaAPIURL(cfg, auth),
-		Target:         strings.TrimSpace(cfg.Daytona.Target),
-	})
+	endpoint := strings.TrimRight(sandbox.GetToolboxProxyUrl(), "/") + "/" + url.PathEscape(sandbox.GetId())
+	httpClient, err := daytonaHTTPClient(rt.HTTP, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	toolboxConfig := toolbox.NewConfiguration()
+	toolboxConfig.Servers = toolbox.ServerConfigurations{{URL: endpoint}}
+	toolboxConfig.HTTPClient = httpClient
+	for key, value := range headers {
+		toolboxConfig.AddDefaultHeader(key, value)
+	}
+	return sdkdaytona.NewSandbox(nil, toolbox.NewAPIClient(toolboxConfig), sandbox, sdktypes.CodeLanguagePython, nil), nil
 }
 
 type daytonaCLIConfig struct {
@@ -128,8 +202,12 @@ type daytonaCLIProfile struct {
 	Name                 string `json:"name"`
 	ActiveOrganizationID string `json:"activeOrganizationId"`
 	API                  struct {
-		URL string `json:"url"`
-		Key string `json:"key"`
+		URL   string `json:"url"`
+		Key   string `json:"key"`
+		Token *struct {
+			AccessToken string `json:"accessToken"`
+			ExpiresAt   string `json:"expiresAt"`
+		} `json:"token"`
 	} `json:"api"`
 }
 
@@ -155,6 +233,10 @@ func daytonaCLIAuthConfig() (daytonaAuth, error) {
 }
 
 func daytonaCLIConfigPaths() []string {
+	if dir := os.Getenv("DAYTONA_CONFIG_DIR"); dir != "" {
+		// The CLI override selects one profile store, never a fallback account.
+		return []string{filepath.Join(dir, "config.json")}
+	}
 	var candidates []string
 	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
 		candidates = append(candidates,
@@ -205,11 +287,21 @@ func parseDaytonaCLIAuthConfig(data []byte) (daytonaAuth, error) {
 	if selected == nil {
 		return daytonaAuth{}, nil
 	}
-	return daytonaAuth{
+	auth := daytonaAuth{
 		APIKey:         strings.TrimSpace(selected.API.Key),
 		OrganizationID: strings.TrimSpace(selected.ActiveOrganizationID),
 		APIURL:         strings.TrimSpace(selected.API.URL),
-	}, nil
+	}
+	if auth.APIKey == "" && selected.API.Token != nil {
+		token := selected.API.Token
+		expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt)
+		if err != nil || !time.Now().Before(expiresAt) {
+			return daytonaAuth{}, fmt.Errorf("daytona CLI OAuth token is expired or has no valid expiry; run 'daytona login' to reauthenticate")
+		}
+		// Refresh and profile writes belong to the Daytona CLI, not this reader.
+		auth.JWTToken = strings.TrimSpace(token.AccessToken)
+	}
+	return auth, nil
 }
 
 func mergeDaytonaCLIAuth(auth, cliAuth daytonaAuth) daytonaAuth {
@@ -236,7 +328,7 @@ func (c *daytonaSDKClient) CreateSandbox(ctx context.Context, body daytona.Creat
 		req = req.XDaytonaOrganizationID(c.orgID)
 	}
 	out, _, err := req.Execute()
-	return out, err
+	return out, c.redactError(err)
 }
 
 func (c *daytonaSDKClient) GetSandbox(ctx context.Context, id string) (*daytona.Sandbox, error) {
@@ -245,7 +337,7 @@ func (c *daytonaSDKClient) GetSandbox(ctx context.Context, id string) (*daytona.
 		req = req.XDaytonaOrganizationID(c.orgID)
 	}
 	out, _, err := req.Execute()
-	return out, err
+	return out, c.redactError(err)
 }
 
 func (c *daytonaSDKClient) ListCrabboxSandboxes(ctx context.Context) ([]daytona.Sandbox, error) {
@@ -262,7 +354,7 @@ func (c *daytonaSDKClient) ListCrabboxSandboxes(ctx context.Context) ([]daytona.
 		}
 		out, _, err := req.Execute()
 		if err != nil {
-			return nil, err
+			return nil, c.redactError(err)
 		}
 		if out == nil {
 			return all, nil
@@ -343,16 +435,37 @@ func (c *daytonaSDKClient) StartSandbox(ctx context.Context, id string) (*dayton
 		req = req.XDaytonaOrganizationID(c.orgID)
 	}
 	out, _, err := req.Execute()
-	return out, err
+	return out, c.redactError(err)
 }
 
 func (c *daytonaSDKClient) DeleteSandbox(ctx context.Context, id string) error {
+	_, err := c.requestSandboxDeletion(ctx, id)
+	return err
+}
+
+func (c *daytonaSDKClient) requestSandboxDeletion(ctx context.Context, id string) (*daytona.Sandbox, error) {
 	req := c.api.SandboxAPI.DeleteSandbox(c.ctx(ctx), id)
 	if c.orgID != "" {
 		req = req.XDaytonaOrganizationID(c.orgID)
 	}
-	_, _, err := req.Execute()
-	return err
+	out, _, err := req.Execute()
+	return out, c.redactError(err)
+}
+
+func (c *daytonaSDKClient) fixedSelection() (string, string) { return c.apiURL, c.orgID }
+
+func (c *daytonaSDKClient) attestDeletionOrganization(ctx context.Context, expected string) error {
+	if expected == "" || c.orgID != "" && c.orgID != expected {
+		return core.Exit(4, "Daytona deletion organization differs from the selected organization")
+	}
+	_, organization, err := c.fixedOrganization(ctx)
+	if err != nil {
+		return err
+	}
+	if organization != expected {
+		return core.Exit(4, "Daytona deletion organization could not be attested")
+	}
+	return nil
 }
 
 func (c *daytonaSDKClient) ReplaceLabels(ctx context.Context, id string, labels map[string]string) error {
@@ -361,26 +474,35 @@ func (c *daytonaSDKClient) ReplaceLabels(ctx context.Context, id string, labels 
 		req = req.XDaytonaOrganizationID(c.orgID)
 	}
 	_, _, err := req.Execute()
-	return err
+	return c.redactError(err)
 }
 
 func (c *daytonaSDKClient) UpdateLastActivity(ctx context.Context, id string) error {
-	req := c.api.SandboxAPI.UpdateLastActivity(c.ctx(ctx), id)
+	req := c.api.SandboxAPI.UpdateLastActivity(c.ctx(ctx), id).UpdateLastActivity(daytona.UpdateLastActivity{})
 	if c.orgID != "" {
 		req = req.XDaytonaOrganizationID(c.orgID)
 	}
 	_, err := req.Execute()
-	return err
+	return c.redactError(err)
+}
+
+func (c *daytonaSDKClient) SetAutoStopInterval(ctx context.Context, id string, interval time.Duration) error {
+	req := c.api.SandboxAPI.SetAutostopInterval(c.ctx(ctx), id, float32(core.DurationMinutesCeil(interval)))
+	if c.orgID != "" {
+		req = req.XDaytonaOrganizationID(c.orgID)
+	}
+	_, _, err := req.Execute()
+	return c.redactError(err)
 }
 
 func (c *daytonaSDKClient) CreateSSHAccess(ctx context.Context, id string, ttl time.Duration) (daytonaSSHAccess, error) {
-	req := c.api.SandboxAPI.CreateSshAccess(c.ctx(ctx), id).ExpiresInMinutes(float32(durationMinutesCeil(ttl)))
+	req := c.api.SandboxAPI.CreateSshAccess(c.ctx(ctx), id).ExpiresInMinutes(float32(core.DurationMinutesCeil(ttl)))
 	if c.orgID != "" {
 		req = req.XDaytonaOrganizationID(c.orgID)
 	}
 	out, _, err := req.Execute()
 	if err != nil {
-		return daytonaSSHAccess{}, err
+		return daytonaSSHAccess{}, c.redactError(err)
 	}
 	if out == nil || out.GetToken() == "" {
 		return daytonaSSHAccess{}, fmt.Errorf("daytona ssh access response missing token")
@@ -388,18 +510,87 @@ func (c *daytonaSDKClient) CreateSSHAccess(ctx context.Context, id string, ttl t
 	return daytonaSSHAccess{Token: out.GetToken(), Command: out.GetSshCommand()}, nil
 }
 
-func daytonaError(action string, err error) error {
+func (c *daytonaSDKClient) redactError(err error) error {
 	if err == nil {
 		return nil
 	}
 	var apiErr *daytona.GenericOpenAPIError
 	if errors.As(err, &apiErr) {
-		body := strings.TrimSpace(summarizeJSON(apiErr.Body()))
+		return &redactedDaytonaAPIError{
+			err:     err,
+			message: redactDaytonaSecrets(apiErr.Error(), c.token),
+			body:    []byte(redactDaytonaSecrets(string(apiErr.Body()), c.token)),
+		}
+	}
+	return err
+}
+
+type redactedDaytonaAPIError struct {
+	err     error
+	message string
+	body    []byte
+}
+
+func (e *redactedDaytonaAPIError) Error() string {
+	return e.message
+}
+
+func (e *redactedDaytonaAPIError) Body() []byte {
+	return e.body
+}
+
+func (e *redactedDaytonaAPIError) Unwrap() error {
+	return e.err
+}
+
+func daytonaError(action string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var redactedAPIError *redactedDaytonaAPIError
+	if errors.As(err, &redactedAPIError) {
+		body := strings.TrimSpace(redactDaytonaSecrets(core.SummarizeJSON(redactedAPIError.Body())))
 		if body != "" {
-			return fmt.Errorf("daytona %s: %s: %s", action, apiErr.Error(), body)
+			return fmt.Errorf("daytona %s: %s: %s", action, redactDaytonaSecrets(redactedAPIError.Error()), body)
+		}
+		return fmt.Errorf("daytona %s: %s", action, redactDaytonaSecrets(redactedAPIError.Error()))
+	}
+	var apiErr *daytona.GenericOpenAPIError
+	if errors.As(err, &apiErr) {
+		body := strings.TrimSpace(redactDaytonaSecrets(core.SummarizeJSON(apiErr.Body())))
+		if body != "" {
+			return fmt.Errorf("daytona %s: %s: %s", action, redactDaytonaSecrets(apiErr.Error()), body)
 		}
 	}
 	return fmt.Errorf("daytona %s: %w", action, err)
+}
+
+var daytonaBearerPattern = regexp.MustCompile(`(?i)\bbearer\s+[^\s"',;\\]+`)
+
+func redactDaytonaSecrets(value string, secrets ...string) string {
+	redacted := value
+	for _, secret := range secrets {
+		secret = strings.TrimSpace(secret)
+		if secret != "" {
+			redacted = strings.ReplaceAll(redacted, secret, daytonaTokenRedacted)
+		}
+	}
+	redacted = daytonaBearerPattern.ReplaceAllString(redacted, "Bearer "+daytonaTokenRedacted)
+	for _, key := range []string{"authorization", "apiKey", "api_key", "accessToken", "access_token", "jwtToken", "jwt_token", "token"} {
+		redacted = redactDaytonaJSONSecretField(redacted, key)
+	}
+	return redacted
+}
+
+func redactDaytonaJSONSecretField(value, key string) string {
+	pattern := regexp.MustCompile(`(?i)"` + regexp.QuoteMeta(key) + `"\s*:\s*"[^"]*"`)
+	return pattern.ReplaceAllStringFunc(value, func(match string) string {
+		colon := strings.Index(match, ":")
+		if colon < 0 {
+			return match
+		}
+		return match[:colon+1] + `"` + daytonaTokenRedacted + `"`
+	})
 }
 
 func daytonaIsNotFoundError(err error) bool {

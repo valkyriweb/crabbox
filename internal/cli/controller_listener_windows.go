@@ -24,6 +24,10 @@ var windowsGetExtendedTCPTable = windows.NewLazySystemDLL("iphlpapi.dll").NewPro
 
 func controllerListenerOwnershipSupported() bool { return true }
 
+func sshForwardRootListenerReady(port string, pid int) error {
+	return controllerVerifyDaemonOwnedListener(port, pid)
+}
+
 func controllerVerifyDaemonOwnedListener(port string, expectedPID int) error {
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 || expectedPID <= 0 {
@@ -61,6 +65,10 @@ func controllerVerifyDaemonOwnedListener(port string, expectedPID int) error {
 		return fmt.Errorf("no tracked IPv4 loopback listener found on port %d", portNumber)
 	}
 	return nil
+}
+
+func controllerVerifyDaemonOwnedListenerWithEnvironment(port string, expectedPID int, _ []string) error {
+	return controllerVerifyDaemonOwnedListener(port, expectedPID)
 }
 
 func controllerWindowsTCPListenerTable() ([]byte, error) {

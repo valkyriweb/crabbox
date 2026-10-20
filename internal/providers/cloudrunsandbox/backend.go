@@ -1,0 +1,925 @@
+package cloudrunsandbox
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"reflect"
+	"regexp"
+	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+func NewBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
+	cfg.Provider = providerName
+	return &backend{spec: spec, cfg: cfg, rt: rt}
+}
+
+type backend struct {
+	spec core.ProviderSpec
+	cfg  core.Config
+	rt   core.Runtime
+}
+
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
+
+func (b *backend) Warmup(ctx context.Context, req core.WarmupRequest) error {
+	if req.ActionsRunner {
+		return core.Exit(2, "--actions-runner is not supported for provider=%s", providerName)
+	}
+	if req.Options.Desktop || req.Options.Browser || req.Options.Code {
+		return core.Exit(2, "provider=%s does not support desktop, browser, or code-server options", providerName)
+	}
+	if req.Options.Tailscale.Enabled {
+		return core.Exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
+	}
+	started := core.ClockNow(b.rt.Clock)
+	transport, err := newTransport(b.cfg, b.rt)
+	if err != nil {
+		return err
+	}
+	leaseID, sandboxID, slug, _, err := b.createSandbox(ctx, transport, req.Repo, req.Reclaim, req.RequestedSlug)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(b.rt.Stdout, "leased %s slug=%s provider=%s sandbox=%s mode=%s\n", leaseID, slug, providerName, sandboxID, transport.Mode())
+	if !req.Keep {
+		fmt.Fprintf(b.rt.Stderr, "warning: cloud-run-sandbox warmup keeps the sandbox until explicit stop\n")
+	}
+	total := core.ClockNow(b.rt.Clock).Sub(started)
+	return shared.CompleteWarmup(b.rt, req.TimingJSON, shared.WarmupCompletion{
+		Provider: providerName,
+		LeaseID:  leaseID,
+		Slug:     slug,
+		Total:    total,
+	})
+}
+
+func (b *backend) Run(ctx context.Context, req core.RunRequest) (finalResult core.RunResult, finalErr error) {
+	if err := core.RejectDelegatedSyncOptionsForSpec(b.spec, req); err != nil {
+		return core.RunResult{}, err
+	}
+	if req.Options.Desktop || req.Options.Browser || req.Options.Code {
+		return core.RunResult{}, core.Exit(2, "provider=%s does not support desktop, browser, or code-server options", providerName)
+	}
+	if req.Options.Tailscale.Enabled {
+		return core.RunResult{}, core.Exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
+	}
+	var command core.CommandIntent
+	if !req.SyncOnly {
+		var err error
+		command, err = core.ParseCommandIntent(req.Command, req.ShellMode, req.CommandLiteralArgs)
+		if err != nil {
+			return core.RunResult{}, core.Exit(2, "%v", err)
+		}
+	}
+	workdir, err := cloudRunSandboxWorkdir(b.cfg)
+	if err != nil {
+		return core.RunResult{}, err
+	}
+	started := core.ClockNow(b.rt.Clock)
+	transport, err := newTransport(b.cfg, b.rt)
+	if err != nil {
+		return core.RunResult{}, err
+	}
+	var prepared *core.PreparedArchive
+	if req.ID == "" && !req.NoSync {
+		prepared, err = b.workspace(transport, "", req, workdir).PrepareArchive(ctx)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		defer prepared.Close()
+	}
+	leaseID, sandboxID, slug := "", "", ""
+	var claim core.LeaseClaim
+	acquired := false
+	if req.ID == "" {
+		leaseID, sandboxID, slug, claim, err = b.createSandbox(ctx, transport, req.Repo, req.Reclaim, req.RequestedSlug)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		fmt.Fprintf(b.rt.Stderr, "leased %s slug=%s provider=%s sandbox=%s mode=%s\n", leaseID, slug, providerName, sandboxID, transport.Mode())
+		acquired = true
+	} else {
+		leaseID, sandboxID, slug, claim, err = b.resolveLeaseID(req.ID, req.Repo.Root, req.Reclaim)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		if state, ready := b.claimStatus(claim); !ready {
+			return core.RunResult{}, core.Exit(4, "cloud-run-sandbox lease %q is not ready for execution (state=%s)", leaseID, state)
+		}
+	}
+	shouldStop := acquired && !req.Keep
+	session := &core.RunSessionHandle{
+		Provider:       providerName,
+		LeaseID:        leaseID,
+		Slug:           slug,
+		Reused:         !acquired,
+		Kept:           !shouldStop,
+		CleanupCommand: cleanupCommand(b.cfg, leaseID),
+	}
+	pendingTiming := core.TimingReport{
+		Provider:      providerName,
+		LeaseID:       leaseID,
+		Slug:          slug,
+		SyncDelegated: true,
+		SyncSkipped:   req.NoSync,
+		Label:         strings.TrimSpace(req.Label),
+	}
+	var syncDuration time.Duration
+	commandRan := false
+	defer func() {
+		finalResult, finalErr = shared.PinDelegatedRunFailure(finalResult, finalErr)
+		if shouldStop {
+			cleanupCtx, cancel := b.cleanupContext(ctx)
+			killErr := b.releaseClaimedSandboxIfUnchanged(cleanupCtx, transport, sandboxID, claim)
+			cancel()
+			if killErr != nil {
+				fmt.Fprintf(b.rt.Stderr, "warning: cloud-run-sandbox destroy failed for %s: %v\n", sandboxID, killErr)
+				session.Kept = true
+				finalResult, finalErr = appendRunFailure(finalResult, finalErr, fmt.Errorf("cloud-run-sandbox automatic teardown failed; recovery claim retained lease=%s: %w", leaseID, killErr))
+			} else {
+				session.Kept = false
+			}
+		} else {
+			session.Kept = true
+		}
+		finalResult.Total = core.ClockNow(b.rt.Clock).Sub(started)
+		finalResult = core.FinalizeRunResult(finalResult, finalErr)
+		if commandRan {
+			if req.NoSync {
+				fmt.Fprintf(b.rt.Stderr, "cloud-run-sandbox run summary sync_skipped=true command=%s total=%s exit=%d\n", finalResult.Command.Round(time.Millisecond), finalResult.Total.Round(time.Millisecond), finalResult.ExitCode)
+			} else {
+				fmt.Fprintf(b.rt.Stderr, "cloud-run-sandbox run summary sync=%s command=%s total=%s exit=%d\n", syncDuration.Round(time.Millisecond), finalResult.Command.Round(time.Millisecond), finalResult.Total.Round(time.Millisecond), finalResult.ExitCode)
+			}
+		}
+		if req.TimingJSON {
+			pendingTiming.ExitCode = finalResult.ExitCode
+			pendingTiming.TotalMs = finalResult.Total.Milliseconds()
+			report := core.TimingReportWithRunResult(pendingTiming, finalResult, finalErr)
+			finalResult, finalErr = appendRunFailure(finalResult, finalErr, core.WriteTimingJSON(b.rt.Stderr, report))
+		}
+	}()
+	activityTimeout, err := claimOperationTimeout(claim, leaseActivityTimeout, core.ClockNow(b.rt.Clock).UTC())
+	if err != nil {
+		return core.RunResult{Provider: providerName, LeaseID: leaseID, Slug: slug, Session: session}, err
+	}
+	claim, err = b.markClaimActivity(claim, "running", activityTimeout)
+	if err != nil {
+		return core.RunResult{Provider: providerName, LeaseID: leaseID, Slug: slug, Session: session}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, activityTimeout)
+	defer cancel()
+	var guardedResult core.RunResult
+	var guardedErr error
+	guardErr := core.WithLeaseClaimUnchanged(leaseID, claim, func() error {
+		guardedResult, guardedErr = func() (core.RunResult, error) {
+			fmt.Fprintf(b.rt.Stderr, "provider=%s lease=%s sandbox=%s workdir=%s mode=%s\n", providerName, leaseID, sandboxID, workdir, transport.Mode())
+
+			syncPhases := []core.TimingPhase{{Name: "sync", Skipped: true, Reason: "--no-sync"}}
+			if req.TimingJSON {
+				pendingTiming.SyncPhases = syncPhases
+			}
+			if !req.NoSync {
+				syncPhases, syncDuration, err = b.workspace(transport, sandboxID, req, workdir).Sync(ctx, prepared)
+				if req.TimingJSON {
+					pendingTiming.SyncMs = syncDuration.Milliseconds()
+					pendingTiming.SyncPhases = syncPhases
+				}
+				if err != nil {
+					core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, leaseID, slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, &shouldStop)
+					return core.RunResult{Provider: providerName, LeaseID: leaseID, Slug: slug, Total: core.ClockNow(b.rt.Clock).Sub(started), SyncDelegated: true, Session: session}, err
+				}
+				fmt.Fprintf(b.rt.Stderr, "sync complete in %s\n", syncDuration.Round(time.Millisecond))
+			} else if err := b.workspace(transport, sandboxID, req, workdir).Ensure(ctx); err != nil {
+				core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, leaseID, slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, &shouldStop)
+				return core.RunResult{Provider: providerName, LeaseID: leaseID, Slug: slug, Total: core.ClockNow(b.rt.Clock).Sub(started), SyncDelegated: true, Session: session}, err
+			}
+
+			if req.SyncOnly {
+				result := core.RunResult{Provider: providerName, LeaseID: leaseID, Slug: slug, Total: core.ClockNow(b.rt.Clock).Sub(started), SyncDelegated: true, Session: session}
+				fmt.Fprintf(b.rt.Stdout, "synced %s\n", workdir)
+				if req.TimingJSON {
+					pendingTiming = core.TimingReport{
+						Provider:      providerName,
+						LeaseID:       leaseID,
+						Slug:          slug,
+						SyncDelegated: true,
+						SyncMs:        syncDuration.Milliseconds(),
+						SyncPhases:    syncPhases,
+						SyncSkipped:   req.NoSync,
+						TotalMs:       result.Total.Milliseconds(),
+						ExitCode:      0,
+						Label:         strings.TrimSpace(req.Label),
+					}
+				}
+				return result, nil
+			}
+
+			if req.EnvSummary || strings.TrimSpace(os.Getenv("CRABBOX_ENV_ALLOW")) != "" {
+				core.PrintEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, req.Env)
+			}
+			commandStart := core.ClockNow(b.rt.Clock)
+			req.Observation.Phase(core.RunPhaseCommand)
+			stdout, stderr := req.Observation.CommandWriters(b.rt.Stdout, b.rt.Stderr, core.RunOutputProvider)
+			exitCode, runErr := transport.Exec(ctx, sandboxID, command.ShellScript(), execOptions{
+				Workdir: workdir, Env: req.Env, Timeout: defaultExecTimeout,
+			}, stdout, stderr)
+			commandDuration := core.ClockNow(b.rt.Clock).Sub(commandStart)
+			commandRan = true
+			outcome := shared.FinalizeDelegatedCommandOutcome(exitCode, runErr)
+			if runErr != nil {
+				if errors.Is(runErr, context.Canceled) {
+					outcome.ExitCode = 130
+				} else if errors.Is(runErr, context.DeadlineExceeded) {
+					outcome.ExitCode = 124
+				}
+			}
+			result := core.RunResult{
+				ExitCode:      outcome.ExitCode,
+				Status:        outcome.Status,
+				ErrorKind:     outcome.ErrorKind,
+				Command:       commandDuration,
+				Total:         core.ClockNow(b.rt.Clock).Sub(started),
+				SyncDelegated: true,
+				Provider:      providerName,
+				LeaseID:       leaseID,
+				Slug:          slug,
+				CommandText:   strings.Join(req.Command, " "),
+				Session:       session,
+			}
+			if req.TimingJSON {
+				pendingTiming = core.TimingReport{
+					Provider:      providerName,
+					LeaseID:       leaseID,
+					Slug:          slug,
+					SyncDelegated: true,
+					SyncMs:        syncDuration.Milliseconds(),
+					SyncPhases:    syncPhases,
+					SyncSkipped:   req.NoSync,
+					CommandMs:     result.Command.Milliseconds(),
+					TotalMs:       result.Total.Milliseconds(),
+					ExitCode:      exitCode,
+					Label:         strings.TrimSpace(req.Label),
+				}
+			}
+			if runErr != nil {
+				core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, leaseID, slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, &shouldStop)
+				return result, shared.ExitErrorWithCause(result.ExitCode, fmt.Sprintf("cloud-run-sandbox run failed: %v", runErr), runErr)
+			}
+			if exitCode != 0 {
+				core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, leaseID, slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, &shouldStop)
+				return result, core.ExitError{Code: exitCode, Message: fmt.Sprintf("cloud-run-sandbox run exited %d", exitCode)}
+			}
+			return result, nil
+		}()
+		return nil
+	})
+	clearedClaim, clearErr := b.clearClaimActivity(claim)
+	if clearErr == nil {
+		claim = clearedClaim
+	}
+	if guardErr != nil {
+		guardedResult, guardedErr = shared.PinDelegatedRunFailure(core.RunResult{Provider: providerName, LeaseID: leaseID, Slug: slug, Session: session}, guardErr)
+	}
+	if clearErr != nil {
+		guardedResult, guardedErr = shared.PinDelegatedRunFailure(guardedResult, guardedErr)
+		return appendRunFailure(guardedResult, guardedErr, fmt.Errorf("clear cloud-run-sandbox active claim: %w", clearErr))
+	}
+	return guardedResult, guardedErr
+}
+
+func appendRunFailure(result core.RunResult, primary, secondary error) (core.RunResult, error) {
+	if secondary == nil || primary != nil {
+		return shared.AppendDelegatedRunFailure(result, primary, secondary, 1)
+	}
+	// Cloud Run already exposed typed claim/cleanup errors as public exit codes.
+	// Select that first failure without discarding measured command/session data.
+	outcome, err := shared.PinDelegatedRunFailure(core.RunResult{}, secondary)
+	result.ExitCode, result.Status, result.ErrorKind = outcome.ExitCode, outcome.Status, outcome.ErrorKind
+	return result, err
+}
+
+func cleanupCommand(cfg core.Config, leaseID string) string {
+	command := "crabbox stop --provider " + providerName
+	if gatewayURL := strings.TrimSpace(cfg.CloudRunSandbox.GatewayURL); gatewayURL != "" {
+		command += " --cloud-run-sandbox-gateway-url " + core.ShellQuote(gatewayURL)
+	} else if cliPath := strings.TrimSpace(cfg.CloudRunSandbox.CLIPath); cliPath != "" && cliPath != core.CloudRunSandboxConfigDefaultCLIPath {
+		command += " --cloud-run-sandbox-cli " + core.ShellQuote(cliPath)
+	}
+	return command + " --id " + core.ShellQuote(leaseID)
+}
+
+func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
+	scope, err := b.claimScope()
+	if err != nil {
+		return nil, err
+	}
+	claims, err := listCloudRunSandboxLeaseClaims()
+	if err != nil {
+		return nil, err
+	}
+	servers := make([]core.Server, 0, len(claims))
+	var transport sandboxTransport
+	for _, claim := range claims {
+		if claim.Provider != providerName || !strings.HasPrefix(claim.LeaseID, leasePrefix) {
+			continue
+		}
+		if claim.ProviderScope != scope {
+			continue
+		}
+		sandboxID := strings.TrimPrefix(claim.LeaseID, leasePrefix)
+		if sandboxID == "" {
+			continue
+		}
+		state, ready := b.claimStatus(claim)
+		if ready {
+			if transport == nil {
+				transport, err = newTransport(b.cfg, b.rt)
+				if err != nil {
+					return nil, err
+				}
+			}
+			ownershipToken := strings.TrimSpace(claim.Labels[claimOwnershipLabel])
+			switch probeErr := transport.Probe(ctx, sandboxID, ownershipToken); {
+			case errors.Is(probeErr, errSandboxNotFound):
+				state = "missing"
+			case probeErr != nil:
+				state = "unknown"
+			}
+		}
+		servers = append(servers, shared.SandboxLeaseView(providerName, targetLinux, claim, sandboxID, sandboxID, state))
+	}
+	return servers, nil
+}
+
+func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
+	transport, err := newTransport(b.cfg, b.rt)
+	if err != nil {
+		return core.DoctorResult{}, err
+	}
+	result := core.DoctorResult{Provider: providerName}
+	healthErr := transport.Health(ctx)
+	details := map[string]string{
+		"mode":    transport.Mode(),
+		"cli":     core.Blank(strings.TrimSpace(b.cfg.CloudRunSandbox.CLIPath), core.CloudRunSandboxConfigDefaultCLIPath),
+		"workdir": core.Blank(strings.TrimSpace(b.cfg.CloudRunSandbox.Workdir), core.CloudRunSandboxConfigDefaultWorkdir),
+	}
+	if transport.Mode() == "remote" {
+		details["gateway"] = strings.TrimSpace(b.cfg.CloudRunSandbox.GatewayURL)
+	}
+	result.Checks = append(result.Checks, doctorCheck("control_plane", healthErr, details))
+	servers, listErr := b.List(ctx, core.ListRequest{})
+	if listErr != nil {
+		result.Checks = append(result.Checks, doctorCheck("local_claims", listErr, nil))
+	} else {
+		result.Checks = append(result.Checks, core.DoctorCheck{
+			Status:  "ok",
+			Check:   "local_claims",
+			Message: fmt.Sprintf("%d claimed sandboxes", len(servers)),
+			Details: map[string]string{"count": fmt.Sprint(len(servers))},
+		})
+	}
+	if healthErr != nil {
+		result.Status = "error"
+		result.Message = fmt.Sprintf("mode=%s control_plane=blocked mutation=false", transport.Mode())
+		return result, errors.Join(healthErr, listErr)
+	}
+	if listErr != nil {
+		result.Status = "error"
+		result.Message = fmt.Sprintf("mode=%s control_plane=ready mutation=false local_claims=blocked", transport.Mode())
+		return result, listErr
+	}
+	result.Status = "ok"
+	result.Message = fmt.Sprintf("mode=%s control_plane=ready mutation=false claims=%d", transport.Mode(), len(servers))
+	return result, nil
+}
+
+func (b *backend) Status(ctx context.Context, req core.StatusRequest) (core.StatusView, error) {
+	leaseID, sandboxID, slug, claim, err := b.resolveLeaseID(req.ID, "", false)
+	if err != nil {
+		return core.StatusView{}, err
+	}
+	state, ready := b.claimStatus(claim)
+	if ready {
+		transport, transportErr := newTransport(b.cfg, b.rt)
+		if transportErr != nil {
+			return core.StatusView{}, transportErr
+		}
+		ownershipToken := strings.TrimSpace(claim.Labels[claimOwnershipLabel])
+		if probeErr := transport.Probe(ctx, sandboxID, ownershipToken); probeErr != nil {
+			if errors.Is(probeErr, errSandboxNotFound) {
+				state = "missing"
+				ready = false
+			} else {
+				return core.StatusView{}, fmt.Errorf("probe cloud-run-sandbox %q: %w", sandboxID, probeErr)
+			}
+		}
+	}
+	return shared.SandboxStatusView(providerName, leaseID, slug, sandboxID, claim.Pond, state, ready), nil
+}
+
+func (b *backend) claimStatus(claim core.LeaseClaim) (string, bool) {
+	state := statusViewReady
+	ready := true
+	claimState := strings.TrimSpace(claim.Labels[claimStateLabel])
+	if claimState == "creating" || claimState == "recovery" || claimState == "conflict" {
+		state = claimState
+		ready = false
+	}
+	if expiresAt := strings.TrimSpace(claim.Labels[claimExpiresAtLabel]); expiresAt != "" {
+		if expires, parseErr := time.Parse(time.RFC3339Nano, expiresAt); parseErr != nil || !core.ClockNow(b.rt.Clock).UTC().Before(expires) {
+			state = "expired"
+			ready = false
+		}
+	}
+	return state, ready
+}
+
+func (b *backend) Stop(ctx context.Context, req core.StopRequest) error {
+	transport, err := newTransport(b.cfg, b.rt)
+	if err != nil {
+		return err
+	}
+	leaseID, sandboxID, _, claim, err := b.resolveLeaseID(req.ID, "", false)
+	if err != nil {
+		return err
+	}
+	if state := strings.TrimSpace(claim.Labels[claimStateLabel]); state == "conflict" {
+		return core.Exit(4, "cloud-run-sandbox lease %q has no destructive ownership (state=%s)", leaseID, state)
+	}
+	if err := b.releaseClaimedSandboxIfUnchanged(ctx, transport, sandboxID, claim); err != nil {
+		return err
+	}
+	fmt.Fprintf(b.rt.Stderr, "released lease=%s sandbox=%s\n", leaseID, sandboxID)
+	return nil
+}
+
+func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
+	scope, err := b.claimScope()
+	if err != nil {
+		return err
+	}
+	// Snapshot candidates before any cleanup mutation. A concurrent reuse updates
+	// the claim before touching the sandbox, and the guarded destroy below must see
+	// that update rather than deleting a newly reclaimed sandbox from a stale view.
+	claims, err := listCloudRunSandboxLeaseClaims()
+	if err != nil {
+		return err
+	}
+	now := core.ClockNow(b.rt.Clock).UTC()
+	checked, removed, claimsRemoved := 0, 0, 0
+	var cleanupErrs []error
+	var transport sandboxTransport
+	for _, claim := range claims {
+		if claim.Provider != providerName {
+			continue
+		}
+		if claim.ProviderScope != scope {
+			continue
+		}
+		checked++
+		sandboxID := strings.TrimPrefix(claim.LeaseID, leasePrefix)
+		if sandboxID == "" || sandboxID == claim.LeaseID {
+			continue
+		}
+		due, reason := claimCleanupDue(claim, now)
+		if !due {
+			fmt.Fprintf(b.rt.Stderr, "skip sandbox=%s lease=%s reason=%s\n", sandboxID, claim.LeaseID, reason)
+			continue
+		}
+		if req.DryRun {
+			if err := core.VerifyLeaseClaimUnchanged(claim.LeaseID, claim); err != nil {
+				changed, inspectErr := claimChangedSinceSnapshot(claim)
+				if inspectErr != nil {
+					return fmt.Errorf("inspect cloud-run-sandbox claim after cleanup guard failed: %v: %w", err, inspectErr)
+				}
+				if changed {
+					fmt.Fprintf(b.rt.Stderr, "skip sandbox=%s lease=%s reason=changed-during-cleanup err=%v\n", sandboxID, claim.LeaseID, err)
+					continue
+				}
+				return err
+			}
+			fmt.Fprintf(b.rt.Stdout, "would delete sandbox=%s lease=%s reason=%s\n", sandboxID, claim.LeaseID, reason)
+			continue
+		}
+		if transport == nil {
+			transport, err = newTransport(b.cfg, b.rt)
+			if err != nil {
+				return err
+			}
+		}
+		wasRemoved, err := b.destroyClaimedSandboxIfUnchanged(ctx, transport, sandboxID, claim)
+		if err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("destroy sandbox=%s lease=%s: %w", sandboxID, claim.LeaseID, err))
+			continue
+		}
+		if !wasRemoved {
+			continue
+		}
+		fmt.Fprintf(b.rt.Stdout, "delete sandbox=%s lease=%s reason=%s\n", sandboxID, claim.LeaseID, reason)
+		removed++
+		claimsRemoved++
+	}
+	if !req.DryRun {
+		fmt.Fprintf(b.rt.Stdout, "%s cleanup removed=%d claims_removed=%d checked=%d\n", providerName, removed, claimsRemoved, checked)
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func (b *backend) destroyClaimedSandboxIfUnchanged(ctx context.Context, transport sandboxTransport, sandboxID string, claim core.LeaseClaim) (bool, error) {
+	ownershipToken := strings.TrimSpace(claim.Labels[claimOwnershipLabel])
+	if ownershipToken == "" {
+		return false, core.Exit(4, "cloud-run-sandbox lease %q has no ownership token", claim.LeaseID)
+	}
+	cleanupStarted := false
+	var destroyErr error
+	cleanupSandbox := func() error {
+		cleanupStarted = true
+		destroyErr = transport.Destroy(ctx, sandboxID, ownershipToken)
+		if errors.Is(destroyErr, errSandboxNotFound) {
+			destroyErr = nil
+		}
+		return destroyErr
+	}
+	// Hold the claim lock across the final comparison and remote destroy. This
+	// closes the compare/destroy race while removing the claim only after a
+	// confirmed destroy (or confirmed absence), so failed cleanup stays tracked.
+	if err := core.RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, cleanupSandbox); err != nil {
+		if destroyErr != nil {
+			fmt.Fprintf(b.rt.Stderr, "warning: destroy sandbox=%s failed; claim retained: %v\n", sandboxID, err)
+			return false, destroyErr
+		}
+		if cleanupStarted {
+			// The remote destroy succeeded, so this is a local claim-removal or
+			// durability failure and must remain visible to cleanup automation.
+			return false, err
+		}
+		changed, inspectErr := claimChangedSinceSnapshot(claim)
+		if inspectErr != nil {
+			return false, fmt.Errorf("inspect cloud-run-sandbox claim after cleanup guard failed: %v: %w", err, inspectErr)
+		}
+		if changed {
+			fmt.Fprintf(b.rt.Stderr, "skip sandbox=%s lease=%s reason=changed-during-cleanup err=%v\n", sandboxID, claim.LeaseID, err)
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (b *backend) releaseClaimedSandboxIfUnchanged(ctx context.Context, transport sandboxTransport, sandboxID string, claim core.LeaseClaim) error {
+	ownershipToken := strings.TrimSpace(claim.Labels[claimOwnershipLabel])
+	if ownershipToken == "" {
+		return core.Exit(4, "cloud-run-sandbox lease %q has no ownership token", claim.LeaseID)
+	}
+	return core.RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, func() error {
+		err := transport.Destroy(ctx, sandboxID, ownershipToken)
+		if errors.Is(err, errSandboxNotFound) {
+			return nil
+		}
+		return err
+	})
+}
+
+func (b *backend) markClaimActivity(claim core.LeaseClaim, state string, timeout time.Duration) (core.LeaseClaim, error) {
+	labels := shared.CloneLabels(claim.Labels)
+	labels[claimStateLabel] = state
+	activeUntil := core.ClockNow(b.rt.Clock).UTC().Add(timeout)
+	if expires, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(labels[claimExpiresAtLabel])); err == nil && expires.Before(activeUntil) {
+		activeUntil = expires
+	}
+	labels[claimActiveUntilLabel] = activeUntil.Format(time.RFC3339Nano)
+	return core.UpdateLeaseClaimLabelsIfUnchanged(claim.LeaseID, claim, labels)
+}
+
+func (b *backend) clearClaimActivity(claim core.LeaseClaim) (core.LeaseClaim, error) {
+	labels := shared.CloneLabels(claim.Labels)
+	delete(labels, claimStateLabel)
+	delete(labels, claimActiveUntilLabel)
+	return core.UpdateLeaseClaimLabelsAndLastUsedIfUnchanged(claim.LeaseID, claim, labels, core.ClockNow(b.rt.Clock).UTC())
+}
+
+func claimOperationTimeout(claim core.LeaseClaim, maximum time.Duration, now time.Time) (time.Duration, error) {
+	expiresAt := strings.TrimSpace(claim.Labels[claimExpiresAtLabel])
+	if expiresAt == "" {
+		return maximum, nil
+	}
+	expires, err := time.Parse(time.RFC3339Nano, expiresAt)
+	if err != nil {
+		return 0, fmt.Errorf("cloud-run-sandbox claim has invalid ttl %q", expiresAt)
+	}
+	remaining := expires.Sub(now)
+	if remaining <= 0 {
+		return 0, core.Exit(4, "cloud-run-sandbox lease %q has expired", claim.LeaseID)
+	}
+	if remaining < maximum {
+		return remaining, nil
+	}
+	return maximum, nil
+}
+
+func claimChangedSinceSnapshot(expected core.LeaseClaim) (bool, error) {
+	current, exists, err := core.ReadLeaseClaimWithPresence(expected.LeaseID)
+	if err != nil {
+		return false, err
+	}
+	return !exists || !reflect.DeepEqual(current, expected), nil
+}
+
+func claimCleanupDue(claim core.LeaseClaim, now time.Time) (bool, string) {
+	state := strings.TrimSpace(claim.Labels[claimStateLabel])
+	if state == "conflict" {
+		return false, "ownership-" + state
+	}
+	if activeUntil := strings.TrimSpace(claim.Labels[claimActiveUntilLabel]); activeUntil != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, activeUntil)
+		if err == nil && now.Before(parsed) {
+			state := strings.TrimSpace(claim.Labels[claimStateLabel])
+			if state == "" {
+				state = "active"
+			}
+			return false, "in-flight-" + state
+		}
+	}
+	if state == "creating" {
+		return true, "stale-creating"
+	}
+	if expiresAt := strings.TrimSpace(claim.Labels[claimExpiresAtLabel]); expiresAt != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, expiresAt)
+		if err != nil {
+			return true, "unparseable-ttl"
+		}
+		if !now.Before(parsed) {
+			return true, "ttl-expired"
+		}
+	}
+	if claim.IdleTimeoutSeconds <= 0 {
+		return false, "no-idle-timeout"
+	}
+	lastUsed := strings.TrimSpace(claim.LastUsedAt)
+	if lastUsed == "" {
+		lastUsed = strings.TrimSpace(claim.ClaimedAt)
+	}
+	if lastUsed == "" {
+		return true, "missing-timestamps"
+	}
+	parsed, err := time.Parse(time.RFC3339, lastUsed)
+	if err != nil {
+		// Accept common claim timestamp formats.
+		parsed, err = time.Parse(time.RFC3339Nano, lastUsed)
+		if err != nil {
+			return true, "unparseable-timestamp"
+		}
+	}
+	idle, valid := shared.PositiveIdleDuration(claim.IdleTimeoutSeconds)
+	if !valid {
+		return false, "invalid-idle-timeout"
+	}
+	deadline := parsed.Add(idle)
+	if now.Before(deadline) {
+		return false, "idle-timeout-remaining"
+	}
+	return true, "idle-timeout-expired"
+}
+
+func (b *backend) createSandbox(ctx context.Context, transport sandboxTransport, repo core.Repo, reclaim bool, requestedSlug string) (string, string, string, core.LeaseClaim, error) {
+	sandboxID, err := newSandboxName(repo)
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	}
+	leaseID := leasePrefix + sandboxID
+	slug, err := core.AllocateClaimLeaseSlug(leaseID, requestedSlug)
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	}
+	scope, err := b.claimScope()
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	}
+	labels := map[string]string{}
+	labels[claimStateLabel] = "creating"
+	labels[claimOwnershipLabel] = sandboxID
+	now := core.ClockNow(b.rt.Clock).UTC()
+	activeUntil := now.Add(defaultExecTimeout)
+	if b.cfg.TTL > 0 {
+		expiresAt := now.Add(b.cfg.TTL)
+		labels[claimExpiresAtLabel] = expiresAt.Format(time.RFC3339Nano)
+		if expiresAt.Before(activeUntil) {
+			activeUntil = expiresAt
+		}
+	}
+	labels[claimActiveUntilLabel] = activeUntil.Format(time.RFC3339Nano)
+	claim, err := core.ClaimLeaseForRepoProviderScopePondWithLabels(leaseID, slug, providerName, scope, b.cfg.Pond, repo.Root, b.cfg.IdleTimeout, labels)
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	}
+	claimed := true
+	defer func() {
+		if claimed {
+			_ = core.RemoveLeaseClaimIfUnchangedAfter(leaseID, claim, nil)
+		}
+	}()
+	workdir, err := cloudRunSandboxWorkdir(b.cfg)
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	}
+	createTimeout, err := claimOperationTimeout(claim, defaultExecTimeout, core.ClockNow(b.rt.Clock).UTC())
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	}
+	createCtx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+	recoveryLabels := shared.CloneLabels(claim.Labels)
+	recoveryLabels[claimStateLabel] = "recovery"
+	delete(recoveryLabels, claimActiveUntilLabel)
+	conflictLabels := shared.CloneLabels(claim.Labels)
+	conflictLabels[claimStateLabel] = "conflict"
+	delete(conflictLabels, claimActiveUntilLabel)
+	readyLabels := shared.CloneLabels(claim.Labels)
+	delete(readyLabels, claimStateLabel)
+	delete(readyLabels, claimActiveUntilLabel)
+	resolvedClaim, conflictClaimRemoved, actionSucceeded, createErr := core.ResolveLeaseClaimAfterActionIfUnchanged(leaseID, claim, func() error {
+		return transport.Create(createCtx, sandboxID, runOptions{
+			AllowEgress:    b.cfg.CloudRunSandbox.AllowEgress,
+			Write:          b.cfg.CloudRunSandbox.Write,
+			Rootfs:         b.cfg.CloudRunSandbox.Rootfs,
+			Workdir:        workdir,
+			OwnershipToken: sandboxID,
+		})
+	}, func(actionErr error) (map[string]string, bool) {
+		if actionErr == nil {
+			return readyLabels, false
+		}
+		if errors.Is(actionErr, errSandboxAlreadyExists) {
+			return conflictLabels, true
+		}
+		return recoveryLabels, false
+	})
+	if actionSucceeded && createErr != nil {
+		rollbackClaim := claim
+		if resolvedClaim.LeaseID != "" {
+			rollbackClaim = resolvedClaim
+		}
+		rollbackCtx, rollbackCancel := b.cleanupContext(ctx)
+		defer rollbackCancel()
+		rollbackErr := b.releaseClaimedSandboxIfUnchanged(rollbackCtx, transport, sandboxID, rollbackClaim)
+		claimed = false
+		if rollbackErr == nil {
+			return "", "", "", core.LeaseClaim{}, fmt.Errorf("cloud-run-sandbox create succeeded but publishing ready ownership failed; sandbox rolled back lease=%s: %w", leaseID, createErr)
+		}
+		fallbackLabels := shared.CloneLabels(rollbackClaim.Labels)
+		fallbackLabels[claimStateLabel] = "recovery"
+		delete(fallbackLabels, claimActiveUntilLabel)
+		_, recoveryErr := core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, rollbackClaim, fallbackLabels)
+		return "", "", "", core.LeaseClaim{}, errors.Join(
+			fmt.Errorf("cloud-run-sandbox create succeeded but publishing ready ownership failed; recovery claim retained lease=%s: %w", leaseID, createErr),
+			rollbackErr,
+			recoveryErr,
+		)
+	}
+	if createErr != nil {
+		if errors.Is(createErr, errSandboxAlreadyExists) {
+			if !conflictClaimRemoved {
+				return "", "", "", core.LeaseClaim{}, fmt.Errorf("cloud-run-sandbox create conflict quarantined but provisional claim removal failed lease=%s: %w", leaseID, createErr)
+			}
+			claimed = false
+			return "", "", "", core.LeaseClaim{}, fmt.Errorf("cloud-run-sandbox create rejected without taking ownership lease=%s: %w", leaseID, createErr)
+		}
+		claimed = false
+		// Creation is not transactional: a timeout or lost response can arrive
+		// after the deterministically named sandbox was created. Keep the exact,
+		// scoped claim so stop/cleanup can recover it instead of leaving untracked
+		// billable infrastructure.
+		return "", "", "", core.LeaseClaim{}, fmt.Errorf("cloud-run-sandbox create remains indeterminate; recovery claim retained lease=%s: %w", leaseID, createErr)
+	}
+	claim = resolvedClaim
+	claimed = false
+	return leaseID, sandboxID, slug, claim, nil
+}
+
+func (b *backend) resolveLeaseID(id, repoRoot string, reclaim bool) (string, string, string, core.LeaseClaim, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", "", "", core.LeaseClaim{}, core.Exit(2, "missing lease id")
+	}
+	scope, err := b.claimScope()
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	}
+	if claim, ok, err := core.ResolveLeaseClaim(id); err != nil {
+		return "", "", "", core.LeaseClaim{}, err
+	} else if ok && claim.Provider == providerName {
+		if claim.ProviderScope != scope {
+			return "", "", "", core.LeaseClaim{}, core.Exit(4, "cloud-run-sandbox lease %q belongs to a different gateway/cli scope", id)
+		}
+		if repoRoot != "" {
+			claim, err = claimLeaseForRepoProviderScopePondIfUnchanged(claim.LeaseID, claim.Slug, providerName, scope, claim.Pond, repoRoot, time.Duration(claim.IdleTimeoutSeconds)*time.Second, reclaim, claim)
+			if err != nil {
+				return "", "", "", core.LeaseClaim{}, err
+			}
+		}
+		return claim.LeaseID, strings.TrimPrefix(claim.LeaseID, leasePrefix), claim.Slug, claim, nil
+	}
+	// Accept raw sandbox id when an exact claim exists.
+	leaseID := id
+	if !strings.HasPrefix(leaseID, leasePrefix) {
+		leaseID = leasePrefix + id
+	}
+	claim, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		return "", "", "", core.LeaseClaim{}, core.Exit(4, "cloud-run-sandbox sandbox %q is not claimed by Crabbox", id)
+	}
+	if claim.Provider != providerName {
+		return "", "", "", core.LeaseClaim{}, core.Exit(4, "cloud-run-sandbox sandbox %q is not claimed by Crabbox", id)
+	}
+	if claim.ProviderScope != scope {
+		return "", "", "", core.LeaseClaim{}, core.Exit(4, "cloud-run-sandbox lease %q belongs to a different gateway/cli scope", id)
+	}
+	if repoRoot != "" {
+		claim, err = claimLeaseForRepoProviderScopePondIfUnchanged(claim.LeaseID, claim.Slug, providerName, scope, claim.Pond, repoRoot, time.Duration(claim.IdleTimeoutSeconds)*time.Second, reclaim, claim)
+		if err != nil {
+			return "", "", "", core.LeaseClaim{}, err
+		}
+	}
+	return claim.LeaseID, strings.TrimPrefix(claim.LeaseID, leasePrefix), claim.Slug, claim, nil
+}
+
+func (b *backend) claimScope() (string, error) {
+	if gateway := strings.TrimSpace(b.cfg.CloudRunSandbox.GatewayURL); gateway != "" {
+		validated, err := validateGatewayURL(gateway)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256([]byte(validated))
+		return "gateway:" + hex.EncodeToString(sum[:8]), nil
+	}
+	cli := core.Blank(strings.TrimSpace(b.cfg.CloudRunSandbox.CLIPath), core.CloudRunSandboxConfigDefaultCLIPath)
+	sum := sha256.Sum256([]byte("direct:" + cli))
+	return "direct:" + hex.EncodeToString(sum[:8]), nil
+}
+
+func (b *backend) cleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), cleanupTimeout)
+}
+
+func cloudRunSandboxWorkdir(cfg core.Config) (string, error) {
+	workdir := core.Blank(strings.TrimSpace(cfg.CloudRunSandbox.Workdir), core.CloudRunSandboxConfigDefaultWorkdir)
+	if !path.IsAbs(workdir) {
+		return "", core.Exit(2, "cloudRunSandbox.workdir must be an absolute path")
+	}
+	return workdir, nil
+}
+
+func newSandboxName(repo core.Repo) (string, error) {
+	base := namePrefix
+	if name := sanitizeName(path.Base(repo.Root)); name != "" {
+		base = namePrefix + name + "-"
+	}
+	suffix, err := randomSuffix()
+	if err != nil {
+		return "", err
+	}
+	maxBase := maxSandboxNameLen - len(suffix) - 1
+	if maxBase < len(namePrefix) {
+		maxBase = len(namePrefix)
+	}
+	if len(base) > maxBase {
+		base = base[:maxBase]
+	}
+	if !strings.HasSuffix(base, "-") {
+		base += "-"
+	}
+	return base + suffix, nil
+}
+
+func sanitizeName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	re := regexp.MustCompile(`[^a-z0-9-]+`)
+	value = re.ReplaceAllString(value, "-")
+	value = strings.Trim(value, "-")
+	return value
+}
+
+func randomSuffix() (string, error) {
+	var buf [sandboxNameSuffix]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("generate cloud-run-sandbox ownership token: %w", err)
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+func doctorCheck(name string, err error, details map[string]string) core.DoctorCheck {
+	if err != nil {
+		return core.DoctorCheck{Status: "error", Check: name, Message: err.Error(), Details: details}
+	}
+	return core.DoctorCheck{Status: "ok", Check: name, Message: "ready", Details: details}
+}

@@ -32,11 +32,14 @@ Railway API. Railway runs whatever start command the service is configured with
 (via `railway.toml`, the dashboard, or `serviceInstanceUpdate`), so accepting a
 generic Crabbox command would create false-positive test results.
 
-`status` returns the latest deployment status and readiness. `stop` calls
-`deploymentStop` on the latest deployment for the service. `list` enumerates one
-row per service across every project the token can see. `warmup` is rejected so
-Crabbox never silently provisions billable Railway resources — create the
-service yourself in the dashboard or via `serviceCreate` first.
+`status` returns the latest deployment status and readiness. Because Railway
+services are created outside Crabbox, the first `stop` requires explicit
+`--reclaim` adoption. Crabbox binds a local claim to the configured API endpoint,
+project, environment, service, and exact latest deployment before calling
+`deploymentStop`. A changed or unclaimed deployment fails closed. `list`
+enumerates one row per service across every project the token can see. `warmup`
+is rejected so Crabbox never silently provisions billable Railway resources —
+create the service yourself in the dashboard or via `serviceCreate` first.
 
 ## Commands
 
@@ -49,7 +52,7 @@ crabbox run --provider railway --no-sync --id "$RAILWAY_SERVICE_ID" -- false
 crabbox status --provider railway --id "$RAILWAY_SERVICE_ID" \
   --railway-project "$RAILWAY_PROJECT_ID" \
   --railway-environment "$RAILWAY_ENVIRONMENT_ID"
-crabbox stop   --provider railway --id "$RAILWAY_SERVICE_ID" \
+crabbox stop   --provider railway --id "$RAILWAY_SERVICE_ID" --reclaim \
   --railway-project "$RAILWAY_PROJECT_ID" \
   --railway-environment "$RAILWAY_ENVIRONMENT_ID"
 crabbox list   --provider railway
@@ -57,8 +60,10 @@ crabbox list   --provider railway
 
 `warmup` is rejected; service creation must happen out-of-band. `run` is rejected
 because there is no Railway exec API. `status` and `stop` require `--id`,
-`--railway-project`, and `--railway-environment`. `list` needs only the API
-token.
+`--railway-project`, and `--railway-environment`. The first stop of an exact
+deployment also requires `--reclaim`; a provider failure retains that binding so
+a retry can omit `--reclaim`. A successful stop removes it. `list` needs only the
+API token.
 
 ## Auth
 
@@ -67,9 +72,11 @@ export RAILWAY_API_TOKEN=...   # required, account token from /account/tokens
 ```
 
 `CRABBOX_RAILWAY_API_TOKEN` is also accepted and wins over `RAILWAY_API_TOKEN`,
-matching the precedence used by other delegated providers. The token is read
-from the environment or config only; the provider does not register a CLI flag
-for it, so it is never passed on the command line. Crabbox sends the same
+matching the precedence used by other delegated providers. CLI configuration
+reads the token only from these environment variables; neither user nor
+repository YAML accepts a token field, and no token flag is registered.
+Programmatic callers can still supply the runtime config's token field.
+Crabbox sends the same
 `Authorization: Bearer <token>` header and a JSON `{query, variables}` body that
 a raw GraphQL request would:
 
@@ -110,6 +117,19 @@ CRABBOX_RAILWAY_ENVIRONMENT_ID (or RAILWAY_ENVIRONMENT_ID)
 
 The `--railway-url` flag and `RAILWAY_API_URL` env var override `railway.apiUrl`.
 A non-`https` URL is rejected unless it targets `localhost`.
+
+The four bindings share one typed declaration. Nonempty YAML strings override
+earlier values; omitted, null, and empty strings leave them unchanged. Environment
+overrides select the first raw nonempty primary or alias value without trimming.
+Explicitly visited empty flags still apply. A repository-selected API URL keeps
+repository provenance and remains subject to the existing credential-destination
+checks; generating its binding does not grant it permission to use inherited
+credentials.
+
+Token and endpoint validation remain deferred to client construction, with the
+token checked first. A raw-empty runtime API URL receives the compiled endpoint
+default, but a whitespace-only URL does not. Claim scoping and command routing
+retain their separate empty-endpoint behavior rather than adding that fallback.
 
 ## Capabilities
 

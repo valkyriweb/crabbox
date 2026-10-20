@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -83,6 +84,7 @@ func TestAdapterRelayRouteAllowlist(t *testing.T) {
 		{http.MethodGet, "/v1/workspaces/fleet-a-is-101", true},
 		{http.MethodDelete, "/v1/workspaces/fleet-a-is-101", true},
 		{http.MethodPost, "/v1/workspaces/fleet-a-is-101/connections/desktop", true},
+		{http.MethodPost, "/v1/workspaces/fleet-a-is-101/connections/native-vnc", true},
 		{http.MethodGet, "/healthz", false},
 		{http.MethodPut, "/v1/workspaces/fleet-a-is-101", false},
 		{http.MethodPost, "/v1/workspaces/fleet-a-is-101/reboot", false},
@@ -252,6 +254,10 @@ func TestAdapterRelayDesktopTimeoutCoversConnectionSetup(t *testing.T) {
 	desktop := adapterRelayRequest{Method: http.MethodPost, Path: "/v1/workspaces/fleet-a-is-101/connections/desktop"}
 	if got := adapterRelayTimeoutForRequest(desktop, 11*time.Minute); got != 11*time.Minute {
 		t.Fatalf("desktop timeout=%s", got)
+	}
+	nativeVNC := adapterRelayRequest{Method: http.MethodPost, Path: "/v1/workspaces/fleet-a-is-101/connections/native-vnc"}
+	if got := adapterRelayTimeoutForRequest(nativeVNC, 11*time.Minute); got != 11*time.Minute {
+		t.Fatalf("native VNC timeout=%s", got)
 	}
 	ordinary := adapterRelayRequest{Method: http.MethodGet, Path: "/v1/workspaces/fleet-a-is-101"}
 	if got := adapterRelayTimeoutForRequest(ordinary, 11*time.Minute); got != 9*time.Second {
@@ -455,19 +461,39 @@ func TestConnectAdapterRelayUsesTicketHeaderAndRelaysResponse(t *testing.T) {
 	defer coordinator.Close()
 
 	baseCoordinatorClient := coordinator.Client()
+	coordinatorTarget := coordinator.URL
+	displayCoordinatorURL := strings.Replace(coordinator.URL, "http://", "http://status-user:status-password@", 1) + "/broker?token=query-secret#fragment-secret"
 	var coordinatorRequests atomic.Int32
 	coordinatorClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		coordinatorRequests.Add(1)
-		return baseCoordinatorClient.Transport.RoundTrip(request)
+		rewritten := request.Clone(request.Context())
+		target := *request.URL
+		target.Scheme = "http"
+		target.Host = strings.TrimPrefix(coordinatorTarget, "http://")
+		target.User = nil
+		target.RawQuery = ""
+		target.Fragment = ""
+		switch request.Method {
+		case http.MethodPost:
+			target.Path = "/v1/adapters/mac-lab/ticket"
+		case http.MethodGet:
+			target.Path = "/v1/adapters/mac-lab/agent"
+		default:
+			t.Fatalf("unexpected coordinator request method=%s", request.Method)
+		}
+		rewritten.URL = &target
+		rewritten.Host = ""
+		return baseCoordinatorClient.Transport.RoundTrip(rewritten)
 	})}
 	coord := &CoordinatorClient{
-		BaseURL: coordinator.URL,
+		BaseURL: displayCoordinatorURL,
 		Token:   "coordinator-token",
 		Client:  coordinatorClient,
 		Access:  AccessConfig{ClientID: "access-client", ClientSecret: "access-secret", Token: "access-token"},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	var status bytes.Buffer
 	err := connectAdapterRelay(
 		ctx,
 		coord,
@@ -477,7 +503,7 @@ func TestConnectAdapterRelayUsesTicketHeaderAndRelaysResponse(t *testing.T) {
 		func() (string, error) { return "local-token", nil },
 		local.Client(),
 		150*time.Second,
-		io.Discard,
+		&status,
 	)
 	var closeError websocket.CloseError
 	if err == nil || !errors.As(err, &closeError) || closeError.Code != websocket.StatusNormalClosure {
@@ -493,6 +519,15 @@ func TestConnectAdapterRelayUsesTicketHeaderAndRelaysResponse(t *testing.T) {
 	}
 	if got := coordinatorRequests.Load(); got != 2 {
 		t.Fatalf("configured coordinator transport requests=%d want ticket+websocket", got)
+	}
+	statusText := status.String()
+	if want := "coordinator=" + redactedConfigURL(displayCoordinatorURL); !strings.Contains(statusText, want) {
+		t.Fatalf("relay status=%q want %q", statusText, want)
+	}
+	for _, secret := range []string{"status-user", "status-password", "query-secret", "fragment-secret"} {
+		if strings.Contains(statusText, secret) {
+			t.Fatalf("relay status leaked %q: %q", secret, statusText)
+		}
 	}
 }
 

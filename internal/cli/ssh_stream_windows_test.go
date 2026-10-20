@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/privatefile"
 )
 
 var errCommandStreamTestWriter = errors.New("stream writer failed")
@@ -90,6 +92,20 @@ func TestRunCommandWithPlatformStreamsAllowsNilWriters(t *testing.T) {
 	cmd.Env = append(os.Environ(), "CRABBOX_NIL_FILE_STREAM_HELPER=1")
 	if err := runCommandWithPlatformStreams(cmd, nil, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCommandStreamFileSecurityIsCurrentUserPrivate(t *testing.T) {
+	attributes, err := commandStreamFileSecurity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := privatefile.WindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := privatefile.ValidateWindowsDescriptor(attributes.SecurityDescriptor, user); err != nil {
+		t.Fatalf("command stream security is not current-user private: %v", err)
 	}
 }
 

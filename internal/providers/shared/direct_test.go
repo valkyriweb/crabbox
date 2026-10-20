@@ -4,13 +4,275 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+func TestDirectTouchPersistsUpdatedLabelsBestEffort(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			var stderr bytes.Buffer
+			backend := DirectSSHBackend{Cfg: core.Config{TTL: time.Hour, IdleTimeout: time.Minute}, RT: core.Runtime{Stderr: &stderr}}
+			server := core.Server{CloudID: "example-server"}
+			if fail {
+				server.Labels = map[string]string{"state": "starting", "provider_metadata": "unchanged"}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			calls := 0
+			var persisted core.Server
+			req := core.TouchRequest{Lease: core.LeaseTarget{Server: server}, State: "ready"}
+			got := backend.Touch(ctx, req, func(actual context.Context, updated core.Server) error {
+				if actual != ctx {
+					t.Fatal("persistence did not receive the caller context")
+				}
+				calls++
+				persisted = updated
+				if fail {
+					return errors.New("provider write failed")
+				}
+				return nil
+			})
+			if calls != 1 || !reflect.DeepEqual(persisted, got) || got.Labels["state"] != "ready" || got.Labels["last_touched_at"] == "" {
+				t.Fatalf("calls=%d persisted=%+v returned=%+v", calls, persisted, got)
+			}
+			if fail {
+				if got.Labels["provider_metadata"] != "unchanged" || server.Labels["state"] != "starting" {
+					t.Fatal("touch changed provider metadata or the input labels")
+				}
+				if stderr.String() != "warning: direct touch state=ready: provider write failed\n" {
+					t.Fatalf("warning=%q", stderr.String())
+				}
+			} else if stderr.Len() != 0 {
+				t.Fatalf("unexpected warning=%q", stderr.String())
+			}
+		})
+	}
+}
+
+func TestDirectCleanupDecisionPreviewsBeforeMutation(t *testing.T) {
+	for _, action := range []DirectCleanupAction{DeleteCleanupServer, ResumeCleanupServer} {
+		t.Run(fmt.Sprint(action), func(t *testing.T) {
+			calls := 0
+			failure := errors.New("provider cleanup failed")
+			decision := DirectCleanupDecision{
+				Action: action,
+				Server: core.Server{CloudID: "example-server", Name: "example-server"},
+				Mutate: func(context.Context) error { calls++; return failure },
+			}
+			var stderr bytes.Buffer
+			rt := core.Runtime{Stderr: &stderr}
+			if err := decision.Apply(context.Background(), core.CleanupRequest{DryRun: true}, rt); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 0 || !strings.Contains(stderr.String(), "server id=example-server") {
+				t.Fatalf("calls=%d output=%q, want preview without mutation", calls, stderr.String())
+			}
+			if err := decision.Apply(context.Background(), core.CleanupRequest{}, rt); !errors.Is(err, failure) || calls != 1 {
+				t.Fatalf("calls=%d err=%v, want one mutation and its error", calls, err)
+			}
+		})
+	}
+}
+
+func TestDirectCleanupDecisionMissingClaimDryRun(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_123456abcdef"
+	if err := core.ClaimLeaseForRepoProviderScope(leaseID, "example", "gcp", "project:example", t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := DirectCleanupDecision{Action: ForgetMissingCleanupServer, Claim: claim}
+	rt := core.Runtime{Stderr: io.Discard}
+	if err := decision.Apply(context.Background(), core.CleanupRequest{DryRun: true}, rt); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := core.ReadLeaseClaim(leaseID); err != nil || !reflect.DeepEqual(after, claim) {
+		t.Fatalf("claim=%+v err=%v, want unchanged preview", after, err)
+	}
+	if err := decision.Apply(context.Background(), core.CleanupRequest{}, rt); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
+		t.Fatalf("claim exists=%v err=%v, want retired missing-server claim", exists, err)
+	}
+}
+
+func TestRemoveSSHLeaseClaimAfter(t *testing.T) {
+	for _, name := range []string{"success", "provider failure", "artifact failure", "changed claim", "canceled before admission", "canceled after deletion"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			leaseID := "cbx_123456abcdef"
+			if err := core.ClaimLeaseForRepoProviderScope(leaseID, "example", "gcp", "project:example", t.TempDir(), time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := core.ReadLeaseClaim(leaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key, err := core.PrepareStoredTestboxKeyPath(leaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Dir(key)
+			for _, file := range []string{"id_ed25519", "id_ed25519.pub", "known_hosts"} {
+				if err := os.WriteFile(filepath.Join(dir, file), []byte("synthetic fixture\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			current := claim
+			if name == "changed claim" {
+				current, err = core.UpdateLeaseClaimLabelsIfUnchanged(leaseID, claim, map[string]string{"state": "renewed"})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if name == "artifact failure" {
+				if err := os.RemoveAll(dir); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			failure := errors.New("provider cleanup failed")
+			calls := 0
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if name == "canceled before admission" {
+				cancel()
+			}
+			err = RemoveSSHLeaseClaimAfter(ctx, claim, func() error {
+				calls++
+				state, stateErr := core.CrabboxStateDir()
+				if stateErr != nil {
+					t.Fatal(stateErr)
+				}
+				if _, statErr := os.Stat(filepath.Join(state, "claims", leaseID+".json")); statErr != nil {
+					t.Fatalf("claim removed before provider cleanup: %v", statErr)
+				}
+				if name != "artifact failure" {
+					if _, statErr := os.Stat(key); statErr != nil {
+						t.Fatalf("SSH material removed before provider cleanup: %v", statErr)
+					}
+				}
+				if name == "provider failure" {
+					return failure
+				}
+				if name == "canceled after deletion" {
+					cancel()
+				}
+				return nil
+			})
+			if name == "success" || name == "canceled after deletion" {
+				if err != nil || calls != 1 {
+					t.Fatalf("calls=%d err=%v", calls, err)
+				}
+				if _, statErr := os.Lstat(dir); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("connection artifacts remain: %v", statErr)
+				}
+				if _, exists, readErr := core.ReadLeaseClaimWithPresence(leaseID); readErr != nil || exists {
+					t.Fatalf("claim exists=%v err=%v", exists, readErr)
+				}
+				return
+			}
+			if err == nil || name == "provider failure" && !errors.Is(err, failure) || name == "canceled before admission" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("missing cleanup error: %v", err)
+			}
+			wantCalls := 1
+			if name == "changed claim" || name == "canceled before admission" {
+				wantCalls = 0
+			}
+			if calls != wantCalls {
+				t.Fatalf("provider cleanup calls=%d want %d", calls, wantCalls)
+			}
+			if after, readErr := core.ReadLeaseClaim(leaseID); readErr != nil || !reflect.DeepEqual(after, current) {
+				t.Fatalf("retry claim changed: %+v err=%v", after, readErr)
+			}
+			if _, statErr := os.Lstat(dir); statErr != nil {
+				t.Fatalf("retry artifacts removed: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestMissingSSHLeaseCleanupCancelsWhileClaimIsLocked(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_123456abcdef"
+	if err := core.ClaimLeaseForRepoProviderScope(leaseID, "example", "gcp", "project:example", t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := core.PrepareStoredTestboxKeyPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(key, []byte("synthetic SSH key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held, release := make(chan struct{}), make(chan struct{})
+	ownerDone := make(chan error, 1)
+	go func() {
+		ownerDone <- core.WithDurableLeaseClaimLock(leaseID, func(*core.LeaseClaim, bool, func() error) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-held:
+	case err := <-ownerDone:
+		t.Fatalf("claim owner failed before lock admission: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		done <- (DirectCleanupDecision{Action: ForgetMissingCleanupServer, Claim: claim}).Apply(ctx, core.CleanupRequest{}, core.Runtime{Stderr: io.Discard})
+	}()
+	<-started
+	cancel()
+	timedOut := false
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		timedOut = true
+	}
+	close(release)
+	if ownerErr := <-ownerDone; ownerErr != nil {
+		t.Fatal(ownerErr)
+	}
+	if timedOut {
+		err = <-done
+		t.Fatalf("canceled cleanup waited for claim owner to release the lock: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cleanup returned %v, want cancellation", err)
+	}
+	if current, err := core.ReadLeaseClaim(leaseID); err != nil || !reflect.DeepEqual(current, claim) {
+		t.Fatalf("canceled cleanup changed claim: %#v err=%v", current, err)
+	}
+	if _, err := os.Stat(key); err != nil {
+		t.Fatalf("canceled cleanup removed SSH material: %v", err)
+	}
+}
 
 func TestCleanupServersUsesSingleBatchCutoff(t *testing.T) {
 	clock := &testCleanupClock{now: time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)}
@@ -57,19 +319,22 @@ func TestCleanupServersSkipsDeletesAndDryRuns(t *testing.T) {
 	servers := []core.Server{
 		testCleanupServerWithLabels("kept", map[string]string{
 			"keep":       "true",
-			"expires_at": clock.now.Add(-time.Hour).Format(time.RFC3339Nano),
+			"expires_at": clock.now.Add(time.Hour).Format(time.RFC3339Nano),
 		}),
 		testCleanupServerWithLabels("failed", map[string]string{
 			"state": "failed",
+		}),
+		testCleanupServerWithLabels("expired-kept", map[string]string{
+			"keep": "true", "expires_at": clock.now.Add(-time.Hour).Format(time.RFC3339Nano),
 		}),
 	}
 	if err := backend.CleanupServers(context.Background(), core.CleanupRequest{}, servers); err != nil {
 		t.Fatalf("CleanupServers returned error: %v", err)
 	}
-	if strings.Join(deleted, ",") != "failed" {
-		t.Fatalf("deleted=%v, want failed", deleted)
+	if strings.Join(deleted, ",") != "failed,expired-kept" {
+		t.Fatalf("deleted=%v, want failed,expired-kept", deleted)
 	}
-	if got := stderr.String(); !strings.Contains(got, "skip server id=kept name=kept reason=keep=true") || !strings.Contains(got, "delete server id=failed name=failed") {
+	if got := stderr.String(); !strings.Contains(got, "skip server id=kept name=kept reason=not expired") || !strings.Contains(got, "delete server id=failed name=failed") {
 		t.Fatalf("stderr=%q, want skip and delete lines", got)
 	}
 
@@ -85,6 +350,28 @@ func TestCleanupServersSkipsDeletesAndDryRuns(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "delete server id=dry-run name=dry-run") {
 		t.Fatalf("dry-run stderr=%q, want delete plan", got)
+	}
+}
+
+func TestCleanupServersRejectsUnowned(t *testing.T) {
+	for _, owner := range []string{"", "false"} {
+		t.Run("owner="+owner, func(t *testing.T) {
+			backend := DirectSSHBackend{
+				RT: core.Runtime{Stderr: io.Discard},
+				PrepareCleanup: func(context.Context, core.Server) (core.Server, bool, CleanupSkipReason, error) {
+					t.Fatal("unowned server reached preparation")
+					return core.Server{}, false, "", nil
+				},
+				Delete: func(context.Context, core.Config, core.Server) error {
+					t.Fatal("unowned server deleted")
+					return nil
+				},
+			}
+			server := core.Server{Labels: map[string]string{"crabbox": owner, "state": "failed", "expires_at": "1"}}
+			if err := backend.CleanupServers(context.Background(), core.CleanupRequest{}, []core.Server{server}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -107,6 +394,212 @@ func TestCleanupServersRequiresDeleteAndPropagatesDeleteErrors(t *testing.T) {
 	err = backend.CleanupServers(context.Background(), core.CleanupRequest{}, []core.Server{server})
 	if !errors.Is(err, deleteErr) {
 		t.Fatalf("err=%v, want deleteErr", err)
+	}
+}
+
+func TestCleanupServersSkipsIneligibleAndContinues(t *testing.T) {
+	clock := &testCleanupClock{now: time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)}
+	var stderr bytes.Buffer
+	var deleted []string
+	backend := DirectSSHBackend{
+		RT: core.Runtime{Stderr: &stderr, Clock: clock},
+		CleanupEligible: func(_ context.Context, server core.Server) (bool, error) {
+			return server.Name == "claimed", nil
+		},
+		Delete: func(_ context.Context, _ core.Config, server core.Server) error {
+			deleted = append(deleted, server.Name)
+			return nil
+		},
+	}
+	servers := []core.Server{
+		testCleanupServer("claimless", clock.now.Add(-time.Hour)),
+		testCleanupServer("claimed", clock.now.Add(-time.Hour)),
+	}
+	if err := backend.CleanupServers(context.Background(), core.CleanupRequest{}, servers); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(deleted, ",") != "claimed" {
+		t.Fatalf("deleted=%v, want claimed", deleted)
+	}
+	if !strings.Contains(stderr.String(), "skip server id=claimless name=claimless reason=no-exact-local-claim") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestCleanupServersPassesPreparedServerToDelete(t *testing.T) {
+	clock := &testCleanupClock{now: time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)}
+	backend := DirectSSHBackend{
+		RT: core.Runtime{Stderr: io.Discard, Clock: clock},
+		PrepareCleanup: func(_ context.Context, server core.Server) (core.Server, bool, CleanupSkipReason, error) {
+			server.Labels = CloneLabels(server.Labels)
+			server.Labels["prepared"] = "true"
+			return server, true, "", nil
+		},
+		Delete: func(_ context.Context, _ core.Config, server core.Server) error {
+			if server.Labels["prepared"] != "true" {
+				t.Fatalf("Delete server=%#v, want prepared server", server)
+			}
+			return nil
+		},
+	}
+	if err := backend.CleanupServers(context.Background(), core.CleanupRequest{}, []core.Server{testCleanupServer("prepared", clock.now.Add(-time.Hour))}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupServersEmitsPrepareSkipReason(t *testing.T) {
+	clock := &testCleanupClock{now: time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)}
+	var stderr bytes.Buffer
+	backend := DirectSSHBackend{
+		RT: core.Runtime{Stderr: &stderr, Clock: clock},
+		PrepareCleanup: func(_ context.Context, server core.Server) (core.Server, bool, CleanupSkipReason, error) {
+			return server, false, CleanupSkipReason("provider-scope-mismatch"), nil
+		},
+		Delete: func(context.Context, core.Config, core.Server) error {
+			t.Fatal("Delete called for skipped server")
+			return nil
+		},
+	}
+	if err := backend.CleanupServers(context.Background(), core.CleanupRequest{}, []core.Server{testCleanupServer("skipped", clock.now.Add(-time.Hour))}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "reason=provider-scope-mismatch") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestCleanupServersDryRunPreparesWithoutDelete(t *testing.T) {
+	clock := &testCleanupClock{now: time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)}
+	prepared := 0
+	backend := DirectSSHBackend{
+		RT: core.Runtime{Stderr: io.Discard, Clock: clock},
+		PrepareCleanup: func(_ context.Context, server core.Server) (core.Server, bool, CleanupSkipReason, error) {
+			prepared++
+			return server, true, "", nil
+		},
+		Delete: func(context.Context, core.Config, core.Server) error {
+			t.Fatal("Delete called during dry-run")
+			return nil
+		},
+	}
+	if err := backend.CleanupServers(context.Background(), core.CleanupRequest{DryRun: true}, []core.Server{testCleanupServer("dry", clock.now.Add(-time.Hour))}); err != nil {
+		t.Fatal(err)
+	}
+	if prepared != 1 {
+		t.Fatalf("prepared=%d, want 1", prepared)
+	}
+}
+
+func TestCleanupServersRechecksPreparedServerAndClaimEligibility(t *testing.T) {
+	clock := &testCleanupClock{now: time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)}
+	for _, test := range []struct {
+		name    string
+		prepare func(core.Server) core.Server
+		reason  string
+	}{
+		{
+			name: "refreshed server is kept",
+			prepare: func(server core.Server) core.Server {
+				server.Labels = CloneLabels(server.Labels)
+				server.Labels["keep"] = "true"
+				server.Labels["expires_at"] = clock.now.Add(time.Hour).Format(time.RFC3339Nano)
+				return server
+			},
+			reason: "not expired",
+		},
+		{
+			name: "prepared claim was renewed",
+			prepare: func(server core.Server) core.Server {
+				claim := core.LeaseClaim{
+					LeaseID:  "cbx_aaaaaaaaaaaa",
+					Provider: "example",
+					Revision: "renewed",
+					Labels: map[string]string{
+						"crabbox":    "true",
+						"lease":      "cbx_aaaaaaaaaaaa",
+						"keep":       "false",
+						"expires_at": clock.now.Add(time.Hour).Format(time.RFC3339Nano),
+					},
+				}
+				server.Labels = CloneLabels(server.Labels)
+				server.Labels["lease"] = claim.LeaseID
+				core.SetServerLeaseClaimSnapshot(&server, claim, true)
+				return server
+			},
+			reason: "not expired",
+		},
+		{
+			name: "refreshed server lost ownership",
+			prepare: func(server core.Server) core.Server {
+				server.Labels = CloneLabels(server.Labels)
+				delete(server.Labels, "crabbox")
+				return server
+			},
+			reason: "missing labels",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			backend := DirectSSHBackend{
+				RT: core.Runtime{Stderr: &stderr, Clock: clock},
+				PrepareCleanup: func(_ context.Context, server core.Server) (core.Server, bool, CleanupSkipReason, error) {
+					return test.prepare(server), true, "", nil
+				},
+				Delete: func(context.Context, core.Config, core.Server) error {
+					t.Fatal("Delete called after prepared cleanup eligibility changed")
+					return nil
+				},
+			}
+			if err := backend.CleanupServers(context.Background(), core.CleanupRequest{}, []core.Server{testCleanupServer("renewed", clock.now.Add(-time.Hour))}); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(stderr.String(), "reason="+test.reason) {
+				t.Fatalf("stderr=%q, want reason=%s", stderr.String(), test.reason)
+			}
+		})
+	}
+}
+
+func TestCleanupServersRejectsSimultaneousPreparationHooks(t *testing.T) {
+	backend := DirectSSHBackend{
+		SpecValue: core.ProviderSpec{Name: "test-provider"},
+		RT:        core.Runtime{Stderr: io.Discard},
+		PrepareCleanup: func(_ context.Context, server core.Server) (core.Server, bool, CleanupSkipReason, error) {
+			return server, true, "", nil
+		},
+		CleanupEligible: func(context.Context, core.Server) (bool, error) { return true, nil },
+	}
+	err := backend.CleanupServers(context.Background(), core.CleanupRequest{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "cannot configure both PrepareCleanup and CleanupEligible") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestCleanupClaimEligible(t *testing.T) {
+	if eligible, err := CleanupClaimEligible(nil); err != nil || !eligible {
+		t.Fatalf("nil error eligible=%v err=%v", eligible, err)
+	}
+	if eligible, err := CleanupClaimEligible(core.Exit(2, "claim mismatch")); err != nil || eligible {
+		t.Fatalf("claim mismatch eligible=%v err=%v", eligible, err)
+	}
+	want := errors.New("read claim")
+	if eligible, err := CleanupClaimEligible(want); eligible || !errors.Is(err, want) {
+		t.Fatalf("read failure eligible=%v err=%v", eligible, err)
+	}
+}
+
+func TestServerWithDefaultLabelCopiesLabels(t *testing.T) {
+	original := core.Server{Labels: map[string]string{"lease": "cbx_123456789abc"}}
+	updated := ServerWithDefaultLabel(original, "provider_account", "account:test")
+	if updated.Labels["provider_account"] != "account:test" || updated.Labels["lease"] != original.Labels["lease"] {
+		t.Fatalf("updated labels=%v", updated.Labels)
+	}
+	if _, ok := original.Labels["provider_account"]; ok {
+		t.Fatalf("original labels mutated: %v", original.Labels)
+	}
+	existing := ServerWithDefaultLabel(updated, "provider_account", "account:other")
+	if existing.Labels["provider_account"] != "account:test" {
+		t.Fatalf("existing label overwritten: %v", existing.Labels)
 	}
 }
 
@@ -198,9 +691,115 @@ func testCleanupServer(name string, expiresAt time.Time) core.Server {
 }
 
 func testCleanupServerWithLabels(name string, labels map[string]string) core.Server {
+	labels = CloneLabels(labels)
+	labels["crabbox"] = "true"
 	return core.Server{CloudID: name, Name: name, Labels: labels}
 }
 
 func bootstrapWaitErr() error {
 	return core.Exit(5, "timed out waiting for SSH: test")
+}
+
+func TestAcquireCleanupFailureVetoesRetryThroughWrapping(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		for _, wrapped := range []bool{false, true} {
+			t.Run(fmt.Sprintf("keep=%t/wrapped=%t", keep, wrapped), func(t *testing.T) {
+				primary := bootstrapWaitErr()
+				cleanup := core.Exit(9, "cleanup denied")
+				var stderr bytes.Buffer
+				attempts := 0
+				_, err := AcquireAttemptsRetry(core.Runtime{Stderr: &stderr}, keep, func() (core.LeaseTarget, error) {
+					attempts++
+					debt := JoinAcquireCleanupError(primary, cleanup)
+					if wrapped {
+						debt = errors.Join(errors.New("attempt context"), fmt.Errorf("wrapped: %w", debt))
+					}
+					return core.LeaseTarget{}, debt
+				})
+				var ee core.ExitError
+				if attempts != 1 || !errors.Is(err, primary) || !errors.Is(err, cleanup) || !core.AsExitError(err, &ee) || ee.Code != 5 {
+					t.Fatalf("attempts=%d error=%v primary=%+v", attempts, err, ee)
+				}
+				if strings.Contains(stderr.String(), "retrying with fresh lease") {
+					t.Fatalf("unexpected retry: %s", stderr.String())
+				}
+				if !strings.Contains(stderr.String(), "cleanup denied") {
+					t.Fatalf("cleanup diagnosis missing from CLI diagnostics: %s", stderr.String())
+				}
+			})
+		}
+	}
+	primary := bootstrapWaitErr()
+	if got := JoinAcquireCleanupError(primary, nil); got != primary {
+		t.Fatalf("successful cleanup changed primary: %v", got)
+	}
+}
+
+func TestResolvedLeaseTargetPreservesEndpoint(t *testing.T) {
+	for _, stored := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			for _, releaseOnly := range []bool{false, true} {
+				t.Run(fmt.Sprintf("stored=%t/enabled=%t/release=%t", stored, enabled, releaseOnly), func(t *testing.T) {
+					testutil.IsolateUserDirs(t)
+					const leaseID = "cbx_123456abcdef"
+					path, err := core.TestboxKeyPath(leaseID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if stored {
+						path, err = core.PrepareStoredTestboxKeyPath(leaseID)
+						if err != nil {
+							t.Fatal(err)
+						}
+						file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+						if err != nil {
+							t.Fatal(err)
+						}
+						secureErr := core.SecureCreatedLeaseSSHFile(file)
+						closeErr := file.Close()
+						if secureErr != nil {
+							t.Fatal(secureErr)
+						}
+						if closeErr != nil {
+							t.Fatal(closeErr)
+						}
+					}
+					target := core.SSHTarget{User: "alice", Host: "192.0.2.10", Key: "configured-key", Port: "2222", FallbackPorts: []string{"22"}, TargetOS: "linux", WindowsMode: "normal", ReadyCheck: "true", CertificateFile: "certificate", KnownHostsFile: "known-hosts", HostKeyAlias: "alias", SSHHostKey: "host-key", NoControlMaster: true, SSHConfigProxy: true, ProxyCommand: "proxy", ChildEnvDenylist: []string{"EXAMPLE"}, ChildEnv: map[string]string{"EXAMPLE_MODE": "test"}}
+					server := core.Server{CloudID: "instance", Labels: map[string]string{"lease": leaseID}}
+					want := core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}
+					if stored && enabled && !releaseOnly {
+						want.SSH.Key = path
+					}
+					backend := DirectSSHBackend{StoredLeaseKeys: enabled}
+					got, err := backend.ResolvedLeaseTarget(server, target, leaseID, releaseOnly)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("target mismatch: got %#v want %#v", got, want)
+					}
+					if target.Key != "configured-key" {
+						t.Fatal("input target changed")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestResolvedLeaseTargetLookupErrorAndReleaseOnly(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	t.Setenv("XDG_STATE_HOME", "relative-state")
+	backend := DirectSSHBackend{StoredLeaseKeys: true}
+	server := core.Server{CloudID: "instance"}
+	target := core.SSHTarget{Host: "192.0.2.10", Key: "configured-key"}
+	got, err := backend.ResolvedLeaseTarget(server, target, "cbx_123456abcdef", false)
+	if err == nil || !reflect.DeepEqual(got, core.LeaseTarget{}) {
+		t.Fatalf("lookup error=%v target=%#v", err, got)
+	}
+	got, err = backend.ResolvedLeaseTarget(server, target, "cbx_123456abcdef", true)
+	want := core.LeaseTarget{Server: server, SSH: target, LeaseID: "cbx_123456abcdef"}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("release-only error=%v target=%#v", err, got)
+	}
 }

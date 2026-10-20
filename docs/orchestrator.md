@@ -26,7 +26,7 @@ How a command reaches a provider is decided by `loadBackend`
 (`internal/cli/provider_backend.go`):
 
 - **Brokered.** The provider's spec advertises coordinator support (`aws`,
-  `azure`, `gcp`, `hetzner`) *and* a broker URL is configured
+  `azure`, `daytona`, `gcp`, `hetzner`) *and* a broker URL is configured
   (`CRABBOX_COORDINATOR` or `config set-broker`). Lease lifecycle calls go
   through the coordinator over HTTP; the CLI still opens SSH and runs commands
   directly against the box.
@@ -36,8 +36,14 @@ How a command reaches a provider is decided by `loadBackend`
 - **Delegated.** Sandbox/run providers that own sync and execution end to end.
   The CLI never opens its own SSH or rsync session.
 
-The four brokerable providers run direct unless a broker is configured, so
+The five brokerable providers run direct unless a broker is configured, so
 "brokered" is a deployment choice, not a property of the provider alone.
+
+Brokered Daytona leases use the coordinator's API key to create the sandbox and
+mint an expiring SSH access token. The CLI receives that token as a secret SSH
+identity and uses the normal SSH/rsync data plane. Daytona workspaces and ready
+pools remain disabled because their stored SSH endpoint would outlive the
+rotating token.
 
 ## Responsibilities
 
@@ -128,14 +134,14 @@ coordinator keeps the lease `active`, records `cleanupAttempts`,
 5 minutes) rather than marking the lease `expired` while the machine may still
 exist. On success the lease moves to `expired`.
 
-Maintenance runs at the earliest active-lease expiry or AWS orphan-sweep time.
-The orphan sweep (report or delete mode, gated by
-`CRABBOX_AWS_ORPHAN_SWEEP_*`) terminates untracked instances and releases idle
-Mac dedicated hosts.
+Maintenance runs at the earliest active-lease expiry or provider orphan-sweep
+time. The AWS and Azure orphan sweeps (report or delete mode, gated by
+provider-specific settings) report untracked provider resources and release or
+terminate only exact resources retained in coordinator lease state.
 
 Direct cleanup only deletes machines that are clearly safe:
 
-- `keep=true` is skipped;
+- `keep=true` is skipped, even after recorded expiry;
 - `running` and `provisioning` are skipped until past expiry plus 12 hours;
 - expired `ready`/`leased`/`active` machines are deleted once past expiry;
 - `failed`/`released`/`expired` machines are deleted;
@@ -193,7 +199,7 @@ Raw Cloudflare Access identity headers are ignored — only a verified Access JW
 email can become the bearer-token owner.
 
 If a new lease would exceed any configured active-lease count or monthly
-reserved-cost budget, the create call returns HTTP 429 `cost_limit_exceeded`
+committed-cost budget, the create call returns HTTP 429 `cost_limit_exceeded`
 and no machine is provisioned. See [Cost and usage](features/cost-usage.md).
 
 ## Usage statistics
@@ -208,7 +214,7 @@ crabbox usage --scope all --json
 ```
 
 A report includes lease count, active-lease count, elapsed runtime, estimated
-elapsed cost, reserved worst-case cost, and breakdowns by owner, org, provider,
+elapsed cost, reserved worst-case cost, committed budget cost, and breakdowns by owner, org, provider,
 and server type.
 
 ## Actions parity boundary

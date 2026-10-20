@@ -7,13 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 // ocAPIClient is a thin REST client for the OpenComputer control plane. The
@@ -92,116 +94,41 @@ func (e *ocAPIError) Unwrap() error { return e.err }
 // newOCAPIClient resolves the API URL and key. Key precedence:
 // CRABBOX_OPENCOMPUTER_API_KEY, OPENCOMPUTER_API_KEY, then the `oc` CLI config
 // (~/.oc/config.json). Returns an error when no key can be found.
-func newOCAPIClient(cfg Config, rt Runtime) (*ocAPIClient, error) {
+func newOCAPIClient(cfg core.Config, rt core.Runtime) (*ocAPIClient, error) {
 	fileCfg := readOCFileConfig()
 	// API URL precedence: an explicit trusted Crabbox setting, then the `oc` CLI
 	// config file's api_url, then the built-in default. Repository YAML cannot
 	// populate cfg.OpenComputer.APIURL.
-	baseURL, err := validateOCAPIURL(blank(strings.TrimSpace(cfg.OpenComputer.APIURL), blank(strings.TrimSpace(fileCfg.APIURL), defaultAPIURL)))
+	baseURL, err := validateOCAPIURL(core.Blank(strings.TrimSpace(cfg.OpenComputer.APIURL), core.Blank(strings.TrimSpace(fileCfg.APIURL), defaultAPIURL)))
 	if err != nil {
 		return nil, err
 	}
-	apiKey := firstNonEmpty(
+	apiKey := shared.FirstNonBlankTrimmed(
 		os.Getenv("CRABBOX_OPENCOMPUTER_API_KEY"),
 		os.Getenv("OPENCOMPUTER_API_KEY"),
 		fileCfg.APIKey,
 	)
 	if apiKey == "" {
-		return nil, exit(2, "provider=opencomputer needs an API key; load CRABBOX_OPENCOMPUTER_API_KEY from a secret manager or configure an existing oc CLI credential")
+		return nil, core.Exit(2, "provider=opencomputer needs an API key; load CRABBOX_OPENCOMPUTER_API_KEY from a secret manager or configure an existing oc CLI credential")
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &ocAPIClient{http: secureOCAPIClient(httpClient, baseURL), baseURL: baseURL, apiKey: apiKey}, nil
+	trusted, _ := url.Parse(baseURL)
+	return &ocAPIClient{http: shared.SecureHTTPClient(httpClient, trusted, ocRedirectError), baseURL: baseURL, apiKey: apiKey}, nil
 }
 
 func validateOCAPIURL(raw string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Opaque != "" {
-		return "", exit(2, "provider=opencomputer API URL must be an absolute HTTPS URL")
-	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		return "", exit(2, "provider=opencomputer API URL must not contain userinfo, query parameters, or a fragment")
-	}
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
-		return "", exit(2, "provider=opencomputer API URL must use HTTPS except for loopback development endpoints")
-	}
-	host := canonicalOCHostname(parsed.Hostname())
-	port := parsed.Port()
-	if (parsed.Scheme == "https" && port == "443") || (parsed.Scheme == "http" && port == "80") {
-		port = ""
-	}
-	if port != "" {
-		parsed.Host = net.JoinHostPort(host, port)
-	} else if strings.Contains(host, ":") {
-		parsed.Host = "[" + host + "]"
-	} else {
-		parsed.Host = host
-	}
-	cleanPath := strings.TrimRight(parsed.Path, "/")
-	if strings.HasSuffix(cleanPath, "/api") {
-		cleanPath = strings.TrimSuffix(cleanPath, "/api")
-	}
-	parsed.Path = cleanPath
-	parsed.RawPath = ""
-	return strings.TrimRight(parsed.String(), "/"), nil
+	return shared.NormalizeSandboxAPIURL(raw, shared.EndpointURLErrors{
+		Invalid:    core.Exit(2, "provider=opencomputer API URL must be an absolute HTTPS URL"),
+		Components: core.Exit(2, "provider=opencomputer API URL must not contain userinfo, query parameters, or a fragment"),
+		Insecure:   core.Exit(2, "provider=opencomputer API URL must use HTTPS except for loopback development endpoints"),
+	}, func(path string) string { return strings.TrimSuffix(path, "/api") })
 }
 
-func canonicalOCHostname(host string) string {
-	if zoneAt := strings.Index(host, "%"); zoneAt > 0 && strings.Contains(host[:zoneAt], ":") {
-		return strings.ToLower(host[:zoneAt]) + host[zoneAt:]
-	}
-	return strings.ToLower(host)
-}
-
-func isLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-func secureOCAPIClient(source *http.Client, baseURL string) *http.Client {
-	client := *source
-	trusted, _ := url.Parse(baseURL)
-	originalCheckRedirect := source.CheckRedirect
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if !sameOCOrigin(trusted, req.URL) {
-			return fmt.Errorf("opencomputer refused cross-origin redirect to %s", req.URL.Redacted())
-		}
-		if originalCheckRedirect != nil {
-			return originalCheckRedirect(req, via)
-		}
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		return nil
-	}
-	return &client
-}
-
-func sameOCOrigin(a, b *url.URL) bool {
-	return a != nil && b != nil &&
-		strings.EqualFold(a.Scheme, b.Scheme) &&
-		strings.EqualFold(a.Hostname(), b.Hostname()) &&
-		effectiveOCPort(a) == effectiveOCPort(b)
-}
-
-func effectiveOCPort(value *url.URL) string {
-	if port := value.Port(); port != "" {
-		return port
-	}
-	switch strings.ToLower(value.Scheme) {
-	case "https":
-		return "443"
-	case "http":
-		return "80"
-	default:
-		return ""
-	}
+func ocRedirectError(destination *url.URL) error {
+	return fmt.Errorf("opencomputer refused cross-origin redirect to %s", destination.Redacted())
 }
 
 func (c *ocAPIClient) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
@@ -243,7 +170,7 @@ func (c *ocAPIClient) doJSONWithTimeout(ctx context.Context, timeout time.Durati
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apiError(method, path, resp)
+		return c.apiError(method, path, resp)
 	}
 	if out == nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
@@ -261,7 +188,7 @@ func (c *ocAPIClient) createSandbox(ctx context.Context, req createSandboxReques
 		return sandbox{}, err
 	}
 	if sb.ID == "" {
-		return sandbox{}, exit(5, "opencomputer create returned no sandbox id")
+		return sandbox{}, core.Exit(5, "opencomputer create returned no sandbox id")
 	}
 	return sb, nil
 }
@@ -309,14 +236,24 @@ func (c *ocAPIClient) getSandboxWithTags(ctx context.Context, id string) (sandbo
 
 func (c *ocAPIClient) execRun(ctx context.Context, id string, req execRunRequest) (execRunResult, error) {
 	var res execRunResult
-	timeout := defaultOCExecRequestTimeout
-	if req.Timeout > 0 {
-		timeout = time.Duration(req.Timeout) * time.Second
+	timeout, err := openComputerExecRequestTimeout(req.Timeout)
+	if err != nil {
+		return res, err
 	}
-	if err := c.doJSONWithTimeout(ctx, timeout+ocExecRequestGrace, http.MethodPost, "/api/sandboxes/"+url.PathEscape(id)+"/exec/run", req, &res); err != nil {
+	if err := c.doJSONWithTimeout(ctx, timeout, http.MethodPost, "/api/sandboxes/"+url.PathEscape(id)+"/exec/run", req, &res); err != nil {
 		return execRunResult{}, err
 	}
 	return res, nil
+}
+
+func openComputerExecRequestTimeout(seconds int) (time.Duration, error) {
+	if seconds <= 0 {
+		return defaultOCExecRequestTimeout + ocExecRequestGrace, nil
+	}
+	if timeout, ok := shared.SecondsWithGrace(int64(seconds), ocExecRequestGrace); ok {
+		return timeout, nil
+	}
+	return 0, core.Exit(2, "opencomputer execution timeout exceeds the supported duration range")
 }
 
 // uploadFile writes content to remotePath inside the sandbox via
@@ -334,12 +271,12 @@ func (c *ocAPIClient) uploadFile(ctx context.Context, id, remotePath string, con
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apiError(http.MethodPut, "files?path="+remotePath, resp)
+		return c.apiError(http.MethodPut, "files?path="+remotePath, resp)
 	}
 	return nil
 }
 
-func apiError(method, path string, resp *http.Response) error {
+func (c *ocAPIClient) apiError(method, path string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	msg := strings.TrimSpace(string(body))
 	// Surface the API's {"error": "..."} message when present.
@@ -349,10 +286,22 @@ func apiError(method, path string, resp *http.Response) error {
 	if json.Unmarshal(body, &wrapped) == nil && wrapped.Error != "" {
 		msg = wrapped.Error
 	}
+	msg = redactOCSecrets(msg, c.apiKey)
+	path = redactOCSecrets(path, c.apiKey)
 	return &ocAPIError{
 		StatusCode: resp.StatusCode,
-		err:        exit(5, "opencomputer %s %s failed: %s: %s", method, path, resp.Status, msg),
+		err:        core.Exit(5, "opencomputer %s %s failed: %s: %s", method, path, resp.Status, msg),
 	}
+}
+
+func redactOCSecrets(value string, secrets ...string) string {
+	redacted := value
+	for _, secret := range secrets {
+		if strings.TrimSpace(secret) != "" {
+			redacted = strings.ReplaceAll(redacted, secret, "[redacted]")
+		}
+	}
+	return redacted
 }
 
 func isOCNotFound(err error) bool {
@@ -374,13 +323,4 @@ func readOCFileConfig() ocFileConfig {
 		return ocFileConfig{}
 	}
 	return cfg
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
 }

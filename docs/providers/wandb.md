@@ -39,6 +39,7 @@ and the broker coordinator are not available.
 ```sh
 crabbox run    --provider wandb --no-sync -- python eval.py
 crabbox run    --provider wandb --no-sync --id swift-crab -- pnpm test
+crabbox run    --provider wandb --no-sync --keep --lease-output session.json -- true
 crabbox status --provider wandb --id swift-crab
 crabbox stop   --provider wandb swift-crab
 crabbox list   --provider wandb
@@ -49,6 +50,10 @@ Without `--id`, `run` acquires a new sandbox, runs the command, and stops the
 sandbox afterwards. With `--id <sandbox-id>` it execs into the existing
 sandbox and leaves it running. `warmup` is rejected — sandboxes are acquired
 per run, with no separate provisioning phase.
+
+`--lease-output <path>` writes a reusable session handle containing the stable
+sandbox ID and an exact cleanup command. Pair it with `--keep` when another
+process should reuse the newly acquired sandbox.
 
 ## Auth
 
@@ -82,8 +87,9 @@ wandb:
   maxLifetimeSeconds: 1800   # 30 min; W&B reclaims the sandbox at this limit
 ```
 
-Defaults applied when unset: `defaultImage` is `ubuntu:24.04` and
-`maxLifetimeSeconds` is `1800`.
+Runtime defaults applied when unset: `defaultImage` is `ubuntu:24.04` and
+`maxLifetimeSeconds` is `1800`. The raw configuration remains empty/zero until
+the provider applies these defaults; flag registration does not eagerly fill them.
 
 Provider flags (each overrides the matching `wandb.*` config key):
 
@@ -102,21 +108,54 @@ Environment overrides:
   `api.cwsandbox.com:443`); the `https://` / `http://` scheme is stripped if
   present.
 
+The three configuration settings use shared typed bindings. Empty file/environment
+strings preserve prior values. File `maxLifetimeSeconds` assigns only when positive;
+zero or negative file values leave the prior setting intact. Environment parsing
+instead accepts signed integers: a parsed primary value, including zero or a
+negative value, wins. An empty or malformed primary falls back to the vendor alias,
+then to the prior setting. Runtime defaulting and the lease TTL still determine the
+effective lifetime. The client-owned API-key precedence above is unchanged.
+
 ## Lifecycle
 
 `crabbox run`:
 
-1. With `--id <sandbox-id>`, `Exec` against the existing sandbox and leave it
-   running.
+1. With `--id <sandbox-id>`, require the exact local claim created when
+   Crabbox acquired the sandbox, verify that the claim still matches the W&B
+   endpoint, entity, project, and sandbox ID, then require the provider-side
+   `crabbox` inventory tag before `Exec`.
 2. Otherwise, `Start` a sandbox with an idle keep-alive command, poll until it
-   reaches `RUNNING` (200 ms backoff, ×1.5, capped at 2 s), `Exec` the
-   command, then `Stop` it unless `--keep` is set.
+   reaches `RUNNING` (200 ms backoff, ×1.5, capped at 2 s), persist the exact
+   ownership claim, `Exec` the command, then `Stop` it unless `--keep` is set.
+   If claim persistence fails, Crabbox rolls back the acquired sandbox before
+   returning.
 
-`status` renders the sandbox state (for example `running`; a `COMPLETED`
-sandbox is reported as `stopped` so `status --wait` treats it as terminal).
-`list` paginates sandboxes tagged `crabbox`. `stop` issues a graceful stop
-(15 s timeout). Acquire and exec apply a startup timeout that is the lesser of
-five minutes and the sandbox lifetime.
+Run outcomes and timing are finalized after automatic Stop. A Stop failure
+makes an otherwise successful run fail with exit `1` and retains its recovery
+session and unchanged claim. Command failures and mapped gRPC exit codes stay
+primary when Stop or timing output also fails; secondary diagnostics remain
+visible. gRPC/API failures are classified as `provider-error`, not as observed
+command exits, while keeping their mapped numeric exit codes. `--keep-on-failure`
+is decided before timing output, so a reporting
+failure cannot discard an already-failed run's sandbox. A timing-output failure
+after successful Stop does not claim the sandbox is retained. Closing the local
+gRPC connection remains warning-only. Command timing measures Exec separately;
+total timing includes acquisition and automatic cleanup.
+
+`status` and `stop` enforce the same exact claim and tagged-inventory checks
+before issuing Get or Stop. A tagged sandbox without the matching local claim,
+or a claim from another endpoint, entity, or project, fails closed. Successful
+automatic or explicit stop removes the unchanged claim; failed cleanup keeps
+it so a later retry can still route to the owned resource. If tagged inventory
+no longer contains a claimed sandbox, Crabbox probes that exact ID: a confirmed
+provider `NotFound` lets `stop` remove only the unchanged stale claim. An
+untagged but existing sandbox or any lookup error preserves the claim and fails
+closed. `status` renders
+the sandbox state (for example `running`; a
+`COMPLETED` sandbox is reported as `stopped` so `status --wait` treats it as
+terminal). `list` paginates sandboxes tagged `crabbox`. `stop` issues a
+graceful stop (15 s timeout). Acquire and exec apply a startup timeout that is
+the lesser of five minutes and the sandbox lifetime.
 
 ## Capabilities
 
@@ -134,15 +173,24 @@ five minutes and the sandbox lifetime.
 - `Exec` is the unary RPC, so command output is buffered server-side and
   returned at completion rather than streamed; there is no interactive PTY.
 - Environment variables are applied at `Start` time only. When you target an
-  existing sandbox with `--id`, env vars cannot be forwarded onto it (the
-  `Exec` RPC has no env field), so an `--id` run with `--allow-env` is
-  rejected.
+  existing sandbox with `--id`, selected user env vars cannot be forwarded onto
+  it (the `Exec` RPC has no env field), so explicit `--allow-env` selections
+  containing such values are rejected, including `CI` and `NODE_OPTIONS`.
+  Crabbox's local run metadata (`CRABBOX_LEASE_ID`, `CRABBOX_RUN_ID`, and
+  `CRABBOX_SLUG`) may be omitted for reuse, including when an env summary is
+  requested. The built-in implicit `CI`/`NODE_OPTIONS` defaults retain their
+  existing omission exception. Neither exception forwards values through `Exec`
+  or refreshes the sandbox's original `Start`-time environment; similarly named
+  custom variables are not treated as reserved metadata.
 - `--reclaim`, `--shell`, `--sync-only`, `--checksum`, `--force-sync-large`,
   `--full-resync`, `--download`, `--artifact-glob`, and `--require-artifact`
   are rejected: W&B owns the sandbox lifecycle and there is no Crabbox
   SSH/rsync target.
+- `--reclaim` remains unsupported because the pinned W&B API has no safe way
+  to adopt a tagged external sandbox into a conflict-safe exact local claim.
 - `--keep` retains a newly acquired sandbox after the run; `--keep-on-failure`
-  retains it only when the command fails, so you can debug.
+  retains it only when the command fails, so you can debug. Both paths retain
+  the exact local claim needed by later `run --id`, `status`, and `stop` calls.
 - gRPC failures map to sysexits-aligned exit codes:
   `77` (unauthenticated / permission denied), `4` (not found), `124`
   (deadline exceeded), `69` (unavailable / resource exhausted).
@@ -151,6 +199,26 @@ five minutes and the sandbox lifetime.
 
 Run a live smoke when changing W&B lifecycle, exec, status, or auth code. Keep
 the API key in the environment; never pass it as an argument.
+
+```sh
+export CRABBOX_WANDB_API_KEY=wandb_v1_...
+export WANDB_ENTITY_NAME=my-team
+go build -trimpath -o bin/crabbox ./cmd/crabbox
+CRABBOX_LIVE=1 \
+CRABBOX_LIVE_PROVIDERS=wandb \
+CRABBOX_LIVE_COORDINATOR=0 \
+CRABBOX_LIVE_REPO=/path/to/my-app \
+scripts/live-smoke.sh
+```
+
+The shared harness exits before any W&B provider command when no API key is
+exported. With the API key and entity configured, it runs `doctor`, creates a
+kept sandbox with a 60-second lifetime, proves status and reuse through the
+exact claim, proves that the provider tag alone cannot authorize stop, then
+stops the sandbox and confirms no active remote inventory or local claim
+residue.
+
+For manual debugging, run the same lifecycle directly:
 
 ```sh
 export CRABBOX_WANDB_API_KEY=wandb_v1_...
@@ -182,5 +250,3 @@ Related docs:
 - [Provider backends](../provider-backends.md)
 - [W&B Sandboxes docs](https://docs.wandb.ai/sandboxes)
 - [CoreWeave Sandboxes docs](https://docs.coreweave.com/products/sandboxes)
-</content>
-</invoke>

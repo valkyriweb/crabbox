@@ -1,14 +1,16 @@
 # Features
 
-Feature docs explain what Crabbox can do and how the pieces fit together. They cover the
-capability-level contract — what a feature is, when it applies, and how the parts interact.
-Command syntax and per-flag reference live in [../commands/README.md](../commands/README.md).
+Crabbox features are reusable capability contracts for configuration, fleet
+control, runner access, synchronization, execution, and evidence. Use this page
+to understand what Crabbox can do after a provider has supplied the execution
+target.
 
-Read when:
-
-- you want a capability overview;
-- you are deciding where a behavior belongs;
-- you need the feature-level contract before changing code.
+Provider choice, direct/coordinator routing, API-key and credential expectations,
+sandbox/provider behavior, adapter-specific caveats, and the generated provider
+matrix live in the [Provider Reference](../providers/README.md). Use
+`crabbox providers` and `crabbox providers recommend` to inspect the provider
+capabilities compiled into your current binary. Exact command syntax and flags
+live in the [Command Reference](../commands/README.md).
 
 ## Foundations
 
@@ -19,7 +21,7 @@ Read when:
 - [Lease capabilities](capabilities.md): `--desktop`, `--browser`, and `--code` selection rules.
 - [Environment forwarding](env-forwarding.md): name-based env allowlist for the remote command.
 
-## Coordinator and brokered fleet
+## Fleet control and coordination
 
 - [Runtime adapter stack](runtime-adapter-stack.md): compose `adapter serve`,
   `adapter ingress`, and `adapter connect` behind a fleet UI.
@@ -34,32 +36,8 @@ Read when:
 - [Telemetry](telemetry.md): lightweight Linux load, memory, disk, uptime, and per-run resource samples.
 - [History and logs](history-logs.md): coordinator run records, events, and retained remote output.
 - [Cost and usage](cost-usage.md): guardrails, provider-backed pricing, and reporting.
+- [Marketplace credits gateway](marketplace-credits.md): preview status and advisory quotes; no payment, credit reservation, or lease provisioning.
 - [Lifecycle cleanup](lifecycle-cleanup.md): release, expiry, keep mode, and direct cleanup.
-
-## Providers
-
-- [Providers](providers.md): provider overview, target matrix, classes, and fallback.
-- [Provider reference](../providers/README.md): per-adapter pages for every registered provider.
-- [Capacity and fallback](capacity-fallback.md): class chains, market spot/on-demand, and region/AZ routing.
-- [Provider backends](../provider-backends.md): contract reference for backend interfaces and registration.
-- [Authoring a provider](provider-authoring.md): step-by-step guide to writing a new provider.
-- [XCP-ng](../providers/xcp-ng.md): direct XCP-ng provider on dedicated x86_64 pool hardware. XCP-ng itself can host Linux, Windows, and BSD guests; Crabbox normal leases use Linux templates, with separate Windows x86_64/x64 ISO E2E coverage.
-- [Incus local E2E testbed](../providers/incus.md): local Apple Silicon runbook and smoke contract for the future `incus` adapter.
-
-Provider deep-dives that live here in `features/`:
-
-- [AWS](aws.md): EC2 Linux, Windows, WSL2, EC2 Mac, capacity, AMIs, and security groups.
-- [Azure](azure.md): Azure Linux, Windows, WSL2, shared infra, capacity, and cleanup.
-- [Hetzner](hetzner.md): Linux-only managed Hetzner behavior, classes, and cleanup.
-- [Blacksmith Testbox](blacksmith-testbox.md): delegated Testbox runner behavior.
-- [Namespace Devbox](namespace-devbox.md): Namespace Devbox SSH leases with Crabbox sync/run.
-- [Namespace Devbox setup](namespace-devbox-setup.md): CLI install, browser authentication, and live checks.
-- [Namespace Compute Instance](../providers/namespace-instance.md): disposable Linux Compute leases through `nsc`.
-- [Semaphore](semaphore.md): Semaphore CI job leases with Crabbox SSH sync/run.
-- [Sprites](sprites.md): Sprites microVM SSH leases through `sprite proxy`.
-- [Daytona](daytona.md): Daytona SDK/toolbox sandbox leases with optional short-lived SSH access.
-- [Islo](islo.md): delegated Islo sandbox runs using the Islo Go SDK.
-- [E2B](e2b.md): delegated E2B sandbox runs using the E2B sandbox APIs.
 
 ## Runners and reachability
 
@@ -68,82 +46,37 @@ Provider deep-dives that live here in `features/`:
 - [Mediated egress](egress.md): browser/app egress through an operator machine
   using the coordinator mediator.
 - [Runner bootstrap](runner-bootstrap.md): cloud-init, installed tools, SSH port, and readiness.
-- [Prebaked runner images](prebaked-images.md): provider-owned image storage and the image/cache/state boundary.
-- [Image bake runbook](image-bake-runbook.md): exact AWS bake, candidate smoke, promotion, rollback, and cleanup flow.
-- [SSH keys](ssh-keys.md): per-lease keys, provider key cleanup, and local storage.
+- [Nested execution](nested-execution.md): WSL2, container engines, prepared KVM
+  hosts, and their conditional boundaries.
+- [Prebaked runner images](prebaked-images.md): image storage and the image/cache/state boundary.
+- [Image bake runbook](image-bake-runbook.md): exact bake, candidate smoke, promotion, rollback, and cleanup flow.
+- [SSH keys](ssh-keys.md): per-lease keys, cleanup, and local storage.
+- [SSH lease transport](ssh-transport.md): native-or-rsync copy selection, loopback tunnels, readiness, and credential boundaries.
 
-## Sync, run, and recording
+## Sync, execution, and evidence
 
 - [Sync](sync.md): Git file-list manifests, rsync, fingerprints, excludes, guardrails, and sanity checks.
 - [Jobs](jobs.md): named repo-local warmup, hydrate, run, and cleanup workflows.
+- [Hermetic agent evidence](hermetic-agent-evidence.md): repo-local pattern for
+  separate code/test writer contexts, QA arbitration, required artifacts, and
+  Crabbox remote proof collection.
+- [Deterministic perf evidence](deterministic-perf-evidence.md): contract for
+  future reproducible metric budgets and perf gate evidence.
 - [Actions hydration](actions-hydration.md): let GitHub Actions prepare a runner, then sync local work into that workspace.
 - [Capsules](capsules.md): local-first replay manifests for GitHub Actions failures.
 - [Checkpoints](checkpoints.md): save, restore, and fork reusable remote workspaces.
-- [Interactive desktop and VNC](interactive-desktop-vnc.md): VNC hub, support matrix, tunnel model, and QA boundaries.
+- [Editor handoff](../commands/open.md): prepare a synced lease for an external editor and keep its activity alive.
+- [Interactive desktop and VNC](interactive-desktop-vnc.md): one guide to desktop, VNC/WebVNC, browser, Code, and portal access, including sharing and cleanup.
 - [Artifacts](artifacts.md): screenshots, video, trimmed GIFs, logs, metadata, templates, and PR publishing.
-- [Linux VNC](vnc-linux.md), [Windows VNC](vnc-windows.md), [macOS VNC](vnc-macos.md): OS-specific desktop setup and troubleshooting.
+- [Linux VNC](vnc-linux.md): Linux desktop setup and troubleshooting.
+- [Windows VNC](vnc-windows.md): Windows desktop setup and troubleshooting.
+- [macOS VNC](vnc-macos.md): macOS desktop setup and troubleshooting.
 - [Test results](test-results.md): JUnit summaries attached to recorded runs.
 - [Cache controls](cache.md): inspect, purge, and warm remote package/build caches.
 - [Cache volumes](cache-volumes.md): provider-backed persistent cache mounts for rebuildable speed state.
 
 ## Integrations
 
+- [Integration catalog](../integrations/README.md): editors, terminal UIs,
+  coding-agent clients, and one-shot harnesses.
 - [Repository onboarding](repository-onboarding.md): `crabbox init`, repo config, workflow stub, and agent skill.
-- [Source map](../source-map.md): implementation files behind documented behavior.
-
-## Command docs
-
-### Setup and configuration
-- [init](../commands/init.md) — initialize repo config
-- [login](../commands/login.md) — authenticate with broker
-- [logout](../commands/logout.md) — clear broker token
-- [whoami](../commands/whoami.md) — show authenticated user
-- [config](../commands/config.md) — show merged config
-- [doctor](../commands/doctor.md) — validate prerequisites
-
-### Lease lifecycle
-- [warmup](../commands/warmup.md) — provision a warm box
-- [run](../commands/run.md) — sync and run a command
-- [job](../commands/job.md) — run a named repo job
-- [status](../commands/status.md) — show lease status
-- [list](../commands/list.md) — list active leases
-- [stop](../commands/stop.md) — release a lease
-- [cleanup](../commands/cleanup.md) — clean up stale leases
-
-### Workspace management
-- [sync-plan](../commands/sync-plan.md) — preview the sync manifest
-- [actions](../commands/actions.md) — hydrate from repo workflow setup
-- [capsule](../commands/capsule.md) — capture/replay Actions failures
-- [checkpoint](../commands/checkpoint.md) — snapshot/restore/fork workspaces
-- [cache](../commands/cache.md) — manage remote caches
-- [image](../commands/image.md) — manage provider images
-
-### Run observation
-- [history](../commands/history.md) — list run history
-- [logs](../commands/logs.md) — show run logs
-- [events](../commands/events.md) — show run events
-- [attach](../commands/attach.md) — attach to an active run
-- [results](../commands/results.md) — show test results
-- [artifacts](../commands/artifacts.md) — manage run artifacts
-- [media](../commands/media.md) — capture screenshots/video
-
-### Interactive access
-- [ssh](../commands/ssh.md) — SSH to a lease
-- [desktop](../commands/desktop.md) — desktop/input commands
-- [vnc](../commands/vnc.md) — native VNC access
-- [webvnc](../commands/webvnc.md) — browser-based VNC
-- [code](../commands/code.md) — code-server access
-- [screenshot](../commands/screenshot.md) — capture screenshots
-- [egress](../commands/egress.md) — mediated egress proxy
-
-### Pond and collaboration
-- [pond](../commands/pond.md) — peer discovery and lifecycle across a lease group
-- [share](../commands/share.md) — share lease access
-- [unshare](../commands/unshare.md) — revoke shared access
-
-### Operations
-- [inspect](../commands/inspect.md) — detailed lease info
-- [providers](../commands/providers.md) — show the provider capability matrix
-- [usage](../commands/usage.md) — cost and usage reports
-- [admin](../commands/admin.md) — admin operations
-- [azure](../commands/azure.md) — Azure-specific commands

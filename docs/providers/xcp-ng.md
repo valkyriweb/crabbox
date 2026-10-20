@@ -116,9 +116,10 @@ crabbox cleanup --provider xcp-ng --dry-run
 
 Keep `CRABBOX_XCP_NG_API_URL` on an administrator-only management network or
 VPN, and prefer trusted certificates. Set `CRABBOX_XCP_NG_INSECURE_TLS=1` or
-pass `--xcp-ng-insecure-tls` only for private lab pools where you control the
-network and certificate issuance. That only disables certificate verification;
-the API URL must still use HTTPS.
+pass `--xcp-ng-insecure-tls` only on a trusted management network in a fully
+trusted private lab. Keep TLS verification enabled, as it is by default, in all
+other environments. Disabling verification does not permit plain HTTP; the API
+URL must still use HTTPS.
 
 ## Configuration
 
@@ -147,6 +148,12 @@ doctor and lifecycle commands. A template name or UUID is required before
 optional placement hints. `user` becomes the cloud-init SSH user, and
 `workRoot` becomes the remote workspace root.
 
+For each template, SR, or network name/UUID pair, file and environment layers
+replace the whole pair when either input is nonempty: name-only clears an
+inherited UUID, UUID-only clears an inherited name, and both inputs keep both
+raw values. Two empty inputs preserve the prior values. Flags remain sequential,
+and the UUID wins if both flags in a pair are visited.
+
 When `network` or `networkUuid` is set, Crabbox moves all VIFs on the copied VM
 to the selected network. Use a single-NIC template for Crabbox-managed VMs, or
 leave the setting unset when the template's network topology should be
@@ -158,10 +165,20 @@ private-lab escape hatch, not a general deployment mode. If `apiUrl` points at
 a pool member that returns XAPI `HOST_IS_SLAVE` during login, Crabbox retries
 login once against the master address reported by XAPI.
 
+**Security consideration:** Following the master address and re-authenticating
+there is required for legitimate pool-master failover. The re-authentication
+includes the configured XAPI password. When `--xcp-ng-insecure-tls` is enabled,
+an on-path attacker who can tamper with the XAPI response could replace the
+reported master address and redirect that password-bearing re-authentication to
+a host of their choosing. Keep TLS verification enabled in any environment that
+is not a fully trusted private lab, and use insecure TLS only on a trusted
+management network. This Low/P3 residual risk is accepted to preserve
+pool-master failover.
+
 Repository-local `crabbox.yaml` and `.crabbox.yaml` files cannot override
 `apiUrl` or `insecureTLS`, so a checkout cannot redirect inherited credentials.
 Configure those connection-trust settings in user config, an explicit
-`CRABBOX_CONFIG` file, or environment variables.
+`CRABBOX_CONFIG` file outside the active repository, or environment variables.
 
 Keep the password in a private config file with `0600` permissions, in an
 environment variable, or in a secret manager. Do not pass it on argv. Crabbox
@@ -236,15 +253,19 @@ classification for CI and local setup probes: `environment_blocked`.
    address.
 9. Wait for SSH, then run the Crabbox Linux bootstrap.
 10. Sync the checkout and run commands over SSH.
-11. Touch lease labels during runs; on release, delete the config drive and VM
-    unless the lease is kept.
+11. Persist an exact ownership claim bound to the normalized pool API endpoint,
+    account, lease, slug, and VM UUID. On release, recheck the live VM's exact
+    Crabbox ownership metadata under the claim lock before deleting it.
+    Failed deletion preserves the claim for a safe retry.
 
 This is full-copy provisioning, not a cheap CoW clone path, so SR throughput
 and template disk size are part of the user-visible provisioning contract.
 
-Cleanup lists XCP-ng inventory and only acts on resources labeled as
-Crabbox-managed leases. Use `crabbox cleanup --provider xcp-ng --dry-run`
-before an actual cleanup sweep.
+Cleanup lists XCP-ng inventory and only deletes expired or otherwise eligible
+VMs when an unchanged local claim matches the same pool, account, lease, slug,
+and VM UUID. Unclaimed and wrong-pool VMs are reported and skipped even when
+their provider labels look like Crabbox leases. Use
+`crabbox cleanup --provider xcp-ng --dry-run` before an actual cleanup sweep.
 
 ## Guarded live smoke
 
@@ -256,6 +277,13 @@ scripts/xcpng-live-smoke.sh --read-only
 
 Read-only mode runs `crabbox doctor --provider xcp-ng --json`, writes redacted
 evidence under `.crabbox/xcpng-live-smoke/`, and does not create or delete VMs.
+
+The read-only path can also be selected through the guarded top-level provider
+matrix:
+
+```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=xcp-ng CRABBOX_LIVE_COORDINATOR=0 CRABBOX_BIN=./bin/crabbox scripts/live-smoke.sh
+```
 
 Mutating smoke requires an explicit gate and a configured template:
 

@@ -11,54 +11,95 @@ import (
 )
 
 type leaseCreateFlagValues struct {
-	Provider      *string
-	Profile       *string
-	Class         *string
-	Architecture  *string
-	OSImage       *string
-	ServerType    *string
-	Market        *string
-	Slug          *string
-	Pond          *string
-	Expose        *stringListFlag
-	CacheVolumes  *stringListFlag
-	TTL           *time.Duration
-	Idle          *time.Duration
-	Desktop       *bool
-	DesktopEnv    *string
-	Browser       *bool
-	Code          *bool
-	ProviderFlags providerFlagValues
-	Target        targetFlagValues
-	Network       networkFlagValues
+	Provider          *string
+	Profile           *string
+	Class             *string
+	Architecture      *string
+	OSImage           *string
+	ServerType        *string
+	SSHPort           *string
+	Market            *string
+	MinVCPUs          *int
+	MinMemoryMiB      *int
+	Slug              *string
+	Pond              *string
+	Expose            *stringListFlag
+	CacheVolumes      *stringListFlag
+	TTL               *time.Duration
+	Idle              *time.Duration
+	LifetimeCanary    *time.Duration
+	LifetimeRetention *time.Duration
+	Desktop           *bool
+	DesktopEnv        *string
+	Browser           *bool
+	ImageMinOS        *string
+	ImageSDK          *stringListFlag
+	ImageRuntime      *stringListFlag
+	ImageBrowser      *bool
+	ImageWebView2     *bool
+	ImageDesktop      *bool
+	Code              *bool
+	ProviderFlags     providerFlagValues
+	Target            targetFlagValues
+	Network           networkFlagValues
+}
+
+type leaseCreateFlagRegistrationOptions struct {
+	serverTypeDefault string
+	observe           providerFlagRegistrationObserver
+}
+
+func ordinaryLeaseCreateFlagRegistrationOptions() leaseCreateFlagRegistrationOptions {
+	return leaseCreateFlagRegistrationOptions{
+		serverTypeDefault: getenv("CRABBOX_SERVER_TYPE", ""),
+	}
 }
 
 func registerLeaseCreateFlags(fs *flag.FlagSet, defaults Config) leaseCreateFlagValues {
+	return registerLeaseCreateFlagsWithOptions(fs, defaults, ordinaryLeaseCreateFlagRegistrationOptions())
+}
+
+func registerLeaseCreateFlagsWithOptions(fs *flag.FlagSet, defaults Config, options leaseCreateFlagRegistrationOptions) leaseCreateFlagValues {
 	expose := stringListFlag{}
 	cacheVolumes := stringListFlag{}
+	imageSDK := stringListFlag{}
+	imageRuntime := stringListFlag{}
 	fs.Var(&expose, "expose", "declare a TCP port this lease wants reachable over the SSH-mesh plane; repeatable")
 	fs.Var(&cacheVolumes, "cache-volume", "provider-backed cache volume [name=]key:path; repeatable")
+	fs.Var(&imageSDK, "image-sdk", "minimum SDK in name=version form; repeatable")
+	fs.Var(&imageRuntime, "image-runtime", "minimum runtime in name=version form; repeatable")
 	return leaseCreateFlagValues{
-		Provider:      fs.String("provider", defaults.Provider, providerHelpAll()),
-		Profile:       fs.String("profile", defaults.Profile, "profile"),
-		Class:         fs.String("class", defaults.Class, "machine class"),
-		Architecture:  fs.String("arch", defaults.Architecture, "CPU architecture: amd64 or arm64"),
-		OSImage:       fs.String("os", defaults.OSImage, "portable Linux OS image selector, for example ubuntu:26.04"),
-		ServerType:    fs.String("type", getenv("CRABBOX_SERVER_TYPE", ""), "provider server/instance type"),
-		Market:        fs.String("market", defaults.Capacity.Market, "capacity market: spot or on-demand"),
-		Slug:          fs.String("slug", "", "request a friendly slug for a new lease"),
-		Pond:          fs.String("pond", defaults.Pond, "tag this lease with a pond name so peers can be selected with --pond"),
-		Expose:        &expose,
-		CacheVolumes:  &cacheVolumes,
-		TTL:           fs.Duration("ttl", defaults.TTL, "maximum lease lifetime"),
-		Idle:          fs.Duration("idle-timeout", defaults.IdleTimeout, "idle timeout"),
-		Desktop:       fs.Bool("desktop", defaults.Desktop, "provision or require a visible desktop/VNC session"),
-		DesktopEnv:    fs.String("desktop-env", defaults.DesktopEnv, "Linux desktop environment: xfce, wayland, or gnome"),
-		Browser:       fs.Bool("browser", defaults.Browser, "provision or require a browser binary"),
-		Code:          fs.Bool("code", defaults.Code, "provision or require web code-server capability"),
-		ProviderFlags: registerProviderFlags(fs, defaults),
-		Target:        registerTargetFlags(fs, defaults),
-		Network:       registerNetworkFlags(fs, defaults),
+		Provider:          registerProviderSelectionFlag(fs, defaults, providerHelpAll()),
+		Profile:           fs.String("profile", defaults.Profile, "profile"),
+		Class:             fs.String("class", defaults.Class, "machine class"),
+		Architecture:      fs.String("arch", defaults.Architecture, "CPU architecture: amd64 or arm64"),
+		OSImage:           fs.String("os", defaults.OSImage, "OS image selector, for example ubuntu:26.04 or windows-server:2025 (AWS Windows)"),
+		ServerType:        fs.String("type", options.serverTypeDefault, "provider server/instance type"),
+		SSHPort:           fs.String("ssh-port", defaults.SSHPort, "SSH port for the leased target"),
+		Market:            fs.String("market", defaults.Capacity.Market, "capacity market: spot or on-demand"),
+		MinVCPUs:          fs.Int("min-vcpus", defaults.Capacity.MinVCPUs, "minimum provisioned vCPUs (AWS Linux; 0 = unconstrained)"),
+		MinMemoryMiB:      fs.Int("min-memory-mib", defaults.Capacity.MinMemoryMiB, "minimum provisioned memory in MiB (AWS Linux; 0 = unconstrained)"),
+		Slug:              fs.String("slug", "", "request a friendly slug for a new lease"),
+		Pond:              fs.String("pond", defaults.Pond, "tag this lease with a pond name so peers can be selected with --pond"),
+		Expose:            &expose,
+		CacheVolumes:      &cacheVolumes,
+		TTL:               fs.Duration("ttl", defaults.TTL, "maximum lease lifetime"),
+		Idle:              fs.Duration("idle-timeout", defaults.IdleTimeout, "idle timeout"),
+		LifetimeCanary:    fs.Duration("lifetime-canary", 0, "admin-only rollout canary: enforce a maximum compute age (1m..744h) on a new coordinator AWS on-demand lease"),
+		LifetimeRetention: fs.Duration("lifetime-retention", 0, "admin-only rollout canary: retain the stopped root disk for this duration (1m..744h); requires --lifetime-canary"),
+		Desktop:           fs.Bool("desktop", defaults.Desktop, "provision or require a visible desktop/VNC session"),
+		DesktopEnv:        fs.String("desktop-env", defaults.DesktopEnv, "Linux desktop environment: xfce, wayland, or gnome"),
+		Browser:           fs.Bool("browser", defaults.Browser, "provision or require a browser binary"),
+		ImageMinOS:        fs.String("image-min-os", "", "minimum promoted-image OS version"),
+		ImageSDK:          &imageSDK,
+		ImageRuntime:      &imageRuntime,
+		ImageBrowser:      fs.Bool("image-require-browser", false, "require browser support in the promoted image"),
+		ImageWebView2:     fs.Bool("image-require-webview2", false, "require WebView2 support in the promoted image"),
+		ImageDesktop:      fs.Bool("image-require-desktop", false, "require desktop support in the promoted image"),
+		Code:              fs.Bool("code", defaults.Code, "provision or require web code-server capability"),
+		ProviderFlags:     registerProviderFlagsObserved(fs, defaults, options.observe),
+		Target:            registerTargetFlags(fs, defaults),
+		Network:           registerNetworkFlags(fs, defaults),
 	}
 }
 
@@ -70,18 +111,113 @@ func applyLeaseCreateFlagsForLease(cfg *Config, fs *flag.FlagSet, values leaseCr
 	return applyLeaseCreateFlagsForLeaseMode(cfg, fs, values, existingLeaseID, true)
 }
 
+func autoRouteClaimLeaseProvider(cfg *Config, fs *flag.FlagSet, identifier string) error {
+	return autoRouteClaimLeaseProviderContext(context.Background(), cfg, fs, identifier)
+}
+
+func autoRouteClaimLeaseProviderContext(ctx context.Context, cfg *Config, fs *flag.FlagSet, identifier string) error {
+	if flagWasSet(fs, "provider") {
+		return nil
+	}
+	return autoRouteClaimLeaseProviderForIdentifierContext(ctx, cfg, identifier)
+}
+
+func autoRouteClaimLeaseProviderForIdentifier(cfg *Config, identifier string) error {
+	return autoRouteClaimLeaseProviderForIdentifierContext(context.Background(), cfg, identifier)
+}
+
+func autoRouteClaimLeaseProviderForIdentifierContext(ctx context.Context, cfg *Config, identifier string) error {
+	if ProviderSelectionIsAuthoritativeRoute(*cfg) {
+		return nil
+	}
+	provider, ok, err := claimProviderForIdentifierContext(ctx, identifier)
+	if err != nil {
+		return err
+	}
+	if ok {
+		setProviderSelection(cfg, provider, providerSelectionLeaseContext)
+	}
+	return nil
+}
+
+func autoRouteLeaseProviderForIdentifier(cfg *Config, fs *flag.FlagSet, identifier string) error {
+	return autoRouteLeaseProviderForIdentifierContext(context.Background(), cfg, fs, identifier)
+}
+
+func autoRouteLeaseProviderForIdentifierContext(ctx context.Context, cfg *Config, fs *flag.FlagSet, identifier string) error {
+	if err := autoRouteClaimLeaseProviderContext(ctx, cfg, fs, identifier); err != nil {
+		return err
+	}
+	if err := autoRouteStaticLeaseContext(ctx, cfg, fs, identifier); err != nil {
+		return err
+	}
+	return autoRouteExternalLeaseContext(ctx, cfg, fs, identifier)
+}
+
 func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values leaseCreateFlagValues, existingLeaseID string, mutateExternal bool) error {
+	return applyLeaseCreateFlagsForTarget(cfg, fs, values, leaseFlagTarget{ID: existingLeaseID, Reuse: existingLeaseID != ""}, mutateExternal)
+}
+
+// Reuse with no ID projects a future follow-up without consulting lease claims.
+type leaseFlagTarget struct {
+	ID                string
+	Reuse             bool
+	SynthesizedInputs bool
+}
+
+func applyLeaseCreateFlagsForTarget(cfg *Config, fs *flag.FlagSet, values leaseCreateFlagValues, target leaseFlagTarget, mutateExternal bool) error {
+	markSynthesizedFlagInputs(cfg, target.SynthesizedInputs)
 	cfg.Provider = *values.Provider
 	prepareProviderDefaults(cfg)
 	cfg.Profile = *values.Profile
+	recordConfigInput(cfg, configInputGeneric, configInputFlag, flagWasSet(fs, "profile"))
+	if flagWasSet(fs, "min-vcpus") {
+		cfg.Capacity.MinVCPUs = *values.MinVCPUs
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
+	}
+	if flagWasSet(fs, "min-memory-mib") {
+		cfg.Capacity.MinMemoryMiB = *values.MinMemoryMiB
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
+	}
+	if err := validateCapacityMinimumValues(cfg.Capacity); err != nil {
+		return err
+	}
+	if hasCapacityMinimums(*cfg) {
+		if target.Reuse {
+			return Exit(2, "resource requirements are unsupported with existing lease reuse (--id)")
+		}
+		if fs.Name() == "prewarm" {
+			return Exit(2, "resource requirements are unsupported for composite prewarm; use warmup")
+		}
+		if fs.Name() == "checkpoint fork" {
+			return Exit(2, "resource requirements are unsupported for checkpoint forks")
+		}
+		if pool := fs.Lookup("pool"); pool != nil && strings.TrimSpace(pool.Value.String()) != "" {
+			return Exit(2, "resource requirements are unsupported with ready pools")
+		}
+	}
 	cfg.Class = *values.Class
+	recordConfigInput(cfg, configInputGeneric, configInputFlag, flagWasSet(fs, "class"))
+	if flagWasSet(fs, "ssh-port") {
+		cfg.SSHPort = strings.TrimSpace(*values.SSHPort)
+		if cfg.SSHPort == "" {
+			return Exit(2, "--ssh-port must not be empty")
+		}
+		MarkSSHPortExplicit(cfg)
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
+	}
+	cfg.classFlagExplicit = flagWasSet(fs, "class")
+	if cfg.classFlagExplicit {
+		MarkClassExplicit(cfg)
+	}
 	if flagWasSet(fs, "arch") {
-		arch, err := normalizeArchitecture(*values.Architecture)
+		arch, err := NormalizeArchitecture(*values.Architecture)
 		if err != nil {
 			return err
 		}
 		cfg.Architecture = arch
 		cfg.architectureExplicit = true
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
 	}
 	if flagWasSet(fs, "pond") {
 		pond, err := requestedPondName(*values.Pond)
@@ -89,6 +225,7 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 			return err
 		}
 		cfg.Pond = pond
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
 	} else if cfg.Pond != "" {
 		pond, err := requestedPondName(cfg.Pond)
 		if err != nil {
@@ -97,14 +234,36 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 		cfg.Pond = pond
 	}
 	applyCapabilityFlags(cfg, *values.Desktop, *values.Browser, *values.Code)
+	recordConfigInput(cfg, configInputGeneric, configInputFlag, flagWasSet(fs, "desktop") || flagWasSet(fs, "browser") || flagWasSet(fs, "code"))
+	if err := validateImageVersion(strings.TrimSpace(*values.ImageMinOS), "image-min-os"); err != nil {
+		return err
+	}
+	imageSDKs, err := parseImageVersions(*values.ImageSDK, "image-sdk")
+	if err != nil {
+		return err
+	}
+	imageRuntimes, err := parseImageVersions(*values.ImageRuntime, "image-runtime")
+	if err != nil {
+		return err
+	}
+	cfg.imageRequirements = imageRequirements{
+		MinOS:    strings.TrimSpace(*values.ImageMinOS),
+		SDKs:     imageSDKs,
+		Runtimes: imageRuntimes,
+		Browser:  *values.ImageBrowser,
+		WebView2: *values.ImageWebView2,
+		Desktop:  *values.ImageDesktop,
+	}
+	recordConfigInput(cfg, configInputGeneric, configInputFlag,
+		flagWasSet(fs, "image-min-os") || flagWasSet(fs, "image-sdk") || flagWasSet(fs, "image-runtime") ||
+			flagWasSet(fs, "image-require-browser") || flagWasSet(fs, "image-require-webview2") || flagWasSet(fs, "image-require-desktop"))
 	cfg.DesktopEnv = *values.DesktopEnv
+	recordConfigInput(cfg, configInputGeneric, configInputFlag, flagWasSet(fs, "desktop-env"))
 	if err := applyTargetFlagOverrides(cfg, fs, values.Target); err != nil {
 		return err
 	}
-	if err := autoRouteStaticLease(cfg, fs, existingLeaseID); err != nil {
-		return err
-	}
-	if err := autoRouteExternalLease(cfg, fs, existingLeaseID); err != nil {
+	// An empty ID preserves explicit routing hints without reading lease claims.
+	if err := autoRouteLeaseProviderForIdentifier(cfg, fs, target.ID); err != nil {
 		return err
 	}
 	if flagWasSet(fs, "os") {
@@ -114,6 +273,7 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 		}
 		cfg.OSImage = osImage
 		cfg.osImageExplicit = true
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
 		applyOSImageProviderDefaults(cfg, false)
 	}
 	if err := applyNetworkFlagOverrides(cfg, fs, values.Network); err != nil {
@@ -125,7 +285,7 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 	prepareProviderDefaults(cfg)
 	applySingleProviderTargetDefault(cfg)
 	applyOSImageProviderDefaults(cfg, false)
-	if existingLeaseID != "" && cfg.Provider == "aws" && cfg.TargetOS == targetMacOS && !flagWasSet(fs, "market") {
+	if target.Reuse && cfg.Provider == "aws" && cfg.TargetOS == targetMacOS && !flagWasSet(fs, "market") {
 		cfg.Capacity.Market = "on-demand"
 	}
 	if err := applyCapacityMarketFlag(cfg, fs, *values.Market); err != nil {
@@ -133,9 +293,11 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 	}
 	if flagWasSet(fs, "ttl") {
 		cfg.TTL = *values.TTL
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
 	}
 	if flagWasSet(fs, "idle-timeout") {
 		cfg.IdleTimeout = *values.Idle
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
 	}
 	if err := applyProviderFlags(cfg, fs, values.ProviderFlags); err != nil {
 		return err
@@ -153,17 +315,24 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 			volumes[i].Required = true
 		}
 		cfg.Cache.Volumes = mergeCacheVolumes(cfg.Cache.Volumes, volumes)
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, len(volumes) > 0)
 	}
-	if err := validateCacheVolumesForLeaseReuse(*cfg, existingLeaseID); err != nil {
+	if err := validateCacheVolumesForLeaseReuse(*cfg, target.ID); err != nil {
 		return err
 	}
 	if err := applyProviderConfigDefaults(cfg); err != nil {
 		return err
 	}
-	if err := validateCacheVolumesForProvider(*cfg); err != nil {
+	if err := ValidateCacheVolumesForProvider(*cfg); err != nil {
 		return err
 	}
 	if err := validateProviderTarget(*cfg); err != nil {
+		return err
+	}
+	if err := validateResourceRequirements(*cfg); err != nil {
+		return err
+	}
+	if err := validateImageRequirementsForLease(*cfg, target.Reuse); err != nil {
 		return err
 	}
 	if err := validateRequestedCapabilities(*cfg); err != nil {
@@ -175,19 +344,47 @@ func applyLeaseCreateFlagsForLeaseMode(cfg *Config, fs *flag.FlagSet, values lea
 			return err
 		}
 		cfg.ExposedPorts = ports
+		recordConfigInput(cfg, configInputGeneric, configInputFlag, true)
+		if target.Reuse && target.ID != "" && providerSelectionIsActionable(*cfg) {
+			provider, err := ProviderFor(cfg.Provider)
+			if err != nil {
+				return err
+			}
+			if ShouldUseCoordinator(*cfg, provider.Spec()) {
+				fmt.Fprintf(fs.Output(), "warning: --expose does not update existing coordinator-managed lease %q; Pond port declarations are unchanged. Use crabbox tunnel --id <lease> <port> to forward an existing loopback service.\n", target.ID)
+			}
+		}
 	}
 	if err := validateLeaseDurations(*cfg); err != nil {
+		return err
+	}
+	if err := applyLifetimeCanaryFlags(cfg, fs, values, target); err != nil {
 		return err
 	}
 	if cfg.Pond != "" {
 		dynamicTailscaleTagAllowed := pondDynamicTailscaleTagAllowed(*cfg)
 		appendPondTailscaleTag(cfg, dynamicTailscaleTagAllowed)
 		// Reuse paths do not mutate ACL state.
-		if mutateExternal && existingLeaseID == "" && dynamicTailscaleTagAllowed {
+		if mutateExternal && !target.Reuse && dynamicTailscaleTagAllowed {
 			if err := maybeBootstrapPondACL(context.Background(), *cfg); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func validateImageRequirementsForLease(cfg Config, reuse bool) error {
+	if imageRequirementsEmpty(cfg.imageRequirements) {
+		return nil
+	}
+	if reuse {
+		return Exit(2, "image capability requirements apply only when creating a new lease")
+	}
+	if cfg.Provider != "aws" ||
+		strings.TrimSpace(cfg.Coordinator) == "" ||
+		cfg.BrokerMode == BrokerModeRegistered {
+		return Exit(2, "image capability requirements require a coordinator-managed AWS lease")
 	}
 	return nil
 }
@@ -200,12 +397,12 @@ func validateCacheVolumesForLeaseReuse(cfg Config, existingLeaseID string) error
 	if len(required) == 0 {
 		return nil
 	}
-	claim, ok, err := resolveLeaseClaimForProvider(existingLeaseID, canonicalClaimProvider(cfg.Provider))
+	claim, ok, err := ResolveLeaseClaimForProvider(existingLeaseID, canonicalClaimProvider(cfg.Provider))
 	if err != nil {
 		return err
 	}
 	if !ok {
-		return exit(2, "required cache volumes cannot be verified for existing lease %s; warm a new lease instead", existingLeaseID)
+		return Exit(2, "required cache volumes cannot be verified for existing lease %s; warm a new lease instead", existingLeaseID)
 	}
 	attached := map[string]struct{}{}
 	for _, spec := range claim.CacheVolumes {
@@ -213,7 +410,7 @@ func validateCacheVolumesForLeaseReuse(cfg Config, existingLeaseID string) error
 	}
 	for _, spec := range required {
 		if _, ok := attached[spec]; !ok {
-			return exit(2, "required cache volume %q is not recorded on existing lease %s; warm a new lease instead", spec, existingLeaseID)
+			return Exit(2, "required cache volume %q is not recorded on existing lease %s; warm a new lease instead", spec, existingLeaseID)
 		}
 	}
 	return nil
@@ -301,10 +498,10 @@ func maybeBootstrapPondACL(ctx context.Context, cfg Config) error {
 
 func validateLeaseDurations(cfg Config) error {
 	if cfg.TTL <= 0 {
-		return exit(2, "ttl must be positive")
+		return Exit(2, "ttl must be positive")
 	}
 	if cfg.IdleTimeout <= 0 {
-		return exit(2, "idle timeout must be positive")
+		return Exit(2, "idle timeout must be positive")
 	}
 	return nil
 }
@@ -319,20 +516,44 @@ func truthyEnv(value string) bool {
 }
 
 type leaseTargetConfigOptions struct {
-	Desktop bool
+	Desktop           bool
+	SynthesizedInputs bool
 	// LeaseID is the resolved lease id/slug from the command's --id flag (or
 	// equivalent positional). When set, `static_<host>` ids auto-route to the
 	// ssh provider so callers don't have to re-pass --provider / --static-host
 	// that warmup already implied.
 	LeaseID string
+	// ProviderResourceID marks LeaseID as a provider-native resource identifier,
+	// not a Crabbox lease identifier. Native snapshot operations use this to
+	// avoid routing unrelated claim, Static, or External lease identities that
+	// happen to match.
+	ProviderResourceID bool
+}
+
+func applyTargetAndProviderFlags(cfg *Config, fs *flag.FlagSet, target targetFlagValues, provider providerFlagValues) error {
+	// Provider flag handlers may validate the target, so resolve explicit target
+	// overrides before they see inherited configuration.
+	if err := applyTargetFlagOverrides(cfg, fs, target); err != nil {
+		return err
+	}
+	return applyProviderFlags(cfg, fs, provider)
 }
 
 func loadLeaseTargetConfig(fs *flag.FlagSet, provider string, targetFlags targetFlagValues, networkFlags networkModeFlagValues, opts leaseTargetConfigOptions) (Config, error) {
-	cfg, err := loadConfig()
+	return loadLeaseTargetConfigContext(context.Background(), fs, provider, targetFlags, networkFlags, opts)
+}
+
+func loadLeaseTargetConfigContext(ctx context.Context, fs *flag.FlagSet, provider string, targetFlags targetFlagValues, networkFlags networkModeFlagValues, opts leaseTargetConfigOptions) (Config, error) {
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.Provider = provider
+	markSynthesizedFlagInputs(&cfg, opts.SynthesizedInputs)
+	if flagWasSet(fs, "provider") {
+		setProviderSelection(&cfg, provider, providerSelectionFlag)
+	} else {
+		cfg.Provider = provider
+	}
 	prepareProviderDefaults(&cfg)
 	if opts.Desktop {
 		cfg.Desktop = true
@@ -340,11 +561,10 @@ func loadLeaseTargetConfig(fs *flag.FlagSet, provider string, targetFlags target
 	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
 		return Config{}, err
 	}
-	if err := autoRouteStaticLease(&cfg, fs, opts.LeaseID); err != nil {
-		return Config{}, err
-	}
-	if err := autoRouteExternalLease(&cfg, fs, opts.LeaseID); err != nil {
-		return Config{}, err
+	if !opts.ProviderResourceID {
+		if err := autoRouteLeaseProviderForIdentifierContext(ctx, &cfg, fs, opts.LeaseID); err != nil {
+			return Config{}, err
+		}
 	}
 	if err := applyNetworkModeFlagOverride(&cfg, fs, networkFlags); err != nil {
 		return Config{}, err
@@ -374,7 +594,7 @@ func setIDFromFirstArg(fs *flag.FlagSet, id *string) {
 
 func requireLeaseID(id, usage string, cfg Config) error {
 	if id == "" && !isStaticProvider(cfg.Provider) {
-		return exit(2, "usage: %s", usage)
+		return Exit(2, "usage: %s", usage)
 	}
 	return nil
 }
@@ -423,7 +643,7 @@ func (a App) resolveNetworkLoginLeaseTargetForRepo(ctx context.Context, cfg *Con
 		return LeaseTarget{}, err
 	}
 	if !probeTransport && lease.SSH.AuthSecret {
-		return LeaseTarget{}, exit(2, "crabbox connect does not support token-as-username SSH targets; use crabbox ssh --show-secret in a trusted terminal")
+		return LeaseTarget{}, Exit(2, "crabbox connect does not support token-as-username SSH targets; use crabbox ssh --show-secret in a trusted terminal")
 	}
 	resolved, err := resolveSSHTargetNetwork(ctx, *cfg, lease.Server, lease.SSH, true)
 	if err != nil {
@@ -465,7 +685,7 @@ func (a App) resolveNetworkLeaseTargetWithRepoConfig(ctx context.Context, cfg *C
 
 func (a App) resolveNetworkSSHTargetWithRepoConfig(ctx context.Context, cfg *Config, id string, printFallback bool, repo Repo, reclaim, allowLoginOnly bool) (Server, SSHTarget, string, error) {
 	if cfg == nil {
-		return Server{}, SSHTarget{}, "", exit(2, "lease target config is required")
+		return Server{}, SSHTarget{}, "", Exit(2, "lease target config is required")
 	}
 	req := ResolveRequest{Repo: repo, ID: id, Reclaim: reclaim}
 	var server Server
@@ -514,7 +734,7 @@ func resolvedLeaseClaimSnapshot(leaseID string, server Server) (leaseClaim, bool
 		return leaseClaim{}, false, nil
 	}
 	if !server.claimSnapshotSet {
-		return leaseClaim{}, false, exit(2, "lease %s resolve claim snapshot is missing", leaseID)
+		return leaseClaim{}, false, Exit(2, "lease %s resolve claim snapshot is missing", leaseID)
 	}
 	return cloneLeaseClaim(server.claimSnapshot), server.claimSnapshotExists, nil
 }
@@ -524,18 +744,21 @@ func updateResolvedLeaseClaimEndpoint(leaseID string, server Server, target SSHT
 	if err != nil || !exists {
 		return leaseClaim{}, exists, err
 	}
-	updated, err := updateLeaseClaimEndpointIfUnchanged(leaseID, expected, server, target)
+	updated, err := UpdateLeaseClaimEndpointIfUnchanged(leaseID, expected, server, target)
 	return updated, true, err
 }
 
-func (a App) claimAndTouchLeaseTarget(ctx context.Context, cfg Config, server Server, target SSHTarget, leaseID string, reclaim bool) error {
-	repo, err := findRepo()
+func (a App) claimAndTouchLeaseTarget(ctx context.Context, cfg Config, server *Server, target SSHTarget, leaseID string, reclaim bool) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	boundary, err := findRepositoryBoundary()
 	if err != nil {
 		return err
 	}
-	if err := a.claimResolvedLeaseTargetForRepoAndRegister(ctx, leaseID, serverSlug(server), cfg, server, target, repo.Root, reclaim); err != nil {
+	if err := a.claimResolvedLeaseTargetForRepoAndRegister(ctx, leaseID, ServerSlug(*server), cfg, server, target, boundary.root, reclaim); err != nil {
 		return err
 	}
-	a.touchLeaseTargetBestEffort(ctx, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, "")
-	return nil
+	*server = a.touchLeaseTargetBestEffort(ctx, cfg, LeaseTarget{Server: *server, SSH: target, LeaseID: leaseID}, "")
+	return context.Cause(ctx)
 }

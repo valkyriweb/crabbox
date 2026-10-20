@@ -2,12 +2,16 @@
 
 `crabbox usage` reports lease cost and usage estimates from the broker, broken down by user, organization, or the whole fleet.
 
+For fleet, authenticated org, and owner admission counts and active-lease limits
+across all months, use [capacity](capacity.md). This separate read-only diagnostic does
+not change monthly usage filtering or access to lease records.
+
 This page is the command reference for cost visibility. Keep command-specific behavior here; broker policy and provider internals live in [../orchestrator.md](../orchestrator.md) and [../features/cost-usage.md](../features/cost-usage.md).
 
 ```sh
 crabbox usage
 crabbox usage --scope org --org example-org
-crabbox usage --scope user --user alice@example.com --month 2026-05
+crabbox usage --scope user --user github:12345 --month 2026-05
 crabbox usage --scope all --json
 ```
 
@@ -17,7 +21,7 @@ crabbox usage --scope all --json
 
 ```text
 --scope user|org|all   reporting scope (default user)
---user <email>         owner email to report (admin only for other owners)
+--user <owner>         owner identity to report (admin only for other owners)
 --org <name>           organization to report
 --month YYYY-MM        billing month to summarize (default current UTC month)
 --json                 print the raw summary and limits as JSON
@@ -28,7 +32,7 @@ crabbox usage --scope all --json
 ## Scopes and authorization
 
 ```text
-user    a single owner email (default)
+user    a single owner identity (default)
 org     a single organization
 all     the entire fleet
 ```
@@ -40,15 +44,20 @@ The broker decides what you may see based on how you authenticated:
 
 Owner identity for shared bearer-token mode comes from `CRABBOX_OWNER`, then Git author/committer email env (`GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_EMAIL`), then local `git config user.email`. Set `CRABBOX_ORG` to group leases under an organization. Only a verified Cloudflare Access JWT email can supply the bearer-token owner; raw Access identity headers are ignored.
 
+GitHub browser-login owners use the immutable `github:<numeric-id>` value shown
+by `crabbox whoami`; emails and GitHub logins are display information, not owner
+selectors. Shared bearer-token owners may still be email-shaped because that
+deployment controls their stable configured identity.
+
 ## Output
 
-Human output prints one total row, then any non-empty group breakdowns (owners, orgs, providers, server types), then the active limits:
+Human output prints one total row, then any non-empty group breakdowns (owners, orgs, providers, server types, and serve machines), then the active limits:
 
 ```text
-usage month=2026-05 scope=user user=alice@example.com org=example-org
-total leases=2 active=0 runtime=12m41s estimated=$0.13 reserved=$4.57
+usage month=2026-05 scope=user user=github:12345 org=example-org
+total leases=2 active=0 runtime=12m41s estimated=$0.13 reserved=$4.57 committed=$0.13
 owners:
-  alice@example.com        leases=2   active=0   runtime=12m41s    estimated=$0.13     reserved=$4.57
+  github:12345             leases=2   active=0   runtime=12m41s    estimated=$0.13     reserved=$4.57 committed=$0.13
 limits:
   active leases: fleet=off user=off org=off
   monthly usd:   fleet=off user=off org=off
@@ -66,10 +75,12 @@ limits:
     "runtimeSeconds": 13551,
     "estimatedUSD": 0.13,
     "reservedUSD": 4.57,
+    "committedUSD": 0.13,
     "byOwner": [],
     "byOrg": [],
     "byProvider": [],
-    "byServerType": []
+    "byServerType": [],
+    "byMachine": []
   },
   "limits": {
     "maxActiveLeases": 0,
@@ -84,11 +95,45 @@ limits:
 }
 ```
 
-## Estimated vs reserved cost
+Serve leases also appear in `byMachine`, keyed by stable machine ID, with an optional
+`label` containing the current display name when the machine record is available.
+Each group includes `leases`, `activeLeases`, `runtimeSeconds`, and `cpuSeconds`
+(runtime multiplied by each lease's assigned CPUs). Text output shows a `by machine`
+section with CPU-hours (`cpuSeconds / 3600`). Serve cost remains zero. These groups
+use the same visibility, scope, and creation-month filters as the rest of the report;
+runtime is not split across calendar months. Missing assignments fall back to the
+machine prefix of `cloudID`, or `unknown`; missing CPU assignments contribute zero
+CPU-seconds. Removed machines remain attributable by ID without a display label.
+This endpoint includes full recorded history. The owner-only `serve machines`
+and portal Machines summaries instead combine current allocations with durable
+monthly completion rollups that start at deployment, without historical backfill.
 
-`estimatedUSD` is the elapsed-runtime cost for leases in the selected month.
+## Estimated, reserved, and committed cost
+
+`estimatedUSD` is the elapsed-runtime cost for leases in the selected month. Terminal
+runtime stops at the persisted end/release time or last observation for legacy rows;
+late release and cleanup preserve that boundary. Confirmed never-allocated leases
+have zero compute runtime.
 
 `reservedUSD` is the worst-case cost based on each lease's TTL. The broker computes reserved cost before provisioning so monthly spend guardrails can reject a lease before any machine is created.
+
+`committedUSD` is the budget contribution, reported in totals and every breakdown.
+Active and provisioning leases retain their full reservation, including live managed
+leases past their heartbeat deadline and retained machines whose compute is still
+running, including older retained VMs without a lifetime policy. Finished leases (released, expired, deleted, reclaimed, or failed) settle to
+elapsed billable runtime times the recorded hourly rate, capped at their reservation;
+leases that never provisioned contribute zero. Existing finished records settle on
+read without a backfill. Unresolved provisioning keeps its reservation until cleanup
+confirms completion. Recorded stop/resume intervals exclude stopped time.
+
+Monthly admission adds a candidate's full reservation to existing committed costs,
+checking fleet, owner, and org budgets after active-lease limits. Finished costs remain
+in the creation month. Live leases from previous months still reserve admission budget,
+although this report keeps its selected-month filter.
+
+Current CLIs append `committed=$...` to text rows and preserve `committedUSD` in JSON.
+Older CLIs ignore the additive field and keep rendering existing columns. If the
+coordinator omits it, newer CLIs retain the old output without inventing a value.
 
 Cost values are estimates for compute leases, not provider invoice reconciliation. They do not fully model provider extras such as static public IP charges, egress, storage, snapshots, taxes, credits, or discounts.
 

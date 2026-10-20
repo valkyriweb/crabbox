@@ -15,8 +15,25 @@ import (
 )
 
 type HetznerClient struct {
-	Token  string
-	Client *http.Client
+	Token   string
+	Client  *http.Client
+	BaseURL string
+}
+
+type HetznerHTTPError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Detail     string
+}
+
+func (e HetznerHTTPError) Error() string {
+	return fmt.Sprintf("hetzner %s %s: http %d: %s", e.Method, e.Path, e.StatusCode, e.Detail)
+}
+
+func IsHetznerNotFound(err error) bool {
+	var httpErr HetznerHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
 }
 
 // privateNet carries a server's private-network IP from any provider. It
@@ -34,6 +51,19 @@ type privateNet struct {
 	IPv4 struct {
 		IP string `json:"ip"`
 	} `json:"ipv4"`
+}
+
+type ServerTypeInfo struct {
+	Name         string `json:"name"`
+	Architecture string `json:"architecture,omitempty"`
+}
+
+type ServerLocationInfo struct {
+	Name string `json:"name"`
+}
+
+type ServerImageInfo struct {
+	Architecture string `json:"architecture"`
 }
 
 func (p *privateNet) UnmarshalJSON(data []byte) error {
@@ -65,9 +95,11 @@ func (p *privateNet) UnmarshalJSON(data []byte) error {
 }
 
 type Server struct {
+	LifetimePolicy      *LeaseLifetimePolicy `json:"lifetimePolicy,omitempty"`
 	CloudID             string
 	Provider            string
 	HostID              string
+	ImmutableID         string `json:"-"` // Provider-generated identity for same-name replacement checks.
 	claimSnapshot       leaseClaim
 	claimSnapshotSet    bool
 	claimSnapshotExists bool
@@ -75,6 +107,8 @@ type Server struct {
 	Name                string            `json:"name"`
 	Status              string            `json:"status"`
 	Labels              map[string]string `json:"labels"`
+	ProviderMetadata    map[string]any    `json:"provider_metadata,omitempty"`
+	ImageEvidence       *ImageEvidence    `json:"imageEvidence,omitempty"`
 	PublicNet           struct {
 		IPv4 struct {
 			IP string `json:"ip"`
@@ -90,10 +124,26 @@ type Server struct {
 	// best-effort populates IPv4.IP from the first array entry, and accepts
 	// the legacy struct shape so direct field assignment in Azure / Proxmox
 	// keeps the field shape unchanged for callers.
-	PrivateNet privateNet `json:"private_net"`
-	ServerType struct {
+	PrivateNet privateNet          `json:"private_net"`
+	ServerType ServerTypeInfo      `json:"server_type"`
+	Location   *ServerLocationInfo `json:"location,omitempty"`
+	Image      *ServerImageInfo    `json:"image,omitempty"`
+
+	AzureUserAssignedIdentityIDs []string `json:"-"` // Observed VM attachments, never inferred from tags.
+}
+
+type HetznerImage struct {
+	ID           int64             `json:"id"`
+	Type         string            `json:"type"`
+	Status       string            `json:"status"`
+	Name         string            `json:"name"`
+	Description  string            `json:"description"`
+	Architecture string            `json:"architecture"`
+	Labels       map[string]string `json:"labels"`
+	CreatedFrom  *struct {
+		ID   int64  `json:"id"`
 		Name string `json:"name"`
-	} `json:"server_type"`
+	} `json:"created_from"`
 }
 
 type SSHKey struct {
@@ -116,9 +166,9 @@ func newHetznerClient() (*HetznerClient, error) {
 		token = os.Getenv("HETZNER_TOKEN")
 	}
 	if token == "" {
-		return nil, exit(3, "HCLOUD_TOKEN or HETZNER_TOKEN is required")
+		return nil, Exit(3, "HCLOUD_TOKEN or HETZNER_TOKEN is required")
 	}
-	return &HetznerClient{Token: token, Client: &http.Client{Timeout: 60 * time.Second}}, nil
+	return &HetznerClient{Token: token, Client: &http.Client{Timeout: 60 * time.Second}, BaseURL: "https://api.hetzner.cloud/v1"}, nil
 }
 
 func NewHetznerClient() (*HetznerClient, error) {
@@ -134,7 +184,11 @@ func (c *HetznerClient) do(ctx context.Context, method, path string, body any, o
 		}
 		r = &buf
 	}
-	req, err := http.NewRequestWithContext(ctx, method, "https://api.hetzner.cloud/v1"+path, r)
+	baseURL := strings.TrimRight(c.BaseURL, "/")
+	if baseURL == "" {
+		baseURL = "https://api.hetzner.cloud/v1"
+	}
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, r)
 	if err != nil {
 		return err
 	}
@@ -150,7 +204,7 @@ func (c *HetznerClient) do(ctx context.Context, method, path string, body any, o
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("hetzner %s %s: http %d: %s", method, path, resp.StatusCode, summarizeJSON(data))
+		return HetznerHTTPError{Method: method, Path: path, StatusCode: resp.StatusCode, Detail: summarizeJSON(data)}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -183,7 +237,7 @@ func (c *HetznerClient) EnsureSSHKey(ctx context.Context, name, publicKey string
 	for _, key := range list.SSHKeys {
 		if key.Name == name {
 			if strings.TrimSpace(key.PublicKey) != strings.TrimSpace(publicKey) {
-				return SSHKey{}, false, exit(3, "hetzner ssh key %q exists with different public key", name)
+				return SSHKey{}, false, Exit(3, "hetzner ssh key %q exists with different public key", name)
 			}
 			return key, false, nil
 		}
@@ -234,12 +288,17 @@ func (c *HetznerClient) DeleteSSHKey(ctx context.Context, name string) error {
 }
 
 func (c *HetznerClient) CreateServer(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool) (Server, error) {
-	name := leaseProviderName(leaseID, slug)
+	name := LeaseProviderName(leaseID, slug)
 	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
-		cfg.Tailscale.Hostname = renderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
+		cfg.Tailscale.Hostname = RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
 	now := time.Now().UTC()
-	labels := directLeaseLabels(cfg, leaseID, slug, "hetzner", "", keep, now)
+	labels := DirectLeaseLabels(cfg, leaseID, slug, "hetzner", "", keep, now)
+	cfg = WithGuestLeaseExpiry(cfg, labels)
+	userData, err := hetznerUserData(cloudInit(cfg, publicKey))
+	if err != nil {
+		return Server{}, err
+	}
 	body := map[string]any{
 		"name":               name,
 		"server_type":        cfg.ServerType,
@@ -247,7 +306,7 @@ func (c *HetznerClient) CreateServer(ctx context.Context, cfg Config, publicKey,
 		"location":           cfg.Location,
 		"labels":             labels,
 		"ssh_keys":           []string{cfg.ProviderKey},
-		"user_data":          cloudInit(cfg, publicKey),
+		"user_data":          userData,
 		"start_after_create": true,
 		"public_net": map[string]any{
 			"enable_ipv4": true,
@@ -264,28 +323,29 @@ func (c *HetznerClient) CreateServer(ctx context.Context, cfg Config, publicKey,
 }
 
 func (c *HetznerClient) CreateServerWithFallback(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any)) (Server, Config, error) {
-	candidates := serverTypeCandidatesForClass(cfg.Class)
-	if cfg.ServerType != "" && cfg.ServerType != candidates[0] {
-		candidates = append([]string{cfg.ServerType}, candidates...)
+	candidates := HetznerServerTypeCandidatesForConfig(cfg)
+	if len(candidates) == 0 && cfg.ServerTypeExplicit && cfg.ServerType != "" {
+		candidates = []string{cfg.ServerType}
 	}
-
-	var errs []error
+	if err := validateProvisioningCandidates(cfg, candidates); err != nil {
+		return Server{}, cfg, err
+	}
+	attempts := make([]ProvisioningCandidate, 0, len(candidates))
 	for i, serverType := range candidates {
 		next := cfg
 		next.ServerType = serverType
-		if i > 0 && logf != nil {
-			logf("fallback provisioning type=%s after quota/capacity rejection\n", serverType)
+		attempt := ProvisioningCandidate{Config: next, FailureLabel: serverType}
+		if i > 0 {
+			attempt.FallbackMessage = fmt.Sprintf("fallback provisioning type=%s after quota/capacity rejection\n", serverType)
 		}
-		server, err := c.CreateServer(ctx, next, publicKey, leaseID, slug, keep)
-		if err == nil {
-			return server, next, nil
-		}
-		errs = append(errs, fmt.Errorf("%s: %w", serverType, err))
-		if !isRetryableProvisioningError(err) {
-			return Server{}, next, joinErrors(errs)
-		}
+		attempts = append(attempts, attempt)
 	}
-	return Server{}, cfg, joinErrors(errs)
+	return ProvisionServerCandidates(ctx, cfg, attempts, ServerProvisioner{
+		Create: func(ctx context.Context, next Config) (Server, error) {
+			return c.CreateServer(ctx, next, publicKey, leaseID, slug, keep)
+		},
+		CanRetry: isRetryableProvisioningError,
+	}, logf)
 }
 
 func isRetryableProvisioningError(err error) bool {
@@ -322,6 +382,35 @@ func (c *HetznerClient) GetServer(ctx context.Context, id int64) (Server, error)
 
 func (c *HetznerClient) DeleteServer(ctx context.Context, id int64) error {
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/servers/%d", id), nil, nil)
+}
+
+func (c *HetznerClient) CreateServerSnapshot(ctx context.Context, serverID int64, description string, labels map[string]string) (HetznerImage, error) {
+	body := struct {
+		Type        string            `json:"type"`
+		Description string            `json:"description"`
+		Labels      map[string]string `json:"labels"`
+	}{Type: "snapshot", Description: description, Labels: labels}
+	var res struct {
+		Image HetznerImage `json:"image"`
+	}
+	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/servers/%d/actions/create_image", serverID), body, &res); err != nil {
+		return HetznerImage{}, err
+	}
+	return res.Image, nil
+}
+
+func (c *HetznerClient) GetImage(ctx context.Context, imageID int64) (HetznerImage, error) {
+	var res struct {
+		Image HetznerImage `json:"image"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/images/%d", imageID), nil, &res); err != nil {
+		return HetznerImage{}, err
+	}
+	return res.Image, nil
+}
+
+func (c *HetznerClient) DeleteImage(ctx context.Context, imageID int64) error {
+	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/images/%d", imageID), nil, nil)
 }
 
 func (c *HetznerClient) SetLabels(ctx context.Context, id int64, labels map[string]string) error {

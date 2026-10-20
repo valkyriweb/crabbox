@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 	sandboxv1 "github.com/openclaw/crabbox/internal/providers/wandb/gen/coreweave/sandbox/v1beta2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -98,8 +100,8 @@ func (e *wandbAPIError) Error() string {
 // path picks up the mapped sysexit code (77/69/124/…) as the process exit.
 // Without this, mapRPCError's exit codes were inert — main printed and exited 1.
 func (e *wandbAPIError) As(target any) bool {
-	if t, ok := target.(*ExitError); ok {
-		*t = ExitError{Code: e.ExitCode, Message: e.Error()}
+	if t, ok := target.(*core.ExitError); ok {
+		*t = core.ExitError{Code: e.ExitCode, Message: e.Error()}
 		return true
 	}
 	return false
@@ -121,11 +123,12 @@ type Auth struct {
 // inside that operation, and the backend closes the connection before returning
 // to avoid leaking sockets in long-lived Crabbox processes.
 type wandbClient struct {
-	conn *grpc.ClientConn
-	gw   sandboxv1.GatewayServiceClient
+	conn   *grpc.ClientConn
+	gw     sandboxv1.GatewayServiceClient
+	apiKey string
 }
 
-func newWandbClient(cfg Config, _ Runtime) (wandbAPI, error) {
+func newWandbClient(cfg core.Config, _ core.Runtime) (wandbAPI, error) {
 	auth, err := resolveAuth(cfg)
 	if err != nil {
 		return nil, err
@@ -156,7 +159,24 @@ func newWandbClient(cfg Config, _ Runtime) (wandbAPI, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial cwsandbox gateway %s: %w", endpoint, err)
 	}
-	return &wandbClient{conn: conn, gw: sandboxv1.NewGatewayServiceClient(conn)}, nil
+	return &wandbClient{conn: conn, gw: sandboxv1.NewGatewayServiceClient(conn), apiKey: auth.APIKey}, nil
+}
+
+// wandbProviderScope binds a local claim to the exact remote namespace without
+// retaining the API key. The client validates that entity is present before a
+// production operation reaches ownership checks.
+func wandbProviderScope() (string, error) {
+	endpoint := strings.TrimSpace(os.Getenv("CWSANDBOX_BASE_URL"))
+	if endpoint == "" {
+		endpoint = defaultEndpoint
+	}
+	resolved, _, err := resolveEndpoint(endpoint)
+	if err != nil {
+		return "", err
+	}
+	return "endpoint:" + url.QueryEscape(resolved) +
+		"|entity:" + url.QueryEscape(strings.TrimSpace(os.Getenv("WANDB_ENTITY_NAME"))) +
+		"|project:" + url.QueryEscape(strings.TrimSpace(os.Getenv("WANDB_PROJECT"))), nil
 }
 
 func (c *wandbClient) Close() error {
@@ -175,7 +195,7 @@ func (c *wandbClient) Close() error {
 //
 // WANDB_ENTITY_NAME is required for W&B-authenticated sandboxes; WANDB_PROJECT
 // is optional.
-func resolveAuth(cfg Config) (Auth, error) {
+func resolveAuth(cfg core.Config) (Auth, error) {
 	key := strings.TrimSpace(os.Getenv("CRABBOX_WANDB_API_KEY"))
 	if key == "" {
 		key = strings.TrimSpace(cfg.Wandb.APIKey)
@@ -187,11 +207,11 @@ func resolveAuth(cfg Config) (Auth, error) {
 		key = readNetrcWandbKey()
 	}
 	if key == "" {
-		return Auth{}, exit(2, "provider=%s requires a W&B API key (run `wandb login`, set CRABBOX_WANDB_API_KEY, or add `wandb.apiKey` to your crabbox config)", providerName)
+		return Auth{}, core.Exit(2, "provider=%s requires a W&B API key (run `wandb login`, set CRABBOX_WANDB_API_KEY, or add `wandb.apiKey` to your crabbox config)", providerName)
 	}
 	entity := strings.TrimSpace(os.Getenv("WANDB_ENTITY_NAME"))
 	if entity == "" {
-		return Auth{}, exit(2, "provider=%s requires WANDB_ENTITY_NAME when using W&B credentials", providerName)
+		return Auth{}, core.Exit(2, "provider=%s requires WANDB_ENTITY_NAME when using W&B credentials", providerName)
 	}
 	return Auth{
 		APIKey:  key,
@@ -296,7 +316,7 @@ func isLoopbackHost(host string) bool {
 // version the client is wired against.
 func (c *wandbClient) Version(ctx context.Context) (string, error) {
 	if _, err := c.gw.List(ctx, &sandboxv1.ListSandboxesRequest{PageSize: 1}); err != nil {
-		return "", mapRPCError(err, "version probe")
+		return "", mapRPCError(err, "version probe", c.apiKey)
 	}
 	return "coreweave.sandbox.v1beta2", nil
 }
@@ -318,7 +338,7 @@ func (c *wandbClient) Acquire(ctx context.Context, req wandbAcquireRequest) (wan
 		MaxLifetimeSeconds:   int32(req.MaxLifetimeSecs),
 	})
 	if err != nil {
-		return wandbSandbox{}, mapRPCError(err, "Start")
+		return wandbSandbox{}, mapRPCError(err, "Start", c.apiKey)
 	}
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout(req.MaxLifetimeSecs))
 	defer cancel()
@@ -343,7 +363,7 @@ func (c *wandbClient) pollUntilRunning(ctx context.Context, id string) (wandbSan
 		}
 		resp, err := c.gw.Get(ctx, &sandboxv1.GetSandboxRequest{SandboxId: id})
 		if err != nil {
-			return wandbSandbox{}, mapRPCError(err, "Get(poll)")
+			return wandbSandbox{}, mapRPCError(err, "Get(poll)", c.apiKey)
 		}
 		switch resp.SandboxStatus {
 		case sandboxv1.SandboxStatus_SANDBOX_STATUS_RUNNING:
@@ -359,12 +379,8 @@ func (c *wandbClient) pollUntilRunning(ctx context.Context, id string) (wandbSan
 			sandboxv1.SandboxStatus_SANDBOX_STATUS_TERMINATING:
 			return wandbSandbox{}, fmt.Errorf("sandbox %s ended before reaching RUNNING (status=%s)", id, resp.SandboxStatus)
 		}
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return wandbSandbox{}, ctx.Err()
-		case <-timer.C:
+		if err := core.SleepContext(ctx, interval); err != nil {
+			return wandbSandbox{}, err
 		}
 		if interval < cap {
 			interval = interval * 3 / 2
@@ -405,7 +421,7 @@ func (c *wandbClient) Exec(ctx context.Context, req wandbExecRequest) (int, erro
 	}
 	resp, err := c.gw.Exec(ctx, grpcReq)
 	if err != nil {
-		return 0, mapRPCError(err, "Exec")
+		return 0, mapRPCError(err, "Exec", c.apiKey)
 	}
 	if resp.Result == nil {
 		return 0, fmt.Errorf("wandb exec: empty response")
@@ -435,7 +451,7 @@ func (c *wandbClient) Stop(ctx context.Context, id string, gracefulSeconds int, 
 		if missingOK && status.Code(err) == codes.NotFound {
 			return nil
 		}
-		return mapRPCError(err, "Stop")
+		return mapRPCError(err, "Stop", c.apiKey)
 	}
 	if resp == nil {
 		return fmt.Errorf("wandb stop %s: empty response", id)
@@ -445,7 +461,7 @@ func (c *wandbClient) Stop(ctx context.Context, id string, gracefulSeconds int, 
 		if msg == "" {
 			msg = "stop failed"
 		}
-		return fmt.Errorf("wandb stop %s: %s", id, msg)
+		return fmt.Errorf("wandb stop %s: %s", id, shared.RedactErrorSecrets(msg, c.apiKey))
 	}
 	return nil
 }
@@ -463,7 +479,7 @@ func (c *wandbClient) List(ctx context.Context, tags []string, statusFilter stri
 	for {
 		resp, err := c.gw.List(ctx, grpcReq)
 		if err != nil {
-			return nil, mapRPCError(err, "List")
+			return nil, mapRPCError(err, "List", c.apiKey)
 		}
 		for _, sb := range resp.Sandboxes {
 			out = append(out, wandbSandbox{
@@ -483,7 +499,7 @@ func (c *wandbClient) List(ctx context.Context, tags []string, statusFilter stri
 func (c *wandbClient) Status(ctx context.Context, id string) (wandbSandbox, error) {
 	resp, err := c.gw.Get(ctx, &sandboxv1.GetSandboxRequest{SandboxId: id})
 	if err != nil {
-		return wandbSandbox{}, mapRPCError(err, "Get")
+		return wandbSandbox{}, mapRPCError(err, "Get", c.apiKey)
 	}
 	return wandbSandbox{
 		ID:        id,
@@ -505,13 +521,14 @@ func formatTimestamp(ts *timestamppb.Timestamp) string {
 // mapRPCError converts a gRPC status into the wandbAPIError surface that
 // callers (and tests) already expect. ExitCode mapping follows sysexits.h:
 // 77 EX_NOPERM, 69 EX_UNAVAILABLE, 124 GNU timeout.
-func mapRPCError(err error, op string) error {
+func mapRPCError(err error, op string, secrets ...string) error {
 	if err == nil {
 		return nil
 	}
 	s, ok := status.FromError(err)
 	if !ok {
-		return &wandbAPIError{ExitCode: 1, Stderr: fmt.Sprintf("%s: %v", op, err)}
+		message := shared.RedactErrorSecrets(err.Error(), secrets...)
+		return &wandbAPIError{ExitCode: 1, Stderr: fmt.Sprintf("%s: %s", op, message)}
 	}
 	exit := 1
 	switch s.Code() {
@@ -528,7 +545,7 @@ func mapRPCError(err error, op string) error {
 	}
 	return &wandbAPIError{
 		ExitCode: exit,
-		Stderr:   fmt.Sprintf("%s: %s", op, s.Message()),
+		Stderr:   fmt.Sprintf("%s: %s", op, shared.RedactErrorSecrets(s.Message(), secrets...)),
 		Code:     s.Code(),
 	}
 }

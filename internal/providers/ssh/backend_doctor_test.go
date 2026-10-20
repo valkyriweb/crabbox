@@ -2,17 +2,20 @@ package ssh
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 func TestStaticSSHDoctorDoesNotReportProbeWhenUnchecked(t *testing.T) {
-	cfg := Config{}
+	cfg := core.Config{}
 	cfg.Static.Host = "example.test"
-	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
 
 	result, err := backend.Doctor(context.Background(), core.DoctorRequest{})
 	if err != nil {
@@ -26,15 +29,67 @@ func TestStaticSSHDoctorDoesNotReportProbeWhenUnchecked(t *testing.T) {
 	}
 }
 
+func TestStaticSSHDoctorReportsWSL2SFTPPrerequisite(t *testing.T) {
+	cfg := core.Config{Provider: "ssh"}
+	cfg.TargetOS = core.TargetWindows
+	cfg.WindowsMode = "wsl2"
+	cfg.Static.Host = "example.test"
+	oldWait := waitForSSHReady
+	oldIsUnavailable := isWSLSFTPUnavailable
+	t.Cleanup(func() {
+		waitForSSHReady = oldWait
+		isWSLSFTPUnavailable = oldIsUnavailable
+	})
+
+	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	result, err := backend.Doctor(t.Context(), core.DoctorRequest{})
+	if err != nil || len(result.Checks) != 1 || result.Checks[0].Check != "wsl2-sftp" || result.Checks[0].Status != "skip" ||
+		!strings.Contains(result.Checks[0].Message, "runtime=unchecked transport=sftp_required mutation=false") ||
+		!strings.Contains(result.Checks[0].Message, "--doctor-probe-ssh") {
+		t.Fatalf("unchecked result=%#v err=%v", result, err)
+	}
+
+	var readyCheck string
+	waitForSSHReady = func(_ context.Context, target *core.SSHTarget, _ io.Writer, _ string, _ time.Duration) error {
+		readyCheck = target.ReadyCheck
+		return nil
+	}
+	result, err = backend.Doctor(t.Context(), core.DoctorRequest{ProbeSSH: true})
+	if err != nil || result.Checks[0].Status != "ok" || !strings.Contains(result.Checks[0].Message, "transport=sftp_ready") {
+		t.Fatalf("ready result=%#v err=%v", result, err)
+	}
+	if readyCheck != "git --version >/dev/null && rsync --version >/dev/null && tar --version >/dev/null" ||
+		strings.Contains(readyCheck, "/tmp/crabbox-ready") || strings.Contains(readyCheck, "wsl-stage") {
+		t.Fatalf("Doctor WSL2 readiness mutates target: %q", readyCheck)
+	}
+
+	missingSFTP := errors.New("missing SFTP")
+	isWSLSFTPUnavailable = func(err error) bool { return errors.Is(err, missingSFTP) }
+	waitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error {
+		return fmt.Errorf("wrapped: %w", missingSFTP)
+	}
+	result, err = backend.Doctor(t.Context(), core.DoctorRequest{ProbeSSH: true})
+	if err != nil || result.Checks[0].Status != "failed" || !strings.Contains(result.Checks[0].Message, "enable_internal-sftp_restart_sshd") {
+		t.Fatalf("missing result=%#v err=%v", result, err)
+	}
+
+	toolErr := errors.New("remote git missing")
+	waitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error { return toolErr }
+	if _, err = backend.Doctor(t.Context(), core.DoctorRequest{ProbeSSH: true}); !errors.Is(err, toolErr) {
+		t.Fatalf("tool failure=%v, want unchanged %v", err, toolErr)
+	}
+}
+
 func TestStaticSSHRequestedSlugPersistsThroughClaimedResolveAndList(t *testing.T) {
+	stubStaticArchitecture(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	oldWait := waitForSSH
-	waitForSSH = func(context.Context, *SSHTarget, io.Writer) error { return nil }
+	waitForSSH = func(context.Context, *core.SSHTarget, io.Writer) error { return nil }
 	t.Cleanup(func() { waitForSSH = oldWait })
 
-	cfg := Config{Provider: "ssh"}
+	cfg := core.Config{Provider: "ssh"}
 	cfg.TargetOS = "macos"
 	cfg.SSHUser = "fallback-user"
 	cfg.SSHPort = "2222"
@@ -42,16 +97,16 @@ func TestStaticSSHRequestedSlugPersistsThroughClaimedResolveAndList(t *testing.T
 	cfg.Static.ID = "static_stable"
 	cfg.Static.Name = "configured-name"
 	cfg.Static.WorkRoot = "/workspace/static"
-	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
-	lease, err := backend.Acquire(context.Background(), AcquireRequest{
+	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	lease, err := backend.Acquire(context.Background(), core.AcquireRequest{
 		Repo:          core.Repo{Root: t.TempDir()},
 		RequestedSlug: "requested-name",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lease.Server.Name != "requested-name" || serverSlug(lease.Server) != "requested-name" {
-		t.Fatalf("acquired name=%q slug=%q, want requested-name", lease.Server.Name, serverSlug(lease.Server))
+	if lease.Server.Name != "requested-name" || core.ServerSlug(lease.Server) != "requested-name" {
+		t.Fatalf("acquired name=%q slug=%q, want requested-name", lease.Server.Name, core.ServerSlug(lease.Server))
 	}
 	claim, ok, err := core.ResolveLeaseClaim(lease.LeaseID)
 	if err != nil || !ok {
@@ -61,32 +116,32 @@ func TestStaticSSHRequestedSlugPersistsThroughClaimedResolveAndList(t *testing.T
 		t.Fatalf("claim did not persist static target details: %#v", claim)
 	}
 
-	backend = NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
-	views, err := backend.List(context.Background(), ListRequest{})
+	backend = NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	views, err := backend.List(context.Background(), core.ListRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(views) != 1 || views[0].Name != "requested-name" || serverSlug(views[0]) != "requested-name" {
+	if len(views) != 1 || views[0].Name != "requested-name" || core.ServerSlug(views[0]) != "requested-name" {
 		t.Fatalf("views=%#v, want requested-name from persisted claim", views)
 	}
-	defaultLease, err := backend.Resolve(context.Background(), ResolveRequest{})
+	defaultLease, err := backend.Resolve(context.Background(), core.ResolveRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if defaultLease.Server.Name != "requested-name" || serverSlug(defaultLease.Server) != "requested-name" {
+	if defaultLease.Server.Name != "requested-name" || core.ServerSlug(defaultLease.Server) != "requested-name" {
 		t.Fatalf("default resolve server=%#v, want requested-name", defaultLease.Server)
 	}
-	byID, err := backend.Resolve(context.Background(), ResolveRequest{ID: lease.LeaseID})
+	byID, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: lease.LeaseID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if byID.Server.Name != "requested-name" || serverSlug(byID.Server) != "requested-name" {
+	if byID.Server.Name != "requested-name" || core.ServerSlug(byID.Server) != "requested-name" {
 		t.Fatalf("resolve by id server=%#v, want requested-name", byID.Server)
 	}
 	if byID.SSH.Host != "static.example.test" || byID.SSH.User != "fallback-user" || byID.SSH.Port != "2222" {
 		t.Fatalf("resolve by id ssh=%#v, want original claimed static target", byID.SSH)
 	}
-	bySlug, err := backend.Resolve(context.Background(), ResolveRequest{ID: "requested-name"})
+	bySlug, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "requested-name"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +152,8 @@ func TestStaticSSHRequestedSlugPersistsThroughClaimedResolveAndList(t *testing.T
 	overrideCfg := cfg
 	overrideCfg.SSHUser = "override-user"
 	overrideCfg.SSHPort = "2200"
-	backend = NewStaticSSHLeaseBackend(Provider{}.Spec(), overrideCfg, Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
-	override, err := backend.Resolve(context.Background(), ResolveRequest{ID: "requested-name"})
+	backend = NewStaticSSHLeaseBackend(Provider{}.Spec(), overrideCfg, core.Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	override, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "requested-name"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,27 +163,28 @@ func TestStaticSSHRequestedSlugPersistsThroughClaimedResolveAndList(t *testing.T
 }
 
 func TestStaticSSHRequestedSlugAvoidsClaimCollision(t *testing.T) {
+	stubStaticArchitecture(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	oldWait := waitForSSH
-	waitForSSH = func(context.Context, *SSHTarget, io.Writer) error { return nil }
+	waitForSSH = func(context.Context, *core.SSHTarget, io.Writer) error { return nil }
 	t.Cleanup(func() { waitForSSH = oldWait })
 	if err := core.ClaimLeaseForRepoProvider("cbx_other123456", "requested-name", "aws", t.TempDir(), 0, false); err != nil {
 		t.Fatal(err)
 	}
 
-	cfg := Config{Provider: "ssh"}
+	cfg := core.Config{Provider: "ssh"}
 	cfg.Static.Host = "static.example.test"
-	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
-	lease, err := backend.Acquire(context.Background(), AcquireRequest{
+	backend := NewStaticSSHLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: io.Discard}).(*staticLeaseBackend)
+	lease, err := backend.Acquire(context.Background(), core.AcquireRequest{
 		Repo:          core.Repo{Root: t.TempDir()},
 		RequestedSlug: "requested-name",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	slug := serverSlug(lease.Server)
+	slug := core.ServerSlug(lease.Server)
 	if slug == "requested-name" || !strings.HasPrefix(slug, "requested-name-") {
 		t.Fatalf("slug=%q, want collision-suffixed requested-name", slug)
 	}

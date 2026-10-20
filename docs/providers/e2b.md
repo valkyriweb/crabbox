@@ -13,6 +13,10 @@ config, repo claims, sync manifests and guardrails, slugs, timing summaries, and
 normalized `list`/`status` rendering. There is no Crabbox SSH lease and no broker
 coordinator — the CLI talks to E2B directly.
 
+E2B and CubeSandbox share the envd Connect wire codec, but retain their own
+process-end interpretation. E2B continues reading after an end event; a later
+RPC or stream-read failure takes precedence over the reported command exit.
+
 ## When to use
 
 Use E2B when the remote Linux sandbox should be owned by E2B and commands run
@@ -21,6 +25,11 @@ when you need direct SSH access to the box.
 
 E2B is Linux-only. Desktop, browser, code, Actions hydration, and SSH-based run
 options are not available.
+
+Multipart archive uploads finish using their borrowed source before returning.
+HTTP failures remain primary; source failures after an early success response are
+reported with token redaction. Cancellation stops HTTP/pipe work but may wait for
+an in-flight source read; the upload does not close the caller-owned source.
 
 ## Commands
 
@@ -46,10 +55,15 @@ export E2B_API_KEY=e2b_...
 `CRABBOX_E2B_API_KEY` is also accepted and takes precedence over `E2B_API_KEY`.
 Do not pass the key as a command-line argument.
 
+The key remains environment-only for CLI configuration: neither user nor
+repository YAML has an API-key field, and no key flag is registered. The first
+raw nonempty primary or alias value wins; an empty value falls through.
+
 Endpoint overrides:
 
 - `CRABBOX_E2B_API_URL` / `E2B_API_URL` or `e2b.apiUrl` override the default API
-  URL `https://api.e2b.app`.
+  URL `https://api.e2b.app`. Overrides must use HTTPS; plain HTTP is accepted
+  only for localhost or loopback development endpoints.
 - `CRABBOX_E2B_DOMAIN` / `E2B_DOMAIN` or `e2b.domain` override the default sandbox
   domain `e2b.app`.
 
@@ -79,6 +93,20 @@ Provider flags (each overrides the matching `e2b.*` config key):
 `template` also reads `CRABBOX_E2B_TEMPLATE`, `workdir` reads
 `CRABBOX_E2B_WORKDIR`, and `user` reads `CRABBOX_E2B_USER`.
 
+All six bindings share one typed declaration. Nonempty YAML strings override
+earlier values without trimming; omitted, null, and empty values preserve them.
+Environment strings retain raw nonempty precedence, including the three existing
+key/URL/domain alias chains. Visited empty flags still apply. Accepted key, API
+URL, and domain inputs keep their existing source classification; URL/domain
+flag visits remain a separate central post-success step. Source admission does
+not grant a repository destination authority to use inherited credentials.
+
+The client, configured claim defaults, bridge/preview domains, template, display,
+and workdir helpers share the compiled defaults while retaining their existing
+normalization. Raw claim scope and command routing do not gain a new fallback.
+The fixed display fallback for missing remote template metadata remains separate
+from the configured template, as do user-home and platform-root rules.
+
 ### Workdir and user resolution
 
 A relative `e2b.workdir` resolves inside the selected E2B user's home: the
@@ -98,15 +126,33 @@ files.
 
 1. Create or resolve a Crabbox-owned E2B sandbox from `e2b.template` (default
    `base`), with internet access enabled.
-2. Store Crabbox metadata on the sandbox and write a local repo claim.
+2. Store Crabbox metadata on the sandbox and write a local repo claim bound to
+   the exact API endpoint and sandbox ID.
 3. Build the Crabbox sync manifest, upload a gzipped archive into `/tmp`, and
-   extract it into the resolved workdir.
+   extract it into the resolved workdir. For new sandboxes, archive preparation
+   and guardrails run before creation.
 4. Execute the command through the E2B process stream in that workdir.
-5. Delete the sandbox on release unless the lease is kept.
+5. Delete a newly created sandbox unless kept. Reused sandboxes remain
+   available. Cleanup failure fails the run and preserves its claim; a prior
+   command failure keeps its exit code. Timing is emitted after cleanup. See
+   the [shared sandbox lifecycle](../features/delegated-runner-contract.md#shared-sandbox-lifecycle).
 
 E2B caps sandbox timeouts at one hour. Crabbox clamps a longer local lease TTL to
 that limit when creating or connecting to a sandbox, and a TTL of zero falls back
 to five minutes.
+
+Sandbox reads and connections must return the exact requested native sandbox
+ID. A missing or different ID is rejected before its metadata or execution
+session can be used; ordinary cleanup of an already acquired sandbox still
+follows that sandbox's original claim.
+
+Commands share Crabbox's argv-versus-shell intent handling. Quoted profile
+arguments remain literal, including separators and assignment-shaped executable
+names. Single-string inferred programs and explicit `--shell` source execute
+in envd's existing `/bin/bash -l -c` shell; explicitly empty shell source is valid.
+Literal argv uses `exec` in that shell, so the workload replaces it rather than
+running a shell suffix or exit trap afterward. No additional shell is inserted.
+Use `--shell` for shell-only builtins or functions rather than literal argv.
 
 ## Capabilities
 
@@ -120,6 +166,22 @@ to five minutes.
 
 Run a live smoke when changing E2B lifecycle, sync, status, or process-stream
 code. Keep the API key in the environment; never pass it as an argument.
+
+```sh
+export E2B_API_KEY=e2b_...
+go build -trimpath -o bin/crabbox ./cmd/crabbox
+CRABBOX_LIVE=1 \
+CRABBOX_LIVE_PROVIDERS=e2b \
+CRABBOX_LIVE_REPO=/path/to/my-app \
+scripts/live-smoke.sh
+```
+
+The shared harness exits before any E2B `warmup`, `status`, `run`, `list`, or
+`stop` command when no API key is exported. With the key configured, it creates
+one E2B sandbox from the selected template, waits for readiness, runs one
+no-sync command, lists normalized E2B inventory, and stops the lease.
+
+For manual debugging, run the same lifecycle directly:
 
 ```sh
 export E2B_API_KEY=e2b_...
@@ -145,8 +207,11 @@ Expected results:
 ## Gotchas
 
 - `--id` accepts a Crabbox slug, a `cbx_...` lease ID, or an E2B sandbox ID in
-  raw or `e2b_<sandboxID>` form. Raw and synthetic sandbox IDs are honored only
-  when the sandbox metadata marks it as Crabbox-owned.
+  raw or `e2b_<sandboxID>` form. Destructive cleanup requires an exact local
+  endpoint-and-sandbox claim. To recover a Crabbox-owned sandbox whose claim is
+  missing or legacy, inspect the exact sandbox ID and pass `stop --reclaim`;
+  Crabbox revalidates its canonical lease metadata before adopting and deleting
+  it.
 - `--class` and `--type` are rejected; the E2B template owns sandbox resources.
 - `--checksum` is rejected because there is no Crabbox SSH/rsync target. Large-
   sync preflight guardrails still apply.

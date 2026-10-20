@@ -1,10 +1,75 @@
 package cli
 
 import (
+	"flag"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+type architectureCapabilityTestProvider struct{ denyAMD64 bool }
+
+func (architectureCapabilityTestProvider) Spec() ProviderSpec {
+	return ProviderSpec{
+		Name:             "architecture-capability-test",
+		Family:           "architecture-capability-test",
+		Kind:             ProviderKindSSHLease,
+		Targets:          []TargetSpec{{OS: targetLinux}, {OS: targetMacOS}, {OS: targetWindows, WindowsMode: windowsModeNormal}, {OS: targetWindows, WindowsMode: windowsModeWSL2}},
+		Coordinator:      CoordinatorNever,
+		ClassDisposition: ProviderClassDispositionUnmapped,
+	}
+}
+func (architectureCapabilityTestProvider) RegisterFlags(*flag.FlagSet, Config) any {
+	return noProviderFlags{}
+}
+func (architectureCapabilityTestProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
+	return nil
+}
+func (architectureCapabilityTestProvider) Configure(Config, Runtime) (Backend, error) {
+	return nil, nil
+}
+func (p architectureCapabilityTestProvider) SupportsArchitecture(_ Config, architecture string) bool {
+	return architecture == ArchitectureARM64 || (architecture == ArchitectureAMD64 && !p.denyAMD64)
+}
+
+func TestProviderArchitectureCapabilityOwnsTargetAdmission(t *testing.T) {
+	p := architectureCapabilityTestProvider{denyAMD64: true}
+	providerRegistry[p.Spec().Name] = p
+	t.Cleanup(func() { delete(providerRegistry, p.Spec().Name) })
+	for _, target := range []string{targetLinux, targetMacOS, targetWindows} {
+		for _, arch := range []string{ArchitectureAMD64, ArchitectureARM64} {
+			t.Run(target+"/"+arch, func(t *testing.T) {
+				cfg := baseConfig()
+				cfg.Provider, cfg.TargetOS, cfg.Architecture = p.Spec().Name, target, arch
+				cfg.architectureExplicit = true
+				err := validateProviderTarget(cfg)
+				if (err == nil) != (arch == ArchitectureARM64) {
+					t.Fatalf("capability admission architecture=%s: %v", arch, err)
+				}
+			})
+		}
+	}
+	cfg := baseConfig()
+	cfg.Provider, cfg.TargetOS, cfg.Architecture = p.Spec().Name, targetWorkerRuntime, ArchitectureARM64
+	if err := validateProviderTarget(cfg); err == nil {
+		t.Fatal("capability bypassed ProviderSpec.Targets")
+	}
+}
+
+func TestProviderArchitectureCapabilityAdmitsStaticArchitecture(t *testing.T) {
+	provider := architectureCapabilityTestProvider{}
+	for _, architecture := range []string{ArchitectureAMD64, ArchitectureARM64} {
+		t.Run(architecture, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.TargetOS = targetLinux
+			if !providerSupportsArchitecture(provider, cfg, architecture) {
+				t.Fatalf("architecture capability rejected %s", architecture)
+			}
+		})
+	}
+}
 
 func TestValidateProviderTargetRejectsUnsupportedAWSTargets(t *testing.T) {
 	t.Run("macOS needs dedicated host", func(t *testing.T) {
@@ -72,7 +137,10 @@ func TestValidateProviderTargetRejectsAWSWSL2ExactTypeWithoutNestedVirtualizatio
 	cfg.ServerTypeExplicit = true
 
 	err := validateProviderTarget(cfg)
-	if err == nil || !strings.Contains(err.Error(), "nested virtualization") || !strings.Contains(err.Error(), "m8i.4xlarge") {
+	if err == nil ||
+		!strings.Contains(err.Error(), "nested virtualization") ||
+		!strings.Contains(err.Error(), "m8i.4xlarge") ||
+		!strings.Contains(err.Error(), "class=tiny|small|standard|fast|large|beast") {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -143,7 +211,7 @@ func TestValidateProviderTargetAllowsAzureWindowsARM64(t *testing.T) {
 	cfg.architectureExplicit = true
 	cfg.ServerType = "Standard_D32pds_v6"
 	cfg.ServerTypeExplicit = true
-	cfg.AzureImage = "Contoso:windows-arm64:server:latest"
+	cfg.Azure.Image = "Contoso:windows-arm64:server:latest"
 	if err := validateProviderTarget(cfg); err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -160,6 +228,28 @@ func TestValidateProviderTargetAllowsTartMacOSARM64(t *testing.T) {
 	}
 }
 
+func TestValidateProviderTargetAllowsExternalARM64Targets(t *testing.T) {
+	for _, target := range []struct {
+		os   string
+		mode string
+	}{
+		{os: targetLinux, mode: windowsModeNormal},
+		{os: targetMacOS, mode: windowsModeNormal},
+		{os: targetWindows, mode: windowsModeNormal},
+		{os: targetWindows, mode: windowsModeWSL2},
+	} {
+		cfg := baseConfig()
+		cfg.Provider = "external"
+		cfg.TargetOS = target.os
+		cfg.WindowsMode = target.mode
+		cfg.Architecture = ArchitectureARM64
+		cfg.architectureExplicit = true
+		if err := validateProviderTarget(cfg); err != nil {
+			t.Errorf("target=%s mode=%s err=%v", target.os, target.mode, err)
+		}
+	}
+}
+
 func TestValidateProviderTargetRejectsTartExplicitAMD64(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Provider = "tart"
@@ -172,9 +262,41 @@ func TestValidateProviderTargetRejectsTartExplicitAMD64(t *testing.T) {
 	}
 }
 
-func TestValidateProviderTargetDefaultsAppleVZToARM64(t *testing.T) {
+func TestValidateProviderTargetAllowsLumeMacOSARM64(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Provider = "apple-vz"
+	cfg.Provider = "lume"
+	cfg.TargetOS = targetMacOS
+	cfg.Architecture = ArchitectureARM64
+	cfg.architectureExplicit = true
+	if err := validateProviderTarget(cfg); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateProviderTargetDefaultsLumeToARM64(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "lume"
+	cfg.TargetOS = targetMacOS
+	if got := effectiveArchitectureForConfig(cfg); got != ArchitectureARM64 {
+		t.Fatalf("effective architecture=%q want arm64", got)
+	}
+}
+
+func TestValidateProviderTargetRejectsLumeExplicitAMD64(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "lume"
+	cfg.TargetOS = targetMacOS
+	cfg.Architecture = ArchitectureAMD64
+	cfg.architectureExplicit = true
+	err := validateProviderTarget(cfg)
+	if err == nil || !strings.Contains(err.Error(), "supports architecture=arm64 only") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateProviderTargetDefaultsAppleVMToARM64(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "apple-vm"
 	cfg.TargetOS = targetLinux
 	if got := effectiveArchitectureForConfig(cfg); got != ArchitectureARM64 {
 		t.Fatalf("effective architecture=%q want arm64", got)
@@ -184,9 +306,9 @@ func TestValidateProviderTargetDefaultsAppleVZToARM64(t *testing.T) {
 	}
 }
 
-func TestValidateProviderTargetAllowsAppleVZExplicitARM64(t *testing.T) {
+func TestValidateProviderTargetAllowsAppleVMExplicitARM64(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Provider = "apple-vz"
+	cfg.Provider = "apple-vm"
 	cfg.TargetOS = targetLinux
 	cfg.Architecture = ArchitectureARM64
 	cfg.architectureExplicit = true
@@ -195,9 +317,64 @@ func TestValidateProviderTargetAllowsAppleVZExplicitARM64(t *testing.T) {
 	}
 }
 
-func TestValidateProviderTargetRejectsAppleVZExplicitAMD64(t *testing.T) {
+func TestValidateProviderTargetRejectsAppleVMExplicitAMD64(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Provider = "apple-vz"
+	cfg.Provider = "apple-vm"
+	cfg.TargetOS = targetLinux
+	cfg.Architecture = ArchitectureAMD64
+	cfg.architectureExplicit = true
+	err := validateProviderTarget(cfg)
+	if err == nil || !strings.Contains(err.Error(), "supports architecture=arm64 only") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateProviderTargetDefaultsAppleContainerToARM64(t *testing.T) {
+	for _, provider := range []string{"apple-container", "apple", "applecontainer"} {
+		cfg := baseConfig()
+		cfg.Provider = provider
+		cfg.TargetOS = targetLinux
+		if got := effectiveArchitectureForConfig(cfg); got != ArchitectureARM64 {
+			t.Errorf("provider=%s effective architecture=%q want arm64", provider, got)
+		}
+	}
+}
+
+func TestProviderSupportsARM64IncludesAppleContainer(t *testing.T) {
+	if !providerSupportsARM64("apple-container") {
+		t.Fatal("apple-container should support ARM64")
+	}
+	if providerSupportsARM64("apple-machine") {
+		t.Fatal("apple-machine should remain conservative until upstream AMD64 support is proven")
+	}
+}
+
+func TestValidateProviderTargetDefaultsAWSLambdaMicroVMToARM64(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws-lambda-microvm"
+	cfg.TargetOS = targetLinux
+	if got := effectiveArchitectureForConfig(cfg); got != ArchitectureARM64 {
+		t.Fatalf("effective architecture=%q want arm64", got)
+	}
+	if err := validateProviderTarget(cfg); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateProviderTargetAllowsAWSLambdaMicroVMExplicitARM64(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws-lambda-microvm"
+	cfg.TargetOS = targetLinux
+	cfg.Architecture = ArchitectureARM64
+	cfg.architectureExplicit = true
+	if err := validateProviderTarget(cfg); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateProviderTargetRejectsAWSLambdaMicroVMExplicitAMD64(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws-lambda-microvm"
 	cfg.TargetOS = targetLinux
 	cfg.Architecture = ArchitectureAMD64
 	cfg.architectureExplicit = true
@@ -216,7 +393,7 @@ func TestValidateProviderTargetRejectsAzureWindowsARM64WSL2(t *testing.T) {
 	cfg.architectureExplicit = true
 	cfg.ServerType = "Standard_D32pds_v6"
 	cfg.ServerTypeExplicit = true
-	cfg.AzureImage = "Contoso:windows-arm64:server:latest"
+	cfg.Azure.Image = "Contoso:windows-arm64:server:latest"
 	err := validateProviderTarget(cfg)
 	if err == nil || !strings.Contains(err.Error(), "supports windows.mode=normal only") {
 		t.Fatalf("err=%v", err)
@@ -320,6 +497,383 @@ func TestLeaseCreateFlagsRejectExeDevNonLinuxTarget(t *testing.T) {
 	err := applyLeaseCreateFlags(&cfg, fs, values)
 	if err == nil || !strings.Contains(err.Error(), "target=linux only") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestLeaseCreateFlagsApplyExplicitSSHPort(t *testing.T) {
+	defaults := baseConfig()
+	fs := newFlagSet("test", io.Discard)
+	values := registerLeaseCreateFlags(fs, defaults)
+	if err := parseFlags(fs, []string{"--provider", "parallels", "--target", "macos", "--ssh-port", "22"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults
+	if err := applyLeaseCreateFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SSHPort != "22" || !IsSSHPortExplicit(&cfg) {
+		t.Fatalf("ssh port=%q explicit=%t", cfg.SSHPort, IsSSHPortExplicit(&cfg))
+	}
+}
+
+func TestNormalizeTargetConfigForcesAWSMacOSLaunchdSSHPort(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetMacOS
+	cfg.SSHPort = "2222"
+	cfg.SSHFallbackPorts = []string{"22", "2200"}
+
+	normalizeTargetConfig(&cfg)
+
+	if cfg.SSHPort != "22" {
+		t.Fatalf("SSHPort=%q, want launchd Remote Login port 22", cfg.SSHPort)
+	}
+	if cfg.SSHFallbackPorts != nil {
+		t.Fatalf("SSHFallbackPorts=%v, want nil", cfg.SSHFallbackPorts)
+	}
+}
+
+func TestNormalizeTargetConfigWorkRoots(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		wantUser  string
+		wantRoot  string
+	}{
+		{
+			name: "static macOS uses static user",
+			configure: func(cfg *Config) {
+				cfg.Provider = staticProvider
+				cfg.TargetOS = targetMacOS
+				cfg.Static.User = "alice"
+			},
+			wantUser: "alice",
+			wantRoot: "/Users/alice/crabbox",
+		},
+		{
+			// StaticLease connects as static.user, so the root follows it.
+			name: "static macOS root follows static user over explicit SSH user",
+			configure: func(cfg *Config) {
+				cfg.Provider = staticProvider
+				cfg.TargetOS = targetMacOS
+				cfg.Static.User = "alice"
+				cfg.SSHUser = "builder"
+				MarkSSHUserExplicit(cfg)
+			},
+			wantUser: "builder",
+			wantRoot: "/Users/alice/crabbox",
+		},
+		{
+			name: "static macOS preserves static work root",
+			configure: func(cfg *Config) {
+				cfg.Provider = staticProvider
+				cfg.TargetOS = targetMacOS
+				cfg.Static.User = "alice"
+				cfg.Static.WorkRoot = "/Volumes/build/crabbox"
+			},
+			wantUser: "alice",
+			wantRoot: "/Volumes/build/crabbox",
+		},
+		{
+			name: "static macOS preserves generic work root",
+			configure: func(cfg *Config) {
+				cfg.Provider = staticProvider
+				cfg.TargetOS = targetMacOS
+				cfg.Static.User = "alice"
+				cfg.WorkRoot = "/srv/crabbox"
+				MarkWorkRootExplicit(cfg)
+			},
+			wantUser: "alice",
+			wantRoot: "/srv/crabbox",
+		},
+		{
+			name: "AWS macOS keeps EC2 Mac default",
+			configure: func(cfg *Config) {
+				cfg.Provider = "aws"
+				cfg.TargetOS = targetMacOS
+			},
+			wantUser: "ec2-user",
+			wantRoot: defaultMacOSWorkRoot,
+		},
+		{
+			name: "static Linux keeps POSIX default",
+			configure: func(cfg *Config) {
+				cfg.Provider = staticProvider
+				cfg.TargetOS = targetLinux
+				cfg.Static.User = "alice"
+			},
+			wantUser: "alice",
+			wantRoot: defaultPOSIXWorkRoot,
+		},
+		{
+			name: "static native Windows keeps Windows default",
+			configure: func(cfg *Config) {
+				cfg.Provider = staticProvider
+				cfg.TargetOS = targetWindows
+				cfg.WindowsMode = windowsModeNormal
+				cfg.Static.User = "alice"
+			},
+			wantUser: "alice",
+			wantRoot: defaultWindowsWorkRoot,
+		},
+		{
+			name: "static WSL2 keeps POSIX default",
+			configure: func(cfg *Config) {
+				cfg.Provider = staticProvider
+				cfg.TargetOS = targetWindows
+				cfg.WindowsMode = windowsModeWSL2
+				cfg.Static.User = "alice"
+			},
+			wantUser: "alice",
+			wantRoot: defaultPOSIXWorkRoot,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			tt.configure(&cfg)
+
+			normalizeTargetConfig(&cfg)
+
+			if cfg.SSHUser != tt.wantUser {
+				t.Fatalf("SSHUser=%q want %q", cfg.SSHUser, tt.wantUser)
+			}
+			if cfg.WorkRoot != tt.wantRoot {
+				t.Fatalf("WorkRoot=%q want %q", cfg.WorkRoot, tt.wantRoot)
+			}
+		})
+	}
+}
+
+func TestRunConfigStaticMacOSWorkRootFollowsStaticLoginUser(t *testing.T) {
+	staticMacOS := []string{"--provider", "ssh", "--target", "macos", "--static-host", "192.0.2.10"}
+	tests := []struct {
+		name      string
+		file      string
+		env       map[string]string
+		args      []string
+		wantLogin string
+		wantRoot  string
+	}{
+		{
+			name:      "flag user",
+			args:      append(staticMacOS, "--static-user", "alice"),
+			wantLogin: "alice",
+			wantRoot:  "/Users/alice/crabbox",
+		},
+		{
+			name:      "flag user over config user",
+			file:      "static:\n  user: bob\n",
+			args:      append(staticMacOS, "--static-user", "alice"),
+			wantLogin: "alice",
+			wantRoot:  "/Users/alice/crabbox",
+		},
+		{
+			name:      "flag user over environment user",
+			env:       map[string]string{"CRABBOX_STATIC_USER": "bob"},
+			args:      append(staticMacOS, "--static-user", "alice"),
+			wantLogin: "alice",
+			wantRoot:  "/Users/alice/crabbox",
+		},
+		{
+			name:      "flag user with config target",
+			file:      "target: macos\n",
+			args:      []string{"--provider", "ssh", "--static-host", "192.0.2.10", "--static-user", "alice"},
+			wantLogin: "alice",
+			wantRoot:  "/Users/alice/crabbox",
+		},
+		{
+			name:      "explicit default SSH user with config static user",
+			file:      "static:\n  user: alice\n",
+			env:       map[string]string{"CRABBOX_SSH_USER": "crabbox"},
+			args:      staticMacOS,
+			wantLogin: "alice",
+			wantRoot:  "/Users/alice/crabbox",
+		},
+		{
+			name:      "explicit SSH user with static user flag",
+			env:       map[string]string{"CRABBOX_SSH_USER": "builder"},
+			args:      append(staticMacOS, "--static-user", "alice"),
+			wantLogin: "alice",
+			wantRoot:  "/Users/alice/crabbox",
+		},
+		{
+			name:      "explicit SSH user with config static user and flag",
+			file:      "static:\n  user: bob\n",
+			env:       map[string]string{"CRABBOX_SSH_USER": "builder"},
+			args:      append(staticMacOS, "--static-user", "alice"),
+			wantLogin: "alice",
+			wantRoot:  "/Users/alice/crabbox",
+		},
+		{
+			name:      "explicit SSH user without static user",
+			env:       map[string]string{"CRABBOX_SSH_USER": "builder"},
+			args:      staticMacOS,
+			wantLogin: "builder",
+			wantRoot:  "/Users/builder/crabbox",
+		},
+		{
+			name:      "explicit work root still wins",
+			file:      "workRoot: /Users/bob/crabbox\n",
+			args:      append(staticMacOS, "--static-user", "alice"),
+			wantLogin: "alice",
+			wantRoot:  "/Users/bob/crabbox",
+		},
+		{
+			name:      "static work root flag still wins",
+			args:      append(staticMacOS, "--static-user", "alice", "--static-work-root", "/Volumes/build/crabbox"),
+			wantLogin: "alice",
+			wantRoot:  "/Volumes/build/crabbox",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, ".crabbox.yaml"))
+			if tt.file != "" {
+				if err := os.WriteFile(filepath.Join(dir, ".crabbox.yaml"), []byte(tt.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, value := range tt.env {
+				t.Setenv(name, value)
+			}
+			fs := newFlagSet("run", io.Discard)
+			flags := registerRunFlags(fs, defaultConfig(), ordinaryLeaseCreateFlagRegistrationOptions())
+			if err := parseFlags(fs, tt.args); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := loadRunConfig(fs, flags, leaseFlagTarget{}, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, target, _, err := StaticLease(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target.User != tt.wantLogin || cfg.WorkRoot != tt.wantRoot {
+				t.Fatalf("login=%q WorkRoot=%q want login=%q WorkRoot=%q", target.User, cfg.WorkRoot, tt.wantLogin, tt.wantRoot)
+			}
+		})
+	}
+}
+
+func TestNormalizeTargetConfigUsesSealosWorkRoot(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "sealos-devbox"
+	cfg.SealosDevbox.WorkRoot = "/home/devbox/project"
+
+	normalizeTargetConfig(&cfg)
+
+	if cfg.WorkRoot != "/home/devbox/project" {
+		t.Fatalf("WorkRoot=%q want Sealos provider root", cfg.WorkRoot)
+	}
+}
+
+func TestNormalizeTargetConfigPreservesExplicitWorkRootForSealos(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "sealos-devbox"
+	cfg.WorkRoot = "/srv/crabbox"
+	MarkWorkRootExplicit(&cfg)
+
+	normalizeTargetConfig(&cfg)
+
+	if cfg.WorkRoot != "/srv/crabbox" {
+		t.Fatalf("WorkRoot=%q want explicit root", cfg.WorkRoot)
+	}
+}
+
+func TestNormalizeTargetConfigPrefersExplicitSealosWorkRoot(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "sealos-devbox"
+	cfg.WorkRoot = "/srv/crabbox"
+	MarkWorkRootExplicit(&cfg)
+	cfg.SealosDevbox.WorkRoot = "/home/devbox/override"
+	MarkSealosDevboxWorkRootExplicit(&cfg)
+
+	normalizeTargetConfig(&cfg)
+
+	if cfg.WorkRoot != "/home/devbox/override" {
+		t.Fatalf("WorkRoot=%q want explicit Sealos root", cfg.WorkRoot)
+	}
+}
+
+func TestNormalizeTargetConfigPreservesExplicitPlatformDefaultWorkRoot(t *testing.T) {
+	tests := []struct {
+		name        string
+		targetOS    string
+		windowsMode string
+		workRoot    string
+	}{
+		{name: "linux root on macOS", targetOS: targetMacOS, windowsMode: windowsModeNormal, workRoot: defaultPOSIXWorkRoot},
+		{name: "macOS root on Linux", targetOS: targetLinux, windowsMode: windowsModeNormal, workRoot: defaultMacOSWorkRoot},
+		{name: "macOS root on WSL2", targetOS: targetWindows, windowsMode: windowsModeWSL2, workRoot: defaultMacOSWorkRoot},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.TargetOS = tt.targetOS
+			cfg.WindowsMode = tt.windowsMode
+			cfg.WorkRoot = tt.workRoot
+			MarkWorkRootExplicit(&cfg)
+
+			normalizeTargetConfig(&cfg)
+
+			if cfg.WorkRoot != tt.workRoot {
+				t.Fatalf("WorkRoot=%q want explicit root %q", cfg.WorkRoot, tt.workRoot)
+			}
+		})
+	}
+}
+
+func TestNormalizeTargetConfigPreservesExternalWorkRoot(t *testing.T) {
+	for _, provider := range []string{"external", "exec-provider"} {
+		t.Run(provider, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Provider = provider
+			cfg.TargetOS = targetMacOS
+			cfg.External.WorkRoot = defaultPOSIXWorkRoot
+			cfg.WorkRoot = cfg.External.WorkRoot
+
+			normalizeTargetConfig(&cfg)
+
+			if cfg.WorkRoot != defaultPOSIXWorkRoot {
+				t.Fatalf("WorkRoot=%q want external root %q", cfg.WorkRoot, defaultPOSIXWorkRoot)
+			}
+		})
+	}
+}
+
+func TestLoadConfigPreservesExternalWorkRootFromEnvironment(t *testing.T) {
+	clearConfigEnv(t)
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.yaml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	t.Setenv("CRABBOX_PROVIDER", "external")
+	t.Setenv("CRABBOX_TARGET", "macos")
+	t.Setenv("CRABBOX_WINDOWS_MODE", "")
+	t.Setenv("CRABBOX_WORK_ROOT", "")
+	t.Setenv("CRABBOX_EXTERNAL_COMMAND", "provider-adapter")
+	t.Setenv("CRABBOX_EXTERNAL_WORK_ROOT", defaultPOSIXWorkRoot)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TargetOS != targetMacOS || cfg.WorkRoot != defaultPOSIXWorkRoot {
+		t.Fatalf("loaded config target=%q workRoot=%q", cfg.TargetOS, cfg.WorkRoot)
 	}
 }
 

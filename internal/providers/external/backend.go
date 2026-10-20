@@ -1,7 +1,6 @@
 package external
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared/procjson"
 )
 
 const externalProviderOutputMaxBytes = 1 << 20
@@ -30,10 +30,17 @@ const externalSlugReservationTTL = 6 * time.Hour
 func (b *leaseBackend) Spec() core.ProviderSpec { return b.spec }
 
 func (b *leaseBackend) SupportsRequestedLeaseID() bool {
+	// This stays on the delegated protocol: the controller acknowledges raw
+	// identity before readiness and rejection rolls back that exact resource even
+	// with Keep=true. Legacy records have no normalized intent fingerprint, so
+	// they cannot be promoted to the built-in fixed-lease engine's custody model.
 	return b.cfg.External.Capabilities.IdempotentLeaseID
 }
 
 func (b *leaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (_ core.LeaseTarget, resultErr error) {
+	if err := b.validateAcquireProviderSSHOutput(); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	leaseID := strings.TrimSpace(req.RequestedLeaseID)
 	fixedLeaseID := leaseID != ""
 	if leaseID == "" {
@@ -111,7 +118,7 @@ func (b *leaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (_ 
 		}
 		return core.LeaseTarget{}, err
 	}
-	if _, err := core.PersistExternalRouting(lease.LeaseID, b.cfg.External); err != nil {
+	if _, err := core.PersistValidatedExternalRouting(lease.LeaseID, b.cfg.External); err != nil {
 		var acquireErr error = core.Exit(2, "%v", err)
 		if !req.Keep {
 			acquireErr = appendAcquireCleanupError(acquireErr, b.rollbackAcquireRelease(ctx, leaseForProtocol(lease)))
@@ -181,6 +188,13 @@ func (b *leaseBackend) Acquire(ctx context.Context, req core.AcquireRequest) (_ 
 		return core.LeaseTarget{}, err
 	}
 	return lease, nil
+}
+
+func (b *leaseBackend) validateAcquireProviderSSHOutput() error {
+	if !lifecycleConfigured(b.cfg.External) || b.cfg.External.Lifecycle.Acquire.Output == lifecycleOutputJSONLease {
+		return core.ValidateExternalProviderSSHOutput(b.cfg)
+	}
+	return nil
 }
 
 func (b *leaseBackend) rollbackAcquireRelease(ctx context.Context, lease *protocolLease) error {
@@ -323,7 +337,7 @@ func (b *leaseBackend) Resolve(ctx context.Context, req core.ResolveRequest) (co
 		return lease, nil
 	}
 	if !req.NoLocalStateMutations {
-		if _, err := core.PersistExternalRouting(lease.LeaseID, b.cfg.External); err != nil {
+		if _, err := core.PersistValidatedExternalRouting(lease.LeaseID, b.cfg.External); err != nil {
 			return core.LeaseTarget{}, core.Exit(2, "%v", err)
 		}
 	}
@@ -528,7 +542,16 @@ func (b *leaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) err
 	if req.DryRun {
 		return nil
 	}
-	response, err := b.invoke(ctx, protocolRequest{Operation: "list", All: true, Refresh: true})
+	// Snapshot orphan-candidate claims before the list call so a claim registered
+	// by a concurrent Acquire cannot be compared against an older list snapshot and
+	// swept as missing. Only claims that predate our list view can be orphans.
+	orphanCandidates, err := core.ListLeaseClaims()
+	if err != nil {
+		return err
+	}
+	response, err := b.invoke(ctx, protocolRequest{
+		Operation: "list", All: true, Refresh: true, SkipSSHOutputValidation: true,
+	})
 	if err != nil {
 		return err
 	}
@@ -540,18 +563,29 @@ func (b *leaseBackend) Cleanup(ctx context.Context, req core.CleanupRequest) err
 		}
 		live[leaseID] = struct{}{}
 	}
-	claims, err := core.ListLeaseClaims()
-	if err != nil {
-		return err
-	}
-	for _, claim := range claims {
+	for _, claim := range orphanCandidates {
 		if claim.Provider != providerName || strings.TrimSpace(claim.ProviderScope) != b.claimScope() {
 			continue
 		}
-		if _, ok := live[claim.LeaseID]; !ok {
-			core.RemoveLeaseClaim(claim.LeaseID)
-			core.RemoveExternalRouting(claim.LeaseID)
+		if _, ok := live[claim.LeaseID]; ok {
+			continue
 		}
+		// Remove the orphan claim only if it is unchanged since our pre-list
+		// snapshot; a concurrent Acquire/Touch that (re)bound this lease makes it no
+		// longer an orphan, so the guard declines and the live lease survives.
+		if err := core.RemoveLeaseClaimIfUnchanged(claim.LeaseID, claim); err != nil {
+			continue
+		}
+		// Retain the external routing rather than deleting it in the sweep. A
+		// concurrent Acquire persists this lease's routing (PersistValidatedExternalRouting,
+		// early in Acquire) BEFORE it publishes the replacement claim (claimLeaseForRepo),
+		// so the old claim can still match our pre-list snapshot at the instant the routing
+		// already belongs to a live reacquisition. Deleting it here would leave that live
+		// lease unroutable. Mirrors the merged tart fix
+		// (https://github.com/openclaw/crabbox/pull/1124), which retains per-lease state
+		// for this reason; the apple-container (https://github.com/openclaw/crabbox/pull/1146)
+		// and local-container (https://github.com/openclaw/crabbox/pull/1147) siblings apply
+		// the same retention. A genuinely dead lease's routing is a harmless small residue.
 	}
 	return nil
 }
@@ -566,29 +600,17 @@ func (b *leaseBackend) invoke(ctx context.Context, request protocolRequest) (pro
 func (b *leaseBackend) invokeProtocol(ctx context.Context, request protocolRequest) (protocolResponse, error) {
 	request.ProtocolVersion = protocolVersion
 	request.Config = b.cfg.External.Config
-	var stdin bytes.Buffer
-	if err := json.NewEncoder(&stdin).Encode(request); err != nil {
-		return protocolResponse{}, fmt.Errorf("encode external provider request: %w", err)
-	}
-	result, err := b.rt.Exec.Run(ctx, core.LocalCommandRequest{
-		Name:                   strings.TrimSpace(b.cfg.External.Command),
-		Args:                   append([]string(nil), b.cfg.External.Args...),
-		Stdin:                  &stdin,
-		Stderr:                 b.rt.Stderr,
-		MaxCapturedOutputBytes: externalProviderOutputMaxBytes,
-	})
-	if limitErr := validateExternalCommandOutputSize(result); limitErr != nil {
-		return protocolResponse{}, limitErr
-	}
+	command := core.LocalCommandRequest{Name: strings.TrimSpace(b.cfg.External.Command), Args: append([]string(nil), b.cfg.External.Args...), Env: externalAdapterEnv(b.cfg, nil), Stderr: b.rt.Stderr}
+	response, result, err := procjson.Exchange[protocolRequest, protocolResponse](ctx, b.rt.Exec, command, request, procjson.Limits{MaxBytesPerStream: externalProviderOutputMaxBytes})
 	if err != nil {
-		message := strings.TrimSpace(result.Stderr)
-		if message == "" {
-			message = strings.TrimSpace(result.Stdout)
+		failure, _ := err.(*procjson.Failure)
+		if failure != nil && failure.Stage == procjson.StageRun {
+			message := strings.TrimSpace(core.Blank(strings.TrimSpace(result.Stderr), result.Stdout))
+			return protocolResponse{}, core.Exit(result.ExitCode, "external provider command failed: %v: %s", failure.Err, message)
 		}
-		return protocolResponse{}, core.Exit(result.ExitCode, "external provider command failed: %v: %s", err, message)
-	}
-	var response protocolResponse
-	if err := json.Unmarshal([]byte(result.Stdout), &response); err != nil {
+		if failure != nil && failure.Stage == procjson.StageOutputLimit {
+			return protocolResponse{}, core.Exit(5, "external provider %v", failure.Err)
+		}
 		return protocolResponse{}, core.Exit(5, "external provider returned invalid JSON: %v", err)
 	}
 	if message := strings.TrimSpace(response.Error); message != "" {
@@ -596,6 +618,9 @@ func (b *leaseBackend) invokeProtocol(ctx context.Context, request protocolReque
 	}
 	if response.ProtocolVersion != protocolVersion {
 		return protocolResponse{}, core.Exit(5, "external provider protocol version %d is unsupported", response.ProtocolVersion)
+	}
+	if err := b.validateProviderSSHOutput(request, response); err != nil {
+		return protocolResponse{}, err
 	}
 	if request.Operation == "list" && b.cfg.External.Capabilities.IdempotentLeaseID {
 		if response.Leases == nil {
@@ -608,6 +633,28 @@ func (b *leaseBackend) invokeProtocol(ctx context.Context, request protocolReque
 		}
 	}
 	return response, nil
+}
+
+func externalAdapterEnv(cfg core.Config, env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	passwordEnvs := core.ExternalDesktopChildEnvironmentDenylist(cfg)
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		blocked := false
+		for _, passwordEnv := range passwordEnvs {
+			if strings.EqualFold(name, passwordEnv) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 func validateExternalCommandOutputSize(result core.LocalCommandResult) error {
@@ -633,6 +680,9 @@ type externalClaimScopeData struct {
 	Capabilities *core.ExternalCapabilitiesConfig `json:"capabilities,omitempty"`
 	Lifecycle    *core.ExternalLifecycleConfig    `json:"lifecycle,omitempty"`
 	Connection   *core.ExternalConnectionConfig   `json:"connection,omitempty"`
+	TargetOS     string                           `json:"targetOS,omitempty"`
+	WindowsMode  string                           `json:"windowsMode,omitempty"`
+	Architecture string                           `json:"architecture,omitempty"`
 }
 
 func externalClaimScope(cfg core.Config) string {
@@ -641,14 +691,25 @@ func externalClaimScope(cfg core.Config) string {
 		return scope
 	}
 	data := []byte(strings.TrimSpace(cfg.External.Command) + "\x00" + strings.Join(cfg.External.Args, "\x00"))
+	targetOS, windowsMode, architecture := externalScopeTarget(cfg)
+	if targetOS != "" {
+		data = append(data, []byte("\x00crabbox-target\x00"+targetOS+"\x00"+windowsMode)...)
+	}
+	if architecture != "" {
+		data = append(data, []byte("\x00crabbox-architecture\x00"+architecture)...)
+	}
 	return externalScopeHash(data)
 }
 
 func externalControllerScope(cfg core.Config) (string, error) {
+	targetOS, windowsMode, architecture := externalScopeTarget(cfg)
 	scope := externalClaimScopeData{
-		Command: strings.TrimSpace(cfg.External.Command),
-		Args:    append([]string(nil), cfg.External.Args...),
-		Config:  cfg.External.Config,
+		Command:      strings.TrimSpace(cfg.External.Command),
+		Args:         append([]string(nil), cfg.External.Args...),
+		Config:       cfg.External.Config,
+		TargetOS:     targetOS,
+		WindowsMode:  windowsMode,
+		Architecture: architecture,
 	}
 	if cfg.External.Capabilities.IdempotentLeaseID {
 		capabilities := cfg.External.Capabilities
@@ -656,13 +717,33 @@ func externalControllerScope(cfg core.Config) (string, error) {
 	}
 	if lifecycleConfigured(cfg.External) {
 		scope.Lifecycle = &cfg.External.Lifecycle
-		scope.Connection = &cfg.External.Connection
+		connection := cfg.External.Connection
+		connection.Desktop = core.ExternalDesktopConfig{}
+		scope.Connection = &connection
 	}
 	data, err := json.Marshal(scope)
 	if err != nil {
 		return "", fmt.Errorf("encode external controller provider scope: %w", err)
 	}
 	return externalScopeHash(data), nil
+}
+
+func externalScopeTarget(cfg core.Config) (string, string, string) {
+	core.NormalizeTargetConfig(&cfg)
+	architecture := strings.ToLower(strings.TrimSpace(cfg.Architecture))
+	if normalized, err := core.NormalizeArchitecture(architecture); architecture != "" && err == nil {
+		architecture = normalized
+	}
+	if architecture == core.ArchitectureAMD64 {
+		architecture = ""
+	}
+	if cfg.TargetOS == core.TargetLinux && cfg.WindowsMode == core.WindowsModeNormal {
+		return "", "", architecture
+	}
+	if cfg.TargetOS != core.TargetWindows {
+		return cfg.TargetOS, "", architecture
+	}
+	return cfg.TargetOS, cfg.WindowsMode, architecture
 }
 
 func externalScopeHash(data []byte) string {

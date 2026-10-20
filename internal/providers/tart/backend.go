@@ -1,25 +1,25 @@
 package tart
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type backend struct {
-	spec                  ProviderSpec
-	cfg                   Config
-	rt                    Runtime
+	spec                  core.ProviderSpec
+	cfg                   core.Config
+	rt                    core.Runtime
 	startupObserveTimeout time.Duration
 }
 
@@ -32,7 +32,7 @@ type tartInstance struct {
 	Source  string      `json:"Source"`
 }
 
-func newBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	applyDefaults(&cfg)
 	return &backend{
 		spec:                  spec,
@@ -42,7 +42,7 @@ func newBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
 	}
 }
 
-func applyDefaults(cfg *Config) {
+func applyDefaults(cfg *core.Config) {
 	cfg.Provider = providerName
 	if cfg.TargetOS == "" {
 		cfg.TargetOS = targetMacOS
@@ -50,7 +50,7 @@ func applyDefaults(cfg *Config) {
 	cfg.WindowsMode = ""
 	cfg.SSHFallbackPorts = []string{}
 	if cfg.Tart.Image == "" {
-		cfg.Tart.Image = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+		cfg.Tart.Image = core.DefaultTartImage
 	}
 	if cfg.Tart.User == "" {
 		if cfg.SSHUser != "" && cfg.SSHUser != "crabbox" {
@@ -62,13 +62,7 @@ func applyDefaults(cfg *Config) {
 	if cfg.Tart.Password == "" {
 		cfg.Tart.Password = "admin" // cirruslabs base-image default; WebVNC viewer credential only
 	}
-	if cfg.Tart.WorkRoot == "" {
-		if !core.IsDefaultWorkRoot(cfg.WorkRoot) {
-			cfg.Tart.WorkRoot = cfg.WorkRoot
-		} else {
-			cfg.Tart.WorkRoot = "/Users/admin/crabbox"
-		}
-	}
+	cfg.Tart.WorkRoot = core.ResolveInheritedWorkRoot(cfg.Tart.WorkRoot, cfg.WorkRoot, "/Users/admin/crabbox")
 	if cfg.Tart.CPUs <= 0 {
 		cfg.Tart.CPUs = 4
 	}
@@ -81,53 +75,54 @@ func applyDefaults(cfg *Config) {
 	cfg.ServerType = cfg.Tart.Image
 }
 
-func (b *backend) Spec() ProviderSpec { return b.spec }
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
-func (b *backend) RebindResolvedLeaseTarget(target *LeaseTarget, leaseID string) error {
-	core.UseStoredTestboxKey(&target.SSH, leaseID)
-	return nil
+func (b *backend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID string) error {
+	return core.UseStoredTestboxKey(&target.SSH, leaseID)
 }
 
-func (b *backend) configForRun() Config {
+func (b *backend) configForRun() core.Config {
 	cfg := b.cfg
 	applyDefaults(&cfg)
 	return cfg
 }
 
-func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
+func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (target core.LeaseTarget, acquireErr error) {
 	cfg := b.configForRun()
-	leaseID := newLeaseID()
+	leaseID := core.NewLeaseID()
 	instances, err := b.listInstances(ctx)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	claims, err := providerClaims()
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	servers := make([]Server, 0, len(instances))
+	servers := make([]core.Server, 0, len(instances))
 	for _, inst := range instances {
 		if !strings.HasPrefix(inst.Name, "crabbox-") {
 			continue
 		}
 		servers = append(servers, b.serverFromInstance(inst, claims[inst.Name], cfg))
 	}
-	slug, err := allocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
+	slug, err := core.AllocateDirectLeaseSlug(leaseID, req.RequestedSlug, servers)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	keyPath, publicKey, err := ensureTestboxKeyForConfig(cfg, leaseID)
+	keyPath, publicKey, err := core.EnsureTestboxKeyForConfig(cfg, leaseID)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	cleanupKey := true
+	cleanupKey := false
 	defer func() {
 		if cleanupKey {
-			removeStoredTestboxKey(leaseID)
+			if err := core.RemoveStoredTestboxConnectionArtifacts(leaseID); err != nil {
+				acquireErr = errors.Join(acquireErr, fmt.Errorf("remove SSH connection artifacts for lease %s: %w", leaseID, err))
+			}
 		}
 	}()
 	cfg.SSHKey = keyPath
-	name := leaseProviderName(leaseID, slug)
+	name := core.LeaseProviderName(leaseID, slug)
 	diskLabel := "clone-default"
 	if core.IsTartDiskExplicit(&cfg) {
 		diskLabel = fmt.Sprintf("%dGB", cfg.Tart.Disk)
@@ -135,88 +130,146 @@ func (b *backend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget,
 	fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s image=%s cpus=%d memory=%dMB disk=%s keep=%v\n", providerName, leaseID, slug, cfg.Tart.Image, cfg.Tart.CPUs, cfg.Tart.Memory, diskLabel, req.Keep)
 
 	if err := b.cloneVM(ctx, cfg, name); err != nil {
-		_ = b.deleteVM(context.Background(), name)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
+	}
+	storage, identity, err := createTartVMIdentity(name)
+	if err != nil {
+		return core.LeaseTarget{}, fmt.Errorf("bind new Tart instance %s ownership (VM retained): %w", name, err)
+	}
+	cleanupUnclaimedVM := func() error {
+		if err := verifyTartVMIdentity(name, storage, identity); err != nil {
+			return err
+		}
+		_ = b.stopVM(context.Background(), name)
+		if err := verifyTartVMIdentity(name, storage, identity); err != nil {
+			return err
+		}
+		if err := b.deleteVM(context.Background(), name); err != nil {
+			return err
+		}
+		cleanupKey = true
+		return nil
+	}
+	if cfg.Tart.Image == core.DefaultTartImage {
+		fmt.Fprintln(b.rt.Stderr, "verifying built-in Tart image contents before boot (full disk read)")
+	}
+	imageDigest, err := verifyDefaultTartImage(ctx, cfg.Tart.Image, storage, name)
+	if err != nil {
+		return core.LeaseTarget{}, errors.Join(err, cleanupUnclaimedVM())
+	}
+	if err := verifyTartVMIdentity(name, storage, identity); err != nil {
+		return core.LeaseTarget{}, fmt.Errorf("Tart clone ownership changed before configuration (VM retained): %w", err)
 	}
 	if err := b.configureVM(ctx, cfg, name); err != nil {
-		_ = b.deleteVM(context.Background(), name)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, errors.Join(err, cleanupUnclaimedVM())
 	}
-	if err := b.startVM(ctx, cfg, name, req.Keep); err != nil {
-		_ = b.deleteVM(context.Background(), name)
-		return LeaseTarget{}, err
+	startup, err := b.startVM(ctx, name, req.Keep)
+	if err != nil {
+		return core.LeaseTarget{}, errors.Join(err, cleanupUnclaimedVM())
 	}
-	cleanupUnclaimedVM := func() {
-		_ = b.stopVM(context.Background(), name)
-		_ = b.deleteVM(context.Background(), name)
-	}
+	var publishedClaim core.LeaseClaim
+	defer func() {
+		if acquireErr == nil {
+			return
+		}
+		// Reap our exact child and preserve its failure before name-based cleanup.
+		acquireErr = startup.abort(acquireErr)
+		cleanup := cleanupUnclaimedVM
+		if publishedClaim.LeaseID != "" {
+			cleanup = func() error {
+				// A failed durable write can return a candidate before or after
+				// rename. Fence cleanup against either absence or that revision.
+				_, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+				if err != nil {
+					return err
+				}
+				return core.CleanupLeaseClaimIfUnchangedAfter(leaseID, publishedClaim, exists, cleanupUnclaimedVM)
+			}
+		}
+		cleanupErr := cleanup()
+		// Retain access material if deletion or retirement of our claim is incomplete.
+		cleanupKey = cleanupErr == nil
+		acquireErr = errors.Join(acquireErr, cleanupErr)
+	}()
+	ctx = startup.ctx
 	ip, err := b.waitForIP(ctx, name)
 	if err != nil {
-		cleanupUnclaimedVM()
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if err := b.injectSSHKey(ctx, name, cfg.Tart.User, publicKey); err != nil {
-		cleanupUnclaimedVM()
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if cfg.Desktop {
 		if err := b.enableScreenSharing(ctx, name); err != nil {
-			cleanupUnclaimedVM()
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 	}
 
-	labels := directLeaseLabels(cfg, leaseID, slug, providerName, "", req.Keep, time.Now().UTC())
+	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", req.Keep, time.Now().UTC())
 	labels["instance"] = name
 	labels["image"] = cfg.Tart.Image
+	if imageDigest != "" {
+		labels["image_digest"] = imageDigest
+	}
 	labels["ssh_user"] = cfg.Tart.User
 	labels["ssh_port"] = sshPort
 	labels["work_root"] = cfg.Tart.WorkRoot
-	claim := core.LeaseClaim{LeaseID: leaseID, Slug: slug, Provider: providerName, ProviderScope: instanceScope(name), Labels: labels}
+	labels["tart_storage"] = storage
+	claim := core.LeaseClaim{LeaseID: leaseID, Slug: slug, Provider: providerName, ProviderScope: instanceScope(name), CloudImmutableID: identity, Labels: labels}
 
 	inst := tartInstance{Name: name, State: "running", Running: true, Source: cfg.Tart.Image}
 	lease, err := b.prepareLease(ctx, cfg, inst, ip, claim, true)
 	if err != nil {
-		cleanupUnclaimedVM()
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, providerName, instanceScope(name), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, lease.Server, lease.SSH); err != nil {
-		cleanupUnclaimedVM()
-		return LeaseTarget{}, err
+	// Cancel lock acquisition on startup exit, and retain the exact published
+	// revision for rollback if startup fails at the final handoff.
+	publishedClaim, err = core.ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurableAfterContext(ctx, leaseID, slug, cfg, instanceScope(name), lease.Server, lease.SSH, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, core.LeaseClaim{}, false, nil)
+	if err != nil {
+		return core.LeaseTarget{}, err
 	}
+	if err := startup.handoff(); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	core.SetServerLeaseClaimSnapshot(&lease.Server, publishedClaim, true)
 	cleanupKey = false
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s instance=%s state=ready\n", leaseID, name)
 	return lease, nil
 }
 
-func (b *backend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error) {
+func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
 	cfg := b.configForRun()
 	inst, ip, claim, err := b.resolveInstance(ctx, req.ID)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if claim.LeaseID == "" {
-		return LeaseTarget{}, exit(4, "tart instance %q has no Crabbox lease claim; remove it with `tart stop %s && tart delete %s` or warm a new lease with `crabbox run`", inst.Name, inst.Name, inst.Name)
+		return core.LeaseTarget{}, core.Exit(4, "tart instance %q has no Crabbox lease claim; remove it with `tart stop %s && tart delete %s` or warm a new lease with `crabbox run`", inst.Name, inst.Name, inst.Name)
 	}
 	if req.ReleaseOnly {
-		return LeaseTarget{Server: b.serverFromInstance(inst, claim, cfg), LeaseID: claim.LeaseID}, nil
+		return core.LeaseTarget{Server: b.serverFromInstance(inst, claim, cfg), LeaseID: claim.LeaseID}, nil
+	}
+	if req.StatusOnly && !req.ReadyProbe {
+		return b.prepareLease(ctx, cfg, inst, ip, claim, false)
 	}
 	if !inst.Running && !instanceRunning(inst.State) && !req.StatusOnly {
-		return LeaseTarget{}, exit(5, "tart instance %s is stopped; start a new lease with `crabbox run` or clean up with `crabbox cleanup --provider tart`", inst.Name)
+		return core.LeaseTarget{}, core.Exit(5, "tart instance %s is stopped; start a new lease with `crabbox run` or clean up with `crabbox cleanup --provider tart`", inst.Name)
 	}
 	lease, err := b.prepareLease(ctx, cfg, inst, ip, claim, false)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	if req.Repo.Root != "" {
-		if err := claimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, providerName, instanceScope(inst.Name), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
-			return LeaseTarget{}, err
+	if req.Repo.Root != "" && !req.NoLocalStateMutations {
+		updated, err := core.ClaimLeaseForRepoProviderScopePondIfUnchanged(claim.LeaseID, claim.Slug, providerName, instanceScope(inst.Name), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, claim, true)
+		if err != nil {
+			return core.LeaseTarget{}, err
 		}
+		core.SetServerLeaseClaimSnapshot(&lease.Server, updated, true)
 	}
 	return lease, nil
 }
 
-func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) {
+func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
 	cfg := b.configForRun()
 	instances, err := b.listInstances(ctx)
 	if err != nil {
@@ -226,26 +279,18 @@ func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) 
 	if err != nil {
 		return nil, err
 	}
-	views := make([]LeaseView, 0, len(instances))
-	for _, inst := range instances {
-		claim := claims[inst.Name]
-		if claim.LeaseID == "" && !strings.HasPrefix(inst.Name, "crabbox-") {
-			continue
-		}
-		views = append(views, b.serverFromInstance(inst, claim, cfg))
-	}
-	return views, nil
+	return shared.LocalInstanceViews(instances, claims, cfg, func(inst tartInstance) string { return inst.Name }, b.serverFromInstance), nil
 }
 
-func (b *backend) Doctor(ctx context.Context, req DoctorRequest) (DoctorResult, error) {
+func (b *backend) Doctor(ctx context.Context, req core.DoctorRequest) (core.DoctorResult, error) {
 	cfg := b.configForRun()
 	version, err := b.tart(ctx, []string{"--version"}, nil, nil)
 	if err != nil {
-		return DoctorResult{}, commandError("tart --version", version, err)
+		return core.DoctorResult{}, shared.LocalCommandError("tart --version", version, err)
 	}
 	instances, err := b.listInstances(ctx)
 	if err != nil {
-		return DoctorResult{}, err
+		return core.DoctorResult{}, err
 	}
 	leases := 0
 	for _, inst := range instances {
@@ -258,75 +303,143 @@ func (b *backend) Doctor(ctx context.Context, req DoctorRequest) (DoctorResult, 
 		probe = "requires_running_lease"
 	}
 	msg := fmt.Sprintf("cli=ready control_plane=local inventory=ready api=list mutation=false leases=%d runtime=%s image=%s ssh_probe=%s", leases, firstLine(version.Stdout+version.Stderr), cfg.Tart.Image, probe)
-	return DoctorResult{Provider: providerName, Message: msg}, nil
+	return core.DoctorResult{Provider: providerName, Message: msg}, nil
 }
 
-func (b *backend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error {
+func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) (err error) {
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("Tart release refused: %w", err)
+		}
+	}()
 	lease := req.Lease
 	if lease.LeaseID == "" {
 		lease.LeaseID = strings.TrimSpace(lease.Server.Labels["lease"])
 	}
-	if lease.LeaseID != "" && tartState(lease.Server.Status) == "missing" {
-		pruneLeaseState(lease.LeaseID)
-		return nil
-	}
-	name := strings.TrimSpace(firstNonBlank(lease.Server.CloudID, lease.Server.Labels["instance"]))
-	if name == "" && lease.LeaseID != "" {
+	name := strings.TrimSpace(shared.FirstNonBlank(lease.Server.CloudID, lease.Server.Labels["instance"]))
+	_, _, snapshotSet := core.ServerLeaseClaimSnapshot(lease.Server)
+	if name == "" && lease.LeaseID != "" && !snapshotSet {
 		inst, _, claim, err := b.resolveInstance(ctx, lease.LeaseID)
 		if err != nil {
 			return err
 		}
 		name = inst.Name
-		if claim.LeaseID != "" {
-			lease.LeaseID = claim.LeaseID
-		}
-		if tartState(inst.State) == "missing" {
-			pruneLeaseState(lease.LeaseID)
-			return nil
-		}
+		lease = core.LeaseTarget{LeaseID: claim.LeaseID, Server: b.serverFromInstance(inst, claim, b.configForRun())}
 	}
 	if name == "" {
-		return exit(2, "provider=%s release requires a tart instance name", providerName)
+		return core.Exit(2, "provider=%s release requires a tart instance name", providerName)
 	}
-	_ = b.stopVM(ctx, name)
-	if err := b.deleteVM(ctx, name); err != nil {
+	claim, err := shared.RequireClaimSnapshot(lease.Server, providerName)
+	if err != nil {
 		return err
 	}
-	if lease.LeaseID != "" {
-		pruneLeaseState(lease.LeaseID)
+	if lease.LeaseID != claim.LeaseID || lease.Server.Provider != providerName || lease.Server.ImmutableID != claim.CloudImmutableID || lease.Server.Labels["instance"] != name || lease.Server.Labels["tart_storage"] != claim.Labels["tart_storage"] {
+		return fmt.Errorf("target does not match its recorded ownership claim")
 	}
-	return nil
+	storage, err := tartStorageRoot()
+	if err != nil {
+		return err
+	}
+	binding, err := tartCleanupBinding(claim, name, storage)
+	if err != nil {
+		return err
+	}
+	claims, err := core.ListLeaseClaimsContext(ctx)
+	if err != nil {
+		return err
+	}
+	matches := 0
+	for _, current := range claims {
+		if current.Provider == providerName && instanceNameFromClaim(current) == name {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("instance %q requires one exact ownership claim, found %d", name, matches)
+	}
+	// Preserve the carried authority through fresh observations, deletion and
+	// claim retirement. Keys may already be reused by an unpublished acquisition.
+	return shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
+		instances, err := b.listInstances(ctx)
+		if err != nil {
+			return err
+		}
+		for _, inst := range instances {
+			if inst.Name != name {
+				continue
+			}
+			if err := verifyTartVMIdentity(name, storage, claim.CloudImmutableID); err != nil {
+				return err
+			}
+			if inst.Running || instanceRunning(inst.State) {
+				if err := b.stopVM(ctx, name); err != nil {
+					return err
+				}
+			}
+			if err := verifyTartVMIdentity(name, storage, claim.CloudImmutableID); err != nil {
+				return err
+			}
+			return b.deleteVM(ctx, name)
+		}
+		return verifyTartVMAbsence(name, storage)
+	})
 }
 
-func pruneLeaseState(leaseID string) {
-	removeLeaseClaim(leaseID)
-	removeStoredTestboxKey(leaseID)
-}
-
-func (b *backend) ReleaseLeaseMessage(lease LeaseTarget) string {
-	return fmt.Sprintf("released lease=%s instance=%s", lease.LeaseID, blank(firstNonBlank(lease.Server.CloudID, lease.Server.Labels["instance"]), "-"))
+func (b *backend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
+	return fmt.Sprintf("released lease=%s instance=%s", lease.LeaseID, core.Blank(shared.FirstNonBlank(lease.Server.CloudID, lease.Server.Labels["instance"]), "-"))
 }
 
 func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	cfg := b.configForRun()
+	// Snapshot candidates before instances so newer claims cannot be compared
+	// against an older instance view and misclassified as orphans.
+	orphanCandidates, err := core.ListLeaseClaims()
+	if err != nil {
+		return err
+	}
 	instances, err := b.listInstances(ctx)
 	if err != nil {
 		return err
 	}
-	claims, err := providerClaims()
+	claims, err := core.ListLeaseClaims()
 	if err != nil {
 		return err
+	}
+	storage, err := tartStorageRoot()
+	if err != nil {
+		return fmt.Errorf("inspect Tart cleanup storage: %w", err)
+	}
+	byName := map[string][]core.LeaseClaim{}
+	for _, claim := range claims {
+		if claim.Provider == providerName {
+			name := instanceNameFromClaim(claim)
+			byName[name] = append(byName[name], claim)
+		}
 	}
 	live := map[string]struct{}{}
 	now := time.Now().UTC()
 	removed := 0
 	for _, inst := range instances {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		live[inst.Name] = struct{}{}
 		if !strings.HasPrefix(inst.Name, "crabbox-") {
 			continue
 		}
-		claim := claims[inst.Name]
-		if claim.LeaseID != "" {
-			live[claim.LeaseID] = struct{}{}
+		matches := byName[inst.Name]
+		if len(matches) != 1 {
+			fmt.Fprintf(b.rt.Stderr, "skip instance name=%s reason=expected one exact claim, found %d\n", inst.Name, len(matches))
+			continue
+		}
+		claim := matches[0]
+		_, err := tartCleanupBinding(claim, inst.Name, storage)
+		if err == nil {
+			err = verifyTartVMIdentity(inst.Name, storage, claim.CloudImmutableID)
+		}
+		if err != nil {
+			fmt.Fprintf(b.rt.Stderr, "skip instance name=%s reason=%v\n", inst.Name, err)
+			continue
 		}
 		server := b.serverFromInstance(inst, claim, cfg)
 		shouldDelete, reason := shouldCleanup(server, claim, claim.LeaseID != "", now)
@@ -335,43 +448,51 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 			continue
 		}
 		if req.DryRun {
-			fmt.Fprintf(b.rt.Stdout, "would remove instance name=%s lease=%s reason=%s\n", inst.Name, blank(claim.LeaseID, "-"), reason)
+			fmt.Fprintf(b.rt.Stdout, "would remove instance name=%s lease=%s reason=%s\n", inst.Name, core.Blank(claim.LeaseID, "-"), reason)
 			continue
 		}
-		fmt.Fprintf(b.rt.Stdout, "remove instance name=%s lease=%s reason=%s\n", inst.Name, blank(claim.LeaseID, "-"), reason)
-		_ = b.stopVM(ctx, inst.Name)
-		if err := b.deleteVM(ctx, inst.Name); err != nil {
+		if err := b.cleanupInstance(ctx, cfg, inst, claim, storage); err != nil {
 			return err
 		}
-		if claim.LeaseID != "" {
-			removeLeaseClaim(claim.LeaseID)
-			removeStoredTestboxKey(claim.LeaseID)
-		}
+		// Key creation precedes claim publication, so the claim fence alone
+		// cannot safely authorize deleting a possibly reused local key.
+		fmt.Fprintf(b.rt.Stdout, "remove instance name=%s lease=%s reason=%s key_retained=true\n", inst.Name, claim.LeaseID, reason)
 		removed++
 	}
 	claimsRemoved := 0
-	allClaims, claimErr := listLeaseClaims()
-	if claimErr != nil {
-		return claimErr
-	}
-	for _, claim := range allClaims {
+	for _, claim := range orphanCandidates {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if claim.Provider != providerName || claim.LeaseID == "" {
 			continue
 		}
-		if _, ok := live[claim.LeaseID]; ok {
+		name := instanceNameFromClaim(claim)
+		if _, ok := live[name]; ok {
+			continue
+		}
+		if _, err := tartCleanupBinding(claim, name, storage); err != nil {
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s reason=%v\n", claim.LeaseID, err)
 			continue
 		}
 		reason := "missing instance"
-		if instanceNameFromClaim(claim) == "" {
-			reason = "malformed claim (no instance)"
-		}
 		if req.DryRun {
-			fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, blank(claim.Slug, "-"), reason)
+			fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, core.Blank(claim.Slug, "-"), reason)
 			continue
 		}
-		fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, blank(claim.Slug, "-"), reason)
-		removeLeaseClaim(claim.LeaseID)
-		removeStoredTestboxKey(claim.LeaseID)
+		// Acquisition creates or reuses the key before publishing its claim, so
+		// missing-instance cleanup cannot safely delete that key without a wider fence.
+		if err := core.CleanupLeaseClaimIfUnchangedAfterContext(ctx, claim.LeaseID, claim, true, nil); err != nil {
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				if errors.Is(err, cancelErr) {
+					return err
+				}
+				return errors.Join(cancelErr, err)
+			}
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=changed-during-cleanup err=%v\n", claim.LeaseID, core.Blank(claim.Slug, "-"), err)
+			continue
+		}
+		fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, core.Blank(claim.Slug, "-"), reason)
 		claimsRemoved++
 	}
 	if !req.DryRun {
@@ -380,33 +501,98 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	return nil
 }
 
-func (b *backend) Touch(_ context.Context, req TouchRequest) (Server, error) {
-	server := req.Lease.Server
-	if server.Labels == nil {
-		server.Labels = map[string]string{}
+func (b *backend) cleanupInstance(ctx context.Context, cfg core.Config, inst tartInstance, claim core.LeaseClaim, storage string) error {
+	binding, err := tartCleanupBinding(claim, inst.Name, storage)
+	if err != nil {
+		return err
 	}
-	original := server.Labels
-	server.Labels = touchDirectLeaseLabels(original, b.configForRun(), req.State, time.Now().UTC())
-	for _, key := range []string{"image", "instance", "ssh_user", "ssh_port", "work_root"} {
-		if value := strings.TrimSpace(original[key]); value != "" {
-			server.Labels[key] = value
+	return shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
+		// Re-read lifecycle state and the incarnation witness under the same
+		// claim fence that covers deletion and durable claim removal.
+		current, err := b.listInstances(ctx)
+		if err != nil {
+			return err
 		}
+		for _, fresh := range current {
+			if fresh.Name != inst.Name {
+				continue
+			}
+			server := b.serverFromInstance(fresh, claim, cfg)
+			if fresh.Running {
+				server.Status = "running"
+			}
+			if eligible, why := shouldCleanup(server, claim, true, time.Now().UTC()); !eligible {
+				return fmt.Errorf("Tart instance %s changed during cleanup: %s", inst.Name, why)
+			}
+			if err := verifyTartVMIdentity(inst.Name, storage, claim.CloudImmutableID); err != nil {
+				return err
+			}
+			if fresh.Running || instanceRunning(fresh.State) {
+				if err := b.stopVM(ctx, inst.Name); err != nil {
+					return err
+				}
+			}
+			if err := verifyTartVMIdentity(inst.Name, storage, claim.CloudImmutableID); err != nil {
+				return err
+			}
+			return b.deleteVM(ctx, inst.Name)
+		}
+		return fmt.Errorf("Tart instance %s disappeared during cleanup; claim retained", inst.Name)
+	})
+}
+
+func (b *backend) AuthorizeStatusTouchClaim(ctx context.Context, lease core.LeaseTarget, claim core.LeaseClaim) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	name := instanceNameFromClaim(claim)
+	root := claim.Labels["tart_storage"]
+	if lease.LeaseID == "" || lease.LeaseID != claim.LeaseID || lease.Server.Provider != providerName || lease.Server.CloudID != name || lease.Server.Name != name || lease.Server.ImmutableID != claim.CloudImmutableID || lease.Server.Labels["instance"] != name || lease.Server.Labels["tart_storage"] != root {
+		return core.Exit(4, "tart lease %s touch identity does not match its claim", lease.LeaseID)
+	}
+	if _, err := tartCleanupBinding(claim, name, root); err != nil {
+		return core.Exit(4, "tart lease %s cannot authorize touch: %v", lease.LeaseID, err)
+	}
+	if err := verifyTartVMIdentity(name, root, claim.CloudImmutableID); err != nil {
+		return core.Exit(4, "tart lease %s cannot authorize touch: %v", lease.LeaseID, err)
+	}
+	return nil
+}
+
+func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	updated, err := shared.CommitClaimTouch(ctx, req, shared.ClaimTouchPolicy{
+		Provider:  providerName,
+		Authorize: b.AuthorizeStatusTouchClaim,
+		Prepare: func(claim core.LeaseClaim) (map[string]string, time.Time) {
+			now := core.ClockNow(b.rt.Clock).UTC()
+			labels := core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(shared.ClaimLifecycleLabels(claim), b.configForRun(), req.State, now, req.IdleTimeoutOverride)
+			return labels, now
+		},
+	})
+	if err != nil {
+		return core.Server{}, err
+	}
+	server := req.Lease.Server
+	server.Labels = shared.CloneLabels(updated.Labels)
+	if state := server.Labels["state"]; state != "" {
+		server.Status = state
+	}
+	core.SetServerLeaseClaimSnapshot(&server, updated, true)
 	return server, nil
 }
 
 // cloneVM clones the base image to create a new VM.
-func (b *backend) cloneVM(ctx context.Context, cfg Config, name string) error {
+func (b *backend) cloneVM(ctx context.Context, cfg core.Config, name string) error {
 	args := []string{"clone", cfg.Tart.Image, name}
 	result, err := b.tart(ctx, args, nil, b.rt.Stderr)
 	if err != nil {
-		return commandError("tart clone", result, err)
+		return shared.LocalCommandError("tart clone", result, err)
 	}
 	return nil
 }
 
 // configureVM applies CPU, memory, and disk settings to the cloned VM before boot.
-func (b *backend) configureVM(ctx context.Context, cfg Config, name string) error {
+func (b *backend) configureVM(ctx context.Context, cfg core.Config, name string) error {
 	if cfg.Tart.CPUs > 0 {
 		if _, err := b.tart(ctx, []string{"set", name, "--cpu", strconv.Itoa(cfg.Tart.CPUs)}, nil, b.rt.Stderr); err != nil {
 			return fmt.Errorf("tart set --cpu: %w", err)
@@ -425,110 +611,68 @@ func (b *backend) configureVM(ctx context.Context, cfg Config, name string) erro
 	return nil
 }
 
-// startVMArgs returns the tart run arguments for starting a VM headless.
-func startVMArgs(name string) []string {
-	return []string{"run", name, "--no-graphics"}
-}
-
-// startVM starts the VM headless in the background.
-// When keep is true the tart process is fully detached so it survives
-// crabbox exit, matching how docker run -d keeps containers alive.
-func (b *backend) startVM(ctx context.Context, cfg Config, name string, keep bool) error {
-	args := startVMArgs(name)
-	var stderrBuf bytes.Buffer
-	var detachedStderr *os.File
-	var cmd *exec.Cmd
-	if keep {
-		if err := ctx.Err(); err != nil {
-			return exit(2, "tart run %s: context already cancelled", name)
-		}
-		cmd = exec.Command("tart", args...)
-		detachCommand(cmd)
-		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-		if err != nil {
-			return exit(2, "tart run %s: open null device: %v", name, err)
-		}
-		defer devNull.Close()
-		detachedStderr, err = os.CreateTemp("", "crabbox-tart-run-*.log")
-		if err != nil {
-			return exit(2, "tart run %s: create startup log: %v", name, err)
-		}
-		defer func() {
-			_ = detachedStderr.Close()
-			_ = os.Remove(detachedStderr.Name())
-		}()
-		cmd.Stdin = devNull
-		cmd.Stdout = devNull
-		cmd.Stderr = detachedStderr
-	} else {
-		cmd = exec.CommandContext(ctx, "tart", args...)
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.MultiWriter(&stderrBuf, b.rt.Stderr)
-	}
-	if err := cmd.Start(); err != nil {
-		return exit(2, "tart run %s: %v", name, err)
-	}
-	exitCh := make(chan error, 1)
-	go func() { exitCh <- cmd.Wait() }()
-	select {
-	case <-ctx.Done():
-		if !keep {
-			_ = cmd.Process.Kill()
-		}
-		return exit(2, "tart run %s: context cancelled during startup", name)
-	case err := <-exitCh:
-		if detachedStderr != nil {
-			if _, seekErr := detachedStderr.Seek(0, io.SeekStart); seekErr == nil {
-				_, _ = io.Copy(&stderrBuf, io.LimitReader(detachedStderr, 64<<10))
-			}
-		}
-		detail := strings.TrimSpace(stderrBuf.String())
-		if detail != "" {
-			return exit(2, "tart run %s failed during startup: %s", name, detail)
-		}
-		if err != nil {
-			return exit(2, "tart run %s failed during startup: %v", name, err)
-		}
-		return exit(2, "tart run %s exited unexpectedly during startup", name)
-	case <-time.After(b.startupObserveTimeout):
-		return nil
-	}
-}
-
 // waitForIP polls `tart ip` until the VM has an IP address.
 func (b *backend) waitForIP(ctx context.Context, name string) (string, error) {
-	deadline := time.After(5 * time.Minute)
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-
-	for {
+	waitForTick := func(pollCtx context.Context, _ time.Duration) error {
 		select {
-		case <-ctx.Done():
-			return "", exit(2, "tart ip %s: context cancelled", name)
-		case <-deadline:
-			return "", exit(5, "tart ip %s: timed out waiting for IP address", name)
+		case <-pollCtx.Done():
+			return context.Cause(pollCtx)
 		case <-ticker.C:
-			result, err := b.tart(ctx, []string{"ip", name}, nil, nil)
-			if err != nil {
-				stderr := strings.ToLower(strings.TrimSpace(result.Stderr))
-				if strings.Contains(stderr, "is your vm running") || strings.Contains(stderr, "not running") {
-					return "", exit(2, "tart ip %s: %s", name, strings.TrimSpace(result.Stderr))
-				}
-				continue
-			}
-			ip := strings.TrimSpace(result.Stdout)
-			if ip != "" && ip != "--" {
-				return ip, nil
-			}
+			return nil
 		}
 	}
+	type observation struct {
+		result core.LocalCommandResult
+		err    error
+	}
+	var result shared.PollResult[observation]
+	// Preserve the delayed first probe and the original ticker cadence.
+	err := waitForTick(waitCtx, 0)
+	if err == nil {
+		result, err = shared.Poll(waitCtx, 0, 3*time.Second, waitForTick,
+			func(pollCtx context.Context) (observation, error) {
+				commandResult, commandErr := b.tart(pollCtx, []string{"ip", name}, nil, nil)
+				return observation{result: commandResult, err: commandErr}, nil
+			},
+			func(_ context.Context, current observation, fetchErr error) (bool, error) {
+				if fetchErr != nil {
+					return false, fetchErr
+				}
+				if current.err != nil {
+					stderr := strings.ToLower(strings.TrimSpace(current.result.Stderr))
+					if strings.Contains(stderr, "is your vm running") || strings.Contains(stderr, "not running") {
+						return false, core.Exit(2, "tart ip %s: %s", name, strings.TrimSpace(current.result.Stderr))
+					}
+					return false, nil
+				}
+				ip := strings.TrimSpace(current.result.Stdout)
+				return ip != "" && ip != "--", nil
+			}, nil)
+	}
+	if err != nil {
+		if cause := context.Cause(ctx); cause != nil && errors.Is(err, cause) {
+			return "", shared.PollTerminationError(ctx, err, core.Exit(2, "tart ip %s: context cancelled", name))
+		}
+		if waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
+			return "", shared.PollTerminationError(waitCtx, err, core.Exit(5, "tart ip %s: timed out waiting for IP address", name))
+		}
+		return "", err
+	}
+	return strings.TrimSpace(result.Value.result.Stdout), nil
 }
 
 var validPOSIXUser = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9._-]*$`)
 
 func (b *backend) injectSSHKey(ctx context.Context, name string, user string, publicKey string) error {
 	if !validPOSIXUser.MatchString(user) {
-		return exit(2, "tart.user %q is not a valid POSIX account name", user)
+		return core.Exit(2, "tart.user %q is not a valid POSIX account name", user)
+	}
+	if err := b.waitForGuestAgent(ctx, name); err != nil {
+		return fmt.Errorf("ssh key injection: %w", err)
 	}
 	sshDir := fmt.Sprintf("~%s/.ssh", user)
 	safeKey := strings.ReplaceAll(strings.TrimSpace(publicKey), "'", "'\\''")
@@ -538,7 +682,45 @@ func (b *backend) injectSSHKey(ctx context.Context, name string, user string, pu
 	)
 	injectResult, err := b.tart(ctx, []string{"exec", name, "bash", "-c", injectScript}, nil, b.rt.Stderr)
 	if err != nil {
-		return commandError("ssh key injection", injectResult, err)
+		return shared.LocalCommandError("ssh key injection", injectResult, err)
+	}
+	return nil
+}
+
+func (b *backend) waitForGuestAgent(ctx context.Context, name string) error {
+	// An IP can come from a previous DHCP lease before the new guest agent is
+	// ready. Probe with a read-only command; never retry the key-writing script.
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	type observation struct {
+		result core.LocalCommandResult
+		err    error
+	}
+	_, err := shared.Poll(waitCtx, 0, 500*time.Millisecond, shared.SleepContext,
+		func(ctx context.Context) (observation, error) {
+			result, err := b.tart(ctx, []string{"exec", name, "/usr/bin/true"}, nil, nil)
+			return observation{result: result, err: err}, nil
+		},
+		func(ctx context.Context, current observation, _ error) (bool, error) {
+			if err := context.Cause(ctx); err != nil {
+				return false, err
+			}
+			if current.err == nil {
+				return true, nil
+			}
+			detail := current.result.Stderr + " " + current.err.Error()
+			if strings.Contains(detail, "GRPCConnectionPoolError") || strings.Contains(detail, "is the Tart Guest Agent running?") {
+				return false, nil
+			}
+			return false, shared.LocalCommandError("Tart Guest Agent readiness", current.result, current.err)
+		},
+		func(result shared.PollResult[observation]) {
+			if result.Attempt == 1 {
+				fmt.Fprintln(b.rt.Stderr, "waiting for Tart Guest Agent before SSH key injection")
+			}
+		})
+	if err != nil {
+		return fmt.Errorf("wait for Tart Guest Agent: %w", err)
 	}
 	return nil
 }
@@ -563,7 +745,7 @@ echo 'macOS Screen Sharing did not start (no VNC listener on 127.0.0.1:5900)' >&
 exit 1`
 	result, err := b.tart(ctx, []string{"exec", name, "bash", "-c", script}, nil, b.rt.Stderr)
 	if err != nil {
-		return commandError("enable screen sharing", result, err)
+		return shared.LocalCommandError("enable screen sharing", result, err)
 	}
 	return nil
 }
@@ -572,7 +754,7 @@ exit 1`
 func (b *backend) stopVM(ctx context.Context, name string) error {
 	result, err := b.tart(ctx, []string{"stop", name}, nil, b.rt.Stderr)
 	if err != nil {
-		return commandError("tart stop", result, err)
+		return shared.LocalCommandError("tart stop", result, err)
 	}
 	return nil
 }
@@ -581,7 +763,7 @@ func (b *backend) stopVM(ctx context.Context, name string) error {
 func (b *backend) deleteVM(ctx context.Context, name string) error {
 	result, err := b.tart(ctx, []string{"delete", name}, nil, b.rt.Stderr)
 	if err != nil {
-		return commandError("tart delete", result, err)
+		return shared.LocalCommandError("tart delete", result, err)
 	}
 	return nil
 }
@@ -589,11 +771,11 @@ func (b *backend) deleteVM(ctx context.Context, name string) error {
 func (b *backend) listInstances(ctx context.Context) ([]tartInstance, error) {
 	result, err := b.tart(ctx, []string{"list", "--source", "local", "--format", "json"}, nil, nil)
 	if err != nil {
-		return nil, commandError("tart list", result, err)
+		return nil, shared.LocalCommandError("tart list", result, err)
 	}
 	var instances []tartInstance
 	if err := json.Unmarshal([]byte(result.Stdout), &instances); err != nil {
-		return nil, exit(2, "parse tart list: %v", err)
+		return nil, core.Exit(2, "parse tart list: %v", err)
 	}
 	return instances, nil
 }
@@ -601,14 +783,14 @@ func (b *backend) listInstances(ctx context.Context) ([]tartInstance, error) {
 func (b *backend) resolveInstance(ctx context.Context, identifier string) (tartInstance, string, core.LeaseClaim, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
-		return tartInstance{}, "", core.LeaseClaim{}, exit(2, "provider=%s requires --id <lease-id-or-slug-or-instance>", providerName)
+		return tartInstance{}, "", core.LeaseClaim{}, core.Exit(2, "provider=%s requires --id <lease-id-or-slug-or-instance>", providerName)
 	}
-	if claim, ok, err := resolveLeaseClaimForProvider(identifier, providerName); err != nil {
+	if claim, ok, err := core.ResolveLeaseClaimForProvider(identifier, providerName); err != nil {
 		return tartInstance{}, "", core.LeaseClaim{}, err
 	} else if ok {
 		name := instanceNameFromClaim(claim)
 		if name == "" {
-			return tartInstance{}, "", core.LeaseClaim{}, exit(4, "tart lease %s has no instance name in its claim", claim.LeaseID)
+			return tartInstance{}, "", core.LeaseClaim{}, core.Exit(4, "tart lease %s has no instance name in its claim", claim.LeaseID)
 		}
 		instances, listErr := b.listInstances(ctx)
 		if listErr != nil {
@@ -630,15 +812,15 @@ func (b *backend) resolveInstance(ctx context.Context, identifier string) (tartI
 	if err != nil {
 		return tartInstance{}, "", core.LeaseClaim{}, err
 	}
-	normalized := normalizeLeaseSlug(identifier)
+	normalized := core.NormalizeLeaseSlug(identifier)
 	for _, inst := range instances {
 		claim := claims[inst.Name]
-		if inst.Name == identifier || claim.LeaseID == identifier || (normalized != "" && normalizeLeaseSlug(claim.Slug) == normalized) {
+		if inst.Name == identifier || claim.LeaseID == identifier || (normalized != "" && core.NormalizeLeaseSlug(claim.Slug) == normalized) {
 			ip := b.getIP(ctx, inst.Name)
 			return inst, ip, claim, nil
 		}
 	}
-	return tartInstance{}, "", core.LeaseClaim{}, exit(4, "tart lease not found: %s", identifier)
+	return tartInstance{}, "", core.LeaseClaim{}, core.Exit(4, "tart lease not found: %s", identifier)
 }
 
 func (b *backend) getIP(ctx context.Context, name string) string {
@@ -653,7 +835,7 @@ func (b *backend) getIP(ctx context.Context, name string) string {
 	return ip
 }
 
-func (b *backend) prepareLease(ctx context.Context, cfg Config, inst tartInstance, ip string, claim core.LeaseClaim, wait bool) (LeaseTarget, error) {
+func (b *backend) prepareLease(ctx context.Context, cfg core.Config, inst tartInstance, ip string, claim core.LeaseClaim, wait bool) (core.LeaseTarget, error) {
 	server := b.serverFromInstance(inst, claim, cfg)
 	if user := strings.TrimSpace(server.Labels["ssh_user"]); user != "" && validPOSIXUser.MatchString(user) {
 		cfg.Tart.User = user
@@ -667,103 +849,66 @@ func (b *backend) prepareLease(ctx context.Context, cfg Config, inst tartInstanc
 		if !instanceRunning(inst.State) {
 			server.Status = inst.State
 			server.Labels["state"] = tartState(inst.State)
-			return LeaseTarget{Server: server, LeaseID: claim.LeaseID}, nil
+			return core.LeaseTarget{Server: server, LeaseID: claim.LeaseID}, nil
 		}
-		return LeaseTarget{}, exit(5, "tart instance %s has no IP address", inst.Name)
+		return core.LeaseTarget{}, core.Exit(5, "tart instance %s has no IP address", inst.Name)
 	}
 	server.PublicNet.IPv4.IP = ip
 	if claim.LeaseID != "" {
-		keyPath, err := testboxKeyPath(claim.LeaseID)
+		keyPath, err := core.OptionalStoredTestboxKeyPath(claim.LeaseID)
 		if err == nil {
 			if _, statErr := os.Stat(keyPath); statErr == nil {
 				cfg.SSHKey = keyPath
 			}
+		} else if !os.IsNotExist(err) {
+			return core.LeaseTarget{}, err
 		}
 	}
-	target := sshTargetFromConfig(cfg, ip)
+	target := core.SSHTargetFromConfig(cfg, ip)
 	target.Port = sshPort
 	target.FallbackPorts = []string{}
 	target.ReadyCheck = "uname -s && test -d ~"
+	target.SSHConfigProxy = true
 	if wait {
-		if err := waitForSSHReady(ctx, &target, b.rt.Stderr, "tart ssh", bootstrapWaitTimeout(cfg)); err != nil {
-			return LeaseTarget{}, err
+		if err := core.WaitForSSHReady(ctx, &target, b.rt.Stderr, "tart ssh", core.BootstrapWaitTimeout(cfg)); err != nil {
+			return core.LeaseTarget{}, err
 		}
 		server.Status = "ready"
 		server.Labels["state"] = "ready"
 	}
-	return LeaseTarget{Server: server, SSH: target, LeaseID: claim.LeaseID}, nil
+	return core.LeaseTarget{Server: server, SSH: target, LeaseID: claim.LeaseID}, nil
 }
 
-func (b *backend) serverFromInstance(inst tartInstance, claim core.LeaseClaim, cfg Config) Server {
-	labels := map[string]string{}
-	for key, value := range claim.Labels {
-		labels[key] = value
-	}
-	if labels["crabbox"] == "" {
-		labels["crabbox"] = "true"
-	}
-	if labels["provider"] == "" {
-		labels["provider"] = providerName
-	}
-	if labels["instance"] == "" {
-		labels["instance"] = inst.Name
-	}
-	if labels["lease"] == "" {
-		labels["lease"] = claim.LeaseID
-	}
-	if labels["slug"] == "" {
-		labels["slug"] = claim.Slug
-	}
-	if labels["state"] == "" {
-		labels["state"] = tartState(inst.State)
-	}
-	if labels["server_type"] == "" {
-		labels["server_type"] = firstNonBlank(inst.Source, cfg.Tart.Image)
-	}
-	if labels["image"] == "" {
-		labels["image"] = cfg.Tart.Image
-	}
-	if labels["ssh_user"] == "" {
-		labels["ssh_user"] = cfg.Tart.User
-	}
-	if labels["ssh_port"] == "" {
-		labels["ssh_port"] = sshPort
-	}
-	if labels["work_root"] == "" {
-		labels["work_root"] = cfg.Tart.WorkRoot
-	}
+func (b *backend) serverFromInstance(inst tartInstance, claim core.LeaseClaim, cfg core.Config) core.Server {
+	labels := shared.LabelsWithDefaults(shared.ClaimLifecycleLabels(claim), map[string]string{
+		"crabbox":     "true",
+		"provider":    providerName,
+		"instance":    inst.Name,
+		"lease":       claim.LeaseID,
+		"slug":        claim.Slug,
+		"state":       tartState(inst.State),
+		"server_type": shared.FirstNonBlank(inst.Source, cfg.Tart.Image),
+		"ssh_user":    cfg.Tart.User,
+		"ssh_port":    sshPort,
+		"work_root":   cfg.Tart.WorkRoot,
+	})
+	// Native inventory's Source is a storage kind, not an image identity.
+	// Only acquisition records image provenance in the claim.
 	status := tartState(inst.State)
-	if instanceRunning(inst.State) && labels["state"] == "ready" {
-		status = "ready"
+	if !inst.Running && !instanceRunning(inst.State) {
+		labels["state"] = status
 	}
-	server := Server{
-		CloudID:  inst.Name,
-		Provider: providerName,
-		Name:     inst.Name,
-		Status:   status,
-		Labels:   labels,
+	server := shared.LocalInstanceServer(providerName, inst.Name, status, instanceRunning(inst.State), labels)
+	server.ImmutableID = claim.CloudImmutableID
+	server.ServerType.Name = shared.FirstNonBlank(labels["server_type"], cfg.Tart.Image)
+	if claim.LeaseID != "" && claim.Provider == providerName {
+		core.SetServerLeaseClaimSnapshot(&server, claim, true)
 	}
-	server.ServerType.Name = firstNonBlank(labels["server_type"], cfg.Tart.Image)
 	return server
 }
 
 func providerClaims() (map[string]core.LeaseClaim, error) {
-	claims, err := listLeaseClaims()
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]core.LeaseClaim{}
-	for _, claim := range claims {
-		if claim.Provider != providerName {
-			continue
-		}
-		name := instanceNameFromClaim(claim)
-		if name == "" {
-			continue
-		}
-		out[name] = claim
-	}
-	return out, nil
+	return shared.IndexProviderClaims(providerName, instanceNameFromClaim)
 }
 
 func instanceScope(name string) string {
@@ -789,34 +934,29 @@ func instanceNameFromScope(scope string) string {
 	return strings.TrimPrefix(scope, "instance:")
 }
 
-func shouldCleanup(server Server, claim core.LeaseClaim, hasClaim bool, now time.Time) (bool, string) {
+func shouldCleanup(server core.Server, claim core.LeaseClaim, hasClaim bool, now time.Time) (bool, string) {
 	if strings.EqualFold(server.Labels["keep"], "true") {
 		return false, "keep=true"
 	}
+	if !hasClaim {
+		return false, "missing claim"
+	}
 	if !instanceRunning(server.Status) && server.Status != "ready" {
-		return true, "instance state=" + blank(server.Status, "unknown")
+		return true, "instance state=" + core.Blank(server.Status, "unknown")
 	}
-	if hasClaim {
-		lastUsed, err := time.Parse(time.RFC3339, strings.TrimSpace(claim.LastUsedAt))
-		if err != nil || lastUsed.IsZero() {
-			return false, "claim active"
-		}
-		idle := time.Duration(claim.IdleTimeoutSeconds) * time.Second
-		if idle <= 0 {
-			return false, "claim active"
-		}
-		if now.After(lastUsed.Add(idle).Add(12 * time.Hour)) {
-			return true, "claim expired"
-		}
-		return false, "claim active"
-	}
-	return false, "missing claim"
+	claim.LastUsedAt = strings.TrimSpace(claim.LastUsedAt)
+	return shared.ClaimIdleExpiredAfterGrace(claim, now, 12*time.Hour)
 }
 
-func (b *backend) tart(ctx context.Context, args []string, stdout, stderr io.Writer) (LocalCommandResult, error) {
-	return b.rt.Exec.Run(ctx, LocalCommandRequest{
+func (b *backend) tart(ctx context.Context, args []string, stdout, stderr io.Writer) (core.LocalCommandResult, error) {
+	env, err := tartEnvironment()
+	if err != nil {
+		return core.LocalCommandResult{}, err
+	}
+	return b.rt.Exec.Run(ctx, core.LocalCommandRequest{
 		Name:   "tart",
 		Args:   args,
+		Env:    env,
 		Stdout: stdout,
 		Stderr: stderr,
 	})
@@ -835,21 +975,6 @@ func tartState(state string) string {
 	return strings.ToLower(strings.TrimSpace(state))
 }
 
-func commandError(action string, result LocalCommandResult, err error) error {
-	code := result.ExitCode
-	if code == 0 {
-		code = 1
-	}
-	detail := strings.TrimSpace(result.Stderr)
-	if detail == "" {
-		detail = strings.TrimSpace(result.Stdout)
-	}
-	if detail != "" {
-		return exit(code, "%s failed: %v: %s", action, err, detail)
-	}
-	return exit(code, "%s failed: %v", action, err)
-}
-
 func firstLine(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -859,13 +984,4 @@ func firstLine(value string) string {
 		value = value[:idx]
 	}
 	return strings.TrimSpace(value)
-}
-
-func firstNonBlank(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }

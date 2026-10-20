@@ -2,8 +2,10 @@ package cli
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -19,14 +21,15 @@ type junitTestSuites struct {
 }
 
 type junitTestSuite struct {
-	XMLName   xml.Name        `xml:"testsuite"`
-	Name      string          `xml:"name,attr"`
-	Tests     int             `xml:"tests,attr"`
-	Failures  int             `xml:"failures,attr"`
-	Errors    int             `xml:"errors,attr"`
-	Skipped   int             `xml:"skipped,attr"`
-	Time      float64         `xml:"time,attr"`
-	TestCases []junitTestCase `xml:"testcase"`
+	XMLName   xml.Name         `xml:"testsuite"`
+	Name      string           `xml:"name,attr"`
+	Tests     int              `xml:"tests,attr"`
+	Failures  int              `xml:"failures,attr"`
+	Errors    int              `xml:"errors,attr"`
+	Skipped   int              `xml:"skipped,attr"`
+	Time      float64          `xml:"time,attr"`
+	TestCases []junitTestCase  `xml:"testcase"`
+	Suites    []junitTestSuite `xml:"testsuite"`
 }
 
 type junitTestCase struct {
@@ -54,20 +57,40 @@ func parseJUnitResults(files map[string]string) (*TestResultSummary, error) {
 		Files:  make([]string, 0, len(files)),
 		Failed: []TestFailure{},
 	}
-	for name, data := range files {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var parseErrors []error
+	for _, name := range names {
+		data := files[name]
 		trimmed := strings.TrimSpace(data)
 		if trimmed == "" {
 			continue
 		}
-		summary.Files = append(summary.Files, name)
-		if err := addJUnitFile(summary, strings.NewReader(trimmed)); err != nil {
-			return nil, fmt.Errorf("parse junit %s: %w", name, err)
+		fileSummary := &TestResultSummary{Format: "junit", Failed: []TestFailure{}}
+		if err := addJUnitFile(fileSummary, strings.NewReader(trimmed)); err != nil {
+			parseErrors = append(parseErrors, fmt.Errorf("skip junit %s: %w", name, err))
+			continue
 		}
+		mergeJUnitSummary(summary, fileSummary)
+		summary.Files = append(summary.Files, name)
 	}
 	if len(summary.Files) == 0 {
-		return nil, nil
+		return nil, errors.Join(parseErrors...)
 	}
-	return summary, nil
+	return summary, errors.Join(parseErrors...)
+}
+
+func mergeJUnitSummary(dst, src *TestResultSummary) {
+	dst.Suites += src.Suites
+	dst.Tests += src.Tests
+	dst.Failures += src.Failures
+	dst.Errors += src.Errors
+	dst.Skipped += src.Skipped
+	dst.TimeSeconds += src.TimeSeconds
+	dst.Failed = append(dst.Failed, src.Failed...)
 }
 
 func addJUnitFile(summary *TestResultSummary, input io.Reader) error {
@@ -104,7 +127,6 @@ func addJUnitFile(summary *TestResultSummary, input io.Reader) error {
 
 func addJUnitSuites(summary *TestResultSummary, suites junitTestSuites) {
 	if len(suites.Suites) == 0 {
-		summary.Suites++
 		summary.Tests += suites.Tests
 		summary.Failures += suites.Failures
 		summary.Errors += suites.Errors
@@ -118,36 +140,36 @@ func addJUnitSuites(summary *TestResultSummary, suites junitTestSuites) {
 }
 
 func addJUnitSuite(summary *TestResultSummary, suite junitTestSuite) {
-	summary.Suites++
-	if suite.Tests > 0 || suite.Failures > 0 || suite.Errors > 0 || suite.Skipped > 0 {
-		summary.Tests += suite.Tests
-		summary.Failures += suite.Failures
-		summary.Errors += suite.Errors
-		summary.Skipped += suite.Skipped
-		summary.TimeSeconds += suite.Time
-	} else {
-		summary.Tests += len(suite.TestCases)
-		for _, tc := range suite.TestCases {
-			summary.TimeSeconds += tc.Time
-			if len(tc.Failures) > 0 {
-				summary.Failures += len(tc.Failures)
-			}
-			if len(tc.Errors) > 0 {
-				summary.Errors += len(tc.Errors)
-			}
-			if len(tc.Skipped) > 0 {
-				summary.Skipped += len(tc.Skipped)
-			}
-		}
-	}
+	derived := &TestResultSummary{Suites: 1, Tests: len(suite.TestCases)}
 	for _, tc := range suite.TestCases {
+		derived.TimeSeconds += tc.Time
+		derived.Failures += len(tc.Failures)
+		derived.Errors += len(tc.Errors)
+		derived.Skipped += len(tc.Skipped)
 		for _, failure := range tc.Failures {
-			summary.Failed = append(summary.Failed, testFailureFromJUnit(suite, tc, failure, "failure"))
+			derived.Failed = append(derived.Failed, testFailureFromJUnit(suite, tc, failure, "failure"))
 		}
 		for _, failure := range tc.Errors {
-			summary.Failed = append(summary.Failed, testFailureFromJUnit(suite, tc, failure, "error"))
+			derived.Failed = append(derived.Failed, testFailureFromJUnit(suite, tc, failure, "error"))
 		}
 	}
+	for _, child := range suite.Suites {
+		addJUnitSuite(derived, child)
+	}
+	// Suite attributes summarize the descendants, not additional test executions.
+	// Keep observed failures/errors/skips as lower bounds even with partial counts.
+	if suite.Tests > 0 || suite.Failures > 0 || suite.Errors > 0 || suite.Skipped > 0 {
+		if suite.Tests != 0 {
+			derived.Tests = suite.Tests
+		}
+		derived.Failures = max(suite.Failures, derived.Failures)
+		derived.Errors = max(suite.Errors, derived.Errors)
+		derived.Skipped = max(suite.Skipped, derived.Skipped)
+		if suite.Time > 0 {
+			derived.TimeSeconds = suite.Time
+		}
+	}
+	mergeJUnitSummary(summary, derived)
 }
 
 func testFailureFromJUnit(suite junitTestSuite, tc junitTestCase, failure junitFailure, kind string) TestFailure {

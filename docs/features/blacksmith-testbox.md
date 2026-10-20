@@ -29,7 +29,7 @@ store Blacksmith credentials.
 
 ## Quick start
 
-If you already have a Testbox ID (`tbx_...`), no Crabbox YAML is required:
+If Crabbox already holds an exact local claim for a Testbox ID (`tbx_...`), no workflow YAML is required for reuse:
 
 ```sh
 crabbox run --provider blacksmith-testbox --id tbx_123 -- pnpm test
@@ -43,8 +43,8 @@ crabbox status --provider blacksmith-testbox --id blue-lobster
 crabbox stop --provider blacksmith-testbox blue-lobster
 ```
 
-This path only needs Blacksmith auth and a reachable Testbox. Crabbox resolves the ID or slug,
-preserves the local repo claim, forwards the command to `blacksmith testbox run`, and prints
+This path needs Blacksmith auth in the claim’s original organization/API scope and a reachable,
+exactly claimed Testbox. Crabbox verifies the ID, native workflow identity and unchanged claim, then forwards the command to `blacksmith testbox run`, and prints
 `sync=delegated` in the final summary.
 
 To create a fresh Testbox without YAML, pass the workflow details as flags:
@@ -143,28 +143,78 @@ blacksmith [--org <org>] testbox run --id <tbx_id> --ssh-private-key <key> [--de
 blacksmith [--org <org>] testbox list
 blacksmith [--org <org>] testbox list --all
 blacksmith [--org <org>] testbox stop --id <tbx_id>
+blacksmith [--org <org>] testbox status --id <tbx_id>
 ```
 
 The wrapper is deliberately thin for warmup, run, and stop. `crabbox list` and `crabbox status`
 normalize Blacksmith output into Crabbox's common list/status views so rendering stays
-core-owned across providers. Both `list` and `status` read `blacksmith testbox list --all` and
-parse its table output.
+core-owned across providers. `list` reads the native inventory. `status` reads the exact ID through
+`blacksmith testbox status --id`, including completed Testboxes absent from inventory.
+Use `status --json` without `--wait` for one queue snapshot: `state` is the native
+Testbox state, and `ready` indicates command readiness. A `completed` snapshot does
+not establish GitHub settlement. `--wait` waits for readiness and fails immediately
+if the Testbox reaches `completed` or `hydration_failed`.
 
 `crabbox list --provider blacksmith-testbox --json` parses that table into compatibility JSON rows
 with the fields Crabbox can see (id, status, repo, workflow, job, ref, created). The parser is a
 compatibility layer, not a Blacksmith API contract; if the CLI gains native JSON output, Crabbox
 should switch to it and drop table parsing.
 
+Stop requires an exact local `blacksmith-testbox` claim and the same organization/API
+route. Native status must return one complete, unambiguous row with the exact ID
+and matching workflow/job/ref. Missing inventory, error prose, malformed tables,
+and canceled or failed queries never establish completion.
+
+Native `completed` is only the Testbox result. Before removing its claim or key,
+Crabbox also reads the exact associated GitHub run using the existing optional
+`gh` integration. The association comes exclusively from the native status row's
+`RUN URL`; Crabbox never selects a run by timestamp, workflow name, or inventory.
+The GitHub response must match that URL and run ID and report `completed` with a
+recognized conclusion. Success, failure, and cancellation all establish terminal
+settlement; completion is not described as proof of cancellation.
+
+Missing `gh`, unavailable existing authentication or repository access, an absent
+or invalid run URL, a changed association, or a nonterminal GitHub run leaves
+settlement unresolved. Stop returns nonzero and retains the unchanged claim and
+key. Crabbox neither installs tools nor acquires credentials. Status reads never
+cancel a workflow or another job.
+
+A queued Testbox may report native completion before its run URL appears. That
+stop reports unresolved settlement promptly. Retry the same stop after association
+becomes available. A retained completed Testbox with a still-active associated run,
+or an association first observed after native stop, permits one further exact
+native stop attempt within the cleanup deadline. If that exact run remains active,
+the claim-fenced stop refreshes the native association and requests cancellation
+through existing `gh` access. This requires GitHub Actions write permission.
+Acquisition rollback without a persisted claim does not cancel workflows.
+Accepted cancellation is not completion: pending GitHub completion is polled
+within that existing deadline. A rejected request can reconcile through confirmed
+completion; unresolved settlement retains the claim and key. Failed native stop errors remain visible
+unless both native and GitHub completion are verified and local cleanup succeeds.
+
+Finalization takes the existing exclusive claim fence and rechecks the original
+claim, exact native completion, unchanged run URL, and GitHub terminal result
+before removing connection artifacts and then the claim. Failed finalization
+retains recovery ownership and never prints successful reconciliation.
+
+Reconciliation applies to explicit stop and automatic one-shot cleanup. It
+preserves an earlier workload failure; unconfirmed cleanup after a successful
+workload returns failure consistently in the CLI, timing and saved metadata. A successful
+GitHub Actions job is not proof that the delegated command succeeded: idle expiry
+can complete the job successfully. `--keep`, `--keep-on-failure`, and reused `--id`
+runs retain their existing cleanup policy.
+
 If `blacksmith testbox list --all` and `crabbox status` both work but new warmups stay `queued`
 with no IP, treat it as Blacksmith service, queue, org-limit, or billing pressure rather than a
 Crabbox provisioning bug. Stop queued IDs you created and switch to another provider until the
-Blacksmith account or service recovers. A `warmup` failure prints a hint suggesting a
-coordinator-backed provider (for example `--provider aws`) and best-effort cleans up the Testbox
-it was creating.
+Blacksmith account or service recovers. If stop reports unresolved settlement,
+retain its recovery ownership and do not assume the previous GitHub work was
+cancelled before replacing it. A `warmup` failure prints a hint suggesting a
+coordinator-backed provider (for example `--provider aws`) and can roll back only the unique Testbox receipt from that invocation while its local claim is absent. It never infers ownership from newly listed resources.
 
 ### Portal visibility
 
-When coordinator auth is configured, `crabbox list --provider blacksmith-testbox` also performs a
+When a coordinator is configured, successful `warmup`, `run`, and `list` also perform a
 best-effort sync of the current all-status Blacksmith list into the portal lease table. Those rows
 are owner-scoped **visibility records** for Blacksmith-owned Testboxes, rendered muted in the
 portal. When a row carries enough context, Crabbox links it to the closest GitHub Actions run and
@@ -177,6 +227,16 @@ These rows are **not** Crabbox leases: they expose no box-access actions, do not
 participate in Crabbox expiry or cost control, and become stale when a later sync no longer sees
 the runner.
 
+Each sync shares one five-second budget across inventory, GitHub Actions
+enrichment, coordinator credential resolution, and upload, including response
+body reads. Earlier caller cancellation wins. An ordinary Actions lookup failure
+only omits that optional metadata. If the budget expires or is canceled before
+upload, Crabbox skips publication so incomplete inventory cannot mark other rows stale. Failed
+syncs warn on stderr without changing command success or Testbox ownership.
+Warmup prints its final completion and timing only after this attempt ends, with
+bookkeeping included in the total. Reuse the retained lease after a warning;
+portal visibility is not an allocation or readiness check.
+
 ## Sync-stall guard
 
 Because Blacksmith owns sync, Crabbox watches the forwarded `testbox run` output for sync progress
@@ -186,6 +246,22 @@ markers. If the CLI starts syncing but does not print a completion marker within
 
 ## Ownership boundary
 
+Stop, reuse, command execution and artifact retrieval require an exact local
+claim binding the provider, Testbox ID, slug, repository owner, organization/API
+route and native workflow/job/ref. Exact Testbox IDs resolve by reading only that
+ID's claim file; only slug lookups scan local claims. Native status checks and
+actions share the unchanged-claim fence. Stop can cancel an active command, then rechecks the
+original claim under an exclusive fence before removing the claim and key.
+Terminal status must be confirmed; a changed claim or cleanup deadline retains
+local state. Uncertainty marks the session kept. A successful
+workload with failed cleanup returns nonzero, while an earlier workload failure
+preserves its exit code.
+
+Legacy or lost claims require independently verified native Blacksmith cleanup;
+raw IDs are accepted only for read-only discovery until a new Crabbox lease is
+created. `--reclaim` changes repository association for an already exact claim,
+not resource or authority. See the [migration and recovery instructions](../providers/blacksmith-testbox.md#older-leases-and-lost-local-state).
+
 - **Blacksmith owns** provisioning, workflow hydration, remote workspace setup, sync, command
   transport, logs emitted by its CLI, machine connectivity, and idle expiry.
 - **Crabbox owns** local YAML/env config, per-Testbox SSH keys, friendly slugs, repo claims,
@@ -194,12 +270,17 @@ markers. If the CLI starts syncing but does not print a completion marker within
 Because Blacksmith owns sync and execution, Crabbox rejects the following `run` options for
 `provider=blacksmith-testbox`:
 
-- sync flags: `--sync-only`, `--checksum`, `--force-sync-large`, `--full-resync`, `--fresh-pr`;
+- sync flags: `--no-sync`, `--sync-only`, `--checksum`, `--force-sync-large`, `--full-resync`, `--fresh-pr`;
 - execution flags: `--script`, `--script-stdin`, `--env-helper`, `--capture-stdout`,
   `--capture-stderr`, `--capture-on-fail`, `--download`, `--stop-after`;
 - environment forwarding: `--allow-env` and `CRABBOX_ENV_ALLOW` are unsupported — configure
   secrets in the Testbox workflow instead;
 - `--actions-runner` on `warmup` — Blacksmith owns runner hydration.
+
+Run option admission precedes backend configuration, including when reusing
+`--id`. Because `prewarm --probe-command` promises a no-sync shell probe, it
+also rejects before configuration, including in dry-run mode. Put readiness
+checks in the Blacksmith workflow or use plain `prewarm` without a probe.
 
 `crabbox run` prints `sync=delegated` in the final summary. `--emit-proof` is supported: it
 persists a local proof bundle (stdout/stderr logs, `timing.json`, `metadata.json`) and links the
@@ -207,11 +288,133 @@ detected GitHub Actions run URL when one appears in the output. Failed runs alwa
 failure bundle with stdout/stderr, timing, and redacted env/config metadata. `--keep-on-failure`
 keeps a failed one-shot Testbox inspectable until its idle timeout or an explicit `crabbox stop`.
 
-`--artifact-glob` and `--require-artifact` are supported through Blacksmith's delegated
-run-artifact adapter. After the command succeeds, Crabbox asks the same Testbox to validate
-required globs and stream one bounded tarball back to the local
-`.crabbox/runs/<lease>/blacksmith-artifacts.tgz` path. The adapter caps retrieval at 256 files and
-10 MiB by default and still excludes `.git` and `.crabbox` paths.
+### Run artifacts
+
+`--artifact-glob` and `--require-artifact` opt into an adapter-owned supervisor
+inside the **original** native run. It executes the command in an isolated,
+non-login `bash -c` child, observes its normal terminal exit, and collects from
+the original physical working directory or the optional prepared workspace.
+A child `cd`, `exit`, `exec`, or trap does not retarget collection. Stdout and
+stderr remain streaming; stdin forwarding remains unsupported.
+
+The supervisor finalizes one private compressed archive, then sends bounded,
+ordered invocation receipts containing its size and SHA-256. After clean native
+completion, the same adapter downloads that exact file through the native
+`blacksmith testbox download` command. There is no second workload, native run,
+re-sync, or transfer fallback. The original organization, API, key and shared
+claim remain bound across collection, transfer and validation.
+
+Native download support is checked before the workload. It is present in the
+published Blacksmith 0.4.57 client and verified 0.4.58 interface; no minimum is
+inferred for older releases. Unsupported command interfaces fail with update
+advice. Bounded file transfer requires a macOS or Linux client and an OpenSSH
+`scp` executable. Artifact operations disable the native CLI's automatic update
+so their metadata and execution phases use a stable interface.
+The client also needs `ps` supporting `-axo pgid=,stat=` (`procps` on Linux).
+A bounded startup check rejects missing or incompatible inspection before the
+workload launches.
+
+Keep the installed tools stable throughout the operation. Native transfer invokes
+the resolved installed `scp` path through a private dispatcher, preserving its
+installation context. Checks before and after transfer reject observed changes
+to its file identity, permissions or contents. They are finite observations,
+not atomic executable pinning; a change restored between checks can go undetected.
+The installed helper is also resolved and inspected before workload launch.
+Missing, non-executable, unreadable, set-id and Linux file-capability helpers
+are rejected at startup.
+
+Collection runs after exit 0 or normal nonzero exits below 128; signal-like
+codes skip collection. The Linux environment needs Bash, `find`, `tar`,
+`sha256sum`, temporary-file utilities and `timeout --kill-after`. One 30-second
+collection deadline starts at the observed workload exit and covers collection,
+native completion, download and validation. The deadline is subordinate to
+caller cancellation and is never reset for transfer. It is not a workload
+limit. Clean receipts, native completion and downloaded bytes are cumulative
+requirements; none alone establishes success or remote source attestation.
+
+The defaults remain 256 selected files and 10 MiB compressed. Required globs
+are all-or-nothing; protected `.git` and `.crabbox` paths and existing leaf-link
+semantics remain unchanged. Downloads use a precreated private regular file,
+a child-only hard file limit, exact size/hash/identity checks and archive
+validation without extraction. The size limit applies to compressed bytes,
+not expanded file contents. Failed transfers are withheld and preserve bounded
+private staging as evidence.
+Native command failures and observed helper drift retain up to 64 KiB each of
+stdout and stderr in exclusive private diagnostic files. The error reports their paths, byte counts
+and SHA-256 values; raw contents remain private and are not accepted artifacts.
+
+Native artifact commands use a standalone process group. The adapter refuses
+an inherited controller-owned group before workload execution rather than
+changing that controller's recovery scope. The command owner completes group
+cleanup before reaping its direct child, so a recycled process ID cannot retarget
+cleanup signals. A natural command exit with live group members fails even when
+cleanup succeeds. Cancellation stops the owned group,
+and the original claim remains held until its live members close. If cleanup
+grace expires, the command reports failure with cleanup pending and keeps
+joining inline; this never permits success after the collection deadline.
+Cleanup reuses the selected `ps` path with bounded observations. If inspection
+fails after launch, the owner reports cleanup pending and retains the claim
+until compatible observation is restored and the group has closed.
+If the original child reservation is contradicted, the same owner reports
+cleanup pending and retains the claim without further signals or reaping.
+Existing pipe-wait limits are unchanged. This is an owned-process-group
+contract: forced termination of the owner releases its file locks, and processes
+that deliberately escape the group are outside this guarantee.
+
+Finalized remote transfer archives are intentionally retained under their
+nonce-owned `.crabbox/blacksmith-artifact-<nonce>/` directory until the original
+ephemeral lease is cleaned up. Their locator and retention policy are recorded
+in the run output. Each finalized archive is bounded by the same 10 MiB cap;
+there is no detached cleanup holder or extra cleanup run. Do not place the
+transfer directory on a sticky disk. Canonical `crabbox stop` owns lease disposal.
+
+Local accepted archives use separate invocation directories:
+`.crabbox/runs/<lease>/<nonce>/blacksmith-artifacts.tgz`. Follow the returned
+artifact path; concurrent same-claim actions must not overwrite one another's
+evidence. Collection, validation, local publication or cleanup failures never
+replace an observed nonzero workload exit. After a successful workload they
+still fail the run. Command timing ends at the workload receipt; collection
+and cleanup count toward total. Proof rendering remains success-only.
+
+Local publication uses exclusive rename, retaining hard links only when the
+platform reports that the exclusive primitive is unsupported. The output
+filesystem must support at least one of these atomic operations. Existing
+targets and ordinary permission failures never permit an overwrite fallback.
+
+Reserved receipts are removed before console/proof/failure capture. Malformed
+or excessive collection diagnostics cancel the operation. `--keep`,
+`--keep-on-failure`, lease reuse and failure bundles retain their existing
+policy. An accepted artifact from a failed workload is not successful proof.
+
+#### Prepared artifact workspace
+
+Trusted CI may create `.git/crabbox-artifact-root` in the native sync checkout as
+a symlink to a separate, existing artifact workspace before marking the Testbox
+ready. This is CI-owned Git metadata, not a CLI flag, configuration key, or
+workload-provided artifact path. CI owns the binding and its target's lifecycle.
+
+For artifact runs, the outer supervisor enters that directory before starting
+the workload. The workload still starts in the original native sync directory,
+so a bootstrap can consume uploaded inputs before entering its execution
+checkout. Collection stays in the supervisor's captured directory even if the
+workload retargets the symlink, replaces the directory's pathname, changes
+working directory, or exits through `exec` or a trap. No files are copied back to
+the sync checkout, and the existing glob, protected-path, and symlink checks
+still apply within the captured artifact workspace.
+
+Without a binding, collection keeps its original-directory behavior. A present
+binding that is not a symlink to an accessible directory fails before the
+workload starts; it never falls back to collecting from the sync checkout.
+The metadata location keeps the binding outside source sync, but it is not an
+authentication or sandbox boundary against same-user workloads. Trusted CI must
+keep the binding valid across reused runs. Signal, timeout, cancellation, and
+transport-failure publication rules remain unchanged.
+
+Check support using `crabbox providers describe blacksmith-testbox --json`:
+`capabilities.features` includes `prepared-artifact-workspace`. This static fact
+reports CLI support, not that a particular Testbox binding is valid. Callers
+requiring the binding must fail closed if the feature is absent or introspection
+fails; `run-artifacts` alone does not promise prepared-workspace support.
 
 ## Desktop and VNC
 
@@ -237,7 +440,7 @@ Use repo YAML when:
 
 ## Related docs
 
-- [Providers](providers.md)
+- [Provider Reference](../providers/README.md)
 - [Actions hydration](actions-hydration.md)
 - [Interactive desktop and VNC](interactive-desktop-vnc.md)
 - [run command](../commands/run.md)

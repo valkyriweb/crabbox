@@ -22,6 +22,12 @@ type windowsWebVNCDaemonProcessIdentity struct {
 
 var errWindowsWebVNCDaemonTreeEmpty = errors.New("tracked supervisor process tree is no longer running")
 
+func configureWebVNCDaemonChildCancellation(*exec.Cmd) {}
+
+func stopWebVNCDaemonProcessTree(identity webVNCDaemonIdentity, _ string) error {
+	return terminateWebVNCDaemonProcessTree(identity.PID)
+}
+
 func terminateWebVNCDaemonProcessTree(pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("pid must be positive")
@@ -33,7 +39,7 @@ func terminateWebVNCDaemonProcessTree(pid int) error {
 		}
 		return fmt.Errorf("inventory WebVNC daemon tree %d: %w", pid, err)
 	}
-	rootKillErr := exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/T", "/F").Run()
+	rootKillErr := windowsTaskkillCommand(pid).Run()
 	// taskkill cannot address an already-exited root even though its orphaned
 	// descendants remain identifiable by their recorded parent PID. Target each
 	// exact-start survivor as a tree root before deciding cleanup succeeded.
@@ -67,7 +73,7 @@ func terminateWindowsWebVNCDaemonSurvivors(tree []windowsWebVNCDaemonProcessIden
 		if !windowsWebVNCDaemonIdentityStillMatches(identity) {
 			continue
 		}
-		if err := exec.Command("taskkill", "/PID", strconv.Itoa(identity.pid), "/T", "/F").Run(); err != nil && windowsWebVNCDaemonIdentityStillMatches(identity) {
+		if err := windowsTaskkillCommand(identity.pid).Run(); err != nil && windowsWebVNCDaemonIdentityStillMatches(identity) {
 			errors = append(errors, fmt.Sprintf("pid %d: %v", identity.pid, err))
 		}
 	}
@@ -99,7 +105,7 @@ func windowsWebVNCDaemonProcessTree(rootPID int) ([]windowsWebVNCDaemonProcessId
 	pids := windowsWebVNCDaemonTreePIDs(parentByPID, rootPID)
 	identities := make([]windowsWebVNCDaemonProcessIdentity, 0, len(pids))
 	for _, processID := range pids {
-		started, err := webVNCDaemonProcessStartIdentity(processID)
+		started, err := LocalProcessStartIdentity(processID)
 		if err != nil {
 			if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 				continue
@@ -147,7 +153,7 @@ func windowsWebVNCDaemonSurvivors(tree []windowsWebVNCDaemonProcessIdentity) []i
 }
 
 func windowsWebVNCDaemonIdentityStillMatches(identity windowsWebVNCDaemonProcessIdentity) bool {
-	started, err := webVNCDaemonProcessStartIdentity(identity.pid)
+	started, err := LocalProcessStartIdentity(identity.pid)
 	if err == nil {
 		return started == identity.started
 	}

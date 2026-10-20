@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type semaphoreBackend struct {
@@ -34,8 +36,7 @@ func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) (core.
 func (b *semaphoreBackend) Spec() core.ProviderSpec { return b.spec }
 
 func (b *semaphoreBackend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID string) error {
-	core.UseStoredTestboxKey(&target.SSH, leaseID)
-	return nil
+	return core.UseStoredTestboxKey(&target.SSH, leaseID)
 }
 
 // Acquire creates a Semaphore job and returns SSH connection info.
@@ -46,11 +47,14 @@ func (b *semaphoreBackend) Acquire(ctx context.Context, req core.AcquireRequest)
 		return core.LeaseTarget{}, core.Exit(2, "semaphore.project is required")
 	}
 
-	machine := withDefault(b.cfg.Semaphore.Machine, "f1-standard-2")
-	osImage := withDefault(b.cfg.Semaphore.OSImage, "ubuntu2204")
+	machine := core.Blank(b.cfg.Semaphore.Machine, core.SemaphoreConfigFlagFallbackMachine)
+	osImage := core.Blank(b.cfg.Semaphore.OSImage, core.SemaphoreConfigFlagFallbackOSImage)
 	timeout, err := idleTimeout(b.cfg)
 	if err != nil {
 		return core.LeaseTarget{}, core.Exit(2, "%v", err)
+	}
+	if err := core.PreflightLeaseSSHStorage(); err != nil {
+		return core.LeaseTarget{}, err
 	}
 
 	fmt.Fprintf(b.rt.Stderr, "provisioning provider=semaphore project=%s machine=%s os=%s\n", project, machine, osImage)
@@ -62,12 +66,18 @@ func (b *semaphoreBackend) Acquire(ctx context.Context, req core.AcquireRequest)
 	}
 
 	// Best-effort cleanup if anything fails after job creation
-	cleanup := func() {
+	cleanup := func() error {
 		fmt.Fprintf(b.rt.Stderr, "cleaning up job %s after failed acquisition\n", jobID)
-		_ = b.client.StopJob(context.Background(), jobID)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		return b.client.StopJob(cleanupCtx, jobID)
 	}
 
 	leaseID := "sem_" + jobID
+	if _, err := core.PrepareStoredTestboxKeyPath(leaseID); err != nil {
+		_ = cleanup()
+		return core.LeaseTarget{}, err
+	}
 	slug := core.NewLeaseSlug(leaseID)
 	fmt.Fprintf(b.rt.Stderr, "created job=%s lease=%s slug=%s\n", jobID, leaseID, slug)
 
@@ -78,20 +88,20 @@ func (b *semaphoreBackend) Acquire(ctx context.Context, req core.AcquireRequest)
 	})
 	fmt.Fprintln(b.rt.Stderr)
 	if err != nil {
-		cleanup()
+		_ = cleanup()
 		return core.LeaseTarget{}, err
 	}
 
 	// 3. Get SSH key and write to file (crabbox expects a file path)
 	sshKey, err := b.client.GetSSHKey(ctx, jobID)
 	if err != nil {
-		cleanup()
+		_ = cleanup()
 		return core.LeaseTarget{}, err
 	}
 
 	keyPath, err := storeSSHKey(leaseID, sshKey)
 	if err != nil {
-		cleanup()
+		_ = cleanup()
 		return core.LeaseTarget{}, fmt.Errorf("store SSH key: %w", err)
 	}
 
@@ -114,12 +124,27 @@ func (b *semaphoreBackend) Acquire(ctx context.Context, req core.AcquireRequest)
 			"slug":     slug,
 			"provider": providerName,
 			"project":  project,
+			"job_id":   jobID,
 			"machine":  machine,
 			"os_image": osImage,
 		},
 	}
 	server.ServerType.Name = machine
 	server.PublicNet.IPv4.IP = ip
+
+	var claimErr error
+	if req.Repo.Root == "" {
+		claimErr = core.ClaimLeaseTargetForConfig(leaseID, slug, b.cfg, server, target, b.cfg.IdleTimeout)
+	} else {
+		claimErr = core.ClaimLeaseTargetForRepoConfig(leaseID, slug, b.cfg, server, target, req.Repo.Root, b.cfg.IdleTimeout, req.Reclaim)
+	}
+	if claimErr != nil {
+		if rollbackErr := cleanup(); rollbackErr != nil {
+			return core.LeaseTarget{}, fmt.Errorf("persist exact semaphore job ownership claim: %w; rollback failed for active job %s; SSH key retained at %s: %v", claimErr, jobID, keyPath, rollbackErr)
+		}
+		core.RemoveStoredTestboxKey(leaseID)
+		return core.LeaseTarget{}, fmt.Errorf("persist exact semaphore job ownership claim: %w", claimErr)
+	}
 
 	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 }
@@ -175,7 +200,7 @@ func (b *semaphoreBackend) resolveByJobID(ctx context.Context, jobID string, rel
 			"provider": providerName,
 		},
 	}
-	server.ServerType.Name = withDefault(b.cfg.Semaphore.Machine, "f1-standard-2")
+	server.ServerType.Name = core.Blank(b.cfg.Semaphore.Machine, core.SemaphoreConfigFlagFallbackMachine)
 	if host != "" {
 		server.PublicNet.IPv4.IP = host
 	}
@@ -185,6 +210,9 @@ func (b *semaphoreBackend) resolveByJobID(ctx context.Context, jobID string, rel
 	}
 	if !endpointReady {
 		return core.LeaseTarget{}, core.Exit(4, "semaphore job %s is running but SSH endpoint is not ready (ip=%q ssh_port=%d)", jobID, status.IP, status.SSHPort)
+	}
+	if _, err := core.PrepareStoredTestboxKeyPath(leaseID); err != nil {
+		return core.LeaseTarget{}, err
 	}
 
 	sshKey, err := b.client.GetSSHKey(ctx, jobID)
@@ -251,12 +279,80 @@ func (b *semaphoreBackend) Doctor(ctx context.Context, _ core.DoctorRequest) (co
 
 // ReleaseLease stops the Semaphore job.
 func (b *semaphoreBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
-	jobID := stripLeasePrefix(req.Lease.LeaseID)
-	if err := b.client.StopJob(ctx, jobID); err != nil {
+	leaseID := strings.TrimSpace(req.Lease.LeaseID)
+	jobID := stripLeasePrefix(leaseID)
+	if cloudID := strings.TrimSpace(req.Lease.Server.CloudID); cloudID != "" && cloudID != jobID {
+		return core.Exit(2, "semaphore lease %s does not own job %s", leaseID, cloudID)
+	}
+	scope := Provider{}.ClaimScope(b.cfg)
+	if scope == "" {
+		return core.Exit(2, "semaphore release requires an exact host and project scope")
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
 		return err
 	}
-	core.RemoveLeaseClaim(req.Lease.LeaseID)
-	core.RemoveStoredTestboxKey(req.Lease.LeaseID)
+	if !exists {
+		return core.Exit(2, "semaphore lease=%s has no exact local ownership claim for job=%s", leaseID, jobID)
+	}
+	binding := shared.ClaimBinding{
+		Provider: providerName, ProviderScope: scope, ExactProviderScope: true,
+		LeaseID: leaseID, Slug: claim.Slug, CloudID: jobID,
+		RequiredLabels: map[string]string{"project": b.cfg.Semaphore.Project, "job_id": jobID},
+	}
+	verifyLiveJob := func() (jobStatus, error) {
+		live, liveErr := b.client.GetJobStatus(ctx, jobID)
+		if liveErr != nil {
+			return jobStatus{}, fmt.Errorf("verify live semaphore job %s ownership: %w", jobID, liveErr)
+		}
+		if !isCrabboxJobName(live.Name) || live.State != "RUNNING" && live.State != "FINISHED" {
+			return jobStatus{}, core.Exit(2, "semaphore job %s ownership or running state changed before stop", jobID)
+		}
+		return live, nil
+	}
+	if claim.ProviderScope == "" {
+		if claim.Provider != providerName || claim.LeaseID != leaseID || claim.Slug == "" || (claim.CloudID != "" && claim.CloudID != jobID) {
+			return core.Exit(2, "semaphore lease=%s has a stale legacy ownership claim for job=%s", leaseID, jobID)
+		}
+		if claim.Labels["project"] != b.cfg.Semaphore.Project {
+			return core.Exit(2, "semaphore lease=%s legacy claim belongs to another project", leaseID)
+		}
+		if _, err := verifyLiveJob(); err != nil {
+			return err
+		}
+		replacement := claim
+		replacement.ProviderScope = scope
+		replacement.CloudID = jobID
+		replacement.Labels = make(map[string]string, len(claim.Labels)+5)
+		for key, value := range claim.Labels {
+			replacement.Labels[key] = value
+		}
+		replacement.Labels["provider"] = providerName
+		replacement.Labels["lease"] = leaseID
+		replacement.Labels["slug"] = claim.Slug
+		replacement.Labels["project"] = b.cfg.Semaphore.Project
+		replacement.Labels["job_id"] = jobID
+		claim, err = core.ReplaceLeaseClaimIfUnchangedDurableReturning(leaseID, claim, replacement)
+		if err != nil {
+			return err
+		}
+	}
+	if err := shared.ValidateClaimBinding(claim, binding); err != nil {
+		return core.Exit(2, "semaphore lease=%s has a missing or stale exact local ownership claim for job=%s: %v", leaseID, jobID, err)
+	}
+	if err := shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
+		live, err := verifyLiveJob()
+		if err != nil {
+			return err
+		}
+		if live.State == "FINISHED" {
+			return nil
+		}
+		return b.client.StopJob(ctx, jobID)
+	}); err != nil {
+		return err
+	}
+	core.RemoveStoredTestboxKey(leaseID)
 	return nil
 }
 
@@ -266,14 +362,14 @@ func (b *semaphoreBackend) Touch(ctx context.Context, req core.TouchRequest) (co
 }
 
 func storeSSHKey(leaseID, keyContent string) (string, error) {
-	path, err := core.TestboxKeyPath(leaseID)
+	path, err := core.PrepareStoredTestboxKeyPath(leaseID)
 	if err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, []byte(keyContent), 0600); err != nil {
+	if err := core.WritePreparedLeaseSSHKeyFile(path, []byte(keyContent)); err != nil {
 		return "", err
 	}
 	return path, nil

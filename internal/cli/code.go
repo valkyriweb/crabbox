@@ -53,7 +53,7 @@ const (
 func (a App) webCode(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("code", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, "provider: hetzner, aws, or azure")
+	provider := registerProviderSelectionFlag(fs, defaults, "provider: hetzner, aws, or azure")
 	id := fs.String("id", "", "lease id or slug")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
 	localPort := fs.String("local-port", "", "local code-server tunnel port")
@@ -67,7 +67,7 @@ func (a App) webCode(ctx context.Context, args []string) error {
 		*id = fs.Arg(0)
 	}
 	if *id == "" {
-		return exit(2, "usage: crabbox code --id <lease-id-or-slug>")
+		return Exit(2, "usage: crabbox code --id <lease-id-or-slug>")
 	}
 	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
 	if err != nil {
@@ -78,14 +78,14 @@ func (a App) webCode(ctx context.Context, args []string) error {
 		return err
 	}
 	if isBlacksmithProvider(cfg.Provider) || isStaticProvider(cfg.Provider) {
-		return exit(2, "code currently supports coordinator-backed hetzner/aws Linux leases")
+		return Exit(2, "code currently supports coordinator-backed hetzner/aws Linux leases")
 	}
 	coord, useCoordinator, err := newTargetCoordinatorClient(cfg)
 	if err != nil {
 		return err
 	}
 	if !useCoordinator || !coord.hasConfiguredAuth() {
-		return exit(2, "code requires a configured coordinator login; run crabbox login --url <broker-url> first")
+		return Exit(2, "code requires a configured coordinator login; run crabbox login --url <broker-url> first")
 	}
 	server, target, leaseID, err := a.resolveNetworkLeaseTargetForRepoWithConfig(ctx, &cfg, *id, true, *reclaim)
 	if err != nil {
@@ -98,11 +98,14 @@ func (a App) webCode(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := a.claimResolvedLeaseTargetForRepoAndRegister(ctx, leaseID, serverSlug(server), cfg, server, target, repo.Root, *reclaim); err != nil {
+	if err := a.claimResolvedLeaseTargetForRepoAndRegister(ctx, leaseID, ServerSlug(server), cfg, &server, target, repo.Root, *reclaim); err != nil {
 		return err
 	}
 	a.touchLeaseTargetBestEffort(ctx, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, "")
-	workspace, folder, hydratedByActions := codeWorkspace(ctx, target, cfg, leaseID, repo)
+	workspace, folder, hydratedByActions, err := codeWorkspace(ctx, target, cfg, leaseID, repo)
+	if err != nil {
+		return err
+	}
 	if hydratedByActions {
 		fmt.Fprintf(a.Stderr, "using GitHub Actions workspace %s\n", workspace)
 	}
@@ -131,7 +134,7 @@ func (a App) webCode(ctx context.Context, args []string) error {
 		fmt.Fprintln(a.Stdout, "bridge: connected; keep this process running while using Code")
 		fmt.Fprintf(a.Stdout, "code: %s\n", portal)
 		if *openPortal && !opened {
-			if err := openLocalURL(portal); err != nil {
+			if err := openLocalURLWithEnvironment(portal, target.ChildEnvDenylist...); err != nil {
 				bridge.Close(websocket.StatusNormalClosure, "bridge stopped")
 				return err
 			}
@@ -146,13 +149,15 @@ func (a App) webCode(ctx context.Context, args []string) error {
 			return err
 		}
 		fmt.Fprintln(a.Stdout, "bridge: disconnected; reconnecting")
-		time.Sleep(300 * time.Millisecond)
+		if err := sleepContext(ctx, 300*time.Millisecond); err != nil {
+			return context.Cause(ctx)
+		}
 	}
 }
 
 func ensureRemoteCodeServer(ctx context.Context, target SSHTarget, workdir string) error {
 	if err := runSSHQuiet(ctx, target, startCodeServerCommand(workdir)); err != nil {
-		return exit(5, "start code-server: %v", err)
+		return Exit(5, "start code-server: %v", err)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
@@ -162,19 +167,25 @@ func ensureRemoteCodeServer(ctx context.Context, target SSHTarget, workdir strin
 		if err := runSSHQuiet(ctx, target, codeServerReadyCommand()); err == nil {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		if err := sleepContext(ctx, 500*time.Millisecond); err != nil {
+			return context.Cause(ctx)
+		}
 	}
-	return exit(5, "timed out waiting for code-server on 127.0.0.1:%s", managedCodePort)
+	return Exit(5, "timed out waiting for code-server on 127.0.0.1:%s", managedCodePort)
 }
 
-func codeWorkspace(ctx context.Context, target SSHTarget, cfg Config, leaseID string, repo Repo) (string, string, bool) {
+func codeWorkspace(ctx context.Context, target SSHTarget, cfg Config, leaseID string, repo Repo) (string, string, bool, error) {
 	workspace := remoteJoin(cfg, leaseID, repo.Name)
 	hydrated := false
-	if state, err := readActionsHydrationState(ctx, target, leaseID); err == nil && state.Workspace != "" {
+	state, err := readActionsWorkspace(ctx, target, leaseID, cfg, repo)
+	if err != nil {
+		return "", "", false, err
+	}
+	if state.Workspace != "" {
 		workspace = state.Workspace
 		hydrated = true
 	}
-	return workspace, mappedRemoteCodeFolder(workspace, repo), hydrated
+	return workspace, mappedRemoteCodeFolder(workspace, repo), hydrated, nil
 }
 
 func mappedRemoteCodeFolder(workspace string, repo Repo) string {
@@ -224,6 +235,7 @@ type codeBridge struct {
 	upstream       map[string]*websocket.Conn
 	pending        map[string][]codeProxyMessage
 	incomingFrames map[string]codePendingWebSocketFrame
+	closed         bool
 	chunkSeq       atomic.Uint64
 }
 
@@ -307,6 +319,7 @@ func (b *codeBridge) Close(code websocket.StatusCode, reason string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.closed = true
 	for id, conn := range b.upstream {
 		_ = conn.Close(websocket.StatusNormalClosure, "bridge stopped")
 		delete(b.upstream, id)
@@ -415,6 +428,14 @@ func (b *codeBridge) openUpstreamWebSocket(ctx context.Context, msg codeProxyMes
 	}
 	conn.SetReadLimit(maxCodeBridgeReadBytes)
 	b.mu.Lock()
+	if b.closed {
+		// Close ran while we were dialing: registering now would leak this conn
+		// and its reader goroutine, since Close has already swept b.upstream and
+		// will not run again. Drop it instead.
+		b.mu.Unlock()
+		_ = conn.Close(websocket.StatusGoingAway, "bridge closed")
+		return
+	}
 	b.upstream[msg.ID] = conn
 	pending := append([]codeProxyMessage(nil), b.pending[msg.ID]...)
 	delete(b.pending, msg.ID)
@@ -772,8 +793,9 @@ func webCodeAgentURL(base, leaseID string) string {
 func webCodePortalURL(base, leaseID string, folder ...string) string {
 	u, err := url.Parse(base)
 	if err != nil {
-		return base
+		return redactedConfigURL(base)
 	}
+	u.User = nil
 	u.Path = strings.TrimRight(u.Path, "/") + "/portal/leases/" + url.PathEscape(leaseID) + "/code/"
 	values := url.Values{}
 	if len(folder) > 0 && folder[0] != "" {

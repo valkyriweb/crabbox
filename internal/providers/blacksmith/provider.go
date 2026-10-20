@@ -2,6 +2,7 @@ package blacksmith
 
 import (
 	"flag"
+	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -10,20 +11,30 @@ func init() {
 	core.RegisterProvider(Provider{})
 }
 
+// GitHub cancels any workflow run after 35 days, so a Testbox claim unused for
+// longer has necessarily settled and no stop retry can still need it.
+const blacksmithClaimExpiryBound = 36 * 24 * time.Hour
+
 type Provider struct{}
 
-func (Provider) Name() string { return "blacksmith-testbox" }
-func (Provider) Aliases() []string {
-	return []string{"blacksmith"}
+var _ core.RunOptionsValidator = Provider{}
+
+func (p Provider) ValidateRunOptions(req core.RunRequest) error {
+	return validateBlacksmithRunOptions(p.Spec(), req)
 }
+
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        "blacksmith-testbox",
-		Family:      "blacksmith",
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureCacheVolume, core.FeatureRunProof, core.FeatureRunSession, core.FeatureRunArtifacts},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"blacksmith"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationCLI),
+		Name:             "blacksmith-testbox",
+		Family:           "blacksmith",
+		Kind:             core.ProviderKindDelegatedRun,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureCacheVolume, core.FeatureRunProof, core.FeatureRunSession, core.FeatureRunArtifacts, core.FeaturePreparedArtifactWorkspace},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+		ClaimExpiryBound: blacksmithClaimExpiryBound,
 	}
 }
 func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
@@ -34,16 +45,4 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 }
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewBlacksmithBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "blacksmith-testbox doctor backend unavailable")
-	}
-	return doctor, nil
 }

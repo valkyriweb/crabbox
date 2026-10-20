@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -25,6 +28,41 @@ func TestWebCodeURLs(t *testing.T) {
 	}
 	if got := webCodePortalURL("https://broker.example.com/", "cbx_abcdef123456", "/work/cbx/repo/worker"); got != "https://broker.example.com/portal/leases/cbx_abcdef123456/code/?folder=%2Fwork%2Fcbx%2Frepo%2Fworker" {
 		t.Fatalf("portal URL with folder=%q", got)
+	}
+}
+
+func TestWebCodePortalURLRemovesCoordinatorCredentials(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		user *url.Userinfo
+	}{
+		{name: "username and password", user: url.UserPassword("fixture-user", "fixture-password")},
+		{name: "username only", user: url.User("fixture-user")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := &url.URL{
+				Scheme:   "https",
+				User:     test.user,
+				Host:     "broker.example.test",
+				Path:     "/team",
+				RawQuery: "token=fixture-query-value",
+				Fragment: "fixture-fragment-value",
+			}
+			portal := webCodePortalURL(coordinator.String(), "cbx_abcdef123456", "/work/cbx/repo/worker")
+			want := "https://broker.example.test/team/portal/leases/cbx_abcdef123456/code/?folder=%2Fwork%2Fcbx%2Frepo%2Fworker"
+			if portal != want {
+				t.Fatalf("portal URL=%q, want %q", portal, want)
+			}
+			_, openerArgs := openURLCommand(portal)
+			for _, forbidden := range []string{"fixture-user", "fixture-password", "fixture-query-value", "fixture-fragment-value"} {
+				if strings.Contains(portal, forbidden) || strings.Contains(strings.Join(openerArgs, " "), forbidden) {
+					t.Fatalf("presentation URL or opener arguments exposed %q: url=%q argv=%#v", forbidden, portal, openerArgs)
+				}
+			}
+			if agent := webCodeAgentURL(coordinator.String(), "cbx_abcdef123456"); !strings.Contains(agent, "fixture-user@") && !strings.Contains(agent, "fixture-user:fixture-password@") {
+				t.Fatalf("authenticated agent transport lost coordinator userinfo: %s", agent)
+			}
+		})
 	}
 }
 
@@ -229,6 +267,88 @@ func TestStartCodeServerCommand(t *testing.T) {
 	}
 	if strings.Contains(got, "pkill -f") {
 		t.Fatalf("startCodeServerCommand should not use pkill -f:\n%s", got)
+	}
+}
+
+func TestEnsureRemoteCodeServerHonorsCancellationDuringBackoff(t *testing.T) {
+	for _, cause := range []error{context.Canceled, errors.New("caller stopped code readiness")} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			testEnsureRemoteCodeServerCancellation(t, cause)
+		})
+	}
+}
+
+func testEnsureRemoteCodeServerCancellation(t *testing.T, cause error) {
+	t.Helper()
+	// Hold the health probe until cancellation so the old unconditional sleep
+	// cannot be nearly over before the test observes the probe marker.
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ssh fixture")
+	}
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	probesPath := filepath.Join(dir, "probes")
+	script := `#!/bin/sh
+cmd=""
+for arg do cmd="$arg"; done
+case "$cmd" in
+  *healthz*)
+    printf 'probe\n' >> "$CRABBOX_FAKE_SSH_PROBES"
+    exec /bin/sleep 30
+    ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CRABBOX_FAKE_SSH_PROBES", probesPath)
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		errCh <- ensureRemoteCodeServer(ctx, SSHTarget{
+			User: "crabbox",
+			Host: "203.0.113.10",
+			Port: "22",
+		}, "/work/cbx/repo")
+	}()
+	t.Cleanup(func() {
+		cancel(cause)
+		<-done
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		// Redirection creates the file before printf commits the probe marker.
+		if probes, err := os.ReadFile(probesPath); err == nil && string(probes) == "probe\n" {
+			break
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("ensureRemoteCodeServer returned before backoff: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ensureRemoteCodeServer did not probe before backoff")
+		}
+	}
+	cancel(cause)
+
+	// Ready-poll sleep is 500ms. A 3s bound would pass even on bare Sleep.
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, cause) {
+			t.Fatalf("ensureRemoteCodeServer returned %v, want %v", err, cause)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ensureRemoteCodeServer did not return within 200ms after cancel; still blocked on bare sleep")
+	}
+	if probes, err := os.ReadFile(probesPath); err != nil || string(probes) != "probe\n" {
+		t.Fatalf("unexpected probes after cancellation: %q, err=%v", probes, err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"path"
 	"reflect"
 	"regexp"
@@ -18,8 +19,10 @@ var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 func (a App) list(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("list", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpAll())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	jsonOut := fs.Bool("json", false, "print JSON")
+	jsonlOut := fs.Bool("jsonl", false, "stream one JSON object per line")
+	retained := fs.Bool("retained", false, "include kept terminal coordinator leases (ignored by direct providers)")
 	all := fs.Bool("all", false, "include provider inventory outside Crabbox-owned leases where supported")
 	refresh := fs.Bool("refresh", false, "refresh provider-backed state where supported")
 	pondFilter := fs.String("pond", "", "only list leases tagged with this pond")
@@ -28,17 +31,17 @@ func (a App) list(ctx context.Context, args []string) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	cfg, err := loadConfig()
+	if *jsonOut && *jsonlOut {
+		return Exit(2, "--json and --jsonl are mutually exclusive")
+	}
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
 	if err := prepareProviderSelection(&cfg, *provider); err != nil {
 		return err
 	}
-	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
-		return err
-	}
-	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
+	if err := applyTargetAndProviderFlags(&cfg, fs, targetFlags, providerFlags); err != nil {
 		return err
 	}
 	if err := finalizeProviderSelection(&cfg); err != nil {
@@ -52,9 +55,18 @@ func (a App) list(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if *jsonOut {
+	req := ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh, Retained: *retained}
+	if streaming, ok := backend.(StreamingListBackend); ok {
+		return a.renderStreamingList(ctx, cfg, backend, streaming, req, pondName, *jsonOut, *jsonlOut)
+	}
+	if !*jsonOut && !*jsonlOut {
+		if err := renderListHeader(a.Stdout); err != nil {
+			return err
+		}
+	}
+	if *jsonOut || *jsonlOut {
 		if jsonBackend, ok := backend.(JSONListBackend); ok {
-			view, err := jsonBackend.ListJSON(ctx, ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh})
+			view, err := jsonBackend.ListJSON(ctx, req)
 			if err != nil {
 				return err
 			}
@@ -62,17 +74,17 @@ func (a App) list(ctx context.Context, args []string) error {
 			if pondName != "" {
 				view = filterJSONListViewByPond(view, pondName)
 			}
-			return json.NewEncoder(a.Stdout).Encode(view)
+			return writeListJSON(a.Stdout, view, *jsonlOut)
 		}
 	}
 	var servers []Server
 	switch b := backend.(type) {
 	case SSHLeaseBackend:
-		servers, err = b.List(ctx, ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh})
+		servers, err = b.List(ctx, req)
 	case DelegatedRunBackend:
-		servers, err = b.List(ctx, ListRequest{Options: leaseOptionsFromConfig(cfg), All: *all, Refresh: *refresh})
+		servers, err = b.List(ctx, req)
 	default:
-		return exit(2, "provider=%s does not support list", backend.Spec().Name)
+		return Exit(2, "provider=%s does not support list", backend.Spec().Name)
 	}
 	if err != nil {
 		return err
@@ -81,11 +93,10 @@ func (a App) list(ctx context.Context, args []string) error {
 	if pondName != "" {
 		servers = filterServersByPond(servers, pondName)
 	}
-	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(servers)
+	if *jsonOut || *jsonlOut {
+		return writeListJSON(a.Stdout, servers, *jsonlOut)
 	}
-	renderServerList(a.Stdout, servers)
-	return nil
+	return renderServerList(a.Stdout, servers)
 }
 
 // filterJSONListViewByPond filters a list-view payload (whatever shape the
@@ -100,7 +111,7 @@ func (a App) list(ctx context.Context, args []string) error {
 // (int → float64). Typed entries are kept in their original form so downstream
 // JSON encoding preserves field order, struct tags, and number precision.
 func filterJSONListViewByPond(view any, pond string) any {
-	pond = normalizePondName(pond)
+	pond = NormalizePondName(pond)
 	if pond == "" {
 		return view
 	}
@@ -124,7 +135,7 @@ func filterJSONListViewByPond(view any, pond string) any {
 		if labels == nil {
 			continue
 		}
-		if normalizePondName(labels[pondLabelKey]) == pond {
+		if NormalizePondName(labels[pondLabelKey]) == pond {
 			kept = append(kept, entry)
 		}
 	}
@@ -240,7 +251,7 @@ func filterTypedSliceByPond(view any, pond string) any {
 		labels := extractLabelMap(elem.Interface())
 		if labels != nil {
 			hasLabels = true
-			if normalizePondName(labels[pondLabelKey]) == pond {
+			if NormalizePondName(labels[pondLabelKey]) == pond {
 				kept = reflect.Append(kept, elem)
 			}
 		}
@@ -259,32 +270,63 @@ func emptyListViewLike(view any) any {
 	return reflect.MakeSlice(v.Type(), 0, 0).Interface()
 }
 
+const externalRunnerSyncTimeout = 5 * time.Second
+
 func (a App) syncExternalRunnersBestEffort(ctx context.Context, cfg Config, backend Backend) {
+	ctx, cancel := context.WithTimeout(ctx, externalRunnerSyncTimeout)
+	defer cancel()
+	if err := syncExternalRunners(ctx, cfg, backend); err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		message := strings.Join(strings.Fields(err.Error()), " ")
+		if len(message) > 240 {
+			message = message[:240] + "..."
+		}
+		fmt.Fprintf(a.Stderr, "warning: external runner portal sync failed: %s\n", message)
+	}
+}
+
+func syncExternalRunners(ctx context.Context, cfg Config, backend Backend) error {
 	if !isBlacksmithProvider(cfg.Provider) {
-		return
+		return nil
 	}
 	client, ok, err := newCoordinatorClient(cfg)
 	if err != nil || !ok {
-		return
+		return err
 	}
 	jsonBackend, ok := backend.(JSONListBackend)
 	if !ok {
-		return
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	view, err := jsonBackend.ListJSON(ctx, ListRequest{Options: leaseOptionsFromConfig(cfg), All: true})
 	if err != nil {
-		fmt.Fprintf(a.Stderr, "warning: external runner portal sync skipped: %v\n", err)
-		return
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	runners, err := coordinatorExternalRunnersFromListView(view)
 	if err != nil {
-		fmt.Fprintf(a.Stderr, "warning: external runner portal sync skipped: %v\n", err)
-		return
+		return err
 	}
 	enrichExternalRunnerActionsBestEffort(ctx, cfg, runners)
-	if _, err := client.SyncExternalRunners(ctx, "blacksmith-testbox", runners); err != nil {
-		fmt.Fprintf(a.Stderr, "warning: external runner portal sync failed: %v\n", err)
+	// A sync marks unseen rows stale. Never publish an inventory after its
+	// budget expired, even if a dependency returned partial data without error.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	// Org scope lets the coordinator stale other owners' rows, so claim it only when the
+	// listing used an explicit Blacksmith org instead of the CLI login's default org.
+	scope := ""
+	if strings.TrimSpace(cfg.Blacksmith.Org) != "" {
+		scope = "org"
+	}
+	_, err = client.SyncExternalRunners(ctx, "blacksmith-testbox", runners, scope)
+	return err
 }
 
 func coordinatorExternalRunnersFromListView(view any) ([]CoordinatorExternalRunner, error) {
@@ -321,6 +363,9 @@ type externalRunnerActionsRun struct {
 func enrichExternalRunnerActionsBestEffort(ctx context.Context, cfg Config, runners []CoordinatorExternalRunner) {
 	cache := map[string][]externalRunnerActionsRun{}
 	for i := range runners {
+		if ctx.Err() != nil {
+			return
+		}
 		repo, ok := externalRunnerGitHubRepo(cfg, runners[i])
 		if !ok || runners[i].Workflow == "" {
 			continue
@@ -329,7 +374,7 @@ func enrichExternalRunnerActionsBestEffort(ctx context.Context, cfg Config, runn
 		runs, seen := cache[key]
 		if !seen {
 			var err error
-			runs, err = externalRunnerGitHubRuns(ctx, repo, runners[i].Workflow, runners[i].Ref)
+			runs, err = externalRunnerGitHubRuns(ctx, cfg, repo, runners[i].Workflow, runners[i].Ref)
 			if err != nil {
 				cache[key] = nil
 				continue
@@ -374,7 +419,7 @@ func externalRunnerGitHubRepo(cfg Config, runner CoordinatorExternalRunner) (Git
 	return repo, err == nil
 }
 
-func externalRunnerGitHubRuns(ctx context.Context, repo GitHubRepo, workflow, ref string) ([]externalRunnerActionsRun, error) {
+func externalRunnerGitHubRuns(ctx context.Context, cfg Config, repo GitHubRepo, workflow, ref string) ([]externalRunnerActionsRun, error) {
 	args := []string{
 		"run", "list",
 		"--repo", repo.Slug(),
@@ -385,12 +430,16 @@ func externalRunnerGitHubRuns(ctx context.Context, repo GitHubRepo, workflow, re
 	if ref != "" {
 		args = append(args, "--branch", ref)
 	}
-	out, err := ghOutput(ctx, "", args...)
+	result, err := (execCommandRunner{}).Run(ctx, LocalCommandRequest{
+		Name: "gh", Args: args,
+		Env:                    childEnvironmentWithout(os.Environ(), externalDesktopChildEnvDenylist(cfg, cfg.TargetOS)...),
+		MaxCapturedOutputBytes: 16 * 1024 * 1024,
+	})
 	if err != nil {
 		return nil, err
 	}
 	var runs []externalRunnerActionsRun
-	if err := json.Unmarshal([]byte(stripANSI(out)), &runs); err != nil {
+	if err := json.Unmarshal([]byte(stripANSI(result.Stdout)), &runs); err != nil {
 		return nil, err
 	}
 	return runs, nil
@@ -495,24 +544,21 @@ func coordinatorMachineOrphanField(labels map[string]string, activeLeaseIDs map[
 func (a App) cleanup(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("machine cleanup", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpCleanup())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpCleanup())
 	dryRun := fs.Bool("dry-run", false, "only print")
 	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	cfg, err := loadConfig()
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
 	if err := prepareProviderSelection(&cfg, *provider); err != nil {
 		return err
 	}
-	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
-		return err
-	}
-	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
+	if err := applyTargetAndProviderFlags(&cfg, fs, targetFlags, providerFlags); err != nil {
 		return err
 	}
 	if err := finalizeProviderSelection(&cfg); err != nil {
@@ -523,28 +569,25 @@ func (a App) cleanup(ctx context.Context, args []string) error {
 		return err
 	}
 	if backendCoordinator(backend) != nil {
-		return exit(2, "machine cleanup is disabled when a coordinator is configured; coordinator TTL alarms own brokered cleanup")
+		return Exit(2, "machine cleanup is disabled when a coordinator is configured; coordinator TTL alarms own brokered cleanup")
 	}
 	cleaner, ok := backend.(CleanupBackend)
 	if !ok {
-		return exit(2, "machine cleanup is not supported for provider=%s", cfg.Provider)
+		return Exit(2, "machine cleanup is not supported for provider=%s", cfg.Provider)
 	}
 	return cleaner.Cleanup(ctx, CleanupRequest{Options: leaseOptionsFromConfig(cfg), DryRun: *dryRun})
 }
 
 func shouldCleanupServer(server Server, now time.Time) (bool, string) {
 	labels := server.Labels
-	if labels == nil {
+	if labels == nil || labels["crabbox"] != "true" {
 		return false, "missing labels"
-	}
-	if strings.EqualFold(labels["keep"], "true") {
-		return false, "keep=true"
 	}
 	state := strings.ToLower(labels["state"])
 	switch state {
 	case "running", "provisioning":
 		expiresAt, ok := cleanupExpiry(labels)
-		if ok && now.After(expiresAt.Add(12*time.Hour)) {
+		if ok && now.After(expiresAt.Add(time.Hour)) {
 			return true, "stale state=" + state
 		}
 		return false, "state=" + state
@@ -562,7 +605,7 @@ func shouldCleanupServer(server Server, now time.Time) (bool, string) {
 	if !ok {
 		return false, "missing expires_at"
 	}
-	if now.Before(expiresAt) {
+	if !now.After(expiresAt) {
 		return false, "not expired"
 	}
 	return true, "expired"
@@ -578,7 +621,7 @@ func cleanupExpiry(labels map[string]string) (time.Time, bool) {
 		if value == "" {
 			continue
 		}
-		if parsed, ok := parseLeaseLabelTime(value); ok {
+		if parsed, ok := parseLeaseLabelTime(value); ok && guestExpiryTimeValid(parsed) {
 			return parsed, true
 		}
 	}

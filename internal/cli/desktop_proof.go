@@ -95,13 +95,13 @@ func markDesktopPublishExplicitFlags(fs *flag.FlagSet, flags *desktopPublishFlag
 
 func validateContactSheetFlags(command string, flags contactSheetFlagValues) error {
 	if flags.Frames != nil && *flags.Frames <= 0 {
-		return exit(2, "%s --contact-sheet-frames must be positive", command)
+		return Exit(2, "%s --contact-sheet-frames must be positive", command)
 	}
 	if flags.Cols != nil && *flags.Cols <= 0 {
-		return exit(2, "%s --contact-sheet-cols must be positive", command)
+		return Exit(2, "%s --contact-sheet-cols must be positive", command)
 	}
 	if flags.Width != nil && *flags.Width <= 0 {
-		return exit(2, "%s --contact-sheet-width must be positive", command)
+		return Exit(2, "%s --contact-sheet-width must be positive", command)
 	}
 	return nil
 }
@@ -113,7 +113,7 @@ func contactSheetEnabled(flags contactSheetFlagValues) bool {
 	return flags.Enabled == nil || *flags.Enabled
 }
 
-func writeContactSheetForVideo(ctx context.Context, videoPath string, flags contactSheetFlagValues) (string, error) {
+func writeContactSheetForVideo(ctx context.Context, videoPath string, flags contactSheetFlagValues, childEnvDenylist []string) (string, error) {
 	if !contactSheetEnabled(flags) {
 		return "", nil
 	}
@@ -125,11 +125,12 @@ func writeContactSheetForVideo(ctx context.Context, videoPath string, flags cont
 		output = contactSheetPathForVideo(videoPath)
 	}
 	_, err := createMediaContactSheet(ctx, mediaContactSheetOptions{
-		Input:  videoPath,
-		Output: output,
-		Frames: valueOrDefault(flags.Frames, 5),
-		Cols:   valueOrDefault(flags.Cols, 5),
-		Width:  valueOrDefault(flags.Width, 320),
+		Input:            videoPath,
+		Output:           output,
+		ChildEnvDenylist: childEnvDenylist,
+		Frames:           valueOrDefault(flags.Frames, 5),
+		Cols:             valueOrDefault(flags.Cols, 5),
+		Width:            valueOrDefault(flags.Width, 320),
 	})
 	if err != nil {
 		return "", err
@@ -160,7 +161,7 @@ func publishOptionsFromDesktopFlags(dir string, flags desktopPublishFlagValues) 
 		publishDir = strings.TrimSpace(*flags.Dir)
 	}
 	if publishDir == "" || publishDir == "." {
-		return artifactPublishOptions{}, false, exit(2, "desktop publish requires --publish-dir or a --record path inside an artifact directory")
+		return artifactPublishOptions{}, false, Exit(2, "desktop publish requires --publish-dir or a --record path inside an artifact directory")
 	}
 	publishArgs := []string{
 		"--dir", publishDir,
@@ -222,14 +223,14 @@ func writeDesktopRecorderDiagnostics(ctx context.Context, target SSHTarget, outp
 		fmt.Fprintf(&b, "- diagnostics-error: %v\n", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil && filepath.Dir(outputPath) != "." {
-		return exit(2, "create diagnostics directory: %v", err)
+		return Exit(2, "create diagnostics directory: %v", err)
 	}
 	return os.WriteFile(outputPath, []byte(b.String()), 0o644)
 }
 
 func desktopRecorderDiagnosticsRemoteCommand(target SSHTarget) string {
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`Write-Output "- target-os: windows"
+		return PowershellCommand(`Write-Output "- target-os: windows"
 foreach ($name in "schtasks.exe","powershell.exe") {
   $cmd = Get-Command $name -ErrorAction SilentlyContinue
   if ($cmd) { Write-Output "- $name: $($cmd.Source)" } else { Write-Output "- ${name}: missing" }
@@ -259,7 +260,7 @@ if command -v ss >/dev/null 2>&1 && ss -ltn | grep -q '127.0.0.1:5900'; then ech
 
 func writeProofMetadata(path string, metadata desktopProofMetadata) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
-		return exit(2, "create proof metadata directory: %v", err)
+		return Exit(2, "create proof metadata directory: %v", err)
 	}
 	return writeJSONFile(path, metadata)
 }

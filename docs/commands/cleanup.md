@@ -10,6 +10,7 @@ crabbox cleanup
 crabbox cleanup --provider namespace-devbox --dry-run
 crabbox cleanup --provider namespace-devbox
 crabbox cleanup --provider hostinger --dry-run
+crabbox cleanup --provider coder --dry-run
 ```
 
 `crabbox machine cleanup` is preserved as a compatibility alias and behaves
@@ -29,17 +30,26 @@ so brokered expiry is owned entirely by the coordinator's TTL alarm. See
 
 What cleanup does depends on the selected provider:
 
-- **Direct cloud/VM providers** (for example `hetzner`, `aws`, `azure`, `gcp`,
-  `proxmox`, `xcp-ng`, `hostinger`, `parallels`, `cloudflare`, `local-container`,
-  `multipass`)
+- **Direct cloud/VM and delegated providers with cleanup** (for example
+  `hetzner`, `aws`, `azure`, `gcp`, `proxmox`, `xcp-ng`, `hostinger`,
+  `parallels`, `cloudflare`, `blaxel`, `local-container`, `multipass`)
   enumerate the machines they own and decide, per machine, whether to delete it.
 - **`hostinger`** is stop-only: cleanup skips VPSs that are not positively
   identified as Crabbox-owned and stops matching VPSs; it does not delete VPSs
   or cancel Hostinger subscriptions.
+- **`blaxel`** starts from local Blaxel claims scoped to the configured API URL
+  and workspace, verifies remote ownership labels before deleting, and keeps
+  missing claims unless `--blaxel-forget-missing` is explicitly set.
 - **`namespace-devbox`** removes only Crabbox-owned local Namespace SSH files;
   it does not delete remote Devboxes.
 - **`namespace-instance`** destroys only Namespace Compute instances carrying
-  Crabbox ownership labels and removes claims for instances already gone.
+  Crabbox ownership labels and an exact local claim for the same instance,
+  tenant, and configured scope; labeled but unclaimed instances are skipped.
+  Claims for instances already gone are removed.
+- **`xcp-ng`** deletes eligible VMs only when an exact local claim matches the
+  normalized pool endpoint, account, lease, slug, and immutable VM UUID.
+  Labeled but unclaimed or wrong-pool VMs are skipped, and failed deletion
+  preserves the claim for a safe retry.
 - **`vercel-sandbox`** sweeps only local `vsbx_...` claims in the configured
   project/team/scope. It deletes idle-expired Crabbox-owned Vercel Sandboxes and
   keeps missing-or-inaccessible claims unless
@@ -48,6 +58,20 @@ What cleanup does depends on the selected provider:
   the loader and removes only stale local claims whose loader metadata is
   missing or terminal. It does not enumerate or delete every Dynamic Worker in
   the Cloudflare account.
+- **`cloudflare-sandbox`** sweeps only local `cfsbx_...` claims in the active
+  provider scope. It deletes idle-expired Crabbox-owned sandboxes and keeps
+  missing-or-inaccessible claims unless
+  `--cloudflare-sandbox-forget-missing` is explicit.
+- **`nomad`** sweeps only local `cbx_...` claims in the active Nomad namespace,
+  region, and task scope. It deregisters idle-expired or TTL-expired
+  Crabbox-owned jobs, removes stale local claims for missing jobs, and skips
+  active claims.
+- **`coder`** lists workspaces with Crabbox ownership evidence, such as the
+  configured workspace prefix or Crabbox labels in Coder JSON, but mutates only
+  workspaces that also have a local Crabbox claim with cleanup metadata. It
+  uses the release action persisted in each local claim: new delete-on-release
+  claims delete, stop-on-release claims stop, and older claims without that
+  metadata default to stop.
 - Providers that have nothing to sweep return an error rather than acting. For
   example `provider=ssh` (static / bring-your-own hosts) reports:
 
@@ -57,19 +81,28 @@ What cleanup does depends on the selected provider:
 
 ### Deletion decisions for direct machines
 
-Selection is label-driven. Cleanup reads the `keep`, `state`, `expires_at`, and
+Selection is label-driven. Cleanup requires `crabbox=true` and reads `state`, `expires_at`, and
 `ttl` labels written when the machine was created. The decision is conservative:
 
-- skip machines labeled `keep=true`;
+- `keep=true` does not exempt a machine from expiry; it only suppresses automatic release after `run`;
 - for `running` or `provisioning` machines, skip until well past expiry — delete
-  only once the expiry time plus a 12-hour stale window has elapsed;
+  only once the expiry time plus a 1-hour stale window has elapsed;
 - for `leased`, `ready`, or `active` machines, delete once expired;
 - always delete machines in `failed`, `released`, or `expired` states;
 - for any other machine, delete only if `expires_at`/`ttl` parses and has passed;
   skip if the expiry label is missing or still in the future.
 
-Resources without these labels are skipped (`reason=missing labels`), so
+Resources without `crabbox=true` are skipped (`reason=missing labels`), so
 non-Crabbox machines are never touched.
+
+Supported direct Linux guests also run an expiry guard every two minutes.
+GCP self-deletes; AWS powers off and terminates; other covered providers power
+off only. Stopped machines can remain billable (including Hetzner and Azure),
+so run cleanup to delete them. See the
+[provider coverage table](../features/lifecycle-cleanup.md#guest-side-expiry-guard).
+
+`directLeases: deny` blocks new remote allocations, not cleanup, stop, list, or
+status of existing machines.
 
 ### Namespace local cleanup
 
@@ -91,12 +124,12 @@ For direct machine providers, each candidate prints one decision line. `--dry-ru
 prints the same lines but makes no provider calls:
 
 ```text
-skip server id=12345 name=crabbox-blue-lobster reason=keep=true
+skip server id=12345 name=crabbox-blue-lobster reason=not expired
 delete server id=67890 name=crabbox-amber-crab
 stop server id=11223 name=crabbox-green-heron
 ```
 
-`skip` lines include a `reason=` (for example `keep=true`, `state=running`,
+`skip` lines include a `reason=` (for example `state=running`,
 `missing expires_at`, `not expired`). Without `--dry-run`, each `delete` line is
 followed by the actual provider delete call; a failed delete returns the provider
 error and stops the sweep. Stop-only providers such as Hostinger print `stop`
@@ -116,10 +149,16 @@ When no matching files exist:
 namespace ssh cleanup no crabbox files found
 ```
 
+Coder cleanup prints one line per cleanup-eligible claimed workspace:
+
+```text
+coder cleanup stop workspace=crabbox-blue dry_run=true
+```
+
 ## Flags
 
 ```text
---provider hetzner|aws|azure|gcp|proxmox|xcp-ng|hostinger|namespace-devbox|cloudflare|cloudflare-dynamic-workers|multipass|vercel-sandbox
+--provider hetzner|aws|azure|gcp|proxmox|xcp-ng|hostinger|namespace-devbox|namespace-instance|coder|cloudflare|cloudflare-dynamic-workers|cloudflare-sandbox|blaxel|multipass|vercel-sandbox
                                                                        provider to sweep (default from config)
 --dry-run                                                              print decisions without making provider calls
 ```

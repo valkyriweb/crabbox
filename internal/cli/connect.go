@@ -41,7 +41,11 @@ func (a App) startInteractiveSSHLeaseActivity(ctx context.Context, cfg Config, l
 		if resolved, ok := parseDurationSecondsLabel(lease.Server.Labels["idle_timeout_secs"]); ok {
 			heartbeatIdleTimeout = resolved
 		}
-		stopHeartbeat = startCoordinatorHeartbeat(ctx, coord, lease.LeaseID, heartbeatIdleTimeout, nil, telemetry, a.Stderr)
+		var heartbeatErr error
+		stopHeartbeat, heartbeatErr = startCoordinatorHeartbeat(ctx, coord, lease.LeaseID, cfg.Provider, heartbeatIdleTimeout, nil, telemetry, a.Stderr)
+		if heartbeatErr != nil {
+			fmt.Fprintf(a.Stderr, "warning: coordinator heartbeat disabled for %s: %v\n", lease.LeaseID, heartbeatErr)
+		}
 	}
 	backend, err := loadBackend(cfg, runtimeForApp(a))
 	if err != nil {
@@ -56,7 +60,7 @@ func (a App) startInteractiveSSHLeaseActivity(ctx context.Context, cfg Config, l
 		fmt.Fprintf(a.Stderr, "warning: provider=%s does not support lease touch\n", backend.Spec().Name)
 		return stopInteractiveSSHHeartbeat(stopHeartbeat)
 	}
-	if touched, touchErr := sshBackend.Touch(ctx, TouchRequest{Lease: lease, State: "running", IdleTimeout: cfg.IdleTimeout}); touchErr == nil {
+	if touched, touchErr := touchLeaseWithGuestExpiry(ctx, sshBackend, cfg, TouchRequest{Lease: lease, State: "running", IdleTimeout: cfg.IdleTimeout}); touchErr == nil {
 		lease.Server = touched
 	} else {
 		fmt.Fprintf(a.Stderr, "warning: direct touch state=running: %v\n", touchErr)
@@ -67,7 +71,7 @@ func (a App) startInteractiveSSHLeaseActivity(ctx context.Context, cfg Config, l
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		if touched, touchErr := sshBackend.Touch(cleanupCtx, TouchRequest{Lease: lease, State: "ready", IdleTimeout: cfg.IdleTimeout}); touchErr == nil {
+		if touched, touchErr := touchLeaseWithGuestExpiry(cleanupCtx, sshBackend, cfg, TouchRequest{Lease: lease, State: "ready", IdleTimeout: cfg.IdleTimeout}); touchErr == nil {
 			lease.Server = touched
 		} else {
 			fmt.Fprintf(a.Stderr, "warning: direct touch state=ready: %v\n", touchErr)
@@ -107,9 +111,17 @@ func probeConnectSSHTransport(ctx context.Context, target *SSHTarget, timeout ti
 	return false
 }
 
-func runInteractiveSSHOnce(ctx context.Context, target SSHTarget, stdin io.Reader, stdout, stderr io.Writer) error {
+func runInteractiveSSHOnce(ctx context.Context, target SSHTarget, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
 	args := append(sshBaseArgs(target), target.User+"@"+target.Host)
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	if target.SSHConfigFile != "" {
+		session, err := newSSHTransportSession(ctx, target, false)
+		if err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, session.Close()) }()
+		args = append(session.commandPrefixWithOptions("10", "3"), "-o", "RequestTTY=auto", session.host())
+	}
+	cmd := sshCommandContext(ctx, target, args...)
 	cmd.Stdin = stdin
 	err := runSSHCommand(cmd, stdout, stderr)
 	if err != nil {

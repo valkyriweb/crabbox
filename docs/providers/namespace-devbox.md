@@ -44,6 +44,22 @@ crabbox stop --provider namespace-devbox swift-crab
 
 Aliases for the provider name: `namespace`, `namespace-devboxes`.
 
+## Live Smoke
+
+The shared live-smoke harness can validate Namespace Devbox without a
+coordinator:
+
+```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=namespace-devbox CRABBOX_LIVE_REPO=/path/to/my-app scripts/live-smoke.sh
+```
+
+The smoke requires the authenticated Namespace `devbox` CLI on `PATH`. It exits
+before any Namespace `run`, `list`, `warmup`, or `stop` command when the CLI is
+missing, so credentialless machines can verify the guard without mutating
+provider state. With `devbox` available and logged in, the harness creates a
+delete-on-release Devbox with size `S` by default, runs one no-sync command, and
+then lists normalized Namespace inventory.
+
 ## Configuration
 
 ```yaml
@@ -105,6 +121,13 @@ CRABBOX_NAMESPACE_DELETE_ON_RELEASE
    `namespace.deleteOnRelease: true` (or `--namespace-delete-on-release`) to
    delete the Devbox and those local SSH files instead (`devbox delete --force`).
 
+Both shutdown and deletion require an unchanged local Crabbox claim bound to
+the exact Devbox name and lease. A missing or mismatched claim never authorizes
+a provider mutation; failed shutdowns or deletions preserve the claim for a
+retry. Namespace Devbox inventory exposes names but no independently verifiable
+lease ownership labels, so `crabbox stop --force` cannot safely adopt a lost
+claim. Inspect and remove an unclaimed Devbox directly with the `devbox` CLI.
+
 ## Capabilities
 
 - **SSH**: yes.
@@ -123,6 +146,8 @@ derives it from `--class`:
 
 | Class      | Size |
 | ---------- | ---- |
+| `tiny`     | `S`  |
+| `small`    | `S`  |
 | `standard` | `S`  |
 | `fast`     | `M`  |
 | `large`    | `L`  |

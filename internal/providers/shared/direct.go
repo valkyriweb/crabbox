@@ -2,6 +2,7 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,28 +14,79 @@ type DirectSSHBackend struct {
 	Cfg             core.Config
 	RT              core.Runtime
 	Delete          func(context.Context, core.Config, core.Server) error
+	PrepareCleanup  func(context.Context, core.Server) (core.Server, bool, CleanupSkipReason, error)
+	CleanupEligible func(context.Context, core.Server) (bool, error)
 	StoredLeaseKeys bool
 }
 
+type CleanupSkipReason string
+
+const CleanupSkipNoExactLocalClaim CleanupSkipReason = "no-exact-local-claim"
+
 func (b *DirectSSHBackend) Spec() core.ProviderSpec { return b.SpecValue }
+
+// ResolvedLeaseTarget preserves the adapter's endpoint and skips stored-key lookup for release-only resolution.
+func (b *DirectSSHBackend) ResolvedLeaseTarget(server core.Server, target core.SSHTarget, leaseID string, releaseOnly bool) (core.LeaseTarget, error) {
+	lease := core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}
+	if !releaseOnly {
+		if err := b.RebindResolvedLeaseTarget(&lease, leaseID); err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
+	return lease, nil
+}
 
 func (b *DirectSSHBackend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID string) error {
 	if b.StoredLeaseKeys {
-		core.UseStoredTestboxKey(&target.SSH, leaseID)
+		if err := core.UseStoredTestboxKey(&target.SSH, leaseID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (b *DirectSSHBackend) CleanupServers(ctx context.Context, req core.CleanupRequest, servers []core.Server) error {
-	now := time.Now().UTC()
-	if b.RT.Clock != nil {
-		now = b.RT.Clock.Now().UTC()
+	if b.PrepareCleanup != nil && b.CleanupEligible != nil {
+		return core.Exit(2, "provider=%s cleanup backend cannot configure both PrepareCleanup and CleanupEligible", b.SpecValue.Name)
 	}
+	now := core.ClockNow(b.RT.Clock).UTC()
 	for _, s := range servers {
 		shouldDelete, reason := core.ShouldCleanupServer(s, now)
 		if !shouldDelete {
 			fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=%s\n", s.DisplayID(), s.Name, reason)
 			continue
+		}
+		if b.PrepareCleanup != nil {
+			prepared, eligible, reason, err := b.PrepareCleanup(ctx, s)
+			if err != nil {
+				return err
+			}
+			if !eligible {
+				fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=%s\n", s.DisplayID(), s.Name, reason)
+				continue
+			}
+			s = prepared
+			if shouldDelete, reason := core.ShouldCleanupServer(s, now); !shouldDelete {
+				fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=%s\n", s.DisplayID(), s.Name, reason)
+				continue
+			}
+			if claim, exists, set := core.ServerLeaseClaimSnapshot(s); set && exists {
+				claimServer := s
+				claimServer.Labels = claim.Labels
+				if shouldDelete, reason := core.ShouldCleanupServer(claimServer, now); !shouldDelete {
+					fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=%s\n", s.DisplayID(), s.Name, reason)
+					continue
+				}
+			}
+		} else if b.CleanupEligible != nil {
+			eligible, err := b.CleanupEligible(ctx, s)
+			if err != nil {
+				return err
+			}
+			if !eligible {
+				fmt.Fprintf(b.RT.Stderr, "skip server id=%s name=%s reason=%s\n", s.DisplayID(), s.Name, CleanupSkipNoExactLocalClaim)
+				continue
+			}
 		}
 		fmt.Fprintf(b.RT.Stderr, "delete server id=%s name=%s\n", s.DisplayID(), s.Name)
 		if !req.DryRun {
@@ -49,9 +101,49 @@ func (b *DirectSSHBackend) CleanupServers(ctx context.Context, req core.CleanupR
 	return nil
 }
 
-func (b *DirectSSHBackend) Touch(ctx context.Context, server core.Server, state string) core.Server {
-	return core.TouchDirectLeaseBestEffort(ctx, b.Cfg, server, state, b.RT.Stderr)
+func ServerWithDefaultLabel(server core.Server, key, value string) core.Server {
+	labels := CloneLabels(server.Labels)
+	if labels[key] == "" {
+		labels[key] = value
+	}
+	server.Labels = labels
+	return server
 }
+
+func CleanupClaimEligible(err error) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+	var exitErr core.ExitError
+	if core.AsExitError(err, &exitErr) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (b *DirectSSHBackend) Touch(ctx context.Context, req core.TouchRequest, persist func(context.Context, core.Server) error) core.Server {
+	server := req.Lease.Server
+	server.Labels = core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(server.Labels, b.Cfg, req.State, time.Now().UTC(), req.IdleTimeoutOverride)
+	if err := persist(ctx, server); err != nil {
+		fmt.Fprintf(b.RT.Stderr, "warning: direct touch state=%s: %v\n", req.State, err)
+	}
+	return server
+}
+
+// JoinAcquireCleanupError marks reported rollback failure as a fresh-allocation
+// retry veto while preserving both causes. A nil cleanup error says only that
+// the provider's existing cleanup contract succeeded, not universal absence.
+func JoinAcquireCleanupError(acquireErr, cleanupErr error) error {
+	if cleanupErr == nil {
+		return acquireErr
+	}
+	return &acquireCleanupError{cause: errors.Join(acquireErr, cleanupErr)}
+}
+
+type acquireCleanupError struct{ cause error }
+
+func (e *acquireCleanupError) Error() string { return e.cause.Error() }
+func (e *acquireCleanupError) Unwrap() error { return e.cause }
 
 func AcquireAttemptsRetry(rt core.Runtime, keep bool, acquire func() (core.LeaseTarget, error)) (core.LeaseTarget, error) {
 	var lastErr error
@@ -62,6 +154,11 @@ func AcquireAttemptsRetry(rt core.Runtime, keep bool, acquire func() (core.Lease
 			return lease, nil
 		}
 		lastErr = err
+		var cleanupErr *acquireCleanupError
+		if errors.As(err, &cleanupErr) {
+			fmt.Fprintf(rt.Stderr, "warning: acquisition cleanup failed; refusing a fresh lease retry: %v\n", err)
+			return core.LeaseTarget{}, err
+		}
 		if attempt == attempts || !core.IsBootstrapWaitError(err) {
 			return core.LeaseTarget{}, err
 		}

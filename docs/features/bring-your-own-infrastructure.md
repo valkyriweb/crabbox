@@ -21,6 +21,7 @@ provider runs are not recorded by the coordinator in registered mode.
 | --- | --- |
 | Deterministic CLI create/delete commands and SSH names | declarative `external.lifecycle` |
 | Arbitrary logic or structured provider metadata | external JSON protocol executable |
+| Slurm allocation that publishes an SSH endpoint from a scheduled job | external JSON protocol executable |
 | KubeVirt cluster | built-in `kubevirt` provider |
 | Existing SSH hosts | built-in `ssh` provider |
 | New reusable public provider | implement a normal provider adapter |
@@ -121,6 +122,14 @@ Keep the executable separately versioned when it is proprietary. Public
 Crabbox needs only the protocol contract documented in
 [External Provider](../providers/external.md).
 
+Academic Slurm clusters usually fit this protocol path: the adapter submits an
+`sbatch` job, waits for the allocation to publish a host/port/key or proxy
+route, returns that as the external SSH target, and uses `scancel` on release.
+See [Slurm academic sandboxes](slurm-academic-sandboxes.md) for the full
+product and security contract, and
+[examples/slurm-external-provider](../../examples/slurm-external-provider/README.md)
+for a reference external adapter.
+
 ## Persisted routing
 
 External leases keep two pieces of private local state on the operator machine:
@@ -163,7 +172,8 @@ export CRABBOX_COORDINATOR_TOKEN_COMMAND='["credential-helper","read","crabbox-u
 ```
 
 The command is executed directly without a shell. It must print exactly one
-token line, complete within 15 seconds, and stay within the output limit. The
+token line and complete within 15 seconds. Crabbox retains at most 16 KiB of
+stdout, including line endings, and rejects overflow before token parsing. The
 CLI reruns it for HTTP requests and reconnecting WebSockets, so an expiring
 token does not need to be persisted. Its output must be a bearer the
 coordinator accepts, such as its shared/admin token or a signed `cbxu_` user
@@ -324,6 +334,8 @@ sweep cannot select a live registered direct resource.
 ## Related documentation
 
 - [External Provider](../providers/external.md)
+- [Slurm academic sandboxes](slurm-academic-sandboxes.md)
+- [Reference Slurm external provider](../../examples/slurm-external-provider/README.md)
 - [KubeVirt Provider](../providers/kubevirt.md)
 - [Coordinator](coordinator.md)
 - [Portable Coordinator](portable-coordinator.md)

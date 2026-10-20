@@ -114,6 +114,115 @@ func TestAutoRouteStaticLeaseRestoresFriendlySlugClaim(t *testing.T) {
 	}
 }
 
+func TestAutoRouteStaticLeasePreservesAuthoritativeProvider(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	claimed := baseConfig()
+	claimed.Provider = staticProvider
+	claimed.Static.Host = "authoritative.example.com"
+	claimed.Static.User = "builder"
+	if err := claimLeaseForRepoConfig("static_authoritative", "authoritative-static", claimed, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	fs := newFlagSet("authoritative static route", io.Discard)
+	registerTargetFlags(fs, baseConfig())
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	nonStatic := baseConfig()
+	setProviderSelection(&nonStatic, "azure", providerSelectionRecordedRun)
+	if err := autoRouteStaticLease(&nonStatic, fs, "authoritative-static"); err != nil {
+		t.Fatal(err)
+	}
+	if nonStatic.Provider != "azure" || nonStatic.providerSelectionSource != providerSelectionRecordedRun || nonStatic.Static.Host != "" {
+		t.Fatalf("non-static authoritative route changed: provider=%q source=%q static=%#v", nonStatic.Provider, nonStatic.providerSelectionSource, nonStatic.Static)
+	}
+
+	static := baseConfig()
+	setProviderSelection(&static, staticProvider, providerSelectionRecordedRun)
+	if err := autoRouteStaticLease(&static, fs, "authoritative-static"); err != nil {
+		t.Fatal(err)
+	}
+	if static.Provider != staticProvider || static.providerSelectionSource != providerSelectionRecordedRun || static.Static.Host != claimed.Static.Host {
+		t.Fatalf("static authoritative route=%q source=%q static=%#v", static.Provider, static.providerSelectionSource, static.Static)
+	}
+}
+
+func TestLeaseTargetConfigPreservesImplicitStaticClaimRouting(t *testing.T) {
+	isolateTestUserDirs(t)
+	claimed := baseConfig()
+	claimed.Provider = staticProvider
+	claimed.Static.Host = "claimed-static.example.com"
+	claimed.Static.User = "builder"
+	claimed.Static.Port = "2202"
+	claimed.Static.WorkRoot = "/work/claimed-static"
+	claimed.TargetOS = targetMacOS
+	if err := claimLeaseForRepoConfig("static_claimed-static", "claimed-static", claimed, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "crabbox.yaml")
+	if err := os.WriteFile(configPath, []byte("provider: aws\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	defaults := defaultConfig()
+	fs := newFlagSet("status", io.Discard)
+	provider := fs.String("provider", defaults.Provider, "")
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: "claimed-static"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != staticProvider || cfg.Static.Host != claimed.Static.Host || cfg.Static.User != claimed.Static.User || cfg.Static.Port != claimed.Static.Port || cfg.WorkRoot != claimed.Static.WorkRoot || cfg.TargetOS != targetMacOS {
+		t.Fatalf("config=%#v static=%#v", cfg, cfg.Static)
+	}
+	if cfg.providerSelectionSource != providerSelectionLeaseContext {
+		t.Fatalf("provider source=%q want %q", cfg.providerSelectionSource, providerSelectionLeaseContext)
+	}
+}
+
+func TestLeaseTargetConfigProviderResourceIDSkipsStaticRouting(t *testing.T) {
+	setupClaimRoutingCommandTest(t, parallelsProvider)
+	claimed := baseConfig()
+	claimed.Provider = staticProvider
+	claimed.Static.Host = "builder.example.com"
+	claimed.Static.User = "builder"
+	claimed.Static.Port = "2202"
+	claimed.Static.WorkRoot = "/work/static-builder"
+	if err := claimLeaseForRepoConfig("static_builder", "builder", claimed, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := defaultConfig()
+	if defaults.Provider != parallelsProvider || !providerSelectionIsActionable(defaults) {
+		t.Fatalf("configured provider=%q source=%q", defaults.Provider, defaults.providerSelectionSource)
+	}
+	fs := newFlagSet("checkpoint list", io.Discard)
+	provider := fs.String("provider", defaults.Provider, "")
+	targetFlags := registerTargetFlags(fs, defaults)
+	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if err := parseFlags(fs, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{
+		LeaseID:            "static_builder",
+		ProviderResourceID: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != parallelsProvider || cfg.providerSelectionSource != defaults.providerSelectionSource {
+		t.Fatalf("provider=%q source=%q want %q/%q", cfg.Provider, cfg.providerSelectionSource, parallelsProvider, defaults.providerSelectionSource)
+	}
+	if cfg.Static.ID != "" || cfg.Static.Name != "" || cfg.Static.Host != "" || cfg.Static.User != "" || cfg.Static.Port != "" || cfg.Static.WorkRoot != "" {
+		t.Fatalf("provider-native id loaded Static config: %#v", cfg.Static)
+	}
+}
+
 func TestAutoRouteStaticLeaseDoesNotGuessHostWithoutClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	defaults := baseConfig()
@@ -219,7 +328,7 @@ func TestAutoRouteStaticLeaseRespectsExplicitProviderFlag(t *testing.T) {
 
 func TestAutoRouteStaticLeaseSkipsClaimScanForExplicitNonStaticProvider(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	dir, err := crabboxStateDir()
+	dir, err := CrabboxStateDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,6 +358,7 @@ func TestAutoRouteStaticLeaseSkipsClaimScanForExplicitNonStaticProvider(t *testi
 }
 
 func TestAutoRouteStaticLeaseRespectsExplicitStaticHost(t *testing.T) {
+	isolateTestUserDirs(t)
 	defaults := baseConfig()
 	fs := newFlagSet("test", io.Discard)
 	target := registerTargetFlags(fs, defaults)
@@ -271,6 +381,7 @@ func TestAutoRouteStaticLeaseRespectsExplicitStaticHost(t *testing.T) {
 }
 
 func TestAutoRouteStaticLeaseIgnoresNonStaticIDs(t *testing.T) {
+	isolateTestUserDirs(t)
 	defaults := baseConfig()
 	fs := newFlagSet("test", io.Discard)
 	registerTargetFlags(fs, defaults)
@@ -347,5 +458,132 @@ func TestStopRejectsIDFlagWithExtraPositional(t *testing.T) {
 	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{"--provider", "e2b", "--id", "box_123", "box_456"})
 	if err == nil || !strings.Contains(err.Error(), "usage: crabbox stop --id") {
 		t.Fatalf("expected usage error for --id plus positional, got %v", err)
+	}
+}
+
+func TestStopRejectsReclaimForProviderWithoutAdoptionContract(t *testing.T) {
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+		"--provider", "e2b", "--id", "box_123", "--reclaim",
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support stop --reclaim") {
+		t.Fatalf("stop --reclaim err=%v, want unsupported-provider rejection", err)
+	}
+}
+
+func TestStopDispatchesExplicitReclaimContract(t *testing.T) {
+	called := false
+	testStopReclaimHook = func(req StopRequest) error {
+		called = true
+		if req.ID != "service-123" {
+			t.Fatalf("reclaim id=%q", req.ID)
+		}
+		return nil
+	}
+	t.Cleanup(func() { testStopReclaimHook = nil })
+
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+		"--provider", "stop-reclaim-test", "--id", "service-123", "--reclaim",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("stop did not dispatch the explicit reclaim contract")
+	}
+}
+
+func TestStopForceRequiresExplicitProviderAndResourceID(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "provider", args: []string{"--id", "service-123", "--force"}, want: "requires an explicit --provider"},
+		{name: "resource", args: []string{"--provider", "stop-reclaim-test", "--force", "service-123"}, want: "requires an exact --id"},
+		{name: "reclaim conflict", args: []string{"--provider", "stop-reclaim-test", "--id", "service-123", "--force", "--reclaim"}, want: "cannot be combined with --reclaim"},
+		{name: "expected identity conflict", args: []string{"--provider", "stop-reclaim-test", "--id", "service-123", "--force", "--expected-provider-resource-id", "replacement-resource"}, want: "cannot be combined with controller-owned release identity"},
+		{name: "confirmed absence conflict", args: []string{"--provider", "stop-reclaim-test", "--id", "service-123", "--force", "--confirmed-absent-local-cleanup"}, want: "cannot be combined with controller-owned release identity"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), test.args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("stop --force err=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestStopForceDispatchesVerifiedReclaimContract(t *testing.T) {
+	called := false
+	testStopReclaimHook = func(req StopRequest) error {
+		called = true
+		if req.ID != "service-123" {
+			t.Fatalf("forced recovery id=%q", req.ID)
+		}
+		return nil
+	}
+	t.Cleanup(func() { testStopReclaimHook = nil })
+
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+		"--provider", "stop-reclaim-test", "--id", "service-123", "--force",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("stop --force did not dispatch the verified reclaim contract")
+	}
+}
+
+func TestStopForceRejectsControllerIdentityBeforeVerifiedAdoption(t *testing.T) {
+	called := false
+	testStopReclaimHook = func(StopRequest) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { testStopReclaimHook = nil })
+
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+		"--provider", "stop-reclaim-test", "--id", "service-123", "--force",
+		"--expected-provider-lease-id", "cbx_abcdef123456",
+		"--expected-provider-attempt-lease-id", "cbx_abcdef123456",
+		"--expected-provider-slug", "original-resource",
+		"--expected-provider-resource-id", "original-resource",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined with controller-owned release identity") {
+		t.Fatalf("stop --force err=%v, want expected-identity rejection", err)
+	}
+	if called {
+		t.Fatal("stop --force dispatched adoption before rejecting controller identity")
+	}
+}
+
+func TestStopForceRejectsProviderWithoutVerifiedRecovery(t *testing.T) {
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+		"--provider", "e2b", "--id", "box_123", "--force",
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support verified forced recovery") {
+		t.Fatalf("stop --force err=%v, want unsupported-provider rejection", err)
+	}
+}
+
+func TestStopForceRejectsSSHProviderWithoutVerifiedRecovery(t *testing.T) {
+	isolateTestUserDirs(t)
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+		"--provider", "ssh", "--static-host", "host.example.test", "--id", "static_host-example-test", "--force",
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support verified forced recovery") {
+		t.Fatalf("stop --force err=%v, want SSH-provider rejection", err)
+	}
+}
+
+func TestStopRejectsReclaimForSSHLeaseProvider(t *testing.T) {
+	isolateTestUserDirs(t)
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).stop(context.Background(), []string{
+		"--provider", "ssh", "--static-host", "host.example.test", "--id", "static_host-example-test", "--reclaim",
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not support stop --reclaim") {
+		t.Fatalf("stop --reclaim err=%v, want SSH-provider rejection", err)
 	}
 }

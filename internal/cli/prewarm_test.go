@@ -3,13 +3,327 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 )
+
+type prewarmCleanupTestBackend struct {
+	resolveCalls    int
+	releaseCalls    int
+	resolveCanceled bool
+	releaseCanceled bool
+	resolveCtx      context.Context
+	releaseCtx      context.Context
+	resolveErr      error
+	releaseErr      error
+}
+
+type prewarmDelegatedTestBackend struct{}
+
+func (prewarmDelegatedTestBackend) Spec() ProviderSpec {
+	return ProviderSpec{Name: "prewarm-delegated-test", Kind: ProviderKindDelegatedRun}
+}
+
+type prewarmOptionsTestProvider struct {
+	backend    Backend
+	configured *int
+}
+
+func (p prewarmOptionsTestProvider) Spec() ProviderSpec {
+	spec := p.backend.Spec()
+	spec.Targets = []TargetSpec{{OS: targetLinux}}
+	spec.Coordinator = CoordinatorNever
+	return spec
+}
+func (prewarmOptionsTestProvider) RegisterFlags(*flag.FlagSet, Config) any { return noProviderFlags{} }
+func (prewarmOptionsTestProvider) ApplyFlags(*Config, *flag.FlagSet, any) error {
+	return nil
+}
+func (p prewarmOptionsTestProvider) Configure(Config, Runtime) (Backend, error) {
+	*p.configured++
+	return p.backend, nil
+}
+
+type prewarmValidatingTestProvider struct {
+	prewarmOptionsTestProvider
+	validate func(RunRequest) error
+}
+
+func (p prewarmValidatingTestProvider) ValidateRunOptions(req RunRequest) error {
+	return p.validate(req)
+}
+
+func TestPrewarmRunOptionsValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		probe     string
+		dryRun    bool
+		validator bool
+		reject    bool
+	}{
+		{name: "reject_before_warmup", probe: "echo ready", validator: true, reject: true},
+		{name: "reject_before_plan", probe: "echo ready", dryRun: true, validator: true, reject: true},
+		{name: "accepted_probe", probe: "echo ready", dryRun: true, validator: true},
+		{name: "optional_validator", probe: "echo ready", dryRun: true},
+		{name: "empty_probe", dryRun: true, validator: true, reject: true},
+		{name: "whitespace_probe", probe: " \t\n", dryRun: true, validator: true, reject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+			var requests []RunRequest
+			configured := 0
+			base := prewarmOptionsTestProvider{backend: prewarmDelegatedTestBackend{}, configured: &configured}
+			var provider Provider = base
+			if tc.validator {
+				provider = prewarmValidatingTestProvider{prewarmOptionsTestProvider: base, validate: func(req RunRequest) error {
+					requests = append(requests, req)
+					if tc.reject {
+						return errors.New("probe options rejected")
+					}
+					return nil
+				}}
+			}
+			RegisterProvider(provider)
+			t.Cleanup(func() { delete(providerRegistry, provider.Spec().Name) })
+			args := []string{"prewarm", "--provider", provider.Spec().Name, "--probe-command", tc.probe}
+			if tc.dryRun {
+				args = append(args, "--dry-run")
+			}
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), args)
+			hasProbe := strings.TrimSpace(tc.probe) != ""
+			wantRequests := 0
+			if tc.validator && hasProbe {
+				wantRequests = 1
+			}
+			if len(requests) != wantRequests {
+				t.Fatalf("validation requests=%+v, want %d", requests, wantRequests)
+			}
+			for _, req := range requests {
+				if !req.NoSync || !req.NoHydrate || !req.ShellMode || !req.ReuseLease || req.ID != "" || !reflect.DeepEqual(req.Command, []string{tc.probe}) {
+					t.Fatalf("unexpected probe intent: %+v", req)
+				}
+			}
+			if tc.reject && hasProbe {
+				if configured != 0 {
+					t.Fatalf("rejection configured %d backends", configured)
+				}
+				var exitErr ExitError
+				if !AsExitError(err, &exitErr) || exitErr.Code != 2 || !strings.Contains(err.Error(), "--probe-command") || !strings.Contains(err.Error(), "probe options rejected") {
+					t.Fatalf("rejection=%v, want contextual exit 2", err)
+				}
+				if stdout.Len() != 0 {
+					t.Fatalf("rejected probe emitted a plan or acquired a lease: %s", &stdout)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("prewarm error=%v stderr=%s", err, &stderr)
+			}
+			if strings.Contains(stdout.String(), "--no-sync --no-hydrate --shell -- 'echo ready'") != hasProbe {
+				t.Fatalf("unexpected probe plan: %s", &stdout)
+			}
+		})
+	}
+}
+
+func (b *prewarmCleanupTestBackend) Spec() ProviderSpec {
+	return ProviderSpec{Name: "prewarm-cleanup-test", Kind: ProviderKindSSHLease}
+}
+func (b *prewarmCleanupTestBackend) Acquire(context.Context, AcquireRequest) (LeaseTarget, error) {
+	return LeaseTarget{}, nil
+}
+func (b *prewarmCleanupTestBackend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error) {
+	b.resolveCalls++
+	b.resolveCtx = ctx
+	b.resolveCanceled = ctx.Err() != nil
+	if b.resolveErr != nil {
+		return LeaseTarget{}, b.resolveErr
+	}
+	server := Server{Provider: "prewarm-cleanup-test"}
+	server.ServerType.Name = "test"
+	return LeaseTarget{LeaseID: req.ID, Server: server}, nil
+}
+func (b *prewarmCleanupTestBackend) List(context.Context, ListRequest) ([]LeaseView, error) {
+	return nil, nil
+}
+func (b *prewarmCleanupTestBackend) ReleaseLease(ctx context.Context, _ ReleaseLeaseRequest) error {
+	b.releaseCalls++
+	b.releaseCtx = ctx
+	b.releaseCanceled = ctx.Err() != nil
+	return b.releaseErr
+}
+func (b *prewarmCleanupTestBackend) Touch(context.Context, TouchRequest) (Server, error) {
+	return Server{}, nil
+}
+
+func TestPrewarmPostWarmupFailuresReleaseSSHLease(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir()) // lease cleanup stops egress daemons; keep lock files out of the real state dir
+	for _, stage := range []string{"actions hydration", "probe", "pool registration"} {
+		t.Run(stage, func(t *testing.T) {
+			backend := &prewarmCleanupTestBackend{}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			cause := errors.New("step failed")
+			var stderr bytes.Buffer
+			app := App{Stdout: io.Discard, Stderr: &stderr}
+
+			err := app.runPrewarmPostWarmupStep(ctx, backend, Config{Provider: "prewarm-cleanup-test"}, LeaseTarget{LeaseID: "cbx_abcdef123456"}, stage, func() error {
+				return cause
+			})
+
+			if !errors.Is(err, cause) {
+				t.Fatalf("step error=%v, want %v", err, cause)
+			}
+			if backend.resolveCalls != 1 || backend.releaseCalls != 1 {
+				t.Fatalf("cleanup calls resolve=%d release=%d", backend.resolveCalls, backend.releaseCalls)
+			}
+			if backend.resolveCanceled || backend.releaseCanceled {
+				t.Fatalf("cleanup inherited canceled context: resolve=%v release=%v", backend.resolveCanceled, backend.releaseCanceled)
+			}
+			if backend.resolveCtx == backend.releaseCtx {
+				t.Fatal("provider release reused the pre-release cleanup context")
+			}
+			for _, want := range []string{
+				"prewarm cleanup: releasing id=cbx_abcdef123456 after " + stage + " failure",
+				"prewarm cleanup: released id=cbx_abcdef123456 after " + stage + " failure",
+			} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestPrewarmSuccessfulStepDoesNotReleaseLease(t *testing.T) {
+	backend := &prewarmCleanupTestBackend{}
+	err := (App{Stdout: io.Discard, Stderr: io.Discard}).runPrewarmPostWarmupStep(
+		context.Background(), backend, Config{Provider: "prewarm-cleanup-test"}, LeaseTarget{LeaseID: "cbx_abcdef123456"}, "probe", func() error { return nil },
+	)
+	if err != nil || backend.resolveCalls != 0 || backend.releaseCalls != 0 {
+		t.Fatalf("successful step err=%v resolve=%d release=%d", err, backend.resolveCalls, backend.releaseCalls)
+	}
+}
+
+func TestPrewarmGuardedCleanupUsesAcquiredLeaseFence(t *testing.T) {
+	base := &warmupFailureReleaseBackend{}
+	backend := &ownershipChangedReleaseBackend{warmupFailureReleaseBackend: base}
+	cause := errors.New("probe failed")
+	var stderr bytes.Buffer
+	err := (App{Stdout: io.Discard, Stderr: &stderr}).runPrewarmPostWarmupStep(
+		context.Background(), backend, Config{Provider: "exe-dev"}, LeaseTarget{LeaseID: "cbx_abcdef123456"}, "probe", func() error { return cause },
+	)
+	if !errors.Is(err, cause) {
+		t.Fatalf("step error=%v, want %v", err, cause)
+	}
+	if base.resolves != 0 || base.releases != 0 {
+		t.Fatalf("guarded cleanup resolves=%d releases=%d, want ownership-fenced stop", base.resolves, base.releases)
+	}
+	if !strings.Contains(stderr.String(), "release lease ownership changed") {
+		t.Fatalf("stderr missing ownership fence:\n%s", stderr.String())
+	}
+}
+
+func TestPrewarmCleanupFailurePrintsStopCommand(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	for _, tc := range []struct {
+		name    string
+		backend *prewarmCleanupTestBackend
+		want    string
+	}{
+		{name: "resolve", backend: &prewarmCleanupTestBackend{resolveErr: errors.New("resolve unavailable")}, want: "automatic release of cbx_abcdef123456 skipped: resolve unavailable"},
+		{name: "release", backend: &prewarmCleanupTestBackend{releaseErr: errors.New("release unavailable")}, want: "automatic release of cbx_abcdef123456 failed: release unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			cause := errors.New("hydrate failed")
+			err := (App{Stdout: io.Discard, Stderr: &stderr}).runPrewarmPostWarmupStep(
+				context.Background(), tc.backend, Config{Provider: "prewarm-cleanup-test"}, LeaseTarget{LeaseID: "cbx_abcdef123456"}, "actions hydration", func() error { return cause },
+			)
+			if !errors.Is(err, cause) {
+				t.Fatalf("step error=%v, want %v", err, cause)
+			}
+			for _, want := range []string{tc.want, "next: crabbox stop --provider prewarm-cleanup-test --id cbx_abcdef123456"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestPrewarmFailureDoesNotReleaseDelegatedProvider(t *testing.T) {
+	cause := errors.New("delegated step failed")
+	var stderr bytes.Buffer
+	err := (App{Stdout: io.Discard, Stderr: &stderr}).runPrewarmPostWarmupStep(
+		context.Background(), prewarmDelegatedTestBackend{}, Config{Provider: "prewarm-delegated-test"}, LeaseTarget{LeaseID: "run_abcdef123456"}, "probe", func() error { return cause },
+	)
+	if !errors.Is(err, cause) {
+		t.Fatalf("step error=%v, want %v", err, cause)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("delegated provider emitted SSH cleanup output:\n%s", stderr.String())
+	}
+}
+
+func TestPrewarmCoordinatorCleanupReleasesByIDWhenResolveFails(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	released := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/leases/cbx_abcdef123456":
+			http.Error(w, `{"error":"resolve unavailable"}`, http.StatusServiceUnavailable)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/leases/cbx_abcdef123456/release":
+			released = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"lease": confirmedCoordinatorRelease("cbx_abcdef123456", "aws")})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := Config{Provider: "aws", Coordinator: server.URL, CoordToken: "test-token"}
+	coord, _, err := newCoordinatorClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &coordinatorLeaseBackend{
+		spec:  ProviderSpec{Name: "aws", Kind: ProviderKindSSHLease},
+		cfg:   cfg,
+		coord: coord,
+		rt:    Runtime{Stderr: io.Discard},
+	}
+	var stderr bytes.Buffer
+	cause := errors.New("probe failed")
+	err = (App{Stdout: io.Discard, Stderr: &stderr}).runPrewarmPostWarmupStep(
+		context.Background(), backend, cfg, LeaseTarget{LeaseID: "cbx_abcdef123456"}, "probe", func() error { return cause },
+	)
+	if !errors.Is(err, cause) {
+		t.Fatalf("step error=%v, want %v", err, cause)
+	}
+	if !released {
+		t.Fatal("coordinator lease was not released by ID")
+	}
+	if !strings.Contains(stderr.String(), "releasing by lease ID") {
+		t.Fatalf("stderr missing resolve fallback:\n%s", stderr.String())
+	}
+}
 
 func TestPrewarmDryRunPlansHydratedLease(t *testing.T) {
 	clearConfigEnv(t)
@@ -77,7 +391,7 @@ cache:
 
 	var stdout, stderr bytes.Buffer
 	app := App{Stdout: &stdout, Stderr: &stderr}
-	if err := app.Run(context.Background(), []string{"prewarm", "--dry-run", "--provider", "blacksmith-testbox", "--blacksmith-workflow", "testbox.yml", "--blacksmith-job", "check", "--cache-volume", "pnpm=repo-pnpm:/var/cache/crabbox/pnpm", "--probe-command", "node -v"}); err != nil {
+	if err := app.Run(context.Background(), []string{"prewarm", "--dry-run", "--provider", "blacksmith-testbox", "--blacksmith-workflow", "testbox.yml", "--blacksmith-job", "check", "--cache-volume", "pnpm=repo-pnpm:/var/cache/crabbox/pnpm"}); err != nil {
 		t.Fatalf("prewarm dry-run failed: %v\nstderr=%s", err, stderr.String())
 	}
 	got := stdout.String()
@@ -90,9 +404,8 @@ cache:
 	if strings.Contains(got, "actions hydrate") {
 		t.Fatalf("blacksmith prewarm should not run local Actions hydration:\n%s", got)
 	}
-	if !strings.Contains(got, "crabbox run --blacksmith-workflow testbox.yml --blacksmith-job check --provider blacksmith-testbox") ||
-		!strings.Contains(got, "--no-sync --no-hydrate --shell -- 'node -v'") {
-		t.Fatalf("blacksmith prewarm should still run explicit probe:\n%s", got)
+	if strings.Contains(got, "crabbox run") {
+		t.Fatalf("plain blacksmith prewarm should not plan a probe:\n%s", got)
 	}
 }
 
@@ -124,6 +437,17 @@ func TestPrewarmDryRunKeepsLocalContainerVolumeOnWarmupOnly(t *testing.T) {
 	}
 	if strings.Contains(lines[1], "--local-container-volume") || !strings.Contains(lines[1], "--id '<lease>'") {
 		t.Fatalf("probe plan should reuse the mounted lease without forwarding the creation-only flag:\n%s", stdout.String())
+	}
+}
+
+func TestPrewarmFollowupDoesNotForwardReclaim(t *testing.T) {
+	args := prewarmProviderPassthroughArgs([]string{"--provider", "exe-dev", "--reclaim", "--exe-dev-control-host", "user@exe.dev"}, defaultConfig())
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--reclaim") {
+		t.Fatalf("follow-up args forwarded ownership transfer: %v", args)
+	}
+	if !strings.Contains(joined, "--exe-dev-control-host user@exe.dev") {
+		t.Fatalf("follow-up args lost provider routing: %v", args)
 	}
 }
 
@@ -326,5 +650,32 @@ actions:
 	}
 	if atomic.LoadInt32(&stub.gets) != 0 || atomic.LoadInt32(&stub.puts) != 0 {
 		t.Fatalf("dry-run touched pond ACL API: gets=%d puts=%d", stub.gets, stub.puts)
+	}
+}
+
+func TestPrewarmPoolIdentityRejectsProviderBeforeBackendAcquisition(t *testing.T) {
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, ".crabbox.yaml")
+	if err := os.WriteFile(configPath, []byte("provider: gcp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identityPath := filepath.Join(dir, "identity.json")
+	identity, err := json.Marshal(testReadyPoolIdentity(t, "", "", "", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(identityPath, identity, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+	t.Setenv("CRABBOX_CONFIG", configPath)
+
+	err = (App{Stdout: io.Discard, Stderr: io.Discard}).Run(context.Background(), []string{
+		"prewarm", "--pool", "builders", "--pool-identity-file", identityPath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "configured typed ready-pool provider") {
+		t.Fatalf("error=%v", err)
 	}
 }

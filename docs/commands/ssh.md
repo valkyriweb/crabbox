@@ -24,10 +24,23 @@ Crabbox uses internally (`BatchMode`, `StrictHostKeyChecking=accept-new`, a
 per-lease `known_hosts` file, and connection keepalives). For most providers
 that is a plain `ssh -i … user@host -p <port>` line you can run as-is.
 
-`crabbox ssh` touches the lease as a side effect — printing the command signals
-intended manual use, so the lease's idle timer is refreshed and the local repo
-claim is validated. Pass `--reclaim` when you are intentionally taking over a
-lease that is claimed by another repo checkout.
+`crabbox ssh` validates the local repo claim, then attempts a best-effort lease
+refresh to signal intended manual use. The refresh has a 20-second budget;
+failure warns and printing continues without guaranteeing renewed expiry.
+Cancellation by the caller stops the command without printing a successful
+result. Pass `--reclaim` when you are intentionally taking over a lease that is
+claimed by another repo checkout.
+
+For coordinator-managed leases, the local claim records the idle timeout
+reported by the coordinator. Printing an SSH command preserves that policy;
+it does not replace it with the local configuration's default.
+
+Before rebinding resolved access to a stored lease, Crabbox rejects conflicting
+known provider identities, including immutable generation IDs and numeric resource
+IDs. Missing identity fields remain unknown for compatibility with older claims;
+they do not establish ownership. When discarding a resolver-created alias,
+Crabbox removes its stored key only after validating and removing its unchanged
+claim. A key directory without an accompanying claim is retained.
 
 ## Network selection
 
@@ -56,6 +69,9 @@ providers resolve access lazily or wrap the connection:
 - **`provider=xcp-ng`** resolves the VM IPv4 address from XCP-ng guest metrics
   during provisioning, then prints the normal per-lease SSH command for the
   cloud-init user.
+- **`provider=coder`** prints a proxy-backed SSH command that uses
+  `coder ssh --stdio --wait <mode> <workspace>`. Coder owns authentication and
+  tunneling; Crabbox does not print or pass Coder tokens on argv.
 - **Provider-routed direct providers** accept the same provider-specific routing
   flags here as `status` and `stop`; for example `--kubevirt-context` or
   `--external-routing-file` can select the exact lease backend when config

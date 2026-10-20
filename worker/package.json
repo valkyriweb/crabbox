@@ -1,15 +1,16 @@
 {
   "name": "@openclaw/crabbox-worker",
-  "version": "0.32.0",
+  "version": "0.79.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
+    "build:aws-qualification-authority": "wrangler deploy --config wrangler.aws-qualification-authority.jsonc --dry-run --outdir dist-aws-qualification-authority",
     "build:cloudflare": "wrangler deploy --config wrangler.cloudflare.jsonc --dry-run --outdir dist-cloudflare",
     "build:cloudflare-dynamic-workers": "wrangler deploy --config wrangler.cloudflare-dynamic-workers.jsonc --dry-run --outdir dist-cloudflare-dynamic-workers",
     "build:node": "node scripts/build-node.mjs",
-    "check": "tsgo --noEmit",
-    "check:node": "tsgo --noEmit -p tsconfig.node.json",
+    "check": "tsc --noEmit",
+    "check:node": "tsc --noEmit -p tsconfig.node.json",
     "deploy": "wrangler deploy",
     "deploy:cloudflare": "wrangler deploy --config wrangler.cloudflare.jsonc --containers-rollout=immediate",
     "deploy:cloudflare-dynamic-workers": "wrangler deploy --config wrangler.cloudflare-dynamic-workers.jsonc",
@@ -23,28 +24,27 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cloudflare/containers": "^0.3.5",
+    "@aws-sdk/credential-providers": "^3.1136.0",
     "@novnc/novnc": "^1.7.0",
     "aws4fetch": "^1.0.20",
-    "fast-xml-parser": "^5.8.0",
-    "pg": "^8.21.0",
-    "pg-boss": "^12.18.2",
+    "fast-xml-parser": "^5.11.1",
+    "pg": "^8.23.0",
+    "pg-boss": "^12.33.3",
     "ssh2": "^1.17.0",
-    "ws": "^8.21.0"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260531.1",
-    "@types/node": "^22.19.19",
-    "@types/pg": "^8.20.0",
+    "@cloudflare/workers-types": "^5.20260921.1",
+    "@types/node": "^22.20.4",
+    "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.1",
-    "@typescript/native-preview": "^7.0.0-dev.20260527.2",
-    "esbuild": "^0.28.1",
-    "oxfmt": "^0.52.0",
-    "oxlint": "^1.67.0",
-    "oxlint-tsgolint": "^0.23.0",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.7",
-    "wrangler": "^4.100.0"
+    "esbuild": "^0.28.2",
+    "oxfmt": "^0.70.0",
+    "oxlint": "^1.85.0",
+    "oxlint-tsgolint": "^7.0.2002",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1",
+    "wrangler": "^4.136.1"
   },
   "engines": {
     "node": ">=22.12.0"

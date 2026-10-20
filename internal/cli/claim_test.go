@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,13 +13,305 @@ import (
 	"time"
 )
 
+func TestLeaseClaimImageEvidenceIdentity(t *testing.T) {
+	for _, mode := range []leaseClaimEndpointMode{claimEndpointUpdate, claimEndpointReplace} {
+		for _, tc := range []struct {
+			name     string
+			server   Server
+			preserve bool
+		}{
+			{"metadata-only", Server{Labels: map[string]string{"state": "ready"}}, true},
+			{"same-identity", Server{CloudID: "resource-a", ID: 1, ImmutableID: "immutable-a"}, true},
+			{"cloud-replaced", Server{CloudID: "resource-b"}, false},
+			{"numeric-replaced", Server{ID: 2}, false},
+			{"immutable-replaced", Server{ImmutableID: "immutable-b"}, false},
+			{"replacement-observed", Server{CloudID: "resource-b", ImageEvidence: &ImageEvidence{ConfiguredReference: "new:tag", RuntimeImageID: "same-image", RepositoryDigests: []string{"reported-digest"}}}, false},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", mode, tc.name), func(t *testing.T) {
+				old := &ImageEvidence{ConfiguredReference: "old:tag", RuntimeImageID: "same-image", RepositoryDigests: []string{}}
+				claim := leaseClaim{CloudID: "resource-a", CloudNumericID: 1, CloudImmutableID: "immutable-a", ImageEvidence: old}
+				applyLeaseClaimEndpoint(&claim, tc.server, SSHTarget{}, mode)
+				if tc.server.ImageEvidence != nil {
+					if !reflect.DeepEqual(claim.ImageEvidence, tc.server.ImageEvidence) {
+						t.Fatal("new observation lost")
+					}
+					claim.ImageEvidence.RepositoryDigests[0] = "changed"
+					if tc.server.ImageEvidence.RepositoryDigests[0] == "changed" {
+						t.Fatal("new observation was not cloned")
+					}
+				} else if tc.preserve {
+					if !reflect.DeepEqual(claim.ImageEvidence, old) {
+						t.Fatal("same-identity observation lost")
+					}
+				} else if claim.ImageEvidence != nil {
+					t.Fatal("replacement retained stale observation")
+				}
+			})
+		}
+	}
+}
+
+func TestLeaseClaimActionsWorkspaceAuthority(t *testing.T) {
+	binding := &ActionsWorkspaceBinding{Origin: "https://github.com/example-org/workflow", MarkerFingerprint: "fixture-marker"}
+	for _, kind := range []string{"metadata", "same-resource", "cloud", "numeric", "immutable", "replace-endpoint", "reclaim", "root", "scope", "replacement-root", "replacement-static"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			original := leaseClaim{
+				LeaseID: "cbx_binding", RepoRoot: "/source", Provider: "aws", ProviderScope: "scope-a",
+				CloudID: "resource-a", CloudNumericID: 1, CloudImmutableID: "immutable-a",
+				ActionsWorkspace: binding,
+			}
+			claim := cloneLeaseClaim(original)
+			if claim.ActionsWorkspace == original.ActionsWorkspace {
+				t.Fatal("claim clone aliases hydration authority")
+			}
+			switch kind {
+			case "metadata":
+				applyLeaseClaimEndpoint(&claim, Server{Labels: map[string]string{"state": "ready"}}, SSHTarget{}, claimEndpointUpdate)
+			case "same-resource":
+				SetLeaseClaimResourceIdentity(&claim, "resource-a", 1, "immutable-a", nil)
+			case "cloud":
+				SetLeaseClaimResourceIdentity(&claim, "resource-b", 1, "immutable-a", nil)
+			case "numeric":
+				SetLeaseClaimResourceIdentity(&claim, "resource-a", 2, "immutable-a", nil)
+			case "immutable":
+				SetLeaseClaimResourceIdentity(&claim, "resource-a", 1, "immutable-b", nil)
+			case "replace-endpoint":
+				applyLeaseClaimEndpoint(&claim, Server{}, SSHTarget{}, claimEndpointReplace)
+			case "reclaim", "root", "scope":
+				root, scope := original.RepoRoot, original.ProviderScope
+				if kind == "root" {
+					root = "/replacement"
+				}
+				if kind == "scope" {
+					scope = "scope-b"
+				}
+				err := transformLeaseClaimForRepo(&claim, original.LeaseID, "", original.Provider, scope, "", staticClaimDetails{}, root, time.Minute, kind != "scope", claimMetadata{}, LeaseLabelTime(time.Now()))
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "replacement-root", "replacement-static":
+				path, err := leaseClaimPath(original.LeaseID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeLeaseClaimAtomic(path, original); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "replacement-root" {
+					claim.RepoRoot = "/replacement"
+				} else {
+					claim.StaticHost = "replacement.example.test"
+				}
+				claim, err = ReplaceLeaseClaimIfUnchangedDurableReturning(original.LeaseID, original, claim)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			preserve := kind == "metadata" || kind == "same-resource"
+			if (claim.ActionsWorkspace != nil) != preserve {
+				t.Fatalf("authority retained=%t, want %t", claim.ActionsWorkspace != nil, preserve)
+			}
+			if !reflect.DeepEqual(original.ActionsWorkspace, binding) {
+				t.Fatal("claim mutation changed the prior snapshot")
+			}
+		})
+	}
+}
+
+func TestFixedAWSClaimProviderCanonicalizesWithoutOverwritingMarker(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_abcdef123464"
+	err := WithDurableLeaseClaimLock(leaseID, func(claim *leaseClaim, _ bool, persist func() error) error {
+		claim.LeaseID = leaseID
+		claim.Slug = "fixed-marker"
+		claim.Provider = FixedAWSClaimProvider
+		claim.ProviderScope = "account:123456789012"
+		claim.RepoRoot = "/repo"
+		claim.FixedCreateIntent = &FixedCreateIntent{
+			Version: 1, Fingerprint: strings.Repeat("a", 64), ProviderScope: claim.ProviderScope,
+			Slug: claim.Slug, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), State: "acquired",
+		}
+		return persist()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonicalClaimProvider(FixedAWSClaimProvider) != "aws" {
+		t.Fatalf("fixed marker canonicalized to %q", canonicalClaimProvider(FixedAWSClaimProvider))
+	}
+	resolved, ok, exact, err := ResolveLeaseClaimForProviderWithExact(leaseID, "aws")
+	if err != nil || !ok || !exact || resolved.Provider != FixedAWSClaimProvider {
+		t.Fatalf("resolved=%#v ok=%t exact=%t err=%v", resolved, ok, exact, err)
+	}
+	if err := ClaimLeaseForRepoProvider(leaseID, "fixed-marker", "aws", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	after, exists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil || !exists || after.Provider != FixedAWSClaimProvider {
+		t.Fatalf("runtime AWS claim update overwrote marker: claim=%#v exists=%t err=%v", after, exists, err)
+	}
+	peer := bridgePeerFromClaim(after, TransportNone)
+	if peer.Provider != "aws" {
+		t.Fatalf("fixed marker displayed as provider %q", peer.Provider)
+	}
+}
+
+func TestFixedMachine0ClaimProviderCanonicalizes(t *testing.T) {
+	if got := canonicalClaimProvider(FixedMachine0ClaimProvider); got != "machine0" {
+		t.Fatalf("fixed Machine0 marker canonicalized to %q", got)
+	}
+}
+
+func TestFixedParallelsClaimProviderCanonicalizesWithoutOverwritingMarker(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_abcdef123467"
+	err := WithDurableLeaseClaimLock(leaseID, func(claim *leaseClaim, _ bool, persist func() error) error {
+		claim.LeaseID = leaseID
+		claim.Slug = "fixed-parallels"
+		claim.Provider = FixedParallelsClaimProvider
+		claim.ProviderScope = strings.Repeat("b", 64)
+		claim.RepoRoot = "/repo"
+		claim.FixedCreateIntent = &FixedCreateIntent{
+			Version: 1, Fingerprint: strings.Repeat("a", 64), ProviderScope: claim.ProviderScope,
+			Slug: claim.Slug, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), State: "acquired",
+		}
+		return persist()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := canonicalClaimProvider(FixedParallelsClaimProvider); got != "parallels" {
+		t.Fatalf("fixed Parallels marker canonicalized to %q", got)
+	}
+	resolved, ok, exact, err := ResolveLeaseClaimForProviderWithExact(leaseID, "parallels")
+	if err != nil || !ok || !exact || resolved.Provider != FixedParallelsClaimProvider {
+		t.Fatalf("resolved=%#v ok=%t exact=%t err=%v", resolved, ok, exact, err)
+	}
+	if err := ClaimLeaseForRepoProvider(leaseID, "fixed-parallels", "parallels", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	after, exists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil || !exists || after.Provider != FixedParallelsClaimProvider {
+		t.Fatalf("runtime parallels claim update overwrote marker: claim=%#v exists=%t err=%v", after, exists, err)
+	}
+}
+
+func TestFixedLocalContainerClaimProviderCanonicalizesWithoutOverwritingMarker(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_abcdef123465"
+	err := WithDurableLeaseClaimLock(leaseID, func(claim *leaseClaim, _ bool, persist func() error) error {
+		claim.LeaseID = leaseID
+		claim.Slug = "fixed-local-container"
+		claim.Provider = FixedLocalContainerClaimProvider
+		claim.ProviderScope = "runtime:docker/context:default"
+		claim.RepoRoot = "/repo"
+		claim.FixedCreateIntent = &FixedCreateIntent{
+			Version: 1, Fingerprint: strings.Repeat("a", 64), ProviderScope: claim.ProviderScope,
+			Slug: claim.Slug, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), State: "acquired",
+		}
+		return persist()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := canonicalClaimProvider(FixedLocalContainerClaimProvider); got != "local-container" {
+		t.Fatalf("fixed local-container marker canonicalized to %q", got)
+	}
+	resolved, ok, exact, err := ResolveLeaseClaimForProviderWithExact(leaseID, "local-container")
+	if err != nil || !ok || !exact || resolved.Provider != FixedLocalContainerClaimProvider {
+		t.Fatalf("resolved=%#v ok=%t exact=%t err=%v", resolved, ok, exact, err)
+	}
+	if err := ClaimLeaseForRepoProvider(leaseID, "fixed-local-container", "local-container", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	after, exists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil || !exists || after.Provider != FixedLocalContainerClaimProvider {
+		t.Fatalf("runtime local-container claim update overwrote marker: claim=%#v exists=%t err=%v", after, exists, err)
+	}
+	peer := bridgePeerFromClaim(after, TransportNone)
+	if peer.Provider != "local-container" {
+		t.Fatalf("fixed marker displayed as provider %q", peer.Provider)
+	}
+}
+
+func TestFixedProxmoxClaimProviderCanonicalizes(t *testing.T) {
+	if got := canonicalClaimProvider(FixedProxmoxClaimProvider); got != "proxmox" {
+		t.Fatalf("fixed Proxmox marker canonicalized to %q", got)
+	}
+}
+
+func TestClaimEndpointReservationDeadlineStartsAfterClaimLockAcquired(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_reservation_lock"
+	if err := ClaimLeaseForRepoProviderScopePond(leaseID, "reservation", "incus", "instance:test", "", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	expected, exists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil || !exists {
+		t.Fatalf("read initial claim: exists=%v err=%v", exists, err)
+	}
+
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	cleanupErr := errors.New("leave claim unchanged")
+	cleanupDone := make(chan error, 1)
+	go func() {
+		cleanupDone <- CleanupLeaseClaimIfUnchangedAfter(leaseID, expected, true, func() error {
+			close(lockHeld)
+			<-releaseLock
+			return cleanupErr
+		})
+	}()
+	<-lockHeld
+
+	const reservationDuration = 2 * time.Minute
+	type claimResult struct {
+		claim leaseClaim
+		err   error
+	}
+	claimDone := make(chan claimResult, 1)
+	go func() {
+		claim, claimErr := ClaimLeaseForRepoProviderScopePondEndpointReservationIfUnchanged(
+			leaseID, "reservation", "incus", "instance:test", "", "/repo", time.Minute, true,
+			Server{CloudID: "test", Labels: map[string]string{"state": "expired"}}, SSHTarget{},
+			"reservation_until", reservationDuration, expected, true,
+		)
+		claimDone <- claimResult{claim: claim, err: claimErr}
+	}()
+	select {
+	case result := <-claimDone:
+		t.Fatalf("claim publication bypassed held lock: err=%v", result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releasedAt := time.Now().UTC()
+	close(releaseLock)
+	if err := <-cleanupDone; !errors.Is(err, cleanupErr) {
+		t.Fatalf("cleanup error=%v want %v", err, cleanupErr)
+	}
+	result := <-claimDone
+	if result.err != nil {
+		t.Fatalf("publish reservation: %v", result.err)
+	}
+	deadline, ok := parseLeaseLabelTime(result.claim.Labels["reservation_until"])
+	if !ok {
+		t.Fatalf("invalid reservation deadline %q", result.claim.Labels["reservation_until"])
+	}
+	if minimum := releasedAt.Add(reservationDuration - time.Second); deadline.Before(minimum) {
+		t.Fatalf("reservation deadline=%s want >=%s", deadline, minimum)
+	}
+}
+
 func TestConfirmedAbsentClaimRemovalRequiresDirectorySyncAndRetriesAfterDeletion(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	const leaseID = "cbx_123456789abc"
-	if err := claimLeaseForRepoProvider(leaseID, "fast-coral", "external", "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider(leaseID, "fast-coral", "external", "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	expected, err := readLeaseClaim(leaseID)
+	expected, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +320,7 @@ func TestConfirmedAbsentClaimRemovalRequiresDirectorySyncAndRetriesAfterDeletion
 	if err == nil || !strings.Contains(err.Error(), syncErr.Error()) {
 		t.Fatalf("claim removal error=%v", err)
 	}
-	if _, exists, readErr := readLeaseClaimWithPresence(leaseID); readErr != nil || exists {
+	if _, exists, readErr := ReadLeaseClaimWithPresence(leaseID); readErr != nil || exists {
 		t.Fatalf("removed claim exists=%t err=%v", exists, readErr)
 	}
 	var synced string
@@ -46,13 +339,237 @@ func TestConfirmedAbsentClaimRemovalRequiresDirectorySyncAndRetriesAfterDeletion
 	}
 }
 
+func TestWriteLeaseClaimAtomicWithSyncPropagatesDirectorySyncFailure(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_sync_failure"
+	path, err := leaseClaimPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("directory sync unavailable")
+	err = writeLeaseClaimAtomicWithSync(path, leaseClaim{LeaseID: leaseID}, func(string) error { return syncErr })
+	if err == nil || !strings.Contains(err.Error(), syncErr.Error()) {
+		t.Fatalf("write error=%v want %v", err, syncErr)
+	}
+}
+
+func TestWriteLeaseClaimAtomicDurableDoesNotSyncExistingAncestors(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_existing_namespace"
+	path, err := leaseClaimPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	err = writeLeaseClaimAtomicDurableWithSync(path, leaseClaim{LeaseID: leaseID}, filepath.Dir(path), func(dir string) error {
+		synced = append(synced, filepath.Clean(dir))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Clean(filepath.Dir(path))}
+	if !reflect.DeepEqual(synced, want) {
+		t.Fatalf("synced=%q want %q", synced, want)
+	}
+}
+
+func TestDurableGuardedClaimWriteSyncsOnlyCreatedNamespaceParents(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(base, "new-state-root"))
+	const leaseID = "cbx_bounded_namespace"
+	var synced []string
+	err := mutateLeaseClaimGuardedDurableWithSync(leaseID, unchangedLeaseClaimGuard(leaseID, leaseClaim{}, false), func(claim *leaseClaim) error {
+		*claim = leaseClaim{LeaseID: leaseID, Slug: "bounded"}
+		return nil
+	}, func(dir string) error {
+		synced = append(synced, filepath.Clean(dir))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := leaseClaimPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := filepath.Dir(filepath.Dir(path))
+	want := []string{
+		filepath.Clean(filepath.Dir(path)),
+		filepath.Clean(stateRoot),
+		filepath.Clean(filepath.Dir(stateRoot)),
+		filepath.Clean(base),
+	}
+	if !reflect.DeepEqual(synced, want) {
+		t.Fatalf("synced=%q want %q", synced, want)
+	}
+}
+
+func TestDurableGuardedClaimWritePropagatesRequiredBoundarySyncFailure(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(base, "new-state-root"))
+	const leaseID = "cbx_boundary_sync_failure"
+	syncErr := errors.New("required namespace sync unavailable")
+	var synced []string
+	err := mutateLeaseClaimGuardedDurableWithSync(leaseID, unchangedLeaseClaimGuard(leaseID, leaseClaim{}, false), func(claim *leaseClaim) error {
+		*claim = leaseClaim{LeaseID: leaseID, Slug: "boundary"}
+		return nil
+	}, func(dir string) error {
+		dir = filepath.Clean(dir)
+		synced = append(synced, dir)
+		if dir == filepath.Clean(base) {
+			return syncErr
+		}
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), syncErr.Error()) {
+		t.Fatalf("write error=%v want %v", err, syncErr)
+	}
+	path, pathErr := leaseClaimPath(leaseID)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("claim should be installed before required directory sync error: %v", statErr)
+	}
+	if got := synced[len(synced)-1]; got != filepath.Clean(base) {
+		t.Fatalf("last synced directory=%q want boundary %q", got, base)
+	}
+}
+
+func TestDurableGuardedClaimWriteHoldsLockThroughDirectorySync(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_durable_lock"
+	first := leaseClaim{LeaseID: leaseID, Slug: "first"}
+	second := leaseClaim{LeaseID: leaseID, Slug: "second"}
+	reachedSync := make(chan struct{})
+	releaseSync := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		var once sync.Once
+		firstDone <- mutateLeaseClaimGuardedWithWrite(leaseID, unchangedLeaseClaimGuard(leaseID, leaseClaim{}, false), func(claim *leaseClaim) error {
+			*claim = first
+			return nil
+		}, func(path string, claim leaseClaim) error {
+			return writeLeaseClaimAtomicDurableWithSync(path, claim, filepath.Dir(path), func(string) error {
+				once.Do(func() {
+					close(reachedSync)
+					<-releaseSync
+				})
+				return nil
+			})
+		})
+	}()
+	select {
+	case <-reachedSync:
+	case <-time.After(2 * time.Second):
+		t.Fatal("durable write did not reach directory sync")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- ReplaceLeaseClaimIfUnchanged(leaseID, first, second)
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("competing mutation completed before durable sync: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseSync)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	stored, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Slug != second.Slug {
+		t.Fatalf("stored claim=%#v want second mutation", stored)
+	}
+}
+
+func TestDurableGuardedClaimActionFailurePreventsPublication(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_durable_action"
+	actionErr := errors.New("storage identity changed")
+	actionCalled := false
+	_, err := ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurableAfter(
+		leaseID,
+		"durable-action",
+		Config{Provider: "aws"},
+		"account:test",
+		Server{Provider: "aws", CloudID: "i-pending"},
+		SSHTarget{},
+		"/repo",
+		time.Minute,
+		false,
+		leaseClaim{},
+		false,
+		func() error {
+			actionCalled = true
+			return actionErr
+		},
+	)
+	if !errors.Is(err, actionErr) || !actionCalled {
+		t.Fatalf("durable action called=%v err=%v", actionCalled, err)
+	}
+	if claim, exists, readErr := ReadLeaseClaimWithPresence(leaseID); readErr != nil || exists {
+		t.Fatalf("claim published after action failure: claim=%#v exists=%v err=%v", claim, exists, readErr)
+	}
+}
+
+func TestDurableGuardedClaimCompletedActionStillPublishesAfterCancellation(t *testing.T) {
+	for _, reclaim := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reclaim=%t", reclaim), func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			const leaseID = "cbx_completed_action"
+			cfg := Config{Provider: "aws"}
+			server := Server{Provider: "aws", CloudID: "i-confirmed"}
+			var previous leaseClaim
+			if reclaim {
+				var err error
+				previous, err = ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurable(
+					leaseID, "completed-action", cfg, "account:test", server, SSHTarget{}, t.TempDir(), time.Minute, false, leaseClaim{}, false,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			repo := t.TempDir()
+			called := false
+			updated, err := ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurableAfterContext(
+				ctx, leaseID, "completed-action", cfg, "account:test", server, SSHTarget{}, repo, time.Minute, reclaim, previous, reclaim,
+				func() error { called = true; cancel(); return nil },
+			)
+			if err != nil || !called || !errors.Is(ctx.Err(), context.Canceled) {
+				t.Fatalf("completed action was discarded: called=%t err=%v", called, err)
+			}
+			stored, exists, err := ReadLeaseClaimWithPresence(leaseID)
+			if err != nil || !exists || !reflect.DeepEqual(stored, updated) || stored.RepoRoot != repo || stored.Revision == "" || reclaim && stored.Revision == previous.Revision {
+				t.Fatalf("completed action was not durably published: stored=%+v updated=%+v err=%v", stored, updated, err)
+			}
+		})
+	}
+}
+
 func TestClaimLeaseForRepoWritesAndUpdatesClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repo := filepath.Join(t.TempDir(), "repo")
-	if err := claimLeaseForRepoProvider("cbx_123", "blue-lobster", "blacksmith-testbox", repo, 30*time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("cbx_123", "blue-lobster", "blacksmith-testbox", repo, 30*time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_123")
+	claim, err := ReadLeaseClaim("cbx_123")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,19 +584,19 @@ func TestClaimLeaseForRepoWritesAndUpdatesClaim(t *testing.T) {
 func TestLeaseClaimPathRejectsTraversalIDs(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repo := filepath.Join(t.TempDir(), "repo")
-	if err := claimLeaseForRepoProvider("../target", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
+	if err := ClaimLeaseForRepoProvider("../target", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
 		t.Fatal("claim with traversal lease id succeeded")
 	}
-	if err := claimLeaseForRepoProvider(" cbx_123 ", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
+	if err := ClaimLeaseForRepoProvider(" cbx_123 ", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
 		t.Fatal("claim with whitespace-padded lease id succeeded")
 	}
-	if err := claimLeaseForRepoProvider("site:runner", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
+	if err := ClaimLeaseForRepoProvider("site:runner", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
 		t.Fatal("claim with Windows-reserved lease id character succeeded")
 	}
-	if err := claimLeaseForRepoProvider("CON", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
+	if err := ClaimLeaseForRepoProvider("CON", "bad", "proxmox", repo, 30*time.Minute, false); err == nil {
 		t.Fatal("claim with Windows-reserved device name succeeded")
 	}
-	if _, ok, err := resolveLeaseClaim("../target"); err != nil || ok {
+	if _, ok, err := ResolveLeaseClaim("../target"); err != nil || ok {
 		t.Fatalf("resolve traversal id ok=%t err=%v, want no direct claim match", ok, err)
 	}
 }
@@ -88,10 +605,10 @@ func TestLeaseClaimPathAllowsCustomFilenameIDs(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repo := filepath.Join(t.TempDir(), "repo")
 	for _, leaseID := range []string{"host@example.com", "site-runner", "東京"} {
-		if err := claimLeaseForRepoProvider(leaseID, "custom", "static", repo, 30*time.Minute, false); err != nil {
+		if err := ClaimLeaseForRepoProvider(leaseID, "custom", "static", repo, 30*time.Minute, false); err != nil {
 			t.Fatalf("claimLeaseForRepoProvider(%q): %v", leaseID, err)
 		}
-		if claim, ok, err := resolveLeaseClaim(leaseID); err != nil || !ok || claim.LeaseID != leaseID {
+		if claim, ok, err := ResolveLeaseClaim(leaseID); err != nil || !ok || claim.LeaseID != leaseID {
 			t.Fatalf("resolve %q claim=%#v ok=%t err=%v", leaseID, claim, ok, err)
 		}
 	}
@@ -118,10 +635,10 @@ func TestClaimLeaseTargetForRepoConfigStoresEndpointMetadata(t *testing.T) {
 	}
 	target := SSHTarget{Host: "203.0.113.10", Port: "2222"}
 
-	if err := claimLeaseTargetForRepoConfig("cbx_123", "web", cfg, server, target, "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig("cbx_123", "web", cfg, server, target, "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_123")
+	claim, err := ReadLeaseClaim("cbx_123")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +651,7 @@ func TestClaimLeaseTargetForRepoConfigStoresEndpointMetadata(t *testing.T) {
 	if claim.Labels[pondLabelKey] != "alpha-pond" {
 		t.Fatalf("claim labels=%#v", claim.Labels)
 	}
-	if resolved, ok, err := resolveLeaseClaimForProviderCloudID("i-123", "aws"); err != nil || !ok || resolved.LeaseID != "cbx_123" {
+	if resolved, ok, err := ResolveLeaseClaimForProviderCloudID("i-123", "aws"); err != nil || !ok || resolved.LeaseID != "cbx_123" {
 		t.Fatalf("cloud id resolution claim=%#v ok=%t err=%v", resolved, ok, err)
 	}
 }
@@ -144,35 +661,78 @@ func TestClaimLeaseTargetForConfigStoresUnattachedProviderResource(t *testing.T)
 	cfg := baseConfig()
 	cfg.Provider = "aws"
 	server := Server{
-		Provider: "aws",
-		CloudID:  "i-1750645",
+		Provider:    "aws",
+		CloudID:     "i-1750645",
+		ID:          42,
+		ImmutableID: "vmid-1750645",
 		Labels: map[string]string{
 			"provider": "aws",
 			"slug":     "warm",
 		},
 	}
 
-	if err := claimLeaseTargetForConfig("cbx_hostinger123", "warm", cfg, server, SSHTarget{Host: "203.0.113.10"}, time.Hour); err != nil {
+	if err := ClaimLeaseTargetForConfig("cbx_hostinger123", "warm", cfg, server, SSHTarget{Host: "203.0.113.10"}, time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_hostinger123")
+	claim, err := ReadLeaseClaim("cbx_hostinger123")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claim.Provider != "aws" || claim.CloudID != "i-1750645" || claim.RepoRoot != "" {
+	if claim.Provider != "aws" || claim.CloudID != "i-1750645" || claim.CloudNumericID != 42 || claim.CloudImmutableID != "vmid-1750645" || claim.RepoRoot != "" {
 		t.Fatalf("unexpected unattached provider claim: %#v", claim)
 	}
 
 	repoRoot := t.TempDir()
-	if err := claimLeaseTargetForRepoConfig("cbx_hostinger123", "warm", cfg, server, SSHTarget{Host: "203.0.113.10"}, repoRoot, time.Hour, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig("cbx_hostinger123", "warm", cfg, server, SSHTarget{Host: "203.0.113.10"}, repoRoot, time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("cbx_hostinger123")
+	claim, err = ReadLeaseClaim("cbx_hostinger123")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if claim.RepoRoot != repoRoot {
 		t.Fatalf("provider claim was not attached to repo: %#v", claim)
+	}
+}
+
+func TestClaimLeaseTargetForConfigIfUnchangedStoresProviderScope(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := baseConfig()
+	cfg.Provider = "railway"
+	cfg.Railway.APIURL = " https://railway.example.test/graphql/v2/ "
+	cfg.Railway.ProjectID = " proj-1 "
+	cfg.Railway.EnvironmentID = " env-1 "
+	server := Server{
+		Provider: "railway",
+		CloudID:  "svc-1",
+		Name:     "api",
+		Labels: map[string]string{
+			"railwayDeploymentId": "dep-1",
+		},
+	}
+	leaseID := "railway_123456789abc"
+	previous, previousExists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claim, err := ClaimLeaseTargetForConfigIfUnchanged(leaseID, "", cfg, server, SSHTarget{}, 0, previous, previousExists)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Provider != "railway" || claim.CloudID != "svc-1" || claim.RepoRoot != "" {
+		t.Fatalf("unexpected provider claim: %#v", claim)
+	}
+	wantScope := "endpoint:https://railway.example.test/graphql/v2|project:proj-1|environment:env-1"
+	if claim.ProviderScope != wantScope {
+		t.Fatalf("ProviderScope=%q, want %q", claim.ProviderScope, wantScope)
+	}
+	if claim.Labels["railwayDeploymentId"] != "dep-1" {
+		t.Fatalf("labels=%#v", claim.Labels)
+	}
+
+	if _, err := ClaimLeaseTargetForConfigIfUnchanged(leaseID, "", cfg, Server{Provider: "railway", CloudID: "svc-2"}, SSHTarget{}, 0, previous, previousExists); err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("stale create-if-absent err=%v", err)
 	}
 }
 
@@ -182,13 +742,13 @@ func TestConditionalClaimMutationRejectsChangedState(t *testing.T) {
 	cfg.Provider = "digitalocean"
 	leaseID := "cbx_conditional123"
 
-	if err := claimLeaseTargetForRepoConfig(leaseID, "other", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/other", time.Minute, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "other", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/other", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := claimLeaseTargetForRepoConfigIfUnchanged(leaseID, "digitalocean", cfg, Server{Provider: "digitalocean", CloudID: "77"}, SSHTarget{}, "/repo", time.Minute, false, leaseClaim{}, false); err == nil || !strings.Contains(err.Error(), "claim changed") {
+	if _, err := ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, "digitalocean", cfg, Server{Provider: "digitalocean", CloudID: "77"}, SSHTarget{}, "/repo", time.Minute, false, leaseClaim{}, false); err == nil || !strings.Contains(err.Error(), "claim changed") {
 		t.Fatalf("create-if-absent err=%v", err)
 	}
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,13 +757,13 @@ func TestConditionalClaimMutationRejectsChangedState(t *testing.T) {
 	}
 
 	expected := claim
-	if err := updateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
+	if err := UpdateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := updateLeaseClaimEndpointIfUnchanged(leaseID, expected, Server{Provider: "digitalocean", CloudID: "77"}, SSHTarget{}); err == nil || !strings.Contains(err.Error(), "claim changed") {
+	if _, err := UpdateLeaseClaimEndpointIfUnchanged(leaseID, expected, Server{Provider: "digitalocean", CloudID: "77"}, SSHTarget{}); err == nil || !strings.Contains(err.Error(), "claim changed") {
 		t.Fatalf("conditional update err=%v", err)
 	}
-	claim, err = readLeaseClaim(leaseID)
+	claim, err = ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,46 +772,161 @@ func TestConditionalClaimMutationRejectsChangedState(t *testing.T) {
 	}
 }
 
+func TestConditionalConfigClaimCanBindProviderScope(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := Config{Provider: "external"}
+	server := Server{Provider: "external", CloudID: "resource-1"}
+	const providerScope = "account:example-org/project:example-project"
+
+	claimed, err := ClaimLeaseTargetForConfigScopeIfUnchanged(
+		"cbx_scoped_config",
+		"scoped",
+		cfg,
+		providerScope,
+		server,
+		SSHTarget{Host: "192.0.2.10", Port: "22"},
+		time.Minute,
+		leaseClaim{},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ProviderScope != providerScope || claimed.CloudID != "resource-1" {
+		t.Fatalf("scoped claim=%#v", claimed)
+	}
+
+	defaultClaim, err := ClaimLeaseTargetForConfigIfUnchanged(
+		"cbx_default_config",
+		"default",
+		cfg,
+		server,
+		SSHTarget{},
+		time.Minute,
+		leaseClaim{},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultClaim.ProviderScope != "" {
+		t.Fatalf("default claim scope=%q", defaultClaim.ProviderScope)
+	}
+}
+
+func TestVerifyLeaseClaimUnchanged(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_guarded_action"
+	cfg := Config{Provider: "external"}
+	server := Server{Provider: "external", CloudID: "resource-1"}
+	if err := ClaimLeaseTargetForConfig(leaseID, "guarded", cfg, server, SSHTarget{}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyLeaseClaimUnchanged(leaseID, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := claim
+	stale.CloudID = "resource-2"
+	err = VerifyLeaseClaimUnchanged(leaseID, stale)
+	if err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("stale guard err=%v", err)
+	}
+}
+
+func TestRemoveLeaseClaimIfUnchangedRejectsSameValueRewrite(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_same_value_rewrite"
+	cfg := Config{Provider: "external"}
+	server := Server{Provider: "external", CloudID: "resource-1"}
+	if err := ClaimLeaseTargetForConfig(leaseID, "same-value", cfg, server, SSHTarget{}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Revision == "" {
+		t.Fatal("initial claim revision is empty")
+	}
+	if err := mutateLeaseClaim(leaseID, func(*leaseClaim) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	rewritten, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten.Revision == snapshot.Revision {
+		t.Fatalf("same-value rewrite kept revision %q", snapshot.Revision)
+	}
+	withoutRevision := func(claim leaseClaim) leaseClaim {
+		claim.Revision = ""
+		return claim
+	}
+	if !reflect.DeepEqual(withoutRevision(rewritten), withoutRevision(snapshot)) {
+		t.Fatalf("rewrite changed claim data beyond revision:\nbefore: %#v\nafter:  %#v", snapshot, rewritten)
+	}
+
+	err = RemoveLeaseClaimIfUnchanged(leaseID, snapshot)
+	if err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("same-value rewrite guard err=%v", err)
+	}
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil {
+		t.Fatal(err)
+	} else if !exists {
+		t.Fatal("same-value rewrite was removed")
+	}
+}
+
 func TestConditionalRepoClaimCanBeRestored(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := "cbx_transaction123"
 
-	previous, previousExists, err := readLeaseClaimWithPresence(leaseID)
+	previous, previousExists, err := ReadLeaseClaimWithPresence(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := claimLeaseForRepoProviderScopePondIfUnchanged(leaseID, "transaction", "kubevirt", "cluster:test", "", "/repo-a", time.Minute, false, previous, previousExists)
+	claimed, err := ClaimLeaseForRepoProviderScopePondIfUnchanged(leaseID, "transaction", "kubevirt", "cluster:test", "", "/repo-a", time.Minute, false, previous, previousExists)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if claimed.RepoRoot != "/repo-a" {
 		t.Fatalf("claimed=%#v", claimed)
 	}
-	if err := restoreLeaseClaimIfUnchanged(leaseID, claimed, previous, previousExists); err != nil {
+	if err := RestoreLeaseClaimIfUnchanged(leaseID, claimed, previous, previousExists); err != nil {
 		t.Fatal(err)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || exists {
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
 		t.Fatalf("restored absent claim exists=%v err=%v", exists, err)
 	}
 
-	if err := claimLeaseForRepoProviderScope(leaseID, "transaction", "kubevirt", "cluster:test", "/repo-original", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProviderScope(leaseID, "transaction", "kubevirt", "cluster:test", "/repo-original", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	previous, previousExists, err = readLeaseClaimWithPresence(leaseID)
+	previous, previousExists, err = ReadLeaseClaimWithPresence(leaseID)
 	if err != nil || !previousExists {
 		t.Fatalf("previous=%#v exists=%v err=%v", previous, previousExists, err)
 	}
-	claimed, err = claimLeaseForRepoProviderScopePondIfUnchanged(leaseID, "transaction", "kubevirt", "cluster:test", "", "/repo-b", time.Minute, true, previous, previousExists)
+	claimed, err = ClaimLeaseForRepoProviderScopePondIfUnchanged(leaseID, "transaction", "kubevirt", "cluster:test", "", "/repo-b", time.Minute, true, previous, previousExists)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreLeaseClaimIfUnchanged(leaseID, claimed, previous, previousExists); err != nil {
+	if err := RestoreLeaseClaimIfUnchanged(leaseID, claimed, previous, previousExists); err != nil {
 		t.Fatal(err)
 	}
-	restored, err := readLeaseClaim(leaseID)
+	restored, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if restored.Revision == previous.Revision {
+		t.Fatalf("restored claim kept revision %q", previous.Revision)
+	}
+	restored.Revision = ""
+	previous.Revision = ""
 	if !reflect.DeepEqual(restored, previous) {
 		t.Fatalf("restored=%#v want %#v", restored, previous)
 	}
@@ -264,18 +939,18 @@ func TestConditionalRepoClaimCanBeRestored(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	previous, previousExists, err = readLeaseClaimWithPresence(incompleteID)
+	previous, previousExists, err = ReadLeaseClaimWithPresence(incompleteID)
 	if err != nil || !previousExists || previous.LeaseID != "" {
 		t.Fatalf("incomplete previous=%#v exists=%v err=%v", previous, previousExists, err)
 	}
-	claimed, err = claimLeaseForRepoProviderScopePondIfUnchanged(incompleteID, "incomplete", "kubevirt", "cluster:test", "", "/repo", time.Minute, false, previous, previousExists)
+	claimed, err = ClaimLeaseForRepoProviderScopePondIfUnchanged(incompleteID, "incomplete", "kubevirt", "cluster:test", "", "/repo", time.Minute, false, previous, previousExists)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreLeaseClaimIfUnchanged(incompleteID, claimed, previous, previousExists); err != nil {
+	if err := RestoreLeaseClaimIfUnchanged(incompleteID, claimed, previous, previousExists); err != nil {
 		t.Fatal(err)
 	}
-	restored, restoredExists, err := readLeaseClaimWithPresence(incompleteID)
+	restored, restoredExists, err := ReadLeaseClaimWithPresence(incompleteID)
 	if err != nil || !restoredExists || restored.LeaseID != "" {
 		t.Fatalf("restored incomplete=%#v exists=%v err=%v", restored, restoredExists, err)
 	}
@@ -289,10 +964,10 @@ func TestReplaceLeaseClaimIfUnchangedPreservesSelectedRuntimeState(t *testing.T)
 		CloudID:  "i-replace",
 		Labels:   map[string]string{"provider": "aws", "state": "running"},
 	}
-	if err := claimLeaseTargetForRepoConfig(leaseID, "replace", Config{Provider: "aws"}, running, SSHTarget{Host: "192.0.2.10", Port: "22"}, "/repo-b", time.Minute, true); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "replace", Config{Provider: "aws"}, running, SSHTarget{Host: "192.0.2.10", Port: "22"}, "/repo-b", time.Minute, true); err != nil {
 		t.Fatal(err)
 	}
-	current, err := readLeaseClaim(leaseID)
+	current, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,18 +976,81 @@ func TestReplaceLeaseClaimIfUnchangedPreservesSelectedRuntimeState(t *testing.T)
 	replacement.Labels["state"] = "stopped"
 	replacement.SSHHost = ""
 	replacement.SSHPort = 0
-	if err := replaceLeaseClaimIfUnchanged(leaseID, current, replacement); err != nil {
+	if err := ReplaceLeaseClaimIfUnchanged(leaseID, current, replacement); err != nil {
 		t.Fatal(err)
 	}
-	replaced, err := readLeaseClaim(leaseID)
+	replaced, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if replaced.RepoRoot != "/repo-a" || replaced.Labels["state"] != "stopped" || replaced.SSHHost != "" {
 		t.Fatalf("replaced=%#v", replaced)
 	}
-	if err := replaceLeaseClaimIfUnchanged(leaseID, current, replacement); err == nil || !strings.Contains(err.Error(), "claim changed") {
+	if err := ReplaceLeaseClaimIfUnchanged(leaseID, current, replacement); err == nil || !strings.Contains(err.Error(), "claim changed") {
 		t.Fatalf("stale replacement err=%v", err)
+	}
+}
+
+func TestDurableClaimReplacementHelpersPublishOnlyAfterAction(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_durable123456"
+	if err := ClaimLeaseForRepoProvider(leaseID, "durable", "aws", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	current, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := cloneLeaseClaim(current)
+	replacement.Slug = "durable-returning"
+	written, err := ReplaceLeaseClaimIfUnchangedDurableReturning(leaseID, current, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written.Slug != replacement.Slug || written.Revision == current.Revision {
+		t.Fatalf("durable replacement=%#v current=%#v", written, current)
+	}
+
+	next := cloneLeaseClaim(written)
+	next.Slug = "durable-after"
+	path, err := leaseClaimPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionCalled := false
+	writtenAfter, err := ReplaceLeaseClaimIfUnchangedDurableAfter(leaseID, written, next, func() error {
+		actionCalled = true
+		beforePublish, exists, err := readLeaseClaimPathWithPresence(path)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.New("claim disappeared before replacement action")
+		}
+		if beforePublish.Slug != written.Slug {
+			return fmt.Errorf("replacement published before action: %#v", beforePublish)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !actionCalled || writtenAfter.Slug != next.Slug || writtenAfter.Revision == written.Revision {
+		t.Fatalf("actionCalled=%t written=%#v previous=%#v", actionCalled, writtenAfter, written)
+	}
+
+	want := errors.New("provider cleanup failed")
+	failedReplacement := cloneLeaseClaim(writtenAfter)
+	failedReplacement.Slug = "must-not-publish"
+	if _, err := ReplaceLeaseClaimIfUnchangedDurableAfter(leaseID, writtenAfter, failedReplacement, func() error { return want }); !errors.Is(err, want) {
+		t.Fatalf("action failure err=%v", err)
+	}
+	unchanged, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Slug != writtenAfter.Slug || unchanged.Revision != writtenAfter.Revision {
+		t.Fatalf("failed action changed claim: got=%#v want=%#v", unchanged, writtenAfter)
 	}
 }
 
@@ -331,7 +1069,7 @@ func TestConditionalClaimCreateRejectsExistingEmptyFile(t *testing.T) {
 	}
 	cfg := baseConfig()
 	cfg.Provider = "digitalocean"
-	if _, err := claimLeaseTargetForRepoConfigIfUnchanged(leaseID, "digitalocean", cfg, Server{Provider: "digitalocean", CloudID: "77"}, SSHTarget{}, "/repo", time.Minute, false, leaseClaim{}, false); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
+	if _, err := ClaimLeaseTargetForRepoConfigIfUnchanged(leaseID, "digitalocean", cfg, Server{Provider: "digitalocean", CloudID: "77"}, SSHTarget{}, "/repo", time.Minute, false, leaseClaim{}, false); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
 		t.Fatalf("conditional create err=%v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -353,17 +1091,17 @@ func TestEndpointClaimRewriteRejectsExistingEmptyFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := claimLeaseTargetForRepoConfig(leaseID, "endpoint", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/repo", time.Minute, false); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "endpoint", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/repo", time.Minute, false); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
 		t.Fatalf("endpoint rewrite err=%v", err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil || string(data) != "{}" {
 		t.Fatalf("empty claim changed: data=%q err=%v", data, err)
 	}
-	if err := updateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
+	if err := UpdateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
 		t.Fatalf("direct endpoint update err=%v", err)
 	}
-	if _, err := updateLeaseClaimEndpointIfUnchanged(leaseID, leaseClaim{}, Server{Provider: "aws", CloudID: "i-789"}, SSHTarget{}); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
+	if _, err := UpdateLeaseClaimEndpointIfUnchanged(leaseID, leaseClaim{}, Server{Provider: "aws", CloudID: "i-789"}, SSHTarget{}); err == nil || !strings.Contains(err.Error(), "claim is incomplete") {
 		t.Fatalf("conditional endpoint update err=%v", err)
 	}
 }
@@ -371,21 +1109,21 @@ func TestEndpointClaimRewriteRejectsExistingEmptyFile(t *testing.T) {
 func TestEndpointClaimRewriteRejectsUnknownExistingProvider(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := "cbx_unknownprovider123"
-	if err := claimLeaseTargetForRepoConfig(leaseID, "unknown", Config{Provider: "unknown-provider"}, Server{
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "unknown", Config{Provider: "unknown-provider"}, Server{
 		Provider: "unknown-provider",
 		CloudID:  "unknown-1",
 		Labels:   map[string]string{"lease": leaseID, "slug": "unknown", "provider": "unknown-provider"},
 	}, SSHTarget{}, "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := claimLeaseTargetForRepoConfig(leaseID, "unknown", Config{Provider: "aws"}, Server{
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "unknown", Config{Provider: "aws"}, Server{
 		Provider: "aws",
 		CloudID:  "i-123",
 		Labels:   map[string]string{"lease": leaseID, "slug": "unknown", "provider": "aws"},
 	}, SSHTarget{}, "/repo", time.Minute, true); err == nil || !strings.Contains(err.Error(), "unavailable provider") {
 		t.Fatalf("provider rewrite err=%v", err)
 	}
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +1136,7 @@ func TestClaimMutationRejectsMisfiledClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	storedLeaseID := "cbx_storedclaim123"
 	requestedLeaseID := "cbx_requestedclaim123"
-	if err := claimLeaseTargetForRepoConfig(storedLeaseID, "stored", Config{Provider: "aws"}, Server{
+	if err := ClaimLeaseTargetForRepoConfig(storedLeaseID, "stored", Config{Provider: "aws"}, Server{
 		Provider: "aws",
 		CloudID:  "i-stored",
 		Labels:   map[string]string{"lease": storedLeaseID, "slug": "stored", "provider": "aws"},
@@ -424,7 +1162,7 @@ func TestClaimMutationRejectsMisfiledClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = claimLeaseTargetForRepoConfig(requestedLeaseID, "requested", Config{Provider: "aws"}, Server{
+	err = ClaimLeaseTargetForRepoConfig(requestedLeaseID, "requested", Config{Provider: "aws"}, Server{
 		Provider: "aws",
 		CloudID:  "i-requested",
 		Labels:   map[string]string{"lease": requestedLeaseID, "slug": "requested", "provider": "aws"},
@@ -454,14 +1192,14 @@ func TestReadLeaseClaimWithPresenceDistinguishesEmptyAndMissing(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	claim, exists, err := readLeaseClaimWithPresence(leaseID)
+	claim, exists, err := ReadLeaseClaimWithPresence(leaseID)
 	if err != nil || !exists || claim.LeaseID != "" {
 		t.Fatalf("empty claim=%#v exists=%v err=%v", claim, exists, err)
 	}
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	claim, exists, err = readLeaseClaimWithPresence(leaseID)
+	claim, exists, err = ReadLeaseClaimWithPresence(leaseID)
 	if err != nil || exists || claim.LeaseID != "" {
 		t.Fatalf("missing claim=%#v exists=%v err=%v", claim, exists, err)
 	}
@@ -470,18 +1208,18 @@ func TestReadLeaseClaimWithPresenceDistinguishesEmptyAndMissing(t *testing.T) {
 func TestConditionalClaimActionUpdateRejectsChangedState(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := "cbx_conditionaldelete123"
-	if err := claimLeaseTargetForRepoConfig(leaseID, "first", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "first", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	expected, err := readLeaseClaim(leaseID)
+	expected, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
+	if err := UpdateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
 	actionCalled := false
-	if _, err := updateLeaseClaimLabelsIfUnchangedAfter(leaseID, expected, map[string]string{"state": "stopped"}, func() error {
+	if _, err := UpdateLeaseClaimLabelsIfUnchangedAfter(leaseID, expected, map[string]string{"state": "stopped"}, func() error {
 		actionCalled = true
 		return nil
 	}); err == nil || !strings.Contains(err.Error(), "claim changed") {
@@ -490,14 +1228,14 @@ func TestConditionalClaimActionUpdateRejectsChangedState(t *testing.T) {
 	if actionCalled {
 		t.Fatal("conditional update ran action for changed claim")
 	}
-	changed, err := readLeaseClaim(leaseID)
+	changed, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if changed.CloudID != "i-456" {
 		t.Fatalf("changed claim removed: %#v", changed)
 	}
-	updated, err := updateLeaseClaimLabelsIfUnchangedAfter(leaseID, changed, map[string]string{"state": "stopped"}, func() error {
+	updated, err := UpdateLeaseClaimLabelsIfUnchangedAfter(leaseID, changed, map[string]string{"state": "stopped"}, func() error {
 		actionCalled = true
 		return nil
 	})
@@ -512,22 +1250,509 @@ func TestConditionalClaimActionUpdateRejectsChangedState(t *testing.T) {
 	}
 }
 
+func TestConditionalClaimActionFailureRetainsClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_conditionalfailure123"
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "first", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionErr := errors.New("provider stop failed")
+	_, err = UpdateLeaseClaimLabelsIfUnchangedAfter(leaseID, expected, map[string]string{"state": "stopped"}, func() error {
+		return actionErr
+	})
+	if !errors.Is(err, actionErr) {
+		t.Fatalf("conditional action err=%v, want provider failure", err)
+	}
+	retained, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retained, expected) {
+		t.Fatalf("claim changed after failed action:\n got %#v\nwant %#v", retained, expected)
+	}
+}
+
+func TestResolveLeaseClaimAfterActionPublishesOutcomeAndRemovesConflict(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_resolvecreate123"
+	initialLabels := map[string]string{"state": "creating", "ownership": "owner-1"}
+	expected, err := ClaimLeaseForRepoProviderScopePondWithLabels(
+		leaseID, "resolve-create", "cloud-run-sandbox", "project:test/region:test", "", "/repo", time.Minute, initialLabels,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialLabels["state"] = "mutated"
+	if expected.Labels["state"] != "creating" {
+		t.Fatalf("claim retained caller labels: %#v", expected.Labels)
+	}
+
+	timeoutErr := errors.New("create result unknown")
+	recovery, removed, actionSucceeded, err := ResolveLeaseClaimAfterActionIfUnchanged(
+		leaseID,
+		expected,
+		func() error { return timeoutErr },
+		func(actionErr error) (map[string]string, bool) {
+			if !errors.Is(actionErr, timeoutErr) {
+				t.Fatalf("resolve action error=%v", actionErr)
+			}
+			return map[string]string{"state": "recovery", "ownership": "owner-1"}, false
+		},
+	)
+	if !errors.Is(err, timeoutErr) || removed || actionSucceeded {
+		t.Fatalf("recovery result removed=%t succeeded=%t err=%v", removed, actionSucceeded, err)
+	}
+	if recovery.Labels["state"] != "recovery" || recovery.Revision == expected.Revision {
+		t.Fatalf("recovery claim=%#v", recovery)
+	}
+	persisted, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Labels["state"] != "recovery" || persisted.Revision != recovery.Revision {
+		t.Fatalf("persisted recovery=%#v want %#v", persisted, recovery)
+	}
+
+	ready, removed, actionSucceeded, err := ResolveLeaseClaimAfterActionIfUnchanged(
+		leaseID,
+		recovery,
+		func() error { return nil },
+		func(actionErr error) (map[string]string, bool) {
+			if actionErr != nil {
+				t.Fatalf("ready action error=%v", actionErr)
+			}
+			return map[string]string{"state": "ready", "ownership": "owner-1"}, false
+		},
+	)
+	if err != nil || removed || !actionSucceeded || ready.Labels["state"] != "ready" {
+		t.Fatalf("ready result claim=%#v removed=%t succeeded=%t err=%v", ready, removed, actionSucceeded, err)
+	}
+
+	conflictErr := errors.New("sandbox already exists")
+	conflict, removed, actionSucceeded, err := ResolveLeaseClaimAfterActionIfUnchanged(
+		leaseID,
+		ready,
+		func() error { return conflictErr },
+		func(actionErr error) (map[string]string, bool) {
+			if !errors.Is(actionErr, conflictErr) {
+				t.Fatalf("conflict action error=%v", actionErr)
+			}
+			return map[string]string{"state": "conflict"}, true
+		},
+	)
+	if !errors.Is(err, conflictErr) || !removed || actionSucceeded || conflict.Labels["state"] != "conflict" {
+		t.Fatalf("conflict result claim=%#v removed=%t succeeded=%t err=%v", conflict, removed, actionSucceeded, err)
+	}
+	if _, exists, readErr := ReadLeaseClaimWithPresence(leaseID); readErr != nil || exists {
+		t.Fatalf("conflict claim exists=%t err=%v", exists, readErr)
+	}
+}
+
+func TestResolveLeaseClaimAfterActionFailsClosedBeforeMutation(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_resolveguard123"
+	expected, err := ClaimLeaseForRepoProviderScopePondWithLabels(
+		leaseID, "resolve-guard", "cloud-run-sandbox", "project:test/region:test", "", "/repo", time.Minute,
+		map[string]string{"state": "creating"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unknownErr := errors.New("unclassified create failure")
+	updated, removed, actionSucceeded, err := ResolveLeaseClaimAfterActionIfUnchanged(
+		leaseID,
+		expected,
+		func() error { return unknownErr },
+		func(error) (map[string]string, bool) { return nil, false },
+	)
+	if !errors.Is(err, unknownErr) || removed || actionSucceeded || updated.LeaseID != "" {
+		t.Fatalf("unclassified result claim=%#v removed=%t succeeded=%t err=%v", updated, removed, actionSucceeded, err)
+	}
+	retained, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(retained, expected) {
+		t.Fatalf("unclassified failure changed claim:\n got %#v\nwant %#v", retained, expected)
+	}
+
+	stale := expected
+	stale.Revision = "stale-revision"
+	called := false
+	if _, _, _, err := ResolveLeaseClaimAfterActionIfUnchanged(
+		leaseID,
+		stale,
+		func() error {
+			called = true
+			return nil
+		},
+		func(error) (map[string]string, bool) { return map[string]string{"state": "ready"}, false },
+	); err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("stale guard err=%v", err)
+	}
+	if called {
+		t.Fatal("action ran after claim changed")
+	}
+
+	if _, _, _, err := ResolveLeaseClaimAfterActionIfUnchanged(
+		"../invalid", leaseClaim{}, func() error { return nil }, func(error) (map[string]string, bool) { return nil, false },
+	); err == nil {
+		t.Fatal("invalid lease ID was accepted")
+	}
+}
+
+func TestUpdateLeaseClaimLabelsAndLastUsedIfUnchanged(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_labeltime123"
+	expected, err := ClaimLeaseForRepoProviderScopePondWithLabels(
+		leaseID, "label-time", "cloud-run-sandbox", "project:test/region:test", "", "/repo", time.Minute,
+		map[string]string{"state": "creating"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lastUsed := time.Date(2026, time.July, 19, 7, 30, 0, 0, time.FixedZone("test", 2*60*60))
+	labels := map[string]string{"state": "ready", "ownership": "owner-1"}
+	updated, err := UpdateLeaseClaimLabelsAndLastUsedIfUnchanged(leaseID, expected, labels, lastUsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels["state"] = "mutated"
+	if updated.Labels["state"] != "ready" || updated.LastUsedAt != "2026-07-19T05:30:00Z" {
+		t.Fatalf("updated claim=%#v", updated)
+	}
+
+	if _, err := UpdateLeaseClaimLabelsAndLastUsedIfUnchanged(leaseID, expected, map[string]string{"state": "stale"}, time.Now()); err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("stale update err=%v", err)
+	}
+	if empty, err := UpdateLeaseClaimLabelsAndLastUsedIfUnchanged("", leaseClaim{}, nil, time.Time{}); err != nil || empty.LeaseID != "" {
+		t.Fatalf("empty update claim=%#v err=%v", empty, err)
+	}
+}
+
+func TestUpdateLeaseClaimTouchIfUnchangedCommitsOptionalTimeoutAtomically(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "static_touch_claim"
+	expected, err := ClaimLeaseForRepoProviderScopePondWithLabels(
+		leaseID, "static-touch", "ssh", "", "", "/repo", 30*time.Minute,
+		map[string]string{"state": "ready", "idle_timeout_secs": "1800"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstTouch := time.Date(2026, time.August, 16, 20, 0, 0, 0, time.UTC)
+	preserved, err := UpdateLeaseClaimTouchIfUnchanged(t.Context(), leaseID, expected, map[string]string{
+		"state": "ready", "idle_timeout_secs": "1800", "last_touched_at": LeaseLabelTime(firstTouch),
+	}, firstTouch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.IdleTimeoutSeconds != 1800 || preserved.LastUsedAt != firstTouch.Format(time.RFC3339) {
+		t.Fatalf("preserved claim=%#v", preserved)
+	}
+
+	secondTouch := firstTouch.Add(time.Minute)
+	override := 45 * time.Minute
+	replaced, err := UpdateLeaseClaimTouchIfUnchanged(t.Context(), leaseID, preserved, map[string]string{
+		"state": "ready", "idle_timeout_secs": "2700", "last_touched_at": LeaseLabelTime(secondTouch),
+	}, secondTouch, &override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced.IdleTimeoutSeconds != 2700 || replaced.LastUsedAt != secondTouch.Format(time.RFC3339) || replaced.Labels["idle_timeout_secs"] != "2700" {
+		t.Fatalf("replaced claim=%#v", replaced)
+	}
+
+	if _, err := UpdateLeaseClaimTouchIfUnchanged(t.Context(), leaseID, preserved, nil, time.Now(), nil); err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("stale touch err=%v", err)
+	}
+	RemoveLeaseClaim(leaseID)
+	if _, err := UpdateLeaseClaimTouchIfUnchanged(t.Context(), leaseID, replaced, nil, time.Now(), nil); err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("raced-away touch err=%v", err)
+	}
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
+		t.Fatalf("raced-away touch recreated claim: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestUpdateLeaseClaimTouchIfUnchangedActionCommitsAtomically(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_touch_action"
+	initial := Server{Provider: "aws", CloudID: "i-touch", Labels: map[string]string{"provider": "aws", "slug": "touch", "state": "ready"}}
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "touch", Config{Provider: "aws"}, initial, SSHTarget{Host: "203.0.113.10", Port: "22"}, "/repo", 30*time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.FixedZone("test", -7*60*60))
+	server := initial
+	server.Labels = map[string]string{"provider": "aws", "slug": "touch", "state": "running", "idle_timeout_secs": "1800"}
+	target := SSHTarget{Host: "203.0.113.20", Port: "2222"}
+	updated, gotServer, gotTarget, err := UpdateLeaseClaimTouchIfUnchangedAction(t.Context(), leaseID, expected, now, nil, func() (Server, SSHTarget, bool, error) {
+		return server, target, true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := ReadLeaseClaim(leaseID)
+	if err != nil || !reflect.DeepEqual(updated, persisted) || updated.Revision == expected.Revision ||
+		updated.LastUsedAt != "2026-08-20T19:00:00Z" || updated.IdleTimeoutSeconds != 1800 ||
+		updated.SSHHost != target.Host || updated.SSHPort != 2222 || updated.Labels["state"] != "running" ||
+		!reflect.DeepEqual(gotServer, server) || !reflect.DeepEqual(gotTarget, target) {
+		t.Fatalf("updated=%#v persisted=%#v server=%#v target=%#v err=%v", updated, persisted, gotServer, gotTarget, err)
+	}
+	override := 45 * time.Minute
+	server.Labels["idle_timeout_secs"] = "2700"
+	replaced, _, _, err := UpdateLeaseClaimTouchIfUnchangedAction(t.Context(), leaseID, updated, now.Add(time.Minute), &override, func() (Server, SSHTarget, bool, error) {
+		return server, target, true, nil
+	})
+	persisted, readErr := ReadLeaseClaim(leaseID)
+	if err != nil || readErr != nil || !reflect.DeepEqual(replaced, persisted) || replaced.IdleTimeoutSeconds != 2700 ||
+		replaced.Labels["idle_timeout_secs"] != "2700" || replaced.LastUsedAt != "2026-08-20T19:01:00Z" || replaced.Revision == updated.Revision {
+		t.Fatalf("replaced=%#v persisted=%#v err=%v readErr=%v", replaced, persisted, err, readErr)
+	}
+	endpoint, _, _, err := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, replaced, func() (Server, SSHTarget, bool, error) {
+		return server, SSHTarget{Host: "203.0.113.30", Port: "22"}, true, nil
+	})
+	if err != nil || endpoint.LastUsedAt != replaced.LastUsedAt || endpoint.IdleTimeoutSeconds != replaced.IdleTimeoutSeconds {
+		t.Fatalf("endpoint compatibility claim=%#v err=%v", endpoint, err)
+	}
+}
+
+func TestLeaseClaimTouchPersistsEffectiveIdleTimeout(t *testing.T) {
+	for _, atomicAction := range []bool{false, true} {
+		t.Run(fmt.Sprint(atomicAction), func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			const id = "cbx_clamped_idle"
+			server := Server{Provider: "aws", CloudID: "i-test", Labels: map[string]string{"provider": "aws"}}
+			if err := ClaimLeaseTargetForRepoConfig(id, "test", Config{Provider: "aws"}, server, SSHTarget{}, "/repo", 30*time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := ReadLeaseClaim(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requested := 90 * time.Minute
+			server.Labels = map[string]string{"provider": "aws", "idle_timeout_secs": "1800", "ttl_secs": "1800"}
+			if atomicAction {
+				claim, _, _, err = UpdateLeaseClaimTouchIfUnchangedAction(t.Context(), id, claim, time.Now(), &requested, func() (Server, SSHTarget, bool, error) { return server, SSHTarget{}, true, nil })
+			} else {
+				claim, err = UpdateLeaseClaimTouchIfUnchanged(t.Context(), id, claim, server.Labels, time.Now(), &requested)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := ReadLeaseClaim(id)
+			if err != nil || claim.IdleTimeoutSeconds != 1800 || persisted.IdleTimeoutSeconds != 1800 {
+				t.Fatalf("effective idle timeout lost: claim=%d persisted=%d err=%v", claim.IdleTimeoutSeconds, persisted.IdleTimeoutSeconds, err)
+			}
+		})
+	}
+}
+
+func TestUpdateLeaseClaimTouchIfUnchangedActionFailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		override *time.Duration
+		prepare  func(string, leaseClaim) leaseClaim
+		action   func(Server, SSHTarget) (Server, SSHTarget, bool, error)
+		wantCall bool
+		wantErr  bool
+	}{
+		{name: "nil action"},
+		{name: "no-op", action: func(server Server, target SSHTarget) (Server, SSHTarget, bool, error) {
+			return server, target, false, nil
+		}, wantCall: true},
+		{name: "provider failure", action: func(server Server, target SSHTarget) (Server, SSHTarget, bool, error) {
+			return server, target, true, errors.New("provider failed")
+		}, wantCall: true, wantErr: true},
+		{name: "zero override", override: durationPointer(0), wantErr: true},
+		{name: "negative override", override: durationPointer(-time.Second), wantErr: true},
+		{name: "rounds to zero", override: durationPointer(time.Millisecond), wantErr: true},
+		{name: "stale revision", prepare: func(_ string, claim leaseClaim) leaseClaim { claim.Revision = "stale"; return claim }, wantErr: true},
+		{name: "removed claim", prepare: func(id string, claim leaseClaim) leaseClaim { RemoveLeaseClaim(id); return claim }, wantErr: true},
+		{name: "ABA replacement", prepare: func(id string, claim leaseClaim) leaseClaim {
+			middle, err := UpdateLeaseClaimLabelsIfUnchanged(id, claim, map[string]string{"provider": "aws", "state": "other"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := UpdateLeaseClaimLabelsIfUnchanged(id, middle, claim.Labels); err != nil {
+				t.Fatal(err)
+			}
+			return claim
+		}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			const leaseID = "cbx_touch_failure"
+			server := Server{Provider: "aws", CloudID: "i-touch", Labels: map[string]string{"provider": "aws", "slug": "touch", "state": "ready"}}
+			if err := ClaimLeaseTargetForRepoConfig(leaseID, "touch", Config{Provider: "aws"}, server, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			expected, err := ReadLeaseClaim(leaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.prepare != nil {
+				expected = test.prepare(leaseID, expected)
+			}
+			before, existed, err := ReadLeaseClaimWithPresence(leaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			var action func() (Server, SSHTarget, bool, error)
+			if test.name != "nil action" {
+				action = func() (Server, SSHTarget, bool, error) {
+					called = true
+					if test.action != nil {
+						return test.action(server, SSHTarget{})
+					}
+					return server, SSHTarget{}, true, nil
+				}
+			}
+			_, _, _, err = UpdateLeaseClaimTouchIfUnchangedAction(t.Context(), leaseID, expected, time.Now(), test.override, action)
+			if (err != nil) != test.wantErr || called != test.wantCall {
+				t.Fatalf("err=%v called=%t wantErr=%t wantCall=%t", err, called, test.wantErr, test.wantCall)
+			}
+			after, exists, readErr := ReadLeaseClaimWithPresence(leaseID)
+			if readErr != nil || exists != existed || exists && !reflect.DeepEqual(after, before) {
+				t.Fatalf("before=%#v after=%#v existed=%t exists=%t err=%v", before, after, existed, exists, readErr)
+			}
+		})
+	}
+}
+
+func TestConditionalClaimActionsRejectMisfiledClaimBeforeProviderMutation(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(string, leaseClaim, func() (Server, SSHTarget, bool, error)) error
+	}{
+		{name: "endpoint", run: func(leaseID string, expected leaseClaim, action func() (Server, SSHTarget, bool, error)) error {
+			_, _, _, err := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, expected, action)
+			return err
+		}},
+		{name: "touch", run: func(leaseID string, expected leaseClaim, action func() (Server, SSHTarget, bool, error)) error {
+			_, _, _, err := UpdateLeaseClaimTouchIfUnchangedAction(t.Context(), leaseID, expected, time.Now(), nil, action)
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			const storedLeaseID = "cbx_touch_stored"
+			const requestedLeaseID = "cbx_touch_requested"
+			server := Server{Provider: "aws", CloudID: "i-touch", Labels: map[string]string{
+				"lease": storedLeaseID, "slug": "touch", "provider": "aws",
+			}}
+			if err := ClaimLeaseTargetForRepoConfig(storedLeaseID, "touch", Config{Provider: "aws"}, server, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			expected, err := ReadLeaseClaim(storedLeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storedPath, err := leaseClaimPath(storedLeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestedPath, err := leaseClaimPath(requestedLeaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original, err := os.ReadFile(storedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(requestedPath, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			err = test.run(requestedLeaseID, expected, func() (Server, SSHTarget, bool, error) {
+				called = true
+				return server, SSHTarget{}, true, nil
+			})
+			if err == nil || !strings.Contains(err.Error(), "refusing misfiled claim") || called {
+				t.Fatalf("misfiled claim error=%v provider callback called=%t", err, called)
+			}
+			current, err := os.ReadFile(requestedPath)
+			if err != nil || string(current) != string(original) {
+				t.Fatalf("misfiled claim changed: current=%q original=%q err=%v", current, original, err)
+			}
+		})
+	}
+}
+
+func TestUpdateLeaseClaimTouchIfUnchangedActionHoldsFenceDuringCallback(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_touch_fence"
+	server := Server{Provider: "aws", CloudID: "i-touch", Labels: map[string]string{"provider": "aws", "slug": "touch", "state": "ready"}}
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "touch", Config{Provider: "aws"}, server, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	touchDone := make(chan error, 1)
+	go func() {
+		_, _, _, err := UpdateLeaseClaimTouchIfUnchangedAction(t.Context(), leaseID, expected, time.Now(), nil, func() (Server, SSHTarget, bool, error) {
+			close(entered)
+			<-proceed
+			return server, SSHTarget{}, true, nil
+		})
+		touchDone <- err
+	}()
+	<-entered
+	mutationDone := make(chan error, 1)
+	go func() {
+		_, err := UpdateLeaseClaimLabelsIfUnchanged(leaseID, expected, map[string]string{"provider": "aws", "state": "stale"})
+		mutationDone <- err
+	}()
+	select {
+	case err := <-mutationDone:
+		t.Fatalf("old snapshot mutated while provider callback held lock: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(proceed)
+	if err := <-touchDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-mutationDone; err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("concurrent old snapshot mutation err=%v", err)
+	}
+}
+
+func durationPointer(value time.Duration) *time.Duration { return &value }
+
 func TestConditionalClaimEndpointActionUpdatesAtomically(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := "cbx_conditionalendpoint123"
 	cfg := Config{Provider: "aws"}
 	server := Server{Provider: "aws", CloudID: "i-123", Labels: map[string]string{"provider": "aws", "state": "running"}}
-	if err := claimLeaseTargetForRepoConfig(leaseID, "endpoint", cfg, server, SSHTarget{Host: "203.0.113.10", Port: "22"}, "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "endpoint", cfg, server, SSHTarget{Host: "203.0.113.10", Port: "22"}, "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	expected, err := readLeaseClaim(leaseID)
+	expected, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stopped := server
 	stopped.Labels = map[string]string{"provider": "aws", "state": "stopped"}
 	actionCalled := false
-	updated, err := updateLeaseClaimEndpointIfUnchangedAfter(leaseID, expected, stopped, SSHTarget{}, func() error {
+	updated, err := UpdateLeaseClaimEndpointIfUnchangedAfter(leaseID, expected, stopped, SSHTarget{}, func() error {
 		actionCalled = true
 		return nil
 	})
@@ -538,11 +1763,11 @@ func TestConditionalClaimEndpointActionUpdatesAtomically(t *testing.T) {
 		t.Fatalf("updated=%#v actionCalled=%v", updated, actionCalled)
 	}
 
-	if err := updateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
+	if err := UpdateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
 	actionCalled = false
-	if _, err := updateLeaseClaimEndpointIfUnchangedAfter(leaseID, updated, stopped, SSHTarget{}, func() error {
+	if _, err := UpdateLeaseClaimEndpointIfUnchangedAfter(leaseID, updated, stopped, SSHTarget{}, func() error {
 		actionCalled = true
 		return nil
 	}); err == nil || !strings.Contains(err.Error(), "claim changed") {
@@ -550,6 +1775,155 @@ func TestConditionalClaimEndpointActionUpdatesAtomically(t *testing.T) {
 	}
 	if actionCalled {
 		t.Fatal("conditional endpoint update ran action for changed claim")
+	}
+}
+
+func TestConditionalClaimEndpointActionBuildsResultUnderLock(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_conditionalresult123"
+	initial := Server{Provider: "aws", CloudID: "i-123", Labels: map[string]string{"provider": "aws", "state": "provisioning"}}
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "result", Config{Provider: "aws"}, initial, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := Server{Provider: "aws", CloudID: "i-123", Labels: map[string]string{"provider": "aws", "state": "ready"}}
+	target := SSHTarget{Host: "203.0.113.20", Port: "22"}
+	actionCalled := false
+	updated, gotServer, gotTarget, err := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, expected, func() (Server, SSHTarget, bool, error) {
+		actionCalled = true
+		return ready, target, true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !actionCalled || gotServer.CloudID != ready.CloudID || gotTarget.Host != target.Host || updated.Labels["state"] != "ready" || updated.SSHHost != target.Host || updated.Revision == expected.Revision {
+		t.Fatalf("called=%t server=%#v target=%#v claim=%#v", actionCalled, gotServer, gotTarget, updated)
+	}
+	guarded, _, _, err := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, updated, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(guarded, updated) {
+		t.Fatalf("nil-action claim=%#v want=%#v", guarded, updated)
+	}
+	stopped := ready
+	stopped.Labels = map[string]string{"provider": "aws", "state": "stopped"}
+	replaced, gotServer, gotTarget, err := ReplaceLeaseClaimEndpointIfUnchangedAction(leaseID, updated, func() (Server, SSHTarget, bool, error) {
+		return stopped, SSHTarget{}, true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotServer.Labels["state"] != "stopped" || gotTarget.Host != "" || replaced.SSHHost != "" || replaced.SSHPort != 0 || replaced.Labels["state"] != "stopped" || replaced.Revision == updated.Revision {
+		t.Fatalf("replaced server=%#v target=%#v claim=%#v", gotServer, gotTarget, replaced)
+	}
+	updated = replaced
+
+	if err := UpdateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
+		t.Fatal(err)
+	}
+	actionCalled = false
+	if _, _, _, err := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, updated, func() (Server, SSHTarget, bool, error) {
+		actionCalled = true
+		return ready, target, true, nil
+	}); err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("err=%v", err)
+	}
+	if actionCalled {
+		t.Fatal("action ran for a changed claim")
+	}
+}
+
+func TestConditionalClaimEndpointActionRevisionRejectsABA(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_endpoint_aba"
+	server := Server{Provider: "aws", CloudID: "i-123", Labels: map[string]string{"provider": "aws", "slug": "endpoint", "state": "ready"}}
+	targetA := SSHTarget{Host: "203.0.113.10", Port: "22"}
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "endpoint", Config{Provider: "aws"}, server, targetA, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	original, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, action := range map[string]func() (Server, SSHTarget, bool, error){
+		"no-op":   func() (Server, SSHTarget, bool, error) { return server, targetA, false, nil },
+		"failure": func() (Server, SSHTarget, bool, error) { return server, targetA, true, errors.New("provider failed") },
+	} {
+		_, _, _, actionErr := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, original, action)
+		if name == "no-op" && actionErr != nil || name != "no-op" && actionErr == nil {
+			t.Fatalf("%s error=%v", name, actionErr)
+		}
+		current, err := ReadLeaseClaim(leaseID)
+		if err != nil || !reflect.DeepEqual(current, original) {
+			t.Fatalf("%s changed claim: current=%#v original=%#v err=%v", name, current, original, err)
+		}
+	}
+	targetB := SSHTarget{Host: "203.0.113.20", Port: "22"}
+	middle, _, _, err := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, original, func() (Server, SSHTarget, bool, error) {
+		return server, targetB, true, nil
+	})
+	if err != nil || middle.Revision == original.Revision {
+		t.Fatalf("A->B claim=%#v err=%v", middle, err)
+	}
+	final, _, _, err := UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, middle, func() (Server, SSHTarget, bool, error) {
+		return server, targetA, true, nil
+	})
+	if err != nil || final.Revision == middle.Revision || final.SSHHost != original.SSHHost {
+		t.Fatalf("B->A claim=%#v err=%v", final, err)
+	}
+	called := false
+	_, _, _, err = UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, original, func() (Server, SSHTarget, bool, error) {
+		called = true
+		return server, targetB, true, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "claim changed") || called {
+		t.Fatalf("stale A snapshot error=%v actionCalled=%t", err, called)
+	}
+	if err := mutateLeaseClaim(leaseID, func(claim *leaseClaim) error {
+		claim.Provider = "unavailable-provider"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = UpdateLeaseClaimEndpointIfUnchangedAction(leaseID, invalid, func() (Server, SSHTarget, bool, error) {
+		return server, targetA, true, nil
+	})
+	unchanged, readErr := ReadLeaseClaim(leaseID)
+	if err == nil || readErr != nil || !reflect.DeepEqual(unchanged, invalid) {
+		t.Fatalf("validation failure err=%v current=%#v expected=%#v readErr=%v", err, unchanged, invalid, readErr)
+	}
+}
+
+func TestWithLeaseClaimUnchangedSkipsActionAfterClaimChange(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_guardedreadonly123"
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "read-only", Config{Provider: "aws"}, Server{Provider: "aws", CloudID: "i-123"}, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateLeaseClaimEndpoint(leaseID, Server{Provider: "aws", CloudID: "i-456"}, SSHTarget{}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := WithLeaseClaimUnchanged(leaseID, expected, func() error {
+		called = true
+		return nil
+	}); err == nil || !strings.Contains(err.Error(), "claim changed") {
+		t.Fatalf("err=%v", err)
+	}
+	if called {
+		t.Fatal("read-only action ran for a changed claim")
 	}
 }
 
@@ -564,16 +1938,16 @@ func TestConditionalClaimHelpersAndExactResolution(t *testing.T) {
 		CloudID:  "i-123",
 		Labels:   map[string]string{"lease": leaseID, "slug": slug, "provider": "aws"},
 	}
-	if err := claimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, SSHTarget{}, "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, slug, cfg, server, SSHTarget{}, "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	expected, err := readLeaseClaim(leaseID)
+	expected, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.CloudID = "i-456"
 	server.Labels["state"] = "ready"
-	updated, err := updateLeaseClaimEndpointIfUnchangedWithProviderMetadata(leaseID, expected, server, SSHTarget{Host: "203.0.113.10", Port: "22"})
+	updated, err := UpdateLeaseClaimEndpointIfUnchangedWithProviderMetadata(leaseID, expected, server, SSHTarget{Host: "203.0.113.10", Port: "22"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,12 +1962,12 @@ func TestConditionalClaimHelpersAndExactResolution(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	updated, err = readLeaseClaim(leaseID)
+	updated, err = ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.CloudID = "i-789"
-	replaced, err := replaceLeaseClaimEndpointIfUnchangedWithProviderMetadata(leaseID, updated, server, SSHTarget{})
+	replaced, err := ReplaceLeaseClaimEndpointIfUnchangedWithProviderMetadata(leaseID, updated, server, SSHTarget{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,33 +1978,33 @@ func TestConditionalClaimHelpersAndExactResolution(t *testing.T) {
 
 	labels := cloneStringMap(updated.Labels)
 	labels["state"] = "cleanup"
-	labeled, err := updateLeaseClaimLabelsIfUnchanged(leaseID, updated, labels)
+	labeled, err := UpdateLeaseClaimLabelsIfUnchanged(leaseID, updated, labels)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if labeled.Labels["state"] != "cleanup" {
 		t.Fatalf("labeled claim=%#v", labeled)
 	}
-	if _, err := updateLeaseClaimLabelsIfUnchanged(leaseID, updated, labels); err == nil || !strings.Contains(err.Error(), "claim changed") {
+	if _, err := UpdateLeaseClaimLabelsIfUnchanged(leaseID, updated, labels); err == nil || !strings.Contains(err.Error(), "claim changed") {
 		t.Fatalf("stale label update err=%v", err)
 	}
-	if empty, err := updateLeaseClaimLabelsIfUnchanged("", leaseClaim{}, nil); err != nil || empty.LeaseID != "" {
+	if empty, err := UpdateLeaseClaimLabelsIfUnchanged("", leaseClaim{}, nil); err != nil || empty.LeaseID != "" {
 		t.Fatalf("empty label update=%#v err=%v", empty, err)
 	}
 
-	exact, ok, exactFile, err := resolveLeaseClaimForProviderWithExact(leaseID, "aws")
+	exact, ok, exactFile, err := ResolveLeaseClaimForProviderWithExact(leaseID, "aws")
 	if err != nil || !ok || !exactFile || exact.LeaseID != leaseID {
 		t.Fatalf("exact claim=%#v ok=%v exact=%v err=%v", exact, ok, exactFile, err)
 	}
-	foreign, ok, exactFile, err := resolveLeaseClaimForProviderWithExact(leaseID, "gcp")
+	foreign, ok, exactFile, err := ResolveLeaseClaimForProviderWithExact(leaseID, "gcp")
 	if err != nil || ok || !exactFile || foreign.LeaseID != leaseID {
 		t.Fatalf("foreign exact claim=%#v ok=%v exact=%v err=%v", foreign, ok, exactFile, err)
 	}
-	alias, ok, exactFile, err := resolveLeaseClaimForProviderWithExact(slug, "aws")
+	alias, ok, exactFile, err := ResolveLeaseClaimForProviderWithExact(slug, "aws")
 	if err != nil || !ok || exactFile || alias.LeaseID != leaseID {
 		t.Fatalf("alias claim=%#v ok=%v exact=%v err=%v", alias, ok, exactFile, err)
 	}
-	if empty, ok, exactFile, err := resolveLeaseClaimForProviderWithExact("", "aws"); err != nil || ok || exactFile || empty.LeaseID != "" {
+	if empty, ok, exactFile, err := ResolveLeaseClaimForProviderWithExact("", "aws"); err != nil || ok || exactFile || empty.LeaseID != "" {
 		t.Fatalf("empty exact claim=%#v ok=%v exact=%v err=%v", empty, ok, exactFile, err)
 	}
 
@@ -641,18 +2015,9 @@ func TestConditionalClaimHelpersAndExactResolution(t *testing.T) {
 		slug:          true,
 		"not-a-match": false,
 	} {
-		if got := leaseClaimMatchesIdentifier(labeled, identifier); got != want {
+		if got := LeaseClaimMatchesIdentifier(labeled, identifier); got != want {
 			t.Fatalf("leaseClaimMatchesIdentifier(%q)=%v want %v", identifier, got, want)
 		}
-	}
-	if exists, err := leaseClaimExists(leaseID); err != nil || !exists {
-		t.Fatalf("existing claim exists=%v err=%v", exists, err)
-	}
-	if exists, err := leaseClaimExists("cbx_missingclaim123"); err != nil || exists {
-		t.Fatalf("missing claim exists=%v err=%v", exists, err)
-	}
-	if exists, err := leaseClaimExists("../invalid"); err != nil || exists {
-		t.Fatalf("invalid claim exists=%v err=%v", exists, err)
 	}
 }
 
@@ -662,26 +2027,56 @@ func TestResolveLeaseClaimForProviderCloudIDRejectsDuplicates(t *testing.T) {
 	cfg.Provider = "aws"
 	for _, leaseID := range []string{"cbx_111111111111", "cbx_222222222222"} {
 		server := Server{Provider: "aws", CloudID: "i-duplicate"}
-		if err := claimLeaseTargetForRepoConfig(leaseID, leaseID, cfg, server, SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+		if err := ClaimLeaseTargetForRepoConfig(leaseID, leaseID, cfg, server, SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, ok, err := resolveLeaseClaimForProviderCloudID("i-duplicate", "aws"); err == nil || ok {
+	if _, ok, err := ResolveLeaseClaimForProviderCloudID("i-duplicate", "aws"); err == nil || ok {
 		t.Fatalf("duplicate cloud id lookup ok=%t err=%v", ok, err)
+	}
+}
+
+func TestResolveLeaseClaimForProviderCloudIDScopeDistinguishesEndpoints(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	for _, tc := range []struct {
+		leaseID string
+		apiURL  string
+	}{
+		{leaseID: "cbx_111111111111", apiURL: "https://cube-a.example.test"},
+		{leaseID: "cbx_222222222222", apiURL: "https://cube-b.example.test"},
+	} {
+		cfg := baseConfig()
+		cfg.Provider = "cubesandbox"
+		cfg.CubeSandbox.APIURL = tc.apiURL
+		server := Server{Provider: "cubesandbox", CloudID: "same-sandbox-id"}
+		if err := ClaimLeaseTargetForRepoConfig(tc.leaseID, "shared-slug", cfg, server, SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+			t.Fatal(err)
+		}
+		claim, ok, err := ResolveLeaseClaimForProviderCloudIDScope("same-sandbox-id", "cubesandbox", providerClaimScope("cubesandbox", cfg))
+		if err != nil || !ok || claim.LeaseID != tc.leaseID {
+			t.Fatalf("apiURL=%s claim=%#v ok=%t err=%v", tc.apiURL, claim, ok, err)
+		}
+		claim, ok, exact, err := ResolveLeaseClaimForProviderScopeWithExact("shared-slug", "cubesandbox", providerClaimScope("cubesandbox", cfg))
+		if err != nil || !ok || exact || claim.LeaseID != tc.leaseID {
+			t.Fatalf("apiURL=%s slug claim=%#v ok=%t exact=%t err=%v", tc.apiURL, claim, ok, exact, err)
+		}
+	}
+	if _, ok, err := ResolveLeaseClaimForProviderCloudID("same-sandbox-id", "cubesandbox"); err == nil || ok {
+		t.Fatalf("unscoped duplicate lookup ok=%t err=%v", ok, err)
 	}
 }
 
 func TestUpdateLeaseClaimTailscaleRecordsEndpointAndLabels(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repo := filepath.Join(t.TempDir(), "repo")
-	if err := claimLeaseForRepoProvider("isb_crabbox-node-a", "node-a", "islo", repo, time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("isb_crabbox-node-a", "node-a", "islo", repo, time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := updateLeaseClaimTailscale("isb_crabbox-node-a", "100.64.2.20", "node-a.tail-scale.ts.net"); err != nil {
+	if err := UpdateLeaseClaimTailscale("isb_crabbox-node-a", "100.64.2.20", "node-a.tail-scale.ts.net"); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("isb_crabbox-node-a")
+	claim, err := ReadLeaseClaim("isb_crabbox-node-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -696,10 +2091,10 @@ func TestUpdateLeaseClaimTailscaleRecordsEndpointAndLabels(t *testing.T) {
 	}
 
 	// A second update with only the IPv4 must preserve the previously stored FQDN.
-	if err := updateLeaseClaimTailscale("isb_crabbox-node-a", "100.64.2.21", ""); err != nil {
+	if err := UpdateLeaseClaimTailscale("isb_crabbox-node-a", "100.64.2.21", ""); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("isb_crabbox-node-a")
+	claim, err = ReadLeaseClaim("isb_crabbox-node-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -712,15 +2107,15 @@ func TestUpdateLeaseClaimTailscaleIgnoresEmptyOrMissingClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	// Empty lease ID is a no-op.
-	if err := updateLeaseClaimTailscale("", "100.64.2.20", ""); err != nil {
+	if err := UpdateLeaseClaimTailscale("", "100.64.2.20", ""); err != nil {
 		t.Fatalf("empty leaseID should be a no-op, got %v", err)
 	}
 
 	// A well-formed but unknown lease ID must not create a claim file.
-	if err := updateLeaseClaimTailscale("isb_crabbox-missing", "100.64.2.20", "x.ts.net"); err != nil {
+	if err := UpdateLeaseClaimTailscale("isb_crabbox-missing", "100.64.2.20", "x.ts.net"); err != nil {
 		t.Fatalf("missing claim should be a no-op, got %v", err)
 	}
-	claim, err := readLeaseClaim("isb_crabbox-missing")
+	claim, err := ReadLeaseClaim("isb_crabbox-missing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,22 +2127,22 @@ func TestUpdateLeaseClaimTailscaleIgnoresEmptyOrMissingClaim(t *testing.T) {
 func TestLeaseClaimTailscaleSettingsSurviveEndpointClear(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := "isb_crabbox-node-a"
-	if err := claimLeaseForRepoProvider(leaseID, "node-a", "islo", t.TempDir(), time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider(leaseID, "node-a", "islo", t.TempDir(), time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	tags := []string{"tag:pond", "tag:ci"}
-	if err := updateLeaseClaimTailscaleSettings(leaseID, "node-a", tags, "https://control.example", "100.64.0.1", true); err != nil {
+	if err := UpdateLeaseClaimTailscaleSettings(leaseID, "node-a", tags, "https://control.example", "100.64.0.1", true); err != nil {
 		t.Fatal(err)
 	}
 	tags[0] = "tag:mutated"
-	if err := updateLeaseClaimTailscale(leaseID, "100.64.2.20", "node-a.example.ts.net"); err != nil {
+	if err := UpdateLeaseClaimTailscale(leaseID, "100.64.2.20", "node-a.example.ts.net"); err != nil {
 		t.Fatal(err)
 	}
-	if err := clearLeaseClaimTailscale(leaseID); err != nil {
+	if err := ClearLeaseClaimTailscale(leaseID); err != nil {
 		t.Fatal(err)
 	}
 
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -770,16 +2165,16 @@ func TestLeaseClaimTailscaleSettingsSurviveEndpointClear(t *testing.T) {
 
 func TestLeaseClaimTailscaleSettingsIgnoreEmptyOrMissingClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := updateLeaseClaimTailscaleSettings("", "node-a", []string{"tag:ci"}, "", "", false); err != nil {
+	if err := UpdateLeaseClaimTailscaleSettings("", "node-a", []string{"tag:ci"}, "", "", false); err != nil {
 		t.Fatalf("empty settings update: %v", err)
 	}
-	if err := clearLeaseClaimTailscale(""); err != nil {
+	if err := ClearLeaseClaimTailscale(""); err != nil {
 		t.Fatalf("empty clear: %v", err)
 	}
-	if err := updateLeaseClaimTailscaleSettings("isb_crabbox-missing", "node-a", []string{"tag:ci"}, "", "", false); err != nil {
+	if err := UpdateLeaseClaimTailscaleSettings("isb_crabbox-missing", "node-a", []string{"tag:ci"}, "", "", false); err != nil {
 		t.Fatalf("missing settings update: %v", err)
 	}
-	if err := clearLeaseClaimTailscale("isb_crabbox-missing"); err != nil {
+	if err := ClearLeaseClaimTailscale("isb_crabbox-missing"); err != nil {
 		t.Fatalf("missing clear: %v", err)
 	}
 }
@@ -787,20 +2182,20 @@ func TestLeaseClaimTailscaleSettingsIgnoreEmptyOrMissingClaim(t *testing.T) {
 func TestClaimLeaseForRepoProviderStoresPond(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repo := filepath.Join(t.TempDir(), "repo")
-	if err := claimLeaseForRepoProviderWithPond("isb_crabbox-test", "web", "islo", "Alpha Pond", repo, 30*time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProviderPond("isb_crabbox-test", "web", "islo", "Alpha Pond", repo, 30*time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("isb_crabbox-test")
+	claim, err := ReadLeaseClaim("isb_crabbox-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if claim.Pond != "alpha-pond" {
 		t.Fatalf("pond=%q want alpha-pond", claim.Pond)
 	}
-	if err := claimLeaseForRepoProvider("isb_crabbox-test", "web", "islo", repo, 30*time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("isb_crabbox-test", "web", "islo", repo, 30*time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("isb_crabbox-test")
+	claim, err = ReadLeaseClaim("isb_crabbox-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,10 +2208,10 @@ func TestClaimLeaseForRepoProviderScopePondCacheVolumesStoresInitialClaim(t *tes
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repo := filepath.Join(t.TempDir(), "repo")
 	specs := []string{"go-build:/var/cache/crabbox/go", "npm:/var/cache/crabbox/npm"}
-	if err := claimLeaseForRepoProviderScopePondCacheVolumes("cbx_cache", "cache", "local-container", "runtime:docker/context:desktop", "Alpha Pond", repo, 30*time.Minute, false, specs); err != nil {
+	if err := ClaimLeaseForRepoProviderScopePondCacheVolumes("cbx_cache", "cache", "local-container", "runtime:docker/context:desktop", "Alpha Pond", repo, 30*time.Minute, false, specs); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_cache")
+	claim, err := ReadLeaseClaim("cbx_cache")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,10 +2222,10 @@ func TestClaimLeaseForRepoProviderScopePondCacheVolumesStoresInitialClaim(t *tes
 		t.Fatalf("cache volumes=%#v, want %#v", claim.CacheVolumes, specs)
 	}
 
-	if err := claimLeaseForRepoProviderScopePondCacheVolumes("cbx_cache", "cache", "local-container", "runtime:docker/context:desktop", "Alpha Pond", repo, 30*time.Minute, true, []string{}); err != nil {
+	if err := ClaimLeaseForRepoProviderScopePondCacheVolumes("cbx_cache", "cache", "local-container", "runtime:docker/context:desktop", "Alpha Pond", repo, 30*time.Minute, true, []string{}); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("cbx_cache")
+	claim, err = ReadLeaseClaim("cbx_cache")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -850,10 +2245,10 @@ func TestClaimLeaseForRepoConfigIfUnchangedPreservesEndpoint(t *testing.T) {
 		Labels:   map[string]string{"provider": "aws", "slug": "owner-only", "state": "ready"},
 	}
 	target := SSHTarget{Host: "192.0.2.130", Port: "22"}
-	if err := claimLeaseTargetForRepoConfig(leaseID, "owner-only", cfg, server, target, "/repo-a", time.Hour, true); err != nil {
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "owner-only", cfg, server, target, "/repo-a", time.Hour, true); err != nil {
 		t.Fatal(err)
 	}
-	expected, expectedExists, err := readLeaseClaimWithPresence(leaseID)
+	expected, expectedExists, err := ReadLeaseClaimWithPresence(leaseID)
 	if err != nil || !expectedExists {
 		t.Fatalf("claim=%#v exists=%v err=%v", expected, expectedExists, err)
 	}
@@ -863,6 +2258,100 @@ func TestClaimLeaseForRepoConfigIfUnchangedPreservesEndpoint(t *testing.T) {
 	}
 	if claimed.RepoRoot != "/repo-b" || claimed.SSHHost != target.Host || claimed.SSHPort != 22 {
 		t.Fatalf("claim=%#v", claimed)
+	}
+}
+
+func TestClaimLeaseTargetIdleOverrideIsAtomicWithAdmission(t *testing.T) {
+	for _, scenario := range []string{"preserve", "replace", "different repo", "stale", "invalid"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			cfg := baseConfig()
+			cfg.Provider = "external"
+			leaseID := "cbx_idle_admission"
+			server := Server{Provider: "external", CloudID: "fixture-instance", Labels: map[string]string{
+				"provider": "external", "lease": leaseID, "slug": "policy", "idle_timeout_secs": "300", "idle_timeout": "300",
+			}}
+			target := SSHTarget{Host: "192.0.2.130", Port: "22"}
+			if err := ClaimLeaseTargetForRepoConfig(leaseID, "policy", cfg, server, target, "/repo-a", 5*time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			expected, err := ReadLeaseClaim(leaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			labels := cloneStringMap(expected.Labels)
+			labels["idle_timeout"], labels["idle_timeout_secs"] = "7200", "7200"
+			expected, err = UpdateLeaseClaimLabelsIfUnchanged(leaseID, expected, labels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := expected
+			server.Labels = labels
+			target.Host = "192.0.2.131"
+			override := 2 * time.Hour
+			requested := &override
+			repo := "/repo-a"
+			wantIdle := 7200
+			switch scenario {
+			case "preserve":
+				requested, wantIdle = nil, 300
+			case "different repo":
+				repo = "/repo-b"
+			case "stale":
+				newer := cloneStringMap(expected.Labels)
+				newer["profile"] = "concurrent"
+				before, err = UpdateLeaseClaimLabelsIfUnchanged(leaseID, expected, newer)
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "invalid":
+				override = 0
+			}
+			updated, claimErr := ClaimLeaseTargetForRepoConfigWithIdleTimeoutOverrideIfUnchanged(leaseID, "policy", cfg, server, target, repo, time.Minute, requested, false, expected, true)
+			after, readErr := ReadLeaseClaim(leaseID)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if scenario == "different repo" || scenario == "stale" || scenario == "invalid" {
+				if claimErr == nil || !reflect.DeepEqual(after, before) {
+					t.Fatal("refused admission partially replaced idle policy or endpoint")
+				}
+				return
+			}
+			if claimErr != nil {
+				t.Fatal(claimErr)
+			}
+			if !reflect.DeepEqual(updated, after) || after.IdleTimeoutSeconds != wantIdle || after.Labels["idle_timeout_secs"] != fmt.Sprint(wantIdle) || after.Labels["idle_timeout"] != fmt.Sprint(wantIdle) || after.SSHHost != target.Host || after.ClaimedAt != expected.ClaimedAt {
+				t.Fatal("admission did not commit the selected idle policy and endpoint together")
+			}
+		})
+	}
+}
+
+func TestClaimLeaseTargetForRepoConfigScopeReplacingEndpointClearsPublishedRoute(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := baseConfig()
+	cfg.Provider = "external"
+	leaseID := "cbx_replaceendpoint"
+	server := Server{
+		CloudID:  "team-a/devbox-one",
+		Provider: "external",
+		Labels:   map[string]string{"provider": "external", "slug": "blue", "state": "ready"},
+	}
+	if err := ClaimLeaseTargetForRepoConfig(leaseID, "blue", cfg, server, SSHTarget{Host: "stale.example.test", Port: "2222"}, "/repo-a", time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	expected, exists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil || !exists {
+		t.Fatalf("claim=%#v exists=%v err=%v", expected, exists, err)
+	}
+
+	updated, err := ClaimLeaseTargetForRepoConfigScopeReplacingEndpointIfUnchanged(leaseID, "blue", cfg, "cluster-a", server, SSHTarget{}, "/repo-b", time.Hour, true, expected, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.RepoRoot != "/repo-b" || updated.ProviderScope != "cluster-a" || updated.SSHHost != "" || updated.SSHPort != 0 {
+		t.Fatalf("updated claim=%#v", updated)
 	}
 }
 
@@ -878,10 +2367,10 @@ func TestClaimLeaseForRepoProviderScopePondEndpointStoresInitialClaim(t *testing
 	}
 	target := SSHTarget{Host: "192.0.2.44", Port: "2222"}
 
-	if err := claimLeaseForRepoProviderScopePondEndpoint("cbx_tart", "mac", "tart", "instance:crabbox-cache-1234", "Mac Pond", repo, 30*time.Minute, false, server, target); err != nil {
+	if err := ClaimLeaseForRepoProviderScopePondEndpoint("cbx_tart", "mac", "tart", "instance:crabbox-cache-1234", "Mac Pond", repo, 30*time.Minute, false, server, target); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_tart")
+	claim, err := ReadLeaseClaim("cbx_tart")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,12 +2380,35 @@ func TestClaimLeaseForRepoProviderScopePondEndpointStoresInitialClaim(t *testing
 	if claim.SSHHost != "192.0.2.44" || claim.SSHPort != 2222 || claim.Labels["instance"] != "crabbox-cache-1234" {
 		t.Fatalf("endpoint metadata not stored in initial claim: %#v", claim)
 	}
+	if err := UpdateLeaseClaimCacheVolumes("cbx_tart", []string{"gomod:/cache/go"}); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := ReadLeaseClaim("cbx_tart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Port = "2233"
+	updated, err := ClaimLeaseForRepoProviderScopePondEndpointIfUnchanged("cbx_tart", "mac", "tart", "instance:crabbox-cache-1234", "Mac Pond", repo, 30*time.Minute, false, server, target, expected, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := ReadLeaseClaim("cbx_tart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(updated, saved) || saved.SSHPort != 2233 || !reflect.DeepEqual(saved.CacheVolumes, expected.CacheVolumes) {
+		t.Fatal("guarded endpoint publication lost unrelated metadata or returned a noncommitted snapshot")
+	}
+	if _, err := ClaimLeaseForRepoProviderScopePondEndpointIfUnchanged("cbx_tart", "mac", "tart", "instance:crabbox-cache-1234", "Mac Pond", repo, 30*time.Minute, false, server, target, expected, true); err == nil {
+		t.Fatal("stale endpoint publication was accepted")
+	}
+
 }
 
 func TestLeaseClaimConcurrentMutationsRemainAtomic(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := "cbx_atomic"
-	if err := claimLeaseForRepoProvider(leaseID, "atomic", "docker-sandbox", "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider(leaseID, "atomic", "docker-sandbox", "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -910,7 +2422,7 @@ func TestLeaseClaimConcurrentMutationsRemainAtomic(t *testing.T) {
 			case <-done:
 				return
 			default:
-				if _, err := readLeaseClaim(leaseID); err != nil {
+				if _, err := ReadLeaseClaim(leaseID); err != nil {
 					select {
 					case readErr <- err:
 					default:
@@ -928,7 +2440,7 @@ func TestLeaseClaimConcurrentMutationsRemainAtomic(t *testing.T) {
 		wg.Add(2)
 		go func(i int) {
 			defer wg.Done()
-			errs <- updateLeaseClaimEndpoint(leaseID, Server{
+			errs <- UpdateLeaseClaimEndpoint(leaseID, Server{
 				Labels: map[string]string{
 					"state":     "ready",
 					"iteration": fmt.Sprintf("%d", i),
@@ -937,7 +2449,7 @@ func TestLeaseClaimConcurrentMutationsRemainAtomic(t *testing.T) {
 		}(i)
 		go func(i int) {
 			defer wg.Done()
-			errs <- updateLeaseClaimCacheVolumes(leaseID, []string{
+			errs <- UpdateLeaseClaimCacheVolumes(leaseID, []string{
 				fmt.Sprintf("cache-%03d:/var/cache/crabbox", i),
 				"shared:/var/cache/shared",
 			})
@@ -958,7 +2470,7 @@ func TestLeaseClaimConcurrentMutationsRemainAtomic(t *testing.T) {
 		t.Fatalf("concurrent read failed: %v", err)
 	default:
 	}
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -985,7 +2497,7 @@ func TestClaimLeaseForRepoConfigScopesProviderClaims(t *testing.T) {
 	if err := claimLeaseForRepoConfig("cbx_static", "mac-mini", cfg, repo, 10*time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_static")
+	claim, err := ReadLeaseClaim("cbx_static")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1005,7 +2517,7 @@ func TestClaimLeaseForRepoConfigScopesProviderClaims(t *testing.T) {
 	if err := claimLeaseForRepoConfig("cbx_static", "mac-mini", cfg, repo, 10*time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("cbx_static")
+	claim, err = ReadLeaseClaim("cbx_static")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1017,7 +2529,7 @@ func TestClaimLeaseForRepoConfigScopesProviderClaims(t *testing.T) {
 	if err := claimLeaseForRepoConfig("cbx_aws", "cloud-box", cfg, repo, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("cbx_aws")
+	claim, err = ReadLeaseClaim("cbx_aws")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1025,11 +2537,11 @@ func TestClaimLeaseForRepoConfigScopesProviderClaims(t *testing.T) {
 		t.Fatalf("provider=%q want aws", claim.Provider)
 	}
 
-	cfg = Config{Provider: "gcp", GCPProject: "project-a"}
+	cfg = Config{Provider: "gcp", GCP: GCPConfig{Project: "project-a"}}
 	if err := claimLeaseForRepoConfig("cbx_gcp", "gcp-box", cfg, repo, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("cbx_gcp")
+	claim, err = ReadLeaseClaim("cbx_gcp")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,11 +2549,11 @@ func TestClaimLeaseForRepoConfigScopesProviderClaims(t *testing.T) {
 		t.Fatalf("gcp claim scope=%#v", claim)
 	}
 
-	cfg = Config{Provider: "google-cloud", GCPProject: "project-a"}
+	cfg = Config{Provider: "google-cloud", GCP: GCPConfig{Project: "project-a"}}
 	if err := claimLeaseForRepoConfig("cbx_gcp_alias", "gcp-alias-box", cfg, repo, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err = readLeaseClaim("cbx_gcp_alias")
+	claim, err = ReadLeaseClaim("cbx_gcp_alias")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1064,12 +2576,51 @@ func TestClaimLeaseForRepoRejectsOtherRepoUnlessReclaimed(t *testing.T) {
 	if err := claimLeaseForRepo("cbx_123", "blue-lobster", secondRepo, 30*time.Minute, true); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_123")
+	claim, err := ReadLeaseClaim("cbx_123")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if claim.RepoRoot != secondRepo {
 		t.Fatalf("repo root=%q want %q", claim.RepoRoot, secondRepo)
+	}
+}
+
+func TestClaimLeaseRepositoryOwnerEmptyRootSemantics(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_repo_owner"
+	if err := ClaimLeaseForRepoProvider(leaseID, "owned", "ssh", "/repo", time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		run  func() error
+		deny bool
+	}{
+		{name: "repository publisher skips empty root", run: func() error {
+			return claimLeaseForRepo(leaseID, "owned", "", time.Minute, false)
+		}},
+		{name: "config publisher cannot clear owner", deny: true, run: func() error {
+			return ClaimLeaseTargetForConfig(leaseID, "owned", Config{Provider: "ssh"}, Server{}, SSHTarget{}, time.Minute)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.run()
+			if tc.deny {
+				if err == nil || !strings.Contains(err.Error(), "claimed by repo /repo; use --reclaim") {
+					t.Fatalf("expected repository-owner rejection, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			after, err := ReadLeaseClaim(leaseID)
+			if err != nil || !reflect.DeepEqual(after, initial) {
+				t.Fatalf("empty-root publication changed claim: err=%v before=%#v after=%#v", err, initial, after)
+			}
+		})
 	}
 }
 
@@ -1095,15 +2646,15 @@ func TestClaimLeaseForRepoIgnoresIncompleteClaimAndRemoveIsIdempotent(t *testing
 	if err := claimLeaseForRepo("cbx_abc123abc123", "blue-lobster", "/repo", 0, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := readLeaseClaim("cbx_abc123abc123")
+	claim, err := ReadLeaseClaim("cbx_abc123abc123")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if claim.RepoRoot != "/repo" || claim.ClaimedAt == "" || claim.LastUsedAt == "" || claim.IdleTimeoutSeconds != 0 {
 		t.Fatalf("unexpected claim: %#v", claim)
 	}
-	removeLeaseClaim("cbx_abc123abc123")
-	removeLeaseClaim("cbx_abc123abc123")
+	RemoveLeaseClaim("cbx_abc123abc123")
+	RemoveLeaseClaim("cbx_abc123abc123")
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("claim should be removed, stat err=%v", err)
 	}
@@ -1121,18 +2672,83 @@ func TestReadLeaseClaimRejectsInvalidJSON(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = readLeaseClaim("cbx_badbadbadbad")
+	_, err = ReadLeaseClaim("cbx_badbadbadbad")
 	if err == nil || !strings.Contains(err.Error(), "parse claim") {
 		t.Fatalf("expected parse claim error, got %v", err)
 	}
 }
 
+func TestResolveLeaseClaimDoesNotTreatCanonicalIDAsSlug(t *testing.T) {
+	const requestedID = "cbx_aaaaaaaaaaaa"
+	const otherID = "cbx_bbbbbbbbbbbb"
+	const scope = "endpoint:https://api.example.test"
+	lookups := []struct {
+		name    string
+		resolve func(string) (leaseClaim, bool, error)
+	}{
+		{"unscoped", ResolveLeaseClaim},
+		{"provider", func(id string) (leaseClaim, bool, error) {
+			return ResolveLeaseClaimForProvider(id, "e2b")
+		}},
+		{"provider exact", func(id string) (leaseClaim, bool, error) {
+			claim, ok, _, err := ResolveLeaseClaimForProviderWithExact(id, "e2b")
+			return claim, ok, err
+		}},
+		{"scope exact", func(id string) (leaseClaim, bool, error) {
+			claim, ok, _, err := ResolveLeaseClaimForProviderScopeWithExact(id, "e2b", scope)
+			return claim, ok, err
+		}},
+	}
+	for _, lookup := range lookups {
+		t.Run(lookup.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			if err := ClaimLeaseForRepoProviderScope(otherID, "cbx-aaaaaaaaaaaa", "e2b", scope, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			if claim, ok, err := lookup.resolve(requestedID); err != nil || ok || claim.LeaseID != "" {
+				t.Errorf("missing canonical ID selected alias: claim=%#v ok=%t err=%v", claim, ok, err)
+			}
+			if claim, ok, err := lookup.resolve("CBX AAAAAAAAAAAA"); err != nil || !ok || claim.LeaseID != otherID {
+				t.Fatalf("ordinary normalized slug: claim=%#v ok=%t err=%v", claim, ok, err)
+			}
+			if err := ClaimLeaseForRepoProviderScope(requestedID, "exact-lease", "e2b", scope, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			if claim, ok, err := lookup.resolve(requestedID); err != nil || !ok || claim.LeaseID != requestedID {
+				t.Fatalf("exact claim precedence: claim=%#v ok=%t err=%v", claim, ok, err)
+			}
+			if err := ClaimLeaseForRepoProviderScope("legacy-file", "cbx-not-canonical", "e2b", scope, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"legacy-file", "cbx_not_canonical"} {
+				if claim, ok, err := lookup.resolve(id); err != nil || !ok || claim.LeaseID != "legacy-file" {
+					t.Fatalf("legacy/literal identifier %q: claim=%#v ok=%t err=%v", id, claim, ok, err)
+				}
+			}
+		})
+	}
+	t.Run("foreign exact provider does not select alias", func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		for _, claim := range []leaseClaim{
+			{LeaseID: requestedID, Slug: "exact-lease", Provider: "gcp"},
+			{LeaseID: otherID, Slug: "cbx-aaaaaaaaaaaa", Provider: "e2b"},
+		} {
+			if err := ClaimLeaseForRepoProvider(claim.LeaseID, claim.Slug, claim.Provider, "/repo", time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if claim, ok, err := ResolveLeaseClaimForProvider(requestedID, "e2b"); err != nil || ok || claim.LeaseID != "" {
+			t.Fatalf("provider fallback selected alias: claim=%#v ok=%t err=%v", claim, ok, err)
+		}
+	})
+}
+
 func TestResolveLeaseClaimFindsSlug(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := claimLeaseForRepoProvider("tbx_abc123", "Blue Lobster", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("tbx_abc123", "Blue Lobster", "blacksmith-testbox", "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, ok, err := resolveLeaseClaim("blue-lobster")
+	claim, ok, err := ResolveLeaseClaim("blue-lobster")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1143,13 +2759,13 @@ func TestResolveLeaseClaimFindsSlug(t *testing.T) {
 
 func TestResolveLeaseClaimForProviderSkipsSlugCollision(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := claimLeaseForRepoProvider("tbx_abc123", "Blue Lobster", "blacksmith-testbox", "/repo-a", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("tbx_abc123", "Blue Lobster", "blacksmith-testbox", "/repo-a", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := claimLeaseForRepoProvider("tlsbx_def456", "Blue Lobster", "tensorlake", "/repo-b", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("tlsbx_def456", "Blue Lobster", "tensorlake", "/repo-b", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, ok, err := resolveLeaseClaimForProvider("blue-lobster", "tensorlake")
+	claim, ok, err := ResolveLeaseClaimForProvider("blue-lobster", "tensorlake")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1160,38 +2776,38 @@ func TestResolveLeaseClaimForProviderSkipsSlugCollision(t *testing.T) {
 
 func TestResolveLeaseClaimForProviderFallsBackToUnscopedLookup(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := claimLeaseForRepoProvider("tbx_abc123", "Blue Lobster", "", "/repo", time.Minute, false); err != nil {
+	if err := ClaimLeaseForRepoProvider("tbx_abc123", "Blue Lobster", "", "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	claim, ok, err := resolveLeaseClaimForProvider("blue-lobster", "")
+	claim, ok, err := ResolveLeaseClaimForProvider("blue-lobster", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok || claim.LeaseID != "tbx_abc123" {
 		t.Fatalf("unexpected unscoped claim ok=%t claim=%#v", ok, claim)
 	}
-	if claim, ok, err := resolveLeaseClaimForProvider("blue-lobster", "runpod"); err != nil || ok || claim.LeaseID != "" {
+	if claim, ok, err := ResolveLeaseClaimForProvider("blue-lobster", "runpod"); err != nil || ok || claim.LeaseID != "" {
 		t.Fatalf("provider mismatch resolved ok=%t claim=%#v err=%v", ok, claim, err)
 	}
 }
 
 func TestResolveLeaseClaimFallbacks(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if claim, ok, err := resolveLeaseClaim(""); err != nil || ok || claim.LeaseID != "" {
+	if claim, ok, err := ResolveLeaseClaim(""); err != nil || ok || claim.LeaseID != "" {
 		t.Fatalf("empty identifier resolved ok=%t claim=%#v err=%v", ok, claim, err)
 	}
-	if claim, ok, err := resolveLeaseClaim("missing-slug"); err != nil || ok || claim.LeaseID != "" {
+	if claim, ok, err := ResolveLeaseClaim("missing-slug"); err != nil || ok || claim.LeaseID != "" {
 		t.Fatalf("missing claims dir resolved ok=%t claim=%#v err=%v", ok, claim, err)
 	}
 
 	if err := claimLeaseForRepo("cbx_abc123abc123", "Blue Lobster", "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
-	if claim, ok, err := resolveLeaseClaim("cbx_abc123abc123"); err != nil || !ok || claim.Slug != "Blue Lobster" {
+	if claim, ok, err := ResolveLeaseClaim("cbx_abc123abc123"); err != nil || !ok || claim.Slug != "Blue Lobster" {
 		t.Fatalf("direct ID resolve ok=%t claim=%#v err=%v", ok, claim, err)
 	}
 
-	dir, err := crabboxStateDir()
+	dir, err := CrabboxStateDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1202,24 +2818,22 @@ func TestResolveLeaseClaimFallbacks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(claimsDir, "note.txt"), []byte("ignore me"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if claim, ok, err := resolveLeaseClaim("not-blue-lobster"); err != nil || ok || claim.LeaseID != "" {
+	if claim, ok, err := ResolveLeaseClaim("not-blue-lobster"); err != nil || ok || claim.LeaseID != "" {
 		t.Fatalf("unmatched slug resolved ok=%t claim=%#v err=%v", ok, claim, err)
 	}
 }
 
 func TestClaimStateDirFallbackAndMissingClaim(t *testing.T) {
-	home := t.TempDir()
+	dirs := isolateTestUserDirs(t)
 	t.Setenv("XDG_STATE_HOME", "")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	dir, err := crabboxStateDir()
+	dir, err := CrabboxStateDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(dir, home) || filepath.Base(dir) != "state" {
-		t.Fatalf("state dir=%q should live under home %q and end in state", dir, home)
+	if !strings.Contains(dir, dirs.Root) || filepath.Base(dir) != "state" {
+		t.Fatalf("state dir=%q should live under test root %q and end in state", dir, dirs.Root)
 	}
-	claim, err := readLeaseClaim("cbx_missing")
+	claim, err := ReadLeaseClaim("cbx_missing")
 	if err != nil {
 		t.Fatal(err)
 	}

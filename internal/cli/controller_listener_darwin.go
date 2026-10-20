@@ -16,13 +16,25 @@ import (
 
 func controllerListenerOwnershipSupported() bool { return true }
 
-func controllerVerifyDaemonOwnedListener(port string, supervisorPID int) error {
+func sshForwardRootListenerReady(port string, pid int) error {
 	owners, err := controllerDarwinLoopbackListenerOwnerPIDs(port)
 	if err != nil {
 		return err
 	}
+	return verifySSHForwardRootOwners(owners, pid)
+}
+
+func controllerVerifyDaemonOwnedListener(port string, supervisorPID int) error {
+	return controllerVerifyDaemonOwnedListenerWithEnvironment(port, supervisorPID, nil)
+}
+
+func controllerVerifyDaemonOwnedListenerWithEnvironment(port string, supervisorPID int, denied []string) error {
+	owners, err := controllerDarwinLoopbackListenerOwnerPIDsWithEnvironment(port, denied)
+	if err != nil {
+		return err
+	}
 	for _, pid := range owners {
-		owned, err := controllerDarwinProcessDescendsFrom(pid, supervisorPID)
+		owned, err := controllerDarwinProcessDescendsFromWithEnvironment(pid, supervisorPID, denied)
 		if err != nil {
 			return fmt.Errorf("verify listener process %d ancestry: %w", pid, err)
 		}
@@ -49,7 +61,7 @@ func localWebVNCListenerIdentity(port string) (localWebVNCSourceIdentity, error)
 	if info.Proc.P_pid != int32(pid) || info.Eproc.Ucred.Uid != uint32(os.Geteuid()) {
 		return localWebVNCSourceIdentity{}, fmt.Errorf("IPv4 loopback listener process %d is not owned by the current user", pid)
 	}
-	started, err := webVNCDaemonProcessStartIdentity(pid)
+	started, err := LocalProcessStartIdentity(pid)
 	if err != nil {
 		return localWebVNCSourceIdentity{}, fmt.Errorf("inspect listener process %d start identity: %w", pid, err)
 	}
@@ -57,6 +69,10 @@ func localWebVNCListenerIdentity(port string) (localWebVNCSourceIdentity, error)
 }
 
 func controllerDarwinLoopbackListenerOwnerPIDs(port string) ([]int, error) {
+	return controllerDarwinLoopbackListenerOwnerPIDsWithEnvironment(port, nil)
+}
+
+func controllerDarwinLoopbackListenerOwnerPIDsWithEnvironment(port string, _ []string) ([]int, error) {
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return nil, fmt.Errorf("invalid local listener port")
@@ -64,7 +80,9 @@ func controllerDarwinLoopbackListenerOwnerPIDs(port string) ([]int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	path := "/usr/sbin/lsof"
-	output, err := exec.CommandContext(ctx, path, "-nP", "-a", "-iTCP:"+port, "-sTCP:LISTEN", "-Fpn").Output()
+	cmd := exec.CommandContext(ctx, path, controllerDarwinListenerLsofArgs(port)...)
+	cmd.Env = systemInspectionEnvironment()
+	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("inspect macOS listener ownership: %w", err)
 	}
@@ -73,6 +91,13 @@ func controllerDarwinLoopbackListenerOwnerPIDs(port string) ([]int, error) {
 		return nil, fmt.Errorf("no process owns the IPv4 loopback listener")
 	}
 	return owners, nil
+}
+
+func controllerDarwinListenerLsofArgs(port string) []string {
+	// We only consume socket fields. Avoid filesystem metadata calls and lsof's
+	// helper-process overhead, which can exceed the fail-closed timeout when
+	// macOS has slow or unavailable simulator volumes mounted.
+	return []string{"-O", "-b", "-w", "-nP", "-a", "-iTCP:" + port, "-sTCP:LISTEN", "-Fpn"}
 }
 
 func controllerDarwinLoopbackListenerOwners(output, port string) []int {
@@ -95,7 +120,7 @@ func controllerDarwinLoopbackListenerOwners(output, port string) []int {
 	return out
 }
 
-func controllerDarwinProcessDescendsFrom(pid, ancestor int) (bool, error) {
+func controllerDarwinProcessDescendsFromWithEnvironment(pid, ancestor int, _ []string) (bool, error) {
 	seen := map[int]struct{}{}
 	for pid > 0 {
 		if pid == ancestor {
@@ -106,7 +131,9 @@ func controllerDarwinProcessDescendsFrom(pid, ancestor int) (bool, error) {
 		}
 		seen[pid] = struct{}{}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		output, err := exec.CommandContext(ctx, "/bin/ps", "-o", "ppid=", "-p", strconv.Itoa(pid)).Output()
+		cmd := exec.CommandContext(ctx, "/bin/ps", "-o", "ppid=", "-p", strconv.Itoa(pid))
+		cmd.Env = systemInspectionEnvironment()
+		output, err := cmd.Output()
 		cancel()
 		if err != nil {
 			return false, err

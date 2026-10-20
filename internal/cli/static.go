@@ -11,49 +11,45 @@ const staticProvider = "ssh"
 type targetFlagValues struct {
 	Target      *string
 	WindowsMode *string
-	StaticHost  *string
-	StaticUser  *string
-	StaticPort  *string
-	StaticRoot  *string
+	Static      StaticConfigFlagValues
+	Commands    staticCommandFlagValues
 }
 
 func registerTargetFlags(fs *flag.FlagSet, defaults Config) targetFlagValues {
 	return targetFlagValues{
 		Target:      fs.String("target", defaults.TargetOS, "target OS: linux, macos, or windows"),
 		WindowsMode: fs.String("windows-mode", defaults.WindowsMode, "Windows mode: normal or wsl2"),
-		StaticHost:  fs.String("static-host", defaults.Static.Host, "static SSH host"),
-		StaticUser:  fs.String("static-user", defaults.Static.User, "static SSH user"),
-		StaticPort:  fs.String("static-port", defaults.Static.Port, "static SSH port"),
-		StaticRoot:  fs.String("static-work-root", defaults.Static.WorkRoot, "static target work root"),
+		Static:      RegisterStaticConfigFlags(fs, defaults.Static),
+		Commands:    registerStaticCommandFlags(fs),
 	}
 }
 
 func applyTargetFlagOverrides(cfg *Config, fs *flag.FlagSet, values targetFlagValues) error {
-	if flagWasSet(fs, "target") {
-		cfg.TargetOS = *values.Target
-		cfg.targetExplicit = true
-		cfg.targetFlagExplicit = true
-		if normalizeTargetOS(cfg.TargetOS) != targetWindows && !flagWasSet(fs, "windows-mode") {
-			cfg.WindowsMode = windowsModeNormal
-			cfg.explicitWindowsMode = ""
-		}
+	var target, mode string
+	if values.Target != nil {
+		target = *values.Target
 	}
-	if flagWasSet(fs, "windows-mode") {
-		cfg.WindowsMode = *values.WindowsMode
-		cfg.explicitWindowsMode = *values.WindowsMode
-		cfg.windowsModeFlagExplicit = true
+	if values.WindowsMode != nil {
+		mode = *values.WindowsMode
 	}
-	if flagWasSet(fs, "static-host") {
-		cfg.Static.Host = *values.StaticHost
+	applyTargetSelectorFlags(cfg, fs, target, mode)
+	applied, err := values.Static.Apply(&cfg.Static, fs)
+	recordConfigInput(cfg, "ssh", configInputFlag, applied.InputAccepted)
+	// Target validation can fail after this explicit host approval has applied.
+	if applied.Host {
+		cfg.credentialProvenance.staticHost = credentialSourceFlag
 	}
 	if flagWasSet(fs, "static-user") {
-		cfg.Static.User = *values.StaticUser
+		cfg.credentialProvenance.staticUser = credentialSourceFlag
 	}
 	if flagWasSet(fs, "static-port") {
-		cfg.Static.Port = *values.StaticPort
+		cfg.credentialProvenance.staticPort = credentialSourceFlag
 	}
-	if flagWasSet(fs, "static-work-root") {
-		cfg.Static.WorkRoot = *values.StaticRoot
+	if err != nil {
+		return err
+	}
+	if err := applyStaticCommandFlags(cfg, fs, values.Commands); err != nil {
+		return err
 	}
 	normalizeTargetConfig(cfg)
 	return validateTargetConfig(*cfg)
@@ -61,15 +57,15 @@ func applyTargetFlagOverrides(cfg *Config, fs *flag.FlagSet, values targetFlagVa
 
 func staticLease(cfg Config) (Server, SSHTarget, string, error) {
 	if cfg.Static.Host == "" {
-		return Server{}, SSHTarget{}, "", exit(2, "provider=%s requires static.host or CRABBOX_STATIC_HOST", cfg.Provider)
+		return Server{}, SSHTarget{}, "", Exit(2, "provider=%s requires static.host or CRABBOX_STATIC_HOST", cfg.Provider)
 	}
 	leaseID := strings.TrimSpace(cfg.Static.ID)
 	if leaseID == "" {
-		leaseID = "static_" + normalizeLeaseSlug(cfg.Static.Host)
+		leaseID = "static_" + NormalizeLeaseSlug(cfg.Static.Host)
 	}
-	slug := normalizeLeaseSlug(cfg.Static.Name)
+	slug := NormalizeLeaseSlug(cfg.Static.Name)
 	if slug == "" {
-		slug = normalizeLeaseSlug(cfg.Static.Host)
+		slug = NormalizeLeaseSlug(cfg.Static.Host)
 	}
 	name := cfg.Static.Name
 	if name == "" {
@@ -78,7 +74,7 @@ func staticLease(cfg Config) (Server, SSHTarget, string, error) {
 	now := time.Now().UTC()
 	labelCfg := cfg
 	labelCfg.ServerType = staticServerType(cfg)
-	labels := directLeaseLabels(labelCfg, leaseID, slug, staticProvider, "", true, now)
+	labels := DirectLeaseLabels(labelCfg, leaseID, slug, staticProvider, "", true, now)
 	labels["target"] = cfg.TargetOS
 	if cfg.TargetOS == targetWindows {
 		labels["windows_mode"] = cfg.WindowsMode
@@ -93,13 +89,19 @@ func staticLease(cfg Config) (Server, SSHTarget, string, error) {
 	}
 	server.PublicNet.IPv4.IP = cfg.Static.Host
 	server.ServerType.Name = staticServerType(cfg)
-	target := sshTargetForLease(cfg, cfg.Static.Host, firstNonEmpty(cfg.Static.User, cfg.SSHUser), firstNonEmpty(cfg.Static.Port, cfg.SSHPort))
+	target := sshTargetForLease(cfg, cfg.Static.Host, staticLoginUser(cfg), firstNonEmpty(cfg.Static.Port, cfg.SSHPort))
 	target.ReadyCheck = staticReadyCommand(target)
 	return server, target, leaseID, nil
 }
 
 func StaticLease(cfg Config) (Server, SSHTarget, string, error) {
 	return staticLease(cfg)
+}
+
+// staticLoginUser is the user Static SSH connects as; the implicit macOS
+// work root is derived from it.
+func staticLoginUser(cfg Config) string {
+	return firstNonEmpty(cfg.Static.User, cfg.SSHUser)
 }
 
 func staticReadyCommand(target SSHTarget) string {

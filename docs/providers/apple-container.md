@@ -55,6 +55,9 @@ need stronger host separation, larger capacity, or shared team infrastructure.
 container system status
 crabbox run --provider apple-container -- pnpm test
 
+crabbox run --provider apple-container --arch arm64 -- uname -m
+crabbox run --provider apple-container --arch amd64 -- uname -m
+
 crabbox warmup --provider apple --slug apple-smoke
 crabbox run --provider apple --id apple-smoke -- pnpm test:changed
 crabbox ssh --provider apple --id apple-smoke
@@ -74,9 +77,10 @@ crabbox run --provider apple-container \
 ```yaml
 provider: apple-container
 target: linux
+architecture: arm64        # native default; set amd64 for an x86_64 guest
 appleContainer:
   cliPath: container        # path to Apple's container CLI
-  image: ubuntu:26.04       # base image; defaults to the Crabbox OS image (--os)
+  # image: example-org/runner:tag # optional trusted custom-image override
   user: crabbox             # SSH user created inside the container
   workRoot: /work/crabbox   # remote Crabbox work root
   cpus: 0                   # CPU limit; 0 leaves the runtime default
@@ -84,11 +88,37 @@ appleContainer:
   extraRunArgs: []          # extra args appended to `container run`
 ```
 
-Defaults applied when unset: `cliPath=container`, `image=` the Crabbox OS image
-default (follows `--os`; currently `ubuntu:26.04`), `user=crabbox`,
+Defaults applied when unset: `cliPath=container`, `image=` the reviewed Ubuntu
+OCI index (follows `--os`; default selector `ubuntu:26.04`), `user=crabbox`,
 `workRoot=/work/crabbox`, SSH port `22`. If provider code is constructed
 directly without the normal config layer, an empty `appleContainer.image` falls
 back to the same Crabbox OS image default.
+
+Shipped images use fully qualified SHA-256 index references for both supported
+architectures. For these catalog references, Crabbox uses `container create`,
+verifies the exact created target's ownership labels, image reference, and
+`configuration.image.descriptor.digest`, then starts that stored configuration.
+It never runs guest bootstrap before the digest check. The index digest and
+reference remain in the lease's image labels. This inspect contract is supported
+by Apple Container 0.10.0 and 1.0.0; missing or ambiguous metadata fails closed.
+
+A well-identified stopped container with the wrong image digest is removed only
+after a fresh unchanged-configuration check under the local claim fence. If
+creation, identity, rollback, or startup is uncertain, Crabbox retains the
+target and its SSH key and reports the exact name/lease for manual native
+inspection and cleanup. Do not start an unverified retained container. After
+independently confirming the reported target belongs to this failed attempt,
+inspect it with `container inspect <name>` and remove it with
+`container delete --force <name>`; preserve unrelated containers and claims.
+External native operators are outside the local Crabbox claim fence.
+
+Explicit custom image overrides keep the existing native `container run` path
+and remain an operator trust decision, including floating tags. Pin rotations
+affect new leases only. See [default-image rotation](../operations.md#default-container-image-pins).
+
+The implicit guest architecture is native `arm64`. Explicit `--arch arm64` and
+`--arch amd64` selections are forwarded to `container run --arch`, so the
+reported Crabbox architecture matches the guest runtime architecture.
 
 Provider flags:
 
@@ -114,6 +144,19 @@ CRABBOX_APPLE_CONTAINER_MEMORY
 CRABBOX_APPLE_CONTAINER_EXTRA_RUN_ARGS
 ```
 
+File `extraRunArgs` entries retain their text, order, and duplicates; a nonempty
+list is copied, while an omitted or empty list leaves prior values intact.
+Environment and flag strings split on whitespace, without interpreting shell
+quotes or commas. A blank environment value leaves prior arguments intact; an
+explicitly visited blank flag clears them. Use a YAML list when an individual
+argument must contain spaces.
+
+Empty file strings leave prior values intact. File CPU values apply only when
+positive; environment and flag input retain their existing zero/negative-value
+behavior. Saving configuration omits zero and empty values without changing the
+original input that was ignored during application. Image explicitness records
+accepted input, including a value equal to the current default.
+
 No secrets are passed as CLI arguments. The only key material handed to the
 container is the per-lease SSH public key, supplied through an environment
 variable consumed by the bootstrap script.
@@ -137,9 +180,41 @@ variable consumed by the bootstrap script.
 6. `status`, `list`, and `stop` inspect or remove labeled containers via
    `container ls --all --format json`, `container inspect`, and
    `container delete --force`.
-7. `cleanup --provider apple-container` removes stopped containers and running
-   non-`keep` containers whose local claim is stale past the idle timeout plus a
-   safety grace period, and prunes orphaned claims.
+7. `cleanup --provider apple-container` removes exactly claimed stopped containers
+   and exactly claimed running non-`keep` containers whose local claim is stale
+   past the idle timeout plus a safety grace period, and prunes orphaned claims.
+
+## Fixed lease IDs
+
+Use `--lease-id cbx_<12 lowercase hex>` to retry an allocation with the same
+durable identity:
+
+```sh
+crabbox warmup --provider apple-container --lease-id cbx_abcdef123456 --slug build-worker
+```
+
+Keep the same local Crabbox state directory and creation settings on retries.
+The provider binds the ID to a deterministic container name and a fingerprint
+of the CLI path, image, SSH public key, user, work root, resource limits,
+extra arguments, cache volumes, explicit architecture, slug request, pond,
+keep setting, TTL, and idle timeout. Changed intent, duplicate candidates,
+missing bound containers, and mismatched identity or image evidence fail with
+`lease_id_conflict`. An identical replay reuses the verified container without
+another create or start when it is already running.
+
+If creation left a stopped container before acquisition completed, retry verifies
+its exact identity and image, rechecks its unchanged configuration, and resumes
+startup. It never restarts a stopped lease that was already acquired. A recorded
+create attempt with no visible resource remains unresolved; retries do not submit
+another create. For a reviewed-image digest mismatch, the fixed attempt, target,
+and SSH key are retained for the manual native inspection described above.
+
+Release rechecks the exact claimed container and confirms its absence in native
+inventory before retaining a terminal tombstone. Missing-resource cleanup does
+the same for acquired leases; unresolved pending attempts retain their recovery
+records even when an earlier inventory did not show a container.
+Released IDs cannot create another container; choose a new ID for a later lease.
+Acquisitions without `--lease-id` keep their existing behavior.
 
 ## Limits and caveats
 
@@ -166,6 +241,21 @@ variable consumed by the bootstrap script.
 - If the bootstrap container exits before SSH is ready, Crabbox fails as soon as
   the runtime reports the stopped state and includes a short `container logs`
   tail instead of waiting for the full SSH timeout.
+
+## Optional live smoke
+
+Run the guarded local smoke on an Apple silicon Mac with Apple's `container`
+service running:
+
+```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=apple-container scripts/live-smoke.sh
+```
+
+The smoke creates one short-lived Apple container, waits for SSH readiness,
+syncs the current checkout, runs the shared live-smoke command, prints recent
+history/log evidence when available, then stops only the lease it created. It
+uses `--ttl 15m --idle-timeout 5m` and the same cleanup path as normal
+`crabbox stop --provider apple-container`.
 
 ## Runtime expectations
 

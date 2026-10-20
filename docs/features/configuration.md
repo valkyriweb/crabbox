@@ -25,6 +25,42 @@ repository remain valid. An inherited user-config or environment credential is
 not sent to a repository-defined destination unless the operator explicitly
 overrides that destination through its environment variable or CLI flag.
 
+## Direct lease policy
+
+`directLeases: allow|deny` defaults to `allow`. Set it in trusted user/system
+configuration to require coordinator-managed remote allocation on this machine:
+
+```yaml
+directLeases: deny
+directLeaseAllow: [hetzner]
+```
+
+`CRABBOX_DIRECT_LEASES` overrides the policy; `CRABBOX_DIRECT_LEASE_ALLOW`
+overrides the allowlist with comma-separated provider names. Names and aliases
+resolve to canonical provider names. Repository configuration may tighten the
+policy to `deny`; it cannot override an inherited deny with `allow` or add
+allowlist entries. Repository `directLeaseAllow` is ignored. Environment is a
+trusted operator override and can explicitly restore `allow`.
+
+When denied, creation fails before configuring or calling the direct provider:
+
+```text
+direct-provider leases are disabled (directLeases: deny); configure a coordinator or add <provider> to directLeaseAllow
+```
+
+This applies to warmup/prewarm, new runs, fixed lease IDs, checkpoint forks,
+and shards. Stop, cleanup, status, list, and runs against existing leases remain
+available. A stale reused lease cannot be replaced with a new direct allocation.
+A coordinator URL exempts only providers actually allocating through the
+coordinator; registered-direct mode and providers without coordinator support
+still obey the policy.
+
+Providers that provision nothing remote are always exempt: `ssh`,
+`local-container`, `docker-sandbox`, `apple-container`, `apple-machine`,
+`apple-vm`, `anthropic-sandbox-runtime`, `mxc`, `multipass`, `firecracker`,
+`lume`, `tart`, `hyperv`, and `windows-sandbox`. Providers capable of selecting
+remote hosts, such as Parallels and Incus, are not automatically exempt.
+
 ## Precedence
 
 ```text
@@ -32,15 +68,47 @@ flags > env > repo-local crabbox.yaml/.crabbox.yaml > user config > defaults
 ```
 
 Lowest precedence is applied first: defaults, then user config, then repo
-config, then env vars, then flags. Each layer only overrides fields that are
-explicitly set; unset fields fall through to the layer below.
+config, then env vars, then flags. Except for the tightening-only repository direct-lease policy above, each layer
+only overrides fields that are explicitly set; unset fields fall through to the layer below.
+
+Lease-creating commands validate OS selector compatibility after resolving the
+provider, target, and Windows mode from all layers. For example,
+`CRABBOX_OS=windows-server:2025 crabbox warmup --provider aws --target windows`
+works without setting a Windows target in the configuration file. A final
+Linux target still rejects a Windows Server selector.
+
+Lifecycle commands apply explicit `--provider` and `--target` selections before
+provider target validation. For example, `stop --provider tart --target macos
+--id <lease>` overrides `provider: proxmox` and `target: linux` in configuration.
+The selected target must still be supported by the provider, and ordinary lease
+identity and ownership checks still apply.
+
+Explicit selector flags are applied before inherited selectors are validated.
+For example, `CRABBOX_TARGET=linux CRABBOX_WINDOWS_MODE=wsl2 crabbox status
+--target windows --id <lease>` resolves a Windows target before validating the
+Windows mode. Correcting a selector does not discard unrelated configuration,
+such as the selected class. Flags that contradict a recorded lease's platform
+still fail before guest access; the recorded identity is not a configurable
+default. Commands without a selector flag continue to validate the inherited
+value.
+
+Provider and template defaults preserve explicit `--target` and
+`--windows-mode` flags throughout resolution. When `--target` selects a
+non-Windows platform, inherited template Windows modes are cleared unless the
+command also explicitly sets `--windows-mode` (which must be compatible).
+
+For the replacement lists `env.allow`, `results.junit`, and
+`run.preflightTools`, omitting the key inherits the lower layer, `[]` clears
+it, and a nonempty list replaces it. This applies to user config and each
+repo-local file independently. Additive lists keep their own policy:
+`sync.exclude` and profile allowlists append rather than clear inherited entries.
 
 Two commands expose the resolved view:
 
 - `crabbox config show` prints the merged configuration as the CLI sees it
   after every layer runs. `--json` is stable enough to diff in scripts, and
   neither form prints secret values (tokens render as a state such as
-  `configured` or `missing`).
+  `configured` or `missing`; Proxmox API URL userinfo renders as `<redacted>@`).
 - `crabbox config path` prints the user config file path so other tools can
   edit it without parsing prose.
 
@@ -60,7 +128,12 @@ read (in that order).
 
 If `CRABBOX_CONFIG` is set, it replaces the entire file search: only that file
 is loaded, and neither the user config nor the repo-local files are read. The
-CLI writes new user config (for example via `crabbox login` or
+override changes file selection, not its trust domain. A selected path inside
+the active repository remains repository configuration, including a path that
+enters the repository through a symlink; use the OS user config path or an
+explicit file outside the repository for trusted operator settings. The trust
+decision uses the discovered workspace root, not its remote, commit, or branch
+metadata. The CLI writes new user config (for example via `crabbox login` or
 `crabbox config set-broker`) with `0600` permissions and warns if an existing
 file is group- or world-readable.
 
@@ -94,20 +167,24 @@ broker:
 
 provider: aws            # default provider when --provider is unset
 target: linux            # default target OS: linux | macos | windows
-architecture: amd64      # amd64 | arm64; arm64 supports Linux on AWS/Azure and native Windows on Azure
-os: ubuntu:26.04         # OS image; resolved to per-provider images for linux
+architecture: amd64      # amd64 | arm64; arm64 supports Linux on AWS/Azure/Apple Container and native Windows on Azure
+os: ubuntu:26.04         # Linux OS image; AWS Windows also supports windows-server:2022|2025
 windows:
   mode: normal           # normal | wsl2 when target=windows
 
 profile: project-check
-class: beast             # standard | fast | large | beast
+class: beast             # tiny | small | standard | fast | large | beast
 serverType: c7a.48xlarge # explicit provider type; overrides class fallback
 network: auto            # auto | tailscale | public
-hostId: h-0123456789abcdef0
+hostId: h-0123456789abcdef0 # brokered use requires admin authentication
+workRoot: /srv/crabbox   # portable base root; not an exact command PWD
 
 lease:
   idleTimeout: 30m
-  ttl: 90m
+  ttl: 30m
+
+warmup:
+  keep: true
 ```
 
 `broker.mode` defaults to `managed`. In `registered` mode, every direct SSH
@@ -118,10 +195,59 @@ local lease removes its registration, and coordinator release/expiry never
 invokes provider deletion. `CRABBOX_COORDINATOR_MODE` and
 `CRABBOX_COORDINATOR_AUTO_WEBVNC` provide environment overrides.
 
+`maxTTL: 4h` (top-level) and `CRABBOX_MAX_TTL` set the direct-provider lifetime
+ceiling; values must be positive and cannot exceed `24h`. Brokered requests retain
+their configured durations and the coordinator clamps them. Its global/org/owner
+settings, response notices, extension permissions, and live policy tightening are
+documented in [ordinary lifetime policy](lifecycle-cleanup.md#ordinary-lifetime-policy).
+
 `ttl`, `idleTimeout`, and `workRoot` are also accepted as top-level keys. The
-default class is `beast`, the default TTL is `90m`, and the default idle
+default class is `beast`, the default TTL is `30m`, and the default idle
 timeout is `30m`. Setting `serverType` (or `--type` on the command line) pins
 that exact provider type and disables class fallback.
+
+`warmup.keep` defaults to `true` and supplies the `warmup --keep` default.
+An explicit `--keep=true` or `--keep=false` overrides `CRABBOX_WARMUP_KEEP`,
+which overrides repository config, user config, and the built-in default.
+It does not change `run --keep`. Managed coordinator expiry and new GCP guest
+expiry guards honor recorded idle/TTL expiry even for kept leases. Manual
+`crabbox cleanup` still skips kept machines. For a direct provider without an
+automatic idle reaper, set `warmup.keep: false` and schedule cleanup, or stop
+the lease explicitly. Provider-specific policies and running/provisioning grace
+periods still apply; see [warmup lifetime](../commands/warmup.md#lifetime-ttl-and-idle-timeout).
+
+### Work roots
+
+Top-level `workRoot` is the provider-neutral base for remote workspaces.
+`CRABBOX_WORK_ROOT` overrides that generic value for the current process, so a
+portable one-run override is:
+
+```sh
+CRABBOX_WORK_ROOT=/srv/crabbox \
+  crabbox run --provider "$PROVIDER" -- pnpm test
+```
+
+For a normal SSH-backed run, Crabbox appends the lease and repository names and
+uses `<root>/<lease>/<repository>` for sync and command execution. The generic
+value therefore does not request an exact remote `chdir`. Delegated adapters
+may own an exact workdir instead, and a valid Actions hydration marker owns the
+canonical workspace used by subsequent syncs and commands.
+
+Root selection has two levels of precedence:
+
+1. For one setting, the normal source order remains flags, environment,
+   repo-local config, user config, then defaults.
+2. After provider routing, an explicitly configured provider-specific work-root
+   or workdir setting is more specific than top-level `workRoot` or
+   `CRABBOX_WORK_ROOT`. If no provider-specific value is explicit, providers
+   that support the generic root inherit it. Provider validation and path
+   translation still apply.
+
+For example, `localContainer.workRoot`,
+`CRABBOX_LOCAL_CONTAINER_WORK_ROOT`, or `--local-container-work-root` wins over
+the generic root. Within that provider-specific setting, the normal source
+order above decides the value. Use `crabbox config show` to inspect the resolved
+root before starting a lease.
 
 ### Profiles and presets
 
@@ -274,10 +400,21 @@ aws:
 hostId: h-0123456789abcdef0
 ```
 
-The default region is `eu-west-1` and the default root volume is `400` GB.
+The default region is `eu-west-1`. For AWS and GCP, an unset or zero root size
+means automatic sizing: `tiny` 40 GB, `small` 80 GB, `standard`/`fast` 150 GB,
+`large` 250 GB, `beast` 400 GB, raised to the source image/snapshot minimum.
+The `rootGB: 400` examples explicitly retain the previous size. Positive user
+sizes and coordinator `CRABBOX_AWS_ROOT_GB` / `CRABBOX_GCP_ROOT_GB` overrides
+remain explicit, so undersized requests still fail. Config output keeps zero
+for automatic sizing; it cannot know the image minimum offline. Older AWS
+clients still sending 400 continue to request 400. See the
+[AWS](../providers/aws.md) and [GCP](../providers/gcp.md) references for fixed-ID,
+ready-pool, and machine-image restore behavior.
 `aws.macHostId` is the AWS-specific allocated EC2 Mac Dedicated Host and
-seeds the generic `hostId` when that is unset; `target: macos` requires one of
-`hostId`, `aws.macHostId`, `CRABBOX_HOST_ID`, or `CRABBOX_AWS_MAC_HOST_ID`.
+seeds the generic `hostId` when that is unset. Direct `target: macos` requires
+one of `hostId`, `aws.macHostId`, `CRABBOX_HOST_ID`, or
+`CRABBOX_AWS_MAC_HOST_ID`. Brokered mode can discover an available host;
+explicit brokered host selection requires admin authentication.
 
 ### Azure
 
@@ -287,18 +424,18 @@ azure:
   backend: vm           # vm | dynamic-sessions
   location: eastus
   resourceGroup: crabbox-leases
-  osDisk: managed       # managed | ephemeral | ephemeral-preview | auto
+  osDisk: managed       # managed | ephemeral | auto
   vnet: crabbox-vnet
   subnet: crabbox-subnet
   nsg: crabbox-nsg
 ```
 
 Azure uses managed `StandardSSD_LRS` OS disks by default so leases can support
-native disk-snapshot checkpoints. `ephemeral` opts into local OS disks for
-stateless leases and disables native Azure checkpoint/fork support.
-`ephemeral-preview` opts into Azure's public-preview full-caching ephemeral OS
-disk mode and skips known unsupported Crabbox Azure SKUs. `auto` is accepted for
-compatibility and resolves to managed.
+native disk-snapshot checkpoints. `ephemeral` enables GA full caching for
+stateless leases and disables native Azure checkpoint/fork support. It requires
+at least eight vCPUs, a supported VM family, and sufficient local storage.
+See [Azure disk requirements](azure.md#os-disk-mode). `ephemeral-preview` is
+removed; replace it with `ephemeral`. `auto` resolves to `managed`.
 
 ### Azure Dynamic Sessions
 
@@ -417,7 +554,7 @@ remains account-owned after Crabbox release. Repo-local config also cannot
 set the API token, API URL, item, payment method, template, data center, or
 purchase opt-in. Put those account and purchase selections in environment
 variables, CLI flags, private user config, or an explicit `CRABBOX_CONFIG`
-file. `paymentMethodId` may be omitted only when the account has exactly one
+file outside the active repository. `paymentMethodId` may be omitted only when the account has exactly one
 active default payment method; otherwise set it explicitly. Use
 `crabbox doctor --provider hostinger --json` to discover available ids without
 making a purchase.
@@ -480,7 +617,7 @@ XCP-ng password command-line flag. Prefer a pool-master `apiUrl`; if XAPI
 returns `HOST_IS_SLAVE`, Crabbox retries login once against the reported master.
 For credential safety, repository-local `crabbox.yaml` and `.crabbox.yaml`
 files cannot override `apiUrl` or `insecureTLS`; set those in user config, an
-explicit `CRABBOX_CONFIG` file, or environment variables.
+explicit `CRABBOX_CONFIG` file outside the active repository, or environment variables.
 
 `target: linux` describes the current Crabbox lease surface, not an XCP-ng
 hypervisor limitation. XCP-ng itself can host Linux, Windows, and BSD guests on
@@ -562,19 +699,19 @@ socket from `DOCKER_HOST` or the Docker context and rejects remote TCP contexts.
 With the socket enabled and no explicit work root, Crabbox chooses a host-visible
 cache work root so nested bind mounts can see the synced checkout.
 
-Use `--desktop --browser` to bootstrap Xvfb, XFCE, x11vnc, noVNC/websockify,
+Use `--desktop --browser` to bootstrap TigerVNC, XFCE, noVNC/websockify,
 desktop input tools, screenshot tools, ffmpeg, and a packaged browser inside
 the container.
 
 ### Apple VZ
 
 ```yaml
-provider: apple-vz
-appleVZ:
+provider: apple-vm
+appleVM:
   # Optional for normal Homebrew/release installs.
-  helperPath: /custom/path/crabbox-apple-vz-helper
-  image: https://cloud-images.ubuntu.com/releases/resolute/release-20260520/ubuntu-26.04-server-cloudimg-arm64.img
-  imageSHA256: 5e091e27d60116efbb0c743b8dd5cb2d15618e414ef04db0817ed43c8e2d7c7b
+  helperPath: /custom/path/crabbox-apple-vm-helper
+  image: https://cloud-images.ubuntu.com/releases/resolute/release-20260731/ubuntu-26.04-server-cloudimg-arm64.img
+  imageSHA256: 3e113fdd41f39e13729375173bb2ae793f87dc6db4294e5251ff2476971788ba
   user: crabbox
   workRoot: /work/crabbox
   cpus: 4
@@ -582,13 +719,13 @@ appleVZ:
   diskGiB: 30
 ```
 
-`provider: applevz` is an alias for `apple-vz`. The backend drives a small
+`provider: applevm` is an alias for `apple-vm`. The backend drives a small
 local helper that boots a headless Linux VM with Apple's
 `Virtualization.framework`, then exposes guest SSH through a host-local proxy so
 Crabbox can use the normal SSH sync and run path. The image default follows the
-portable `osImage` selector unless `appleVZ.image` is set explicitly. Default
+portable `osImage` selector unless `appleVM.image` is set explicitly. Default
 remote images include pinned SHA-256 checksums; custom remote image URLs must
-set `appleVZ.imageSHA256`, while local image paths may omit it. Apple Silicon
+set `appleVM.imageSHA256`, while local image paths may omit it. Apple Silicon
 Homebrew bottles and release archives install the helper beside `crabbox`;
 `helperPath` is only needed for a custom or source-built helper. The effective
 architecture defaults to `arm64`, and explicit `amd64` is rejected.
@@ -664,6 +801,23 @@ For repository-local config, Crabbox ignores `cli`, `endpoint`, `region`,
 `keychain`, and `volumes`; set those through trusted user config, environment
 variables, or explicit flags.
 
+### Phala Cloud (confidential TDX)
+
+```yaml
+provider: phala
+phala:
+  cli: phala
+  instanceType: tdx.small
+  workRoot: /var/volatile/crabbox
+  nodeId: ""
+  compose: ""
+```
+
+`phala` provisions confidential Intel TDX CVMs through the `phala` CLI, which
+uses its own stored auth; Crabbox never holds a Phala API key. For
+repository-local config, Crabbox ignores `cli`, `nodeId`, and `compose`; set
+those through trusted user config, environment variables, or explicit flags.
+
 ### KubeVirt
 
 ```yaml
@@ -686,6 +840,9 @@ kubevirt:
 The template must be one KubeVirt `VirtualMachine` using `runStrategy: Manual`.
 Crabbox sets its name, namespace, and lease labels, replaces documented
 placeholders, applies it with `kubectl`, and starts it with `virtctl`.
+Repository-local config may set inline `sshPublicKey` text, but Crabbox ignores
+`sshKey` and file-form `sshPublicKey` there. Put operator SSH key paths in
+trusted user config, environment variables, or explicit flags.
 
 ### External provider
 
@@ -700,9 +857,17 @@ external:
   config:
     backend: vm
     namespace: team-devboxes
+  connection:
+    ssh:
+      trustProviderOutput: true
   workRoot: /workspaces/crabbox
   routingFile: ""
 ```
+
+If the protocol response contains SSH coordinates, keep
+`trustProviderOutput: true` together with the exact command, arguments, and
+`external.config` plus its connection inputs in trusted user config. Repository
+config cannot inherit the approval after changing that adapter contract.
 
 The executable receives one versioned JSON request on stdin per lifecycle
 operation and returns one JSON response on stdout. This keeps internal control
@@ -736,18 +901,29 @@ external:
     ssh:
       user: "{{env.DEVBOX_USER}}"
       host: "{{resourceName}}"
+      allowEnv: true
+      trustProviderOutput: true
       sshConfigProxy: true
   config:
     size: cpu16
   workRoot: /home/developer/crabbox
 ```
 
+Put this destination-bearing example in trusted user config. Repository config
+may define the lifecycle, but its exact `resourceName`, SSH destination, and
+environment opt-in must be repeated in trusted user config before Crabbox uses
+operator-managed SSH credentials.
+
 Declarative lifecycle entries use one `argv` array or an ordered `steps` list,
 not shell commands. Acquire steps can opt into release cleanup with
 `rollbackOnFailure: true`. Put credentials in an operation `env:` map, not in
 `argv` or `steps`; environment-derived argv values require the explicit
 `allowEnvArgv: true` compatibility opt-in, and environment-derived resource
-names require `connection.allowEnvResourceName: true`. See
+names require `connection.allowEnvResourceName: true`. Repository lifecycle
+commands cannot place inherited `external.config` values in argv without an
+exact lifecycle and config-derived connection-template contract carrying
+`allowConfigArgv: true` in trusted user config; repository-owned config values
+are unchanged. See
 [External Provider](../providers/external.md) for placeholders, output
 semantics, inventory formats, routing behavior, controller-safe raw
 `json-lease` identity attestation, and security guidance.
@@ -819,17 +995,20 @@ workdir only; tokens do not belong in YAML or command-line flags.
 provider: cloudflare
 cloudflare:
   apiUrl: https://crabbox-cloudflare-container-runner.example.workers.dev
+  image: default
   workdir: /workspace/crabbox
 ```
 
 Keep `CRABBOX_CLOUDFLARE_RUNNER_TOKEN` in the shell or credential manager.
 `CRABBOX_CLOUDFLARE_RUNNER_URL` can supply the runner URL from the environment.
 Repo config should select the runner URL and workdir, not hold bearer tokens.
-`crabbox config show` reports the runner URL, workdir, and token state as
-`cloudflare.auth` without printing the token. `--type` selects one of the
-instance types wired into the deployed runner; update
-`worker/wrangler.cloudflare.jsonc` and redeploy when changing the available
-`instance_type` bindings or `max_instances`.
+`crabbox config show` reports the runner URL, image, workdir, and token state as
+`cloudflare.auth` without printing the token. `--type` selects the Cloudflare
+instance type for each lease (`standard-1` through `standard-4`; `basic` maps to
+`standard-1` with a warning), and
+`image` (`CRABBOX_CLOUDFLARE_IMAGE`, `--cloudflare-image`) selects a named image
+from the runner's `containers[].images` map; update
+`worker/wrangler.cloudflare.jsonc` and redeploy to add images.
 
 Use `cloudflare-dynamic-workers` instead when the target is Worker-runtime module
 source rather than Linux command execution.
@@ -868,18 +1047,20 @@ layout. The authenticated `sprite` CLI must also be on `PATH`.
 Other delegated and SSH-lease providers (RunPod, Tensorlake, Upstash, Islo,
 W&B, Railway, Parallels) follow the same shape: a top-level section named after
 the provider, with credentials sourced from provider-native env vars rather
-than YAML. See [Providers](providers.md) for the per-provider reference.
+than YAML. See [Provider Reference](../providers/README.md) for the per-provider reference.
 
 ### Sync
 
 ```yaml
 sync:
+  source: git # git (default) or explicit include-only directory
   delete: true
   checksum: false
   gitSeed: true
+  gitOverlay: false
   fingerprint: true
   baseRef: main
-  timeout: 15m
+  timeout: 15m # rsync I/O inactivity; manifest/archive wall-clock limit
   warnFiles: 50000
   warnBytes: 5368709120
   failFiles: 150000
@@ -891,8 +1072,17 @@ sync:
     - dist
 ```
 
-A `.crabboxignore` file at the repo root appends to `sync.exclude`. See
-[Sync](sync.md) for the matcher rules.
+`sync.source` selects `git` (default) or explicit `directory` mode;
+`CRABBOX_SYNC_SOURCE` overrides it. Directory mode requires a nonempty effective
+`sync.include`, uses the current directory as its root, and still requires Git
+for isolated source-tree ignore matching. See
+[directory source](sync.md#explicit-directory-source) for supported transports,
+Git-only restrictions, and inactive `--no-sync` behavior.
+
+A `.crabboxignore` file at the repo root appends to `sync.exclude`.
+`sync.gitOverlay` is an opt-in, credential-free Git transfer optimization for
+eligible Linux SSH workspaces; `CRABBOX_SYNC_GIT_OVERLAY` overrides it. See
+[Sync](sync.md) for the matcher rules and overlay eligibility.
 
 ### Env forwarding
 
@@ -907,24 +1097,63 @@ env:
 `env.allow` is name-based and supports trailing wildcards. Crabbox forwards
 matching local env vars to the remote command. The default allowlist is
 `CI` and `NODE_OPTIONS`. Secrets do not belong in `env.allow`; pass them
-through provider-side mechanisms. See [Environment forwarding](env-forwarding.md).
+through provider-side mechanisms. A selected profile may provide its own
+additive allowlist; clearing top-level `env.allow` does not remove profile
+additions. `CRABBOX_ENV_ALLOW` replaces the fully resolved config/profile
+list, and explicit `--allow-env` flags append afterward. See
+[Environment forwarding](env-forwarding.md).
 
 ### Run preflight
 
 ```yaml
 run:
   preflightTools:
-    - node
-    - bun
-    - docker
+    - default
+    - cmake
 ```
 
 `run.preflightTools` configures which built-in probes `crabbox run --preflight`
 executes before the remote command. The CLI flag
-`--preflight-tools node,bun,docker` overrides this list for one run. Use
-`default` to include Crabbox's default built-ins and `none` to print only the
-workspace summary. Preflight probes only report availability; they do not
-install toolchains or mutate the machine.
+`--preflight-tools default,cmake` overrides this list for one run. Inspect the
+same accepted names, aliases, defaults, and target support offline with
+[`crabbox preflight-tools [--json]`](../commands/preflight-tools.md). The CMake probe invokes only
+the literal `cmake --version` command and reports its first output line or
+`cmake=missing`. Use `default` (alias `defaults`) to include Crabbox's default built-ins
+and `none` alone to print only the workspace summary; mixed `none,git` still
+selects `git`. An omitted `run.preflightTools` inherits
+the lower layer (built-in probes by default); `preflightTools: []` clears the
+list and prints only the workspace summary, without restoring default probes.
+Preflight probes are diagnostic only: a missing tool does not block the
+workload, and Crabbox does not install or upgrade toolchains.
+
+Use `preflightTools: [default, bash]` to append the opt-in literal
+`bash --version` probe without changing the defaults. The CLI equivalent is
+`--preflight --preflight-tools default,bash`. Linux, macOS and WSL2 report a
+bounded first output line or `bash=missing`; native Windows skips the probe.
+A missing Bash diagnostic does not block an independent command. Linux SSH
+execution without Bash needs the complete companion runtime pack; see
+[run preflight](../commands/run.md#preflight) and the
+[run command](../commands/run.md) for installation and shell requirements.
+
+Add `python3-venv` to this list in repository or user configuration to opt into a
+functional disposable-venv check on Linux, macOS or WSL2. For example,
+`preflightTools: [default, python3-venv, python3-venv]` retains the ordered defaults
+and runs the added probe once; unsupported native Windows targets filter it out.
+The CLI equivalent is `--preflight-tools default,python3-venv`. It does not change
+literal `python`/`python3` probes or make the functional probe default-on.
+
+The probe creates a fresh environment, seeds pip only there, and checks its own
+Python and pip without installing host or project packages or reusing a project
+environment. Its diagnostic `ready` result requires confirmed cleanup, not just
+successful creation. Caller cancellation prevents the later workload; unavailable
+capability alone does not. A worker failure or probe timeout with confirmed
+cleanup is also diagnostic only. An unresolved owned stage, reported as
+`unavailable cleanup=unconfirmed`, fails the run before the workload. Cleanup status
+is independent: a transport, setup or envelope error can still fail the run after
+cleanup succeeds (`unavailable cleanup=confirmed`).
+See [run preflight](../commands/run.md#preflight) for
+the complete state/cleanup output and separate probe, cleanup and transport
+budgets. `python3-venv` is not a profile-doctor version-only tool requirement.
 
 ### Actions
 
@@ -967,6 +1196,7 @@ existing-lease reuse rules.
 ```yaml
 results:
   auto: false
+  failOnFailures: false
   junit:
     - junit.xml
     - reports/junit.xml
@@ -985,6 +1215,27 @@ ssh:
 
 The default SSH user is `crabbox`, the default port is `2222`, and the default
 fallback port is `22`.
+
+Static SSH power hooks live under `static:`, separate from shared SSH credentials:
+
+```yaml
+static:
+  host: 127.0.0.1
+  user: root
+  port: "2222"
+  power:
+    dedicated: true
+    hostID: lab-container
+  startCommand: ["/usr/local/bin/docker", "start", "lab-ssh"]
+  stopCommand: ["/usr/local/bin/docker", "stop", "lab-ssh"]
+```
+
+`static.power.dedicated: true` is mandatory for hooks and declares exclusive
+host power control by one controller/state directory. `static.power.hostID` is
+optional. Use trusted user config, an IP literal, explicit user/port, and absolute
+hook executable paths. Local durable host references gate first start and final
+stop; a failed stop retains custody for retry. See [Power hooks](../providers/ssh.md#power-hooks)
+for trust, concurrency, cancellation, rollback, and recovery semantics.
 
 ### Tailscale
 
@@ -1036,19 +1287,25 @@ the list when the first candidate cannot be provisioned.
 
 | Class | Intent |
 |:------|:-------|
+| `tiny` | smoke checks and minimal repositories |
+| `small` | small repositories and light CI lanes |
 | `standard` | typical CI lane |
 | `fast` | ~2x more cores than standard for parallel-friendly suites |
 | `large` | memory-heavy or many-process workloads |
 | `beast` | maximum capacity within the provider's burstable family |
 
-Class-to-type mappings live in [Providers](providers.md). When you set
+Class-to-type mappings live in [Machine classes](providers.md#machine-classes). When you set
 `serverType:` (or `--type`), that exact provider type wins and the class is
 ignored. The `serverType:` and `--type` paths intentionally do not fall back;
 they fail loud if the provider rejects the type.
 
 Set `architecture: arm64` (or `--arch arm64`) for Linux ARM capacity on AWS or
-Azure. Explicit ARM provider types also select matching ARM Linux images when
-no provider-specific image override is set.
+Azure. Apple Container defaults to native ARM64 and also accepts explicit ARM64
+or AMD64 guest selection. Local Container treats explicit `amd64` or `arm64` as
+an assertion about the selected Docker/Podman daemon's native architecture,
+including remote contexts; it does not add `--platform` or enable emulation.
+Explicit ARM cloud provider types select matching ARM Linux images when no
+provider-specific image override is set.
 
 ## Environment variables
 
@@ -1073,11 +1330,19 @@ CRABBOX_PROFILE                 default profile
 CRABBOX_DEFAULT_CLASS           default machine class
 CRABBOX_SERVER_TYPE             explicit provider type
 CRABBOX_IDLE_TIMEOUT            idle timeout
-CRABBOX_TTL                     lease TTL
+CRABBOX_WARMUP_KEEP             warmup retention default (true | false)
+CRABBOX_CLAIMS_AUTO_PRUNE        prune eligible old local claims after successful stop/release (true | false; default true)
+CRABBOX_TTL                     lease TTL (default 30m)
+CRABBOX_MAX_TTL                 direct-provider ceiling (default 4h; at most 24h)
 CRABBOX_NETWORK                 network mode
 CRABBOX_OWNER                   usage owner override
 CRABBOX_ORG                     usage org override
 ```
+
+`claims.autoPrune: false` disables automatic local-claim maintenance in YAML;
+`CRABBOX_CLAIMS_AUTO_PRUNE` overrides it. Maintenance runs only after successful
+explicit stop/release, with a five-second budget and a daily completion stamp.
+See [`claims prune`](../commands/claims.md#prune) for eligibility and manual use.
 
 Provider credentials live outside the Crabbox env namespace where the provider
 SDK or CLI already defines them:
@@ -1135,6 +1400,14 @@ Related docs:
 - [config command](../commands/config.md)
 - [doctor command](../commands/doctor.md)
 - [Sync](sync.md)
-- [Providers](providers.md)
+- [Provider Reference](../providers/README.md)
 - [Capacity and fallback](capacity-fallback.md)
 - [Network and reachability](network.md)
+
+## Contributor wiring
+
+Vercel Sandbox is the pilot for generated mechanical config wiring. Its concrete
+Go config type is the single description for YAML, env, defaults, and flags;
+provider validation and credential policy remain explicit. See
+[Typed provider config](../refactor/typed-provider-config.md) for the design,
+preserved presence/precedence behavior, regeneration checks, and field recipe.

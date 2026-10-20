@@ -7,12 +7,27 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 type App struct {
-	Stdout io.Writer
-	Stderr io.Writer
-	Stdin  io.Reader
+	Stdout                io.Writer
+	Stderr                io.Writer
+	Stdin                 io.Reader
+	synthesizedFlagInputs bool
+
+	runOutcome             *shardRunOutcome
+	runEnvDenylist         []string
+	egressClientRuntime    bool
+	workspaceOwnerAcquirer func(context.Context, SSHTarget, string, io.Writer) (*workspaceOwner, error)
+	sshReadinessWaiter     func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error
+}
+
+func (a App) waitForSSHReady(ctx context.Context, target *SSHTarget, phase string, timeout time.Duration) error {
+	if a.sshReadinessWaiter != nil {
+		return a.sshReadinessWaiter(ctx, target, a.Stderr, phase, timeout)
+	}
+	return waitForSSHReady(ctx, target, a.Stderr, phase, timeout)
 }
 
 func Run(ctx context.Context, args []string) error {
@@ -27,15 +42,26 @@ func (a App) input() io.Reader {
 	return os.Stdin
 }
 
-func (a App) Run(ctx context.Context, args []string) error {
+func (a App) Run(ctx context.Context, args []string) (err error) {
+	controls := &serveRelayControls{}
+	ctx = context.WithValue(ctx, serveRelayControlsKey{}, controls)
+	defer func() { err = errors.Join(err, controls.closeLease("")) }()
 	if len(args) == 0 {
 		a.printHelp()
-		return exit(2, "missing command")
+		return Exit(2, "missing command")
 	}
 
 	switch args[0] {
+	case "__webvnc-supervisor":
+		return a.webVNCDaemonSupervisor(ctx, args[1:])
 	case "__namespace-instance-proxy":
 		return a.namespaceInstanceProxy(ctx, args[1:])
+	case "__serve-relay-proxy":
+		return a.serveRelayProxy(ctx, args[1:])
+	case "__phala-proxy":
+		return a.phalaProxy(ctx, args[1:])
+	case "__herdr-plugin":
+		return a.herdrPlugin(ctx, args[1:])
 	case "-h", "--help":
 		a.printHelp()
 		return nil
@@ -75,12 +101,18 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.prewarm(ctx, helpArgs), true
 	case "run":
 		return a.runCommand(ctx, helpArgs), true
+	case "watch":
+		return a.watch(ctx, helpArgs), true
+	case "shard":
+		return a.shard(ctx, helpArgs), true
 	case "job":
 		return nil, false
 	case "sync-plan":
 		return a.syncPlan(ctx, helpArgs), true
 	case "providers":
 		return a.providers(ctx, helpArgs), true
+	case "preflight-tools":
+		return a.preflightTools(helpArgs), true
 	case "history":
 		return a.history(ctx, helpArgs), true
 	case "logs":
@@ -91,20 +123,36 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.attach(ctx, helpArgs), true
 	case "results":
 		return a.results(ctx, helpArgs), true
+	case "receipt":
+		return a.receipt(ctx, helpArgs), true
+	case "verify":
+		return a.verify(ctx, helpArgs), true
 	case "status":
 		return a.status(ctx, helpArgs), true
+	case "extend":
+		return a.extend(ctx, helpArgs), true
+	case "heartbeat":
+		return a.heartbeat(ctx, helpArgs), true
 	case "list":
 		return a.list(ctx, helpArgs), true
 	case "usage":
 		return a.usage(ctx, helpArgs), true
+	case "capacity":
+		return a.capacity(ctx, helpArgs), true
 	case "ssh":
 		return a.ssh(ctx, helpArgs), true
 	case "connect":
 		return a.connect(ctx, helpArgs), true
+	case "exec":
+		return a.execCommand(ctx, helpArgs), true
+	case "open":
+		return a.open(ctx, helpArgs), true
 	case "ports":
 		return a.ports(ctx, helpArgs), true
 	case "cp":
 		return a.copyCommand(ctx, helpArgs), true
+	case "tunnel":
+		return a.tunnel(ctx, helpArgs), true
 	case "vnc":
 		return a.vnc(ctx, helpArgs), true
 	case "webvnc":
@@ -127,6 +175,8 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.stop(ctx, helpArgs), true
 	case "pause":
 		return a.pause(ctx, helpArgs), true
+	case "hold":
+		return a.hold(ctx, helpArgs), true
 	case "resume":
 		return a.resume(ctx, helpArgs), true
 	case "cleanup":
@@ -169,35 +219,50 @@ Commands:
   logout      Remove the stored broker token
   whoami      Show broker identity
   doctor      Check local and broker/provider readiness
+  serve       Donate trusted container capacity to the coordinator
   warmup      Lease a box and wait until it is ready
   prewarm     Lease and hydrate a reusable test-ready box
   run         Sync the repo, run a remote command, stream output
+  watch       Re-run a command on a warm lease when local files change
+  shard       Fork a checkpoint into parallel shards and merge their test results
+  bench       Record and report local benchmark timings
   job         Run named repo-local Crabbox jobs
   desktop     Launch apps into a visible desktop session
   media       Create preview artifacts from recorded desktop videos
   artifacts   Collect, transform, and publish QA artifacts
   sync-plan   Show local sync manifest size hotspots
-  providers   Show provider capabilities
+  providers   Show provider capabilities and recommendations
+  preflight-tools  List accepted preflight names and target support offline
   history     List recorded remote runs
   logs        Print recorded run logs
   events      Print recorded run events
   attach      Follow recorded events for an active run
   results     Show recorded test result summaries
+  receipt     Retrieve and verify a signed terminal run receipt
+  verify      Verify a signed run receipt
   cache       Inspect, purge, warm, or list remote cache volumes
   status      Show lease state; add --wait to block until ready
+  extend      Extend a lease within its lifetime policy
+  heartbeat   Refresh a lease idle deadline and print its state
+  claims      Inspect unverified local lease claims without loading providers
   list        List Crabbox machines
   share       Share a lease with users or the owning org
   unshare     Remove lease sharing
   image       Create provider images and promote brokered AWS runner images
   usage       Show cost and usage estimates by user, org, or fleet
+  capacity    Show fleet, org, and owner lease headroom
+  marketplace  Preview the Crabbox credits gateway and smart routing quotes
   admin       Lease admin controls for trusted operators
   actions     Hydrate boxes from repo workflows or GitHub runners
   capsule     Capture and replay lightweight failure capsules
   checkpoint  Create, restore, and fork workspace checkpoints
   ssh         Print the SSH command for a lease
   connect     Open an interactive SSH session to a lease
+  exec        Execute a command under the current lease claim without syncing
+  open        Prepare an editor handoff for a lease
   ports       Publish, list, or unpublish provider-native ports
-  cp          Copy files between host and a delegated sandbox
+  cp          Copy files between the host and a lease
+  tunnel      Forward a lease loopback port to this machine
   vnc         Print or open VNC connection details for a desktop lease
   webvnc      Open a desktop lease or local VNC tunnel in a browser
   code        Bridge a code lease into the authenticated web portal
@@ -206,6 +271,7 @@ Commands:
   inspect     Print lease/provider details; add --json for scripts
   stop        Release a lease or delete a direct-provider machine
   pause       Pause a lease, freeing remote compute while preserving state
+  hold        Retain an exact failed lease and its resources for salvage
   resume      Resume a previously paused lease
   cleanup     Sweep expired direct-provider machines or local provider state
   pool        Manage ready-pool leases and list machine inventory aliases
@@ -219,11 +285,18 @@ Common Flows:
   crabbox job run openclaw-wsl2
   crabbox warmup
   crabbox status --id blue-lobster --wait
+  crabbox heartbeat --id blue-lobster --idle-timeout 90m
+  crabbox claims list
   crabbox run --id blue-lobster --shell 'pnpm install --frozen-lockfile && pnpm test'
+  crabbox run --timing-record=default -- pnpm test
+  crabbox bench run --providers aws,hetzner --repeats 3 -- pnpm test
+  crabbox bench report --since 7d
   crabbox connect blue-lobster
   crabbox ssh --id blue-lobster
+  crabbox open --editor=zed --id blue-lobster
   crabbox ports --id blue-lobster --publish 8080
   crabbox cp --id blue-lobster ./coverage.xml SANDBOX:/tmp/coverage.xml
+  crabbox tunnel --id blue-lobster 3000
   crabbox vnc --id blue-lobster --open
   crabbox desktop launch --id blue-lobster --browser --url https://example.com --webvnc --open
   crabbox desktop proof --id blue-lobster --output artifacts/blue-lobster-proof -- ./scripts/visual-smoke.sh
@@ -250,6 +323,7 @@ Common Flows:
   crabbox cache volumes
   crabbox pool ready
   crabbox usage --scope org
+  crabbox marketplace quote --provider auto --class beast --ttl 1h --max-credits 5
   crabbox admin leases --state active
   crabbox admin lease-audit --state expired --provider aws
   crabbox admin providers identity --provider aws --region eu-west-1
@@ -301,11 +375,14 @@ Environment:
   CRABBOX_BROWSER              Provision or require browser capability
   CRABBOX_CODE                 Provision or require web code capability
   CRABBOX_STATIC_HOST          Static SSH host for provider=ssh
+  CRABBOX_STATIC_START_COMMAND JSON argv run locally before a static lease
+  CRABBOX_STATIC_STOP_COMMAND  JSON argv run locally after the last static lease
   CRABBOX_OWNER                Usage owner override
   CRABBOX_ORG                  Usage org override
   CRABBOX_CONFIG               Optional config path
   CRABBOX_IDLE_TIMEOUT         Default idle expiry, e.g. 30m
-  CRABBOX_TTL                  Maximum lease lifetime, e.g. 90m
+  CRABBOX_TTL                  Lease lifetime (default 30m)
+  CRABBOX_MAX_TTL              Direct lease ceiling (default 4h, at most 24h)
   CRABBOX_AWS_REGION           Default eu-west-1
   CRABBOX_AWS_SSH_CIDRS        Comma-separated AWS SSH source CIDRs
   CRABBOX_SSH_FALLBACK_PORTS   Comma-separated SSH fallback ports, or none
@@ -334,12 +411,18 @@ func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
+func registerProviderSelectionFlag(fs *flag.FlagSet, defaults Config, usage string) *string {
+	provider := fs.String("provider", defaults.Provider, usage)
+	fs.Lookup("provider").DefValue = ""
+	return provider
+}
+
 func parseFlags(fs *flag.FlagSet, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return ExitError{Code: 0}
 		}
-		return exit(2, "%v", err)
+		return Exit(2, "%v", err)
 	}
 	return nil
 }

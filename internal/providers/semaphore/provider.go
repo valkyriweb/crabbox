@@ -4,6 +4,7 @@ package semaphore
 
 import (
 	"flag"
+	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -14,42 +15,38 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return "semaphore" }
-func (Provider) Aliases() []string { return []string{"sem"} }
+func (Provider) ClaimScope(cfg core.Config) string {
+	host, err := normalizeSemaphoreHost(cfg.Semaphore.Host)
+	project := strings.TrimSpace(cfg.Semaphore.Project)
+	if err != nil || host == "" || project == "" {
+		return ""
+	}
+	return "host:" + strings.ToLower(host) + "|project:" + project
+}
+
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        "semaphore",
-		Family:      "semaphore",
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"sem"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIToken),
+		Name:             "semaphore",
+		Family:           "semaphore",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
 func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
-	return registerFlags(fs, defaults)
+	return core.RegisterSemaphoreConfigFlags(fs, defaults.Semaphore)
 }
 
 func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
-	if v, ok := values.(flagValues); ok {
-		applyFlagOverrides(cfg, fs, v)
-	}
-	return nil
+	_, err := core.ApplyProviderConfigFlags[core.SemaphoreConfigFlagValues](cfg, fs, values, &cfg.Semaphore, "semaphore")
+	return err
 }
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return newBackend(p.Spec(), cfg, rt)
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "semaphore doctor backend unavailable")
-	}
-	return doctor, nil
 }

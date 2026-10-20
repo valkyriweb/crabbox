@@ -80,6 +80,18 @@ Defaults:
 
 `snapshot` is required to create a new instance.
 
+Nonempty YAML strings replace their prior values; omitted, `null`, or empty
+strings keep the previous value. Whitespace is retained until the existing
+runtime normalization. Boolean inputs preserve explicit `false`, including
+`wakeOnSSH: false`. An omitted deletion policy is distinct from an explicitly
+supplied `deleteOnRelease: false` when forwarding command configuration.
+
+A nonblank Morph work root takes precedence over the generic work root. If the
+Morph value is blank, a non-default generic root is inherited; otherwise the
+fallback is `/tmp/crabbox`. API endpoint, gateway, and work-root defaults share
+their configuration definitions without combining API routing, SSH target,
+display, or work-root classification rules.
+
 Flags:
 
 ```text
@@ -123,10 +135,13 @@ crabbox stop --provider morph blue-lobster
 4. Set the provider-side TTL and optional `wake_on_ssh` policy.
 5. Wait for the instance to become ready, fetch the Morph SSH private key, and
    store it in Crabbox's normal per-lease key path.
-6. Connect as SSH user `<instance-id>@<sshGatewayHost>:22` and use the normal
+6. Persist an exact ownership claim binding the configured Morph API endpoint,
+   Crabbox lease, slug, instance ID, and provider ownership metadata.
+7. Connect as SSH user `<instance-id>@<sshGatewayHost>:22` and use the normal
    Crabbox sync/run flow.
-7. On release, pause the instance by default. If `morph.deleteOnRelease` is
-   true, Crabbox deletes it instead.
+8. On release, verify the exact local claim and fresh live ownership metadata,
+   then pause the instance by default. If `morph.deleteOnRelease` is true,
+   Crabbox deletes it instead. Provider failures preserve the claim for retry.
 
 ## Gotchas
 
@@ -142,6 +157,13 @@ crabbox stop --provider morph blue-lobster
 - `stop` pauses by default. Paused instances can be reused later by `run`,
   `ssh`, or `status --wait`; with `wakeOnSSH=true`, SSH can wake them through
   the gateway. The local claim and SSH key remain until the instance is deleted.
+- Both pause and deletion reject missing claims, another Morph API endpoint,
+  a different instance ID, or changed live ownership metadata. The claim lock
+  covers the final ownership check and provider mutation. A newly created
+  instance is rolled back if its exact ownership claim cannot be persisted.
+- Claims from older Crabbox versions are upgraded to include the API endpoint
+  only after their exact instance identity and fresh live ownership metadata
+  have been verified.
 - `morph.snapshot` is required for new leases. Existing leases can still be
   resolved by lease id, slug, or instance id.
 - The SSH hostname is the shared gateway, not the instance-specific hostname,
@@ -152,7 +174,7 @@ crabbox stop --provider morph blue-lobster
 ## Live testing
 
 Two opt-in entry points exercise the real Morph API. Neither runs in the
-default `go test -race ./...` or `node --test scripts/*.test.js` CI jobs;
+default `go test -race -timeout=20m ./...` or `node --test scripts/*.test.js` CI jobs;
 both are skipped or fail-fast when the API key is absent. Both force
 `deleteOnRelease=true` so test instances are deleted instead of retained.
 

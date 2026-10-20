@@ -1,3 +1,6 @@
+import type { PortalExternalRunnerRecord, PortalLeaseRecord } from "./org-records";
+import type { ServeMachineView } from "./serve";
+import { orderedTelemetrySamples } from "./telemetry";
 import type {
   ExternalRunnerRecord,
   LeaseRecord,
@@ -20,12 +23,13 @@ const shareIcon = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" s
 const themeMoonIcon = `<svg class="theme-icon-moon" viewBox="0 0 20 20" aria-hidden="true"><path d="M14.6 12.1A6.5 6.5 0 0 1 7.4 2.7a6.5 6.5 0 1 0 7.2 9.4z" fill="currentColor"/></svg>`;
 const themeSunIcon = `<svg class="theme-icon-sun" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4" fill="currentColor"/><g stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="10" y1="2" x2="10" y2="4"/><line x1="10" y1="16" x2="10" y2="18"/><line x1="2" y1="10" x2="4" y2="10"/><line x1="16" y1="10" x2="18" y2="10"/><line x1="4.2" y1="4.2" x2="5.6" y2="5.6"/><line x1="14.4" y1="14.4" x2="15.8" y2="15.8"/><line x1="4.2" y1="15.8" x2="5.6" y2="14.4"/><line x1="14.4" y1="5.6" x2="15.8" y2="4.2"/></g></svg>`;
 const themeSystemIcon = `<svg class="theme-icon-system" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="10" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7 17h6M10 14v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
-const portalBrand = "🦀 crabbox";
+const portalBrandMark = "🦀";
 const genericProviderIcon = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v12H4z"/><path d="m7 10 3 2-3 2M12 15h5"/></svg>`;
 const providerIcons: Record<string, string> = {
   "blacksmith-testbox": `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v5H4z"/><path d="M4 13h16v5H4z"/><path d="M8 8.5h.01M8 15.5h.01M12 8.5h5M12 15.5h5"/></svg>`,
   aws: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 15.5c3.8 2.2 9.1 2.5 14.8.9"/><path d="M17.5 13.2 20 16l-3.7.7"/><path d="M7 8.5h10l1.8 4H5.2z"/></svg>`,
   azure: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 17.5h9.2a4 4 0 0 0 .5-8 5.5 5.5 0 0 0-10.5-1.6A4.8 4.8 0 0 0 7.5 17.5Z"/><path d="M9 13h6"/></svg>`,
+  daytona: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v12H4z"/><path d="M8 10h8M8 14h5"/></svg>`,
   gcp: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 17 3.5 12.5 9.5 2h5L20.5 12.5 18 17z"/><path d="M8.5 17h9.5M9.5 2l3 5.5M14.5 2l-3 5.5"/></svg>`,
   hetzner: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 20 7.5v9L12 21l-8-4.5v-9z"/><path d="M8 8v8M16 8v8M8 12h8"/></svg>`,
 };
@@ -63,7 +67,7 @@ export interface PortalMacHostRecord {
   instanceType: string;
   autoPlacement: string;
   allocationTime?: string;
-  lease?: LeaseRecord;
+  lease?: PortalLeaseRecord;
 }
 
 export interface PortalAdminProviderStatus {
@@ -118,11 +122,12 @@ export interface PortalAdminView {
 export type PortalAdminTab = "health" | "leases" | "users";
 
 export function portalHome(
-  leases: LeaseRecord[],
-  runners: ExternalRunnerRecord[],
+  leases: PortalLeaseRecord[],
+  runners: PortalExternalRunnerRecord[],
   request: Request,
   macHosts: PortalMacHostRecord[] = [],
   manageableLeaseIDs: ReadonlySet<string> = new Set(),
+  machines: ServeMachineView[] = [],
 ): Response {
   const sortedLeases = leases.toSorted((a, b) => leaseSortTime(b).localeCompare(leaseSortTime(a)));
   const active = sortedLeases.filter((lease) => lease.state === "active");
@@ -175,23 +180,90 @@ export function portalHome(
           : macHostRow(row.host, { admin, owner, org }),
     )
     .join("");
-  const summary = admin
-    ? `${active.length + activeRunners.length + activeMacHosts.length} active / ${ended} ended / ${sortedRunners.length} external / ${system} system`
-    : `${active.length + activeRunners.length + activeMacHosts.length} active / ${ended} ended / ${sortedRunners.length} external`;
+  const activeTotal = active.length + activeRunners.length + activeMacHosts.length;
+  const stuckRunners = sortedRunners.filter(
+    (runner) => externalRunnerActionState(runner)?.stuck,
+  ).length;
+  const staleRunners = sortedRunners.length - activeRunners.length;
+  const queuedRunners = activeRunners.filter((runner) =>
+    ["queued", "pending", "starting"].includes(runner.status),
+  ).length;
+  const attention = stuckRunners + staleRunners;
+  const tiles = [
+    fleetTile({
+      label: "running now",
+      value: activeTotal,
+      detail: [
+        `${active.length} lease${active.length === 1 ? "" : "s"}`,
+        `${activeRunners.length} external`,
+        activeMacHosts.length
+          ? `${activeMacHosts.length} host${activeMacHosts.length === 1 ? "" : "s"}`
+          : "",
+      ],
+      preset: "state:active",
+      tone: "accent",
+    }),
+    fleetTile({
+      label: "crabbox leases",
+      value: active.length,
+      detail: [`${ended} ended`],
+      preset: "kind:lease,state:active",
+    }),
+    fleetTile({
+      label: "external runners",
+      value: activeRunners.length,
+      detail: [queuedRunners ? `${queuedRunners} queued` : "none queued"],
+      preset: "kind:external,state:active",
+    }),
+    activeMacHosts.length > 0
+      ? fleetTile({
+          label: "dedicated hosts",
+          value: activeMacHosts.length,
+          detail: [`${macHosts.length} allocated`],
+          preset: "kind:dedicated,state:active",
+        })
+      : "",
+    machines.length > 0
+      ? `<a class="fleet-tile" href="#machines">
+          <span class="fleet-tile-label">machines available</span>
+          <strong class="fleet-tile-value">${machines.filter((machine) => machine.online && !machine.draining && (!machine.availability || machine.availability.state === "available")).length}/${machines.length}</strong>
+          <span class="fleet-tile-detail">your donated capacity</span>
+        </a>`
+      : "",
+    fleetTile({
+      label: "needs attention",
+      value: attention,
+      detail: [`${stuckRunners} stuck`, `${staleRunners} stale`],
+      preset: stuckRunners > 0 || staleRunners === 0 ? "state:stuck" : "state:stale",
+      tone: attention > 0 ? "warn" : "quiet",
+    }),
+    admin
+      ? fleetTile({
+          label: "other owners",
+          value: system,
+          detail: [`${systemLeases} leases`, `${systemRunners} runners`],
+          preset: "owner:system",
+        })
+      : "",
+  ].join("");
   return html(
     "Crabbox Portal",
-    `<main class="portal-shell">
+    `<main class="portal-shell" data-view="home">
       ${portalHeader({
-        meta: `${escapeHTML(new URL(request.url).host)}${admin ? ` <span class="pill admin-pill">admin</span>` : ""}`,
-        actions: `${admin ? `<a class="button secondary admin-nav-link" href="/portal/admin">${lockIcon}<span>admin</span></a>` : ""}<a class="button secondary" href="/portal/logout">log out</a>`,
+        meta: escapeHTML(new URL(request.url).host),
+        actions: `${admin ? `<a class="oc-action oc-action-outline admin-nav-link" href="/portal/admin">${lockIcon}<span>admin</span></a>` : ""}${portalLogoutButton()}`,
       })}
-      ${admin ? portalAdminSummary({ owner, org, active: active.length, ended, runners: sortedRunners.length, system, providers: portalProviderSummary(sortedLeases, sortedRunners, macHosts) }) : ""}
-      <section class="panel table-panel">
+      ${admin ? portalAdminSummary({ owner, org }) : ""}
+      <section class="fleet-overview" aria-label="Fleet overview">
+        <div class="fleet-tiles">${tiles}</div>
+        ${providerTideBar(sortedLeases, sortedRunners, macHosts)}
+      </section>
+      <section class="panel table-panel fleet-panel">
         <div class="section-head">
-          <h2>leases</h2>
-          <span>${escapeHTML(summary)}</span>
+          <h2>fleet</h2>
+          <span>${sortedLeases.length + sortedRunners.length + macHosts.length} records${admin ? " · all scopes" : ""}</span>
         </div>
-        <table class="lease-table" data-portal-table data-page-size="12" data-search-placeholder="search leases" data-filter-groups="${escapeHTML(filterGroups)}" data-filter-default="${defaultFilter}">
+        <table class="lease-table" data-portal-table data-page-size="20" data-search-placeholder="search by name, id, repo, owner…" data-filter-groups="${escapeHTML(filterGroups)}" data-filter-default="${defaultFilter}">
           <thead>
             <tr>
               <th>lease</th>
@@ -200,15 +272,120 @@ export function portalHome(
               <th>target</th>
               <th>class</th>
               <th>access</th>
-              <th>time</th>
-              <th></th>
+              <th>activity</th>
+              <th><span class="sr-only">actions</span></th>
             </tr>
           </thead>
-          <tbody>${rows || `<tr><td colspan="8" class="empty">no leases or external runners visible</td></tr>`}</tbody>
+          <tbody>${rows || `<tr><td colspan="8" class="empty"><strong>No boxes in the water.</strong><span>Leases you start with <code>crabbox warmup</code> or <code>crabbox run</code> show up here.</span></td></tr>`}</tbody>
         </table>
       </section>
+      ${portalMachines(machines)}
     </main>`,
   );
+}
+
+function portalMachines(machines: ServeMachineView[]): string {
+  if (machines.length === 0) return "";
+  const rows = machines
+    .toSorted((a, b) => a.name.localeCompare(b.name) || a.machineID.localeCompare(b.machineID))
+    .map((machine) => {
+      const connection = machine.online ? "online" : "offline";
+      const availability = machine.availability;
+      const state = availability?.state ?? "available";
+      const availabilityLabel = [state, ...(availability?.reasons ?? [])].join(" · ");
+      const measurements = availability
+        ? `host CPU ${availability.hostCPU === null ? "unknown" : `${Math.round(availability.hostCPU * 100)}%`} · user idle ${availability.userIdleSeconds === null ? "unknown" : `${Math.floor(availability.userIdleSeconds)}s`} · power ${availability.power}`
+        : "";
+      const labels = Object.entries(machine.labels)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(" · ");
+      const leases = machine.allocatedLeaseRefs
+        .map(
+          (lease) =>
+            `<a class="lease-link" href="/portal/leases/${encodeURIComponent(lease.id)}"><strong>${escapeHTML(lease.slug || lease.id)}</strong><small>${escapeHTML(lease.state)}</small></a>`,
+        )
+        .join("");
+      return `<tr data-filter-tags="${connection}${machine.draining ? " draining" : ""}">
+        <td><div class="lease-link"><strong>${escapeHTML(machine.name)}</strong><small title="${escapeHTML(machine.machineID)}">${escapeHTML(machine.machineID.slice(0, 8))} · ${escapeHTML(machine.os)}/${escapeHTML(machine.arch)}</small>${labels ? `<small>${escapeHTML(labels)}</small>` : ""}</div></td>
+        <td><div class="state-stack"><span class="${badgeClass(machine.online ? "ok" : "neutral")}">${connection}</span><span class="${badgeClass(state === "available" ? "ok" : state === "busy" ? "warn" : "neutral")}">${escapeHTML(availabilityLabel)}</span>${machine.draining ? `<span class="${badgeClass("warn")}">draining</span>` : ""}<small>seen ${escapeHTML(relativeTime(new Date(machine.lastHeartbeat).toISOString()))}</small>${measurements ? `<small>${escapeHTML(measurements)}</small>` : ""}</div></td>
+        <td><div class="lease-link"><strong>${machine.allocatedCPUs}/${machine.cpus} CPUs · ${machine.allocatedMemoryMB}/${machine.memoryMB} MiB</strong><small>${machine.freeCPUs} CPUs · ${machine.freeMemoryMB} MiB free</small></div></td>
+        <td><div class="machine-leases"><span>${machine.allocatedLeases}/${machine.maxLeases} allocated</span>${leases || `<span class="muted">No allocated leases.</span>`}</div></td>
+        <td>${machine.usage ? `<div class="lease-link"><strong>${machine.usage.leases} served · ${(machine.usage.cpuSeconds / 3600).toFixed(2)} CPU-hours</strong><small>${escapeHTML(formatDuration(machine.usage.runtimeSeconds * 1000))} runtime · ${escapeHTML(machine.usage.month)} UTC</small></div>` : `<span class="muted">Unavailable</span>`}</td>
+        <td><div class="lease-link"><strong>${escapeHTML(machine.runtime)} ${escapeHTML(machine.runtimeVersion)}</strong><small>agent ${escapeHTML(machine.agentVersion)}</small><small>${escapeHTML(machine.address)}:${machine.frontDoor.port}</small></div></td>
+      </tr>`;
+    })
+    .join("");
+  return `<section class="panel table-panel fleet-panel" id="machines" aria-labelledby="machines-heading">
+    <div class="section-head"><h2 id="machines-heading">Machines</h2><span>${machines.length} donated · owner only</span></div>
+    <table class="machine-table" data-portal-table data-page-size="10" data-search-placeholder="search machines, labels, leases…" data-filter-buttons="all:all,online:online,offline:offline,draining:draining">
+      <thead><tr><th>machine</th><th>connection / availability</th><th>capacity used / offered</th><th>leases</th><th>served this month</th><th>runtime / endpoint</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </section>`;
+}
+
+function fleetTile(input: {
+  label: string;
+  value: number;
+  detail: string[];
+  preset: string;
+  tone?: "accent" | "warn" | "quiet";
+}): string {
+  const detail = input.detail.filter(Boolean).join(" · ");
+  return `<button class="fleet-tile" type="button" data-filter-preset="${escapeHTML(input.preset)}"${input.tone ? ` data-tone="${input.tone}"` : ""} aria-pressed="false">
+    <span class="fleet-tile-label">${escapeHTML(input.label)}</span>
+    <strong class="fleet-tile-value">${input.value}</strong>
+    <span class="fleet-tile-detail">${escapeHTML(detail)}</span>
+  </button>`;
+}
+
+// Active footprint by provider. Providers are identity series, so each gets a
+// stable hue from the provider palette instead of a status color.
+function providerTideBar(
+  leases: LeaseRecord[],
+  runners: ExternalRunnerRecord[],
+  macHosts: PortalMacHostRecord[],
+): string {
+  const counts = new Map<string, number>();
+  for (const provider of [
+    ...leases.filter((lease) => lease.state === "active").map((lease) => lease.provider),
+    ...runners.filter((runner) => !runner.stale).map((runner) => runner.provider),
+    ...macHosts.filter((host) => host.state !== "released").map((host) => host.provider),
+  ]) {
+    counts.set(provider, (counts.get(provider) ?? 0) + 1);
+  }
+  return tideBar(counts, (provider) => ({
+    tag: "button",
+    attrs: `type="button" data-filter-preset="provider:${escapeHTML(provider)},state:active" aria-pressed="false"`,
+  }));
+}
+
+function tideBar(
+  counts: Map<string, number>,
+  key: (provider: string) => { tag: "button" | "a"; attrs: string },
+): string {
+  const total = [...counts.values()].reduce((sum, count) => sum + count, 0);
+  if (total === 0) {
+    return "";
+  }
+  const shares = [...counts.entries()].toSorted(([, a], [, b]) => b - a);
+  const segments = shares
+    .map(
+      ([provider, count]) =>
+        `<span class="tide-segment" data-provider="${escapeHTML(provider)}" style="flex-grow:${count}" title="${escapeHTML(`${providerFilterLabel(provider)}: ${count} active`)}"></span>`,
+    )
+    .join("");
+  const legend = shares
+    .map(([provider, count]) => {
+      const { tag, attrs } = key(provider);
+      return `<${tag} class="tide-key" ${attrs} data-provider="${escapeHTML(provider)}"><span class="tide-swatch"></span>${escapeHTML(providerFilterLabel(provider))}<strong>${count}</strong><small>${Math.round((count / total) * 100)}%</small></${tag}>`;
+    })
+    .join("");
+  return `<div class="tide">
+    <div class="tide-head"><span>active by provider</span><span>${total} running</span></div>
+    <div class="tide-bar" aria-hidden="true">${segments}</div>
+    <div class="tide-legend">${legend}</div>
+  </div>`;
 }
 
 export function portalAdmin(
@@ -249,11 +426,11 @@ export function portalAdmin(
     "Crabbox Admin",
     `<main class="portal-shell admin-shell">
       ${portalHeader({
-        meta: `${escapeHTML(new URL(request.url).host)} <span class="pill admin-pill">admin</span>`,
+        meta: `${escapeHTML(new URL(request.url).host)} <span class="oc-badge oc-badge-accent">admin</span>`,
         actions: `
-          <a class="button secondary" href="/portal">leases</a>
-          <a class="button secondary admin-nav-link" href="/portal/admin">${lockIcon}<span>admin</span></a>
-          <a class="button secondary" href="/portal/logout">log out</a>
+          <a class="oc-action oc-action-outline" href="/portal">leases</a>
+          <a class="oc-action oc-action-outline admin-nav-link" href="/portal/admin">${lockIcon}<span>admin</span></a>
+          ${portalLogoutButton()}
         `,
       })}
       ${adminTabs(tab, providerFilter)}
@@ -265,6 +442,7 @@ export function portalAdmin(
         ${adminMetric("users", String(users.length))}
         ${adminMetric("checked", shortTime(generatedAt))}
       </section>
+      ${providerSplitStrip(providers)}
       ${body}
     </main>`,
   );
@@ -378,7 +556,7 @@ function providerAdminRow(provider: PortalAdminProviderStatus): string {
         <strong>${escapeHTML(providerSpec.label)}</strong>
         <span><span class="traffic-light" data-tone="${provider.status}" aria-label="${provider.status}"></span>${escapeHTML(provider.configured ? "configured" : "missing config")}</span>
       </div>
-      <span class="pill"${tone ? ` data-tone="${tone}"` : ""}>${escapeHTML(provider.status)}</span>
+      <span class="${badgeClass(tone)}">${escapeHTML(provider.status)}</span>
     </div>
     <dl class="provider-status-meta">
       <div><dt>config</dt><dd>${provider.configured ? "ready" : "missing"}</dd></div>
@@ -421,7 +599,7 @@ function adminLeaseRow(
   const releaseConfirmation = leaseReleaseConfirmation(lease);
   return `<tr data-filter-tags="${escapeHTML([stateGroup, lease.state, lease.provider, lease.owner, lease.org, lease.target, lease.serverType].join(" "))}">
     <td><a class="lease-link" href="/portal/leases/${encodeURIComponent(lease.id)}"><strong>${escapeHTML(lease.slug || lease.id)}</strong><small>${escapeHTML(lease.id)}</small></a></td>
-    <td><span class="pill" data-state="${escapeHTML(lease.state)}">${escapeHTML(lease.state)}</span></td>
+    <td><span class="${leaseStateBadge(lease.state)}" data-state="${escapeHTML(lease.state)}">${escapeHTML(lease.state)}</span></td>
     <td>${providerBadge(lease.provider)}</td>
     <td><strong>${escapeHTML(lease.owner || "unknown")}</strong><small>${escapeHTML(lease.org || "no org")}</small></td>
     <td>${targetBadge(lease.target)}</td>
@@ -441,31 +619,15 @@ function normalizeAdminProviderFilter(
     : undefined;
 }
 
-function portalAdminSummary(input: {
-  owner: string;
-  org: string;
-  active: number;
-  ended: number;
-  runners: number;
-  system: number;
-  providers: string;
-}): string {
-  return `<section class="panel admin-panel" data-admin-panel>
-    <div class="section-head">
-      <h2>admin mode</h2>
-      <span class="pill admin-pill">all scopes</span>
-    </div>
-    <div class="admin-grid">
-      ${adminMetric("identity", `${input.owner || "unknown"} / ${input.org || "unknown"}`)}
-      ${adminMetric("fleet", `${input.active} active / ${input.ended} ended`)}
-      ${adminMetric("system", `${input.system} external or other-owner`)}
-      ${adminMetric("providers", input.providers || "none")}
-    </div>
-    <div class="admin-actions">
-      <a class="button secondary" href="/v1/admin/leases">leases JSON</a>
-      <a class="button secondary" href="/v1/pool">pool JSON</a>
-      <a class="button secondary" href="/v1/usage?scope=all">usage JSON</a>
-    </div>
+function portalAdminSummary(input: { owner: string; org: string }): string {
+  return `<section class="admin-bar" data-admin-panel>
+    <span class="admin-bar-mode">${lockIcon}<span>admin mode</span></span>
+    <span class="admin-bar-scope">all scopes · signed in as <strong>${escapeHTML(`${input.owner || "unknown"} / ${input.org || "unknown"}`)}</strong></span>
+    <nav class="admin-bar-links" aria-label="Admin JSON endpoints">
+      <a href="/v1/admin/leases">leases JSON</a>
+      <a href="/v1/pool">pool JSON</a>
+      <a href="/v1/usage?scope=all">usage JSON</a>
+    </nav>
   </section>`;
 }
 
@@ -474,25 +636,6 @@ function adminMetric(label: string, value: string, tone = ""): string {
     <span>${escapeHTML(label)}</span>
     <strong>${escapeHTML(value)}</strong>
   </div>`;
-}
-
-function portalProviderSummary(
-  leases: LeaseRecord[],
-  runners: ExternalRunnerRecord[],
-  macHosts: PortalMacHostRecord[],
-): string {
-  const counts = new Map<string, number>();
-  for (const provider of [
-    ...leases.map((lease) => lease.provider),
-    ...runners.map((runner) => runner.provider),
-    ...macHosts.map((host) => host.provider),
-  ]) {
-    counts.set(provider, (counts.get(provider) ?? 0) + 1);
-  }
-  return [...counts.entries()]
-    .toSorted(([a], [b]) => a.localeCompare(b))
-    .map(([provider, count]) => `${provider}:${count}`)
-    .join(" ");
 }
 
 export function portalLeaseDetail(
@@ -511,16 +654,14 @@ export function portalLeaseDetail(
     : `<tr><td colspan="8" class="empty">no recorded runs for this lease</td></tr>`;
   const vncAction =
     active && lease.desktop
-      ? `<a class="button" href="/portal/leases/${encodeURIComponent(lease.id)}/vnc">open VNC</a>`
+      ? `<a class="oc-action oc-action-primary" href="/portal/leases/${encodeURIComponent(lease.id)}/vnc">open VNC</a>`
       : `<span class="muted">no desktop</span>`;
   const codeAction =
     active && lease.code
-      ? `<a class="button" href="/portal/leases/${encodeURIComponent(lease.id)}/code/">open code</a>`
+      ? `<a class="oc-action oc-action-primary" href="/portal/leases/${encodeURIComponent(lease.id)}/code/">open code</a>`
       : `<span class="muted">no code</span>`;
-  const egressAction =
-    active && bridgeStatus.egress
-      ? `<span class="muted">${escapeHTML(canManage ? egressSummary(bridgeStatus.egress) : "active")}</span>`
-      : `<span class="muted">no egress</span>`;
+  const egressDetail =
+    active && bridgeStatus.egress && canManage ? egressSummary(bridgeStatus.egress) : "";
   const commands = active
     ? [
         commandBlock("shell", `crabbox ssh --id ${shellArg(slug)}`),
@@ -548,15 +689,15 @@ export function portalLeaseDetail(
               ? `<a class="icon-btn" href="/portal/leases/${encodeURIComponent(lease.id)}/share" title="share lease" aria-label="share lease">${shareIcon}</a>`
               : ""
           }
-          <a class="button secondary" href="/portal">leases</a>
-          <a class="button secondary" href="/portal/logout">log out</a>
+          <a class="oc-action oc-action-outline" href="/portal">leases</a>
+          ${portalLogoutButton()}
         `,
       })}
       <section class="detail-grid">
         <div class="panel detail-card">
           <div class="section-head">
             <h2>status</h2>
-            <span class="pill" data-state="${escapeHTML(lease.state)}">${escapeHTML(lease.state)}</span>
+            <span class="${leaseStateBadge(lease.state)}" data-state="${escapeHTML(lease.state)}">${escapeHTML(lease.state)}</span>
           </div>
           <dl class="meta-grid">
             ${metaHTMLRow("provider", providerBadge(lease.provider))}
@@ -564,7 +705,7 @@ export function portalLeaseDetail(
             ${metaHTMLRow("target", targetBadge(target, lease.windowsMode))}
             ${metaRow("class", lease.class)}
             ${metaRow("host", lease.host || "pending")}
-            ${metaRow("ssh", lease.sshPort ? `${lease.sshUser || "crabbox"}@${lease.host || "host"}:${lease.sshPort}` : "pending")}
+            ${metaRow("ssh", portalSSHAddress(lease))}
             ${metaRow("work root", lease.workRoot || "pending")}
             ${leaseTelemetryRows(lease.telemetry)}
             ${metaRow("expires", shortTime(lease.expiresAt))}
@@ -573,7 +714,7 @@ export function portalLeaseDetail(
           ${
             active && canManage
               ? `<form method="post" action="/portal/leases/${encodeURIComponent(lease.id)}/release" class="stop-form" data-confirm="${escapeHTML(leaseReleaseConfirmation(lease))}">
-                  <button class="button ${registered && !lease.runtimeAdapterID ? "secondary" : "danger"}" type="submit">${registered ? (lease.runtimeAdapterID ? "delete workspace" : "remove registration") : "stop lease"}</button>
+                  <button class="oc-action ${registered && !lease.runtimeAdapterID ? "oc-action-outline" : "oc-action-danger"}" type="submit">${registered ? (lease.runtimeAdapterID ? "delete workspace" : "remove registration") : "stop lease"}</button>
                 </form>`
               : ""
           }
@@ -586,7 +727,7 @@ export function portalLeaseDetail(
           <div class="bridge-grid">
             ${bridgeRow("WebVNC", active && lease.desktop === true, bridgeStatus.webVNCBridgeConnected, bridgeStatus.webVNCViewerConnected, vncAction)}
             ${bridgeRow("code", active && lease.code === true, bridgeStatus.codeBridgeConnected, false, codeAction)}
-            ${bridgeRow("egress", active && Boolean(bridgeStatus.egress), bridgeStatus.egress?.hostConnected ?? false, bridgeStatus.egress?.clientConnected ?? false, egressAction, "host", "client")}
+            ${bridgeRow("egress", active && Boolean(bridgeStatus.egress), bridgeStatus.egress?.hostConnected ?? false, bridgeStatus.egress?.clientConnected ?? false, "", "host", "client", !canManage, egressDetail)}
           </div>
           <div class="access-commands">${commands}</div>
         </div>
@@ -594,7 +735,7 @@ export function portalLeaseDetail(
       <section class="panel table-panel">
         <div class="section-head">
           <h2>recent runs</h2>
-          <span>${runs.length}</span>
+          <span class="runs-trend">${runDurationDelta(runs)}${runDurationBars(runs)}<span>${runs.length}</span></span>
         </div>
         <table class="run-table" data-portal-table data-page-size="8" data-search-placeholder="search runs" data-filter-buttons="succeeded:succeeded,failed:failed,running:running,all:all">
           <thead>
@@ -626,12 +767,12 @@ export function portalShareLease(
         .map(
           ([user, role]) => `<tr>
             <td>${escapeHTML(user)}</td>
-            <td><span class="pill">${escapeHTML(role)}</span></td>
+            <td><span class="oc-badge oc-badge-neutral">${escapeHTML(role)}</span></td>
             <td>
               <form method="post" action="${sharePath}">
                 <input type="hidden" name="action" value="remove-user">
                 <input type="hidden" name="user" value="${escapeHTML(user)}">
-                <button class="button secondary" type="submit">remove</button>
+                <button class="oc-action oc-action-outline" type="submit">remove</button>
               </form>
             </td>
           </tr>`,
@@ -647,16 +788,16 @@ export function portalShareLease(
           : portalHeader({
               meta: `share ${escapeHTML(slug)} <span class="mono">${escapeHTML(lease.id)}</span>`,
               actions: `
-                <a class="button secondary" href="/portal/leases/${encodeURIComponent(lease.id)}">back to lease</a>
-                <a class="button secondary" href="/portal">leases</a>
-                <a class="button secondary" href="/portal/logout">log out</a>
+                <a class="oc-action oc-action-outline" href="/portal/leases/${encodeURIComponent(lease.id)}">back to lease</a>
+                <a class="oc-action oc-action-outline" href="/portal">leases</a>
+                ${portalLogoutButton()}
               `,
             })
       }
       <section class="panel">
         <div class="section-head">
           <h2>org access</h2>
-          <span class="pill">${escapeHTML(lease.share?.org ?? "off")}</span>
+          <span class="oc-badge oc-badge-neutral">${escapeHTML(lease.share?.org ?? "off")}</span>
         </div>
         <form class="share-form" method="post" action="${sharePath}">
           <input type="hidden" name="action" value="set-org">
@@ -665,7 +806,7 @@ export function portalShareLease(
             <option value="use"${lease.share?.org === "use" ? " selected" : ""}>use</option>
             <option value="manage"${lease.share?.org === "manage" ? " selected" : ""}>manage</option>
           </select>
-          <button class="button action" type="submit">save</button>
+          <button class="oc-action oc-action-secondary" type="submit">save</button>
         </form>
       </section>
       <section class="panel">
@@ -677,7 +818,7 @@ export function portalShareLease(
             <option value="use">use</option>
             <option value="manage">manage</option>
           </select>
-          <button class="button action" type="submit">add</button>
+          <button class="oc-action oc-action-secondary" type="submit">add</button>
         </form>
         <div class="table-scroll">
           <table>
@@ -688,7 +829,7 @@ export function portalShareLease(
       </section>
       <form method="post" action="${sharePath}">
         <input type="hidden" name="action" value="clear">
-        <button class="button danger" type="submit">clear sharing</button>
+        <button class="oc-action oc-action-danger" type="submit">clear sharing</button>
       </form>
     </main>`,
     200,
@@ -719,8 +860,8 @@ export function portalExternalRunnerDetail(
       ${portalHeader({
         meta: `${escapeHTML(runner.id)} · ${escapeHTML(runner.provider)} external runner`,
         actions: `
-          <a class="button secondary" href="/portal">leases</a>
-          <a class="button secondary" href="/portal/logout">log out</a>
+          <a class="oc-action oc-action-outline" href="/portal">leases</a>
+          ${portalLogoutButton()}
         `,
       })}
       <section class="detail-grid">
@@ -728,7 +869,7 @@ export function portalExternalRunnerDetail(
           <div class="section-head">
             <h2>runner</h2>
             <div class="state-stack">
-              <span class="pill" data-tone="${runner.stale ? "warn" : runnerStatusTone(runner.status)}">${escapeHTML(runner.status || "-")}</span>
+              <span class="${badgeClass(runner.stale ? "warn" : runnerStatusTone(runner.status))}">${escapeHTML(runner.status || "-")}</span>
               ${externalRunnerActionBadge(actionState)}
             </div>
           </div>
@@ -794,13 +935,13 @@ export function portalMacHostDetail(
     : false;
   const vncAction =
     activeLease && activeLeaseVNC
-      ? `<a class="button" href="/portal/leases/${encodeURIComponent(activeLease.id)}/vnc">open VNC</a>`
+      ? `<a class="oc-action oc-action-primary" href="/portal/leases/${encodeURIComponent(activeLease.id)}/vnc">open VNC</a>`
       : activeLease
-        ? `<form method="post" action="${macHostVNCPath(host)}"><button class="button" type="submit">enable VNC</button></form>`
-        : `<button class="button" type="button" data-copy-value="${escapeHTML(startDesktopCommand)}">copy start command</button>`;
+        ? `<form method="post" action="${macHostVNCPath(host)}"><button class="oc-action oc-action-primary" type="submit">enable VNC</button></form>`
+        : `<button class="oc-action oc-action-primary" type="button" data-copy-value="${escapeHTML(startDesktopCommand)}">copy start command</button>`;
   const codeAction =
     activeLease?.code === true
-      ? `<a class="button" href="/portal/leases/${encodeURIComponent(activeLease.id)}/code/">open code</a>`
+      ? `<a class="oc-action oc-action-primary" href="/portal/leases/${encodeURIComponent(activeLease.id)}/code/">open code</a>`
       : `<span class="muted">${activeLease ? "no code" : "no active lease"}</span>`;
   const commands = activeLease
     ? [
@@ -830,15 +971,15 @@ export function portalMacHostDetail(
       ${portalHeader({
         meta: `${escapeHTML(host.id)} · ${escapeHTML(host.provider)} ${escapeHTML(host.target)} dedicated host`,
         actions: `
-          <a class="button secondary" href="/portal">leases</a>
-          <a class="button secondary" href="/portal/logout">log out</a>
+          <a class="oc-action oc-action-outline" href="/portal">leases</a>
+          ${portalLogoutButton()}
         `,
       })}
       <section class="detail-grid">
         <div class="panel detail-card">
           <div class="section-head">
             <h2>dedicated host</h2>
-            <span class="pill" data-tone="${stateTone}">${escapeHTML(host.state || "-")}</span>
+            <span class="${badgeClass(stateTone)}">${escapeHTML(host.state || "-")}</span>
           </div>
           <dl class="meta-grid">
             ${metaRow("id", host.id)}
@@ -861,7 +1002,7 @@ export function portalMacHostDetail(
               ? `<dl class="meta-grid">
                   ${metaRow("lease", activeLease.slug ? `${activeLease.slug} / ${activeLease.id}` : activeLease.id)}
                   ${metaRow("host", activeLease.host || "pending")}
-                  ${metaRow("ssh", activeLease.sshPort ? `${activeLease.sshUser || "crabbox"}@${activeLease.host || "host"}:${activeLease.sshPort}` : "pending")}
+                  ${metaRow("ssh", portalSSHAddress(activeLease))}
                   ${metaRow("desktop", activeLeaseVNC ? "enabled" : "disabled")}
                   ${metaRow("expires", shortTime(activeLease.expiresAt))}
                 </dl>`
@@ -914,16 +1055,16 @@ export function portalRunDetail(
       ${portalHeader({
         meta: `${escapeHTML(run.id)} · ${escapeHTML(run.slug || run.leaseID)} · ${escapeHTML(run.state)}`,
         actions: `
-          <a class="button secondary" href="/portal/leases/${encodeURIComponent(run.leaseID)}">lease</a>
-          <a class="button secondary" href="/portal">leases</a>
-          <a class="button secondary" href="/portal/logout">log out</a>
+          <a class="oc-action oc-action-outline" href="/portal/leases/${encodeURIComponent(run.leaseID)}">lease</a>
+          <a class="oc-action oc-action-outline" href="/portal">leases</a>
+          ${portalLogoutButton()}
         `,
       })}
       <section class="detail-grid">
         <div class="panel detail-card run-summary-card">
           <div class="section-head">
             <h2>run</h2>
-            <span class="pill" data-tone="${stateTone}">${escapeHTML(run.state)}</span>
+            <span class="${badgeClass(stateTone)}">${escapeHTML(run.state)}</span>
           </div>
           <dl class="meta-grid">
             ${metaRow("lease", run.slug ? `${run.slug} / ${run.leaseID}` : run.leaseID)}
@@ -948,8 +1089,8 @@ export function portalRunDetail(
             <span>${run.results ? "junit" : "logs"}</span>
           </div>
           <div class="run-artifacts">
-            <a class="button" href="/portal/runs/${encodeURIComponent(run.id)}/logs">raw logs</a>
-            <a class="button secondary" href="/portal/runs/${encodeURIComponent(run.id)}/events">events json</a>
+            <a class="oc-action oc-action-primary" href="/portal/runs/${encodeURIComponent(run.id)}/logs">raw logs</a>
+            <a class="oc-action oc-action-outline" href="/portal/runs/${encodeURIComponent(run.id)}/events">events json</a>
             ${resultsSummary(run)}
           </div>
         </div>
@@ -1008,7 +1149,34 @@ export function portalRunDetail(
   );
 }
 
-export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } = {}): Response {
+export function webVNCCredentialsFromHistoryState(
+  state: unknown,
+  storageID: string,
+): { username: string; password: string } | undefined {
+  if (!storageID || !state || typeof state !== "object") return undefined;
+  const value = (state as Record<string, unknown>)["crabboxWebVNCCredentials"];
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record["id"] !== storageID ||
+    typeof record["username"] !== "string" ||
+    typeof record["password"] !== "string"
+  ) {
+    return undefined;
+  }
+  return { username: record["username"], password: record["password"] };
+}
+
+export function portalVNC(
+  lease: LeaseRecord,
+  options: {
+    canManage?: boolean;
+    viewerOnly?: boolean;
+    sessionCredentialHandoff?: boolean;
+    sessionCredentialStorageID?: string;
+    takeControl?: boolean;
+  } = {},
+): Response {
   const nonce = scriptNonce();
   const slug = lease.slug || lease.id;
   const target = lease.target || "linux";
@@ -1017,9 +1185,11 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
   const statusPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/status`;
   const controlPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/control`;
   const themePath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/theme`;
+  const handoffPath = `/portal/leases/${encodeURIComponent(lease.id)}/vnc/handoff`;
   const sharePath = `/portal/leases/${encodeURIComponent(lease.id)}/share`;
   const shareAPIPath = `${sharePath}?format=json`;
   const canManage = options.canManage === true;
+  const viewerOnly = options.viewerOnly === true;
   const shareData = canManage
     ? {
         leaseID: lease.id,
@@ -1056,17 +1226,23 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
         meta: `<span>WebVNC ${escapeHTML(slug)}</span><span class="vnc-dot"></span>${providerBadge(lease.provider)}<span class="vnc-dot"></span>${targetBadge(target, lease.windowsMode)}<span class="vnc-dot"></span><span class="vnc-id">${escapeHTML(lease.id)}</span>`,
         actions: `
           <span id="status" class="status-pill">waiting for bridge</span>
-          <button id="vnc-takeover" class="button secondary vnc-control" type="button" hidden>take control</button>
+          <select id="vnc-sizing" aria-label="desktop sizing" title="Match requests the window size from a supported server; Fit scales without resizing. Wayland sizing stays with the first resizing viewer until it disconnects.">
+            <option value="match"${target === "linux" ? " selected" : ""}>Match window</option>
+            <option value="fit"${target !== "linux" ? " selected" : ""}>Fit desktop</option>
+          </select>
+          <button id="vnc-takeover" class="oc-action oc-action-outline vnc-control" type="button" hidden>take control</button>
           <button id="vnc-copy-remote" class="icon-btn" type="button" title="copy remote clipboard" aria-label="copy remote clipboard" disabled>${copyIcon}</button>
           <button id="vnc-paste" class="icon-btn" type="button" title="paste clipboard" aria-label="paste clipboard">${pasteIcon}</button>
           <button id="vnc-reconnect" class="icon-btn" type="button" title="reconnect" aria-label="reconnect">${reconnectIcon}</button>
           <button id="vnc-fullscreen" class="icon-btn" type="button" title="fullscreen" aria-label="toggle fullscreen">${fullscreenIcon}</button>
-          ${canManage ? `<button id="vnc-share" class="button secondary" type="button">share</button>` : ""}
-          <a class="button secondary" href="/portal">leases</a>
-          <a class="button secondary" href="/portal/logout">log out</a>
+          ${canManage ? `<button id="vnc-share" class="oc-action oc-action-outline" type="button">share</button>` : ""}
+          ${viewerOnly ? "" : `<a class="oc-action oc-action-outline" href="/portal">leases</a>${portalLogoutButton()}`}
         `,
       })}
-      <section id="screen" class="screen" aria-label="WebVNC display" tabindex="0"></section>
+      <div class="vnc-display">
+        <p id="vnc-sizing-notice" class="vnc-sizing-notice" role="status" hidden>Wayland sizing may remain owned by the previous viewer. Close that viewer, then reconnect.</p>
+        <section id="screen" class="screen" aria-label="WebVNC display" tabindex="0"></section>
+      </div>
       ${
         canManage
           ? `<footer class="vnc-bridge">
@@ -1090,7 +1266,7 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
               <option value="use">Can use</option>
               <option value="manage">Can manage</option>
             </select>
-            <button id="vnc-share-add" class="button action" type="button">add</button>
+            <button id="vnc-share-add" class="oc-action oc-action-secondary" type="button">add</button>
           </div>
           <section class="vnc-share-section" aria-label="People with access">
             <h2>People with access</h2>
@@ -1114,9 +1290,9 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
           <p id="vnc-share-status" class="vnc-share-status" role="status"></p>
         </div>
         <div class="vnc-share-foot">
-          <button id="vnc-share-copy-link" class="button secondary" type="button">copy WebVNC link</button>
-          <button id="vnc-share-clear" class="button secondary danger-text" type="button">clear sharing</button>
-          <button id="vnc-share-done" class="button" type="button">done</button>
+          <button id="vnc-share-copy-link" class="oc-action oc-action-outline" type="button">copy WebVNC link</button>
+          <button id="vnc-share-clear" class="oc-action oc-action-outline danger-text" type="button">clear sharing</button>
+          <button id="vnc-share-done" class="oc-action oc-action-primary" type="button">done</button>
         </div>
       </dialog>`
           : ""
@@ -1132,6 +1308,7 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       const statusURL = new URL(${JSON.stringify(statusPath)}, window.location.href);
       const controlURL = new URL(${JSON.stringify(controlPath)}, window.location.href);
       const themeURL = new URL(${JSON.stringify(themePath)}, window.location.href);
+      const handoffURL = new URL(${JSON.stringify(handoffPath)}, window.location.href);
       const sharePageURL = new URL(${JSON.stringify(sharePath)}, window.location.href);
       const shareAPIURL = new URL(${JSON.stringify(shareAPIPath)}, window.location.href);
       const shareInitial = ${scriptJSON(shareData)};
@@ -1140,19 +1317,174 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       statusURL.searchParams.set("viewer", viewerID);
       const fragment = new URLSearchParams(window.location.hash.slice(1));
       const target = ${JSON.stringify(target)};
-      const username = fragment.get("username") || "";
-      const password = fragment.get("password") || "";
-      const takeControlOnConnect = fragment.get("control") === "take";
+      const mayUseWayland = ${JSON.stringify(target === "linux" && lease.desktopEnv !== "xfce")};
+      const sizing = document.getElementById("vnc-sizing");
+      const sizingNotice = document.getElementById("vnc-sizing-notice");
+      let username = fragment.get("username") || "";
+      let password = fragment.get("password") || "";
+      const handoffTicket = fragment.get("handoff") || "";
+      const sessionCredentialHandoff = ${JSON.stringify(options.sessionCredentialHandoff === true)};
+      const viewerBootstrapSession = ${JSON.stringify(viewerOnly)};
+      const credentialStorageID = ${JSON.stringify(options.sessionCredentialStorageID ?? "")};
+      const restoreWebVNCCredentials = ${webVNCCredentialsFromHistoryState.toString()};
+      let credentialsReady = !handoffTicket && !sessionCredentialHandoff;
+      if (credentialStorageID && !handoffTicket) {
+        const stored = restoreWebVNCCredentials(window.history.state, credentialStorageID);
+        if (stored) {
+          username = stored.username;
+          password = stored.password;
+          credentialsReady = true;
+        }
+      }
+      const takeControlOnConnect = ${JSON.stringify(options.takeControl === true)} || fragment.get("control") === "take";
+      const reuseWindowName = "crabbox-webvnc-" + ${JSON.stringify(lease.id)};
+      const reuseChannel = typeof BroadcastChannel === "function" ? new BroadcastChannel(reuseWindowName) : null;
+      let portalReadyForReuse = false;
       const bridgeMissingMessage = ${JSON.stringify(bridgeMissingMessage)};
-      const credentials = {};
-      if (username) credentials.username = username;
-      if (password) credentials.password = password;
-      const options = Object.keys(credentials).length ? { credentials } : {};
       const missingVNCCredentialMessage = "VNC credentials missing; open WebVNC from crabbox webvnc status";
       const failedVNCCredentialMessage = "VNC authentication failed; reopen WebVNC from crabbox webvnc status";
+      function rfbOptions() {
+        const credentials = {};
+        if (username) credentials.username = username;
+        if (password) credentials.password = password;
+        return Object.keys(credentials).length ? { credentials } : {};
+      }
+      async function loadHandoffCredentials() {
+        if (credentialsReady) return;
+        const response = await fetch(handoffURL, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify(handoffTicket ? { ticket: handoffTicket } : {}),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.message || body.error || "VNC handoff failed");
+        username = typeof body.username === "string" ? body.username : "";
+        password = typeof body.password === "string" ? body.password : "";
+        credentialsReady = true;
+        const cleanFragment = new URLSearchParams(window.location.hash.slice(1));
+        cleanFragment.delete("handoff");
+        const cleanURL = new URL(window.location.href);
+        cleanURL.hash = cleanFragment.toString();
+        const historyState = window.history.state && typeof window.history.state === "object" ? { ...window.history.state } : {};
+        if (credentialStorageID) {
+          historyState.crabboxWebVNCCredentials = { id: credentialStorageID, username, password };
+        }
+        window.history.replaceState(historyState, "", cleanURL);
+      }
       function setStatus(value, tone = "") {
         status.textContent = value;
         status.dataset.tone = tone;
+      }
+      function handoffFragment(value) {
+        const offered = new URLSearchParams(String(value || ""));
+        const ticket = offered.get("handoff") || "";
+        if (!/^vnc_handoff_[a-f0-9]{32}$/.test(ticket)) return "";
+        const safe = new URLSearchParams({ handoff: ticket });
+        if (offered.get("control") === "take") safe.set("control", "take");
+        return safe.toString();
+      }
+      reuseChannel?.addEventListener("message", (event) => {
+        const message = event.data;
+        if (!portalReadyForReuse || typeof message?.requestID !== "string") return;
+        if (message.type === "handoff-offer" || message.type === "session-offer") {
+          reuseChannel.postMessage({
+            type: "handoff-candidate",
+            requestID: message.requestID,
+            recipientID: viewerID,
+            connected,
+            controller: isController,
+          });
+          return;
+        }
+        if (message.type === "session-grant" && message.recipientID === viewerID) {
+          reuseChannel.postMessage({
+            type: "handoff-accepted",
+            requestID: message.requestID,
+            recipientID: viewerID,
+          });
+          window.focus();
+          const nextURL = new URL(window.location.href);
+          nextURL.hash = "";
+          window.location.replace(nextURL);
+          return;
+        }
+        if (message.type !== "handoff-grant" || message.recipientID !== viewerID) return;
+        const nextFragment = handoffFragment(message.fragment);
+        if (!nextFragment) return;
+        reuseChannel.postMessage({
+          type: "handoff-accepted",
+          requestID: message.requestID,
+          recipientID: viewerID,
+        });
+        const nextURL = new URL(window.location.href);
+        nextURL.hash = nextFragment;
+        window.focus();
+        window.location.replace(nextURL);
+      });
+      window.addEventListener("hashchange", () => {
+        const nextTicket = new URLSearchParams(window.location.hash.slice(1)).get("handoff") || "";
+        if (nextTicket && nextTicket !== handoffTicket && handoffFragment("handoff=" + encodeURIComponent(nextTicket))) {
+          window.location.reload();
+        }
+      });
+      async function reuseExistingWebVNCTab() {
+        if ((!handoffTicket && !viewerBootstrapSession) || !reuseChannel) return false;
+        const requestID = viewerID;
+        const offered = new URLSearchParams({ handoff: handoffTicket });
+        if (takeControlOnConnect) offered.set("control", "take");
+        return await new Promise((resolve) => {
+          const candidates = new Map();
+          let recipientID = "";
+          let acceptedTimeout;
+          function finish(reused) {
+            window.clearTimeout(candidateTimeout);
+            window.clearTimeout(acceptedTimeout);
+            reuseChannel.removeEventListener("message", receive);
+            resolve(reused);
+          }
+          function receive(event) {
+            const message = event.data;
+            if (message?.requestID !== requestID) return;
+            if (message.type === "handoff-candidate" && typeof message.recipientID === "string") {
+              candidates.set(message.recipientID, {
+                recipientID: message.recipientID,
+                connected: message.connected === true,
+                controller: message.controller === true,
+              });
+              return;
+            }
+            if (message.type === "handoff-accepted" && message.recipientID === recipientID) {
+              finish(true);
+            }
+          }
+          reuseChannel.addEventListener("message", receive);
+          const candidateTimeout = window.setTimeout(() => {
+            const selected = [...candidates.values()].sort(
+              (left, right) => Number(right.controller) - Number(left.controller) || Number(right.connected) - Number(left.connected) || left.recipientID.localeCompare(right.recipientID),
+            )[0];
+            if (!selected) {
+              finish(false);
+              return;
+            }
+            recipientID = selected.recipientID;
+            if (handoffTicket) {
+              reuseChannel.postMessage({
+                type: "handoff-grant",
+                requestID,
+                recipientID,
+                fragment: offered.toString(),
+              });
+            } else {
+              reuseChannel.postMessage({ type: "session-grant", requestID, recipientID });
+            }
+            acceptedTimeout = window.setTimeout(() => finish(false), 180);
+          }, 80);
+          if (handoffTicket) {
+            reuseChannel.postMessage({ type: "handoff-offer", requestID });
+          } else {
+            reuseChannel.postMessage({ type: "session-offer", requestID });
+          }
+        });
       }
       let rfb;
       let retryTimer;
@@ -1163,6 +1495,15 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       let statusTimer;
       let controllerLabel = "";
       let isController = false;
+      let controllerID = "";
+      let sizingOwnerChanged = false;
+      let sizingHandoffPending = false;
+      let connectionEpoch = 0;
+      let collaborationRequest = 0;
+      let statusPending = false;
+      let controlPending = false;
+      const collaborationControllers = new Set();
+      const collaborationTimeoutMs = 10000;
       let takeControlAttempted = false;
       let credentialsSent = false;
       let authenticationFailed = false;
@@ -1170,6 +1511,32 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       let lastDesktopTheme = "";
       let desktopThemeTimer;
       const terminalStatusCodes = new Set([403, 404, 409, 410]);
+      function applySizing() {
+        if (rfb) {
+          const controlling = connected && isController;
+          rfb.viewOnly = !controlling;
+          const resize = controlling && !sizingHandoffPending && sizing.value === "match";
+          // The noVNC setter sends a resize; unchanged status polls must not resend it.
+          if (rfb.resizeSession !== resize) rfb.resizeSession = resize;
+        }
+        sizingNotice.hidden = !mayUseWayland || !sizingOwnerChanged || sizing.value !== "match";
+      }
+      sizing.addEventListener("change", applySizing);
+      function retireConnection() {
+        connectionEpoch += 1;
+        collaborationRequest += 1;
+        for (const controller of collaborationControllers) controller.abort();
+        connected = false;
+        isController = false;
+        statusPending = false;
+        controlPending = false;
+        window.clearInterval(statusTimer);
+        clearDesktopThemeSyncState();
+        applySizing();
+        const previous = rfb;
+        rfb = undefined;
+        try { previous?.disconnect(); } catch (_) {}
+      }
       function focusVNC() {
         if (!isController || document.body.dataset.portalDialogOpen === "true") return;
         try {
@@ -1202,6 +1569,29 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
           return fallback;
         }
       }
+      async function collaborationOperation(operation) {
+        const controller = new AbortController();
+        collaborationControllers.add(controller);
+        let timedOut = false;
+        // Coalesced requests must release their slot even if headers or the body
+        // stall. Retirement aborts transport; epochs still fence obsolete replies.
+        const timer = window.setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, collaborationTimeoutMs);
+        try {
+          const result = await operation(controller.signal);
+          // A JSON fallback must not convert a cancelled takeover into success.
+          if (controller.signal.aborted) throw new Error("WebVNC collaboration request cancelled");
+          return result;
+        } catch (error) {
+          if (timedOut) throw new Error("WebVNC collaboration request timed out; try again");
+          throw error;
+        } finally {
+          window.clearTimeout(timer);
+          collaborationControllers.delete(controller);
+        }
+      }
       function fallbackCopyText(text) {
         const ta = document.createElement("textarea");
         ta.value = text;
@@ -1227,33 +1617,38 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       }
       async function bridgeState() {
         try {
-          const response = await fetch(statusURL, { cache: "no-store" });
-          if (response.ok) {
-            return await response.json();
-          }
-          const message = await responseMessage(response, "WebVNC bridge unavailable");
-          if (terminalStatusCodes.has(response.status)) {
-            return { terminal: true, message };
-          }
-          return { transient: true, message };
+          return await collaborationOperation(async (signal) => {
+            const response = await fetch(statusURL, { cache: "no-store", signal });
+            if (response.ok) {
+              return await response.json();
+            }
+            const message = await responseMessage(response, "WebVNC bridge unavailable");
+            if (terminalStatusCodes.has(response.status)) {
+              return { terminal: true, message };
+            }
+            return { transient: true, message };
+          });
         } catch (error) {
           return { transient: true, message: error instanceof Error ? error.message : String(error) };
         }
       }
       function applyCollaborationState(state) {
-        if (!state) return;
+        if (!state || !connected) return;
         const role = state.viewerRole || "none";
         const takeoverBtn = document.getElementById("vnc-takeover");
         const previousControllerLabel = controllerLabel;
         const wasController = isController;
         controllerLabel = state.controllerLabel || "";
+        const nextControllerID = state.controllerID || "";
+        if (controllerID && nextControllerID && controllerID !== nextControllerID) sizingOwnerChanged = true;
+        if (nextControllerID) controllerID = nextControllerID;
+        sizingHandoffPending = state.wayvncHandoff === "pending";
+        if (state.wayvncHandoff === "verified") sizingOwnerChanged = false;
         const controlling = role === "controller";
         const connectedViewer = role === "controller" || role === "observer";
         isController = controlling;
-        if (rfb) {
-          rfb.viewOnly = !controlling;
-          if (controlling) window.setTimeout(focusVNC, 0);
-        }
+        applySizing();
+        if (controlling) window.setTimeout(focusVNC, 0);
         if (takeoverBtn) {
           takeoverBtn.hidden = !connectedViewer;
           takeoverBtn.disabled = controlling || !connectedViewer;
@@ -1273,9 +1668,18 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
         }
       }
       async function refreshCollaborationState() {
-        const state = await bridgeState();
-        applyCollaborationState(state);
-        return state;
+        if (!connected || controlPending || statusPending) return;
+        const epoch = connectionEpoch;
+        const request = ++collaborationRequest;
+        statusPending = true;
+        try {
+          const state = await bridgeState();
+          if (!connected || epoch !== connectionEpoch || request !== collaborationRequest) return;
+          applyCollaborationState(state);
+          return state;
+        } finally {
+          if (epoch === connectionEpoch) statusPending = false;
+        }
       }
       async function refreshCollaborationStateAndMaybeTakeControl() {
         const state = await refreshCollaborationState();
@@ -1283,18 +1687,34 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
         return state;
       }
       async function takeControl(label = "you took control") {
-        const response = await fetch(controlURL, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ viewerID }),
-        });
-        const state = response.ok ? await response.json() : undefined;
-        if (!response.ok) throw new Error(state?.message || "takeover failed");
-        applyCollaborationState(state);
-        setStatus(label, "ok");
-        queueDesktopTheme();
-        focusVNC();
-        return state;
+        if (!connected || controlPending) return;
+        const epoch = connectionEpoch;
+        const request = ++collaborationRequest;
+        controlPending = true;
+        try {
+          const { response, state } = await collaborationOperation(async (signal) => {
+            const response = await fetch(controlURL, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ viewerID }),
+              signal,
+            });
+            const state = await response.json().catch(() => ({}));
+            return { response, state };
+          });
+          if (!connected || epoch !== connectionEpoch || request !== collaborationRequest) return;
+          if (!response.ok) throw new Error(state.message || "takeover failed");
+          applyCollaborationState(state);
+          setStatus(label, "ok");
+          queueDesktopTheme();
+          focusVNC();
+          return state;
+        } catch (error) {
+          if (!connected || epoch !== connectionEpoch || request !== collaborationRequest) return;
+          throw error;
+        } finally {
+          if (epoch === connectionEpoch) controlPending = false;
+        }
       }
       async function takeControlIfRequested(state) {
         if (!takeControlOnConnect || takeControlAttempted) return;
@@ -1303,8 +1723,8 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
           return;
         }
         if (state?.viewerRole !== "observer") return;
-        await takeControl();
-        takeControlAttempted = true;
+        const result = await takeControl();
+        if (result?.viewerRole === "controller") takeControlAttempted = true;
       }
       function resolvedPortalTheme() {
         return document.documentElement.dataset.theme === "light" ? "light" : "dark";
@@ -1336,11 +1756,8 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       }
       function stopPolling(label) {
         stopped = true;
-        connected = false;
         window.clearTimeout(retryTimer);
-        window.clearInterval(statusTimer);
-        clearDesktopThemeSyncState();
-        try { rfb?.disconnect(); } catch (_) {}
+        retireConnection();
         screen.replaceChildren();
         setStatus(label, "bad");
       }
@@ -1354,12 +1771,18 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       }
       async function connect() {
         if (stopped) return;
-        connected = false;
+        retireConnection();
+        const epoch = connectionEpoch;
+        const current = () => !stopped && epoch === connectionEpoch;
         credentialsSent = false;
         authenticationFailed = false;
         screen.replaceChildren();
         try {
+          await loadHandoffCredentials();
+          if (!current()) return;
           const state = await bridgeState();
+          if (!current()) return;
+          if (state?.controllerID) controllerID = state.controllerID;
           if (state?.terminal) {
             stopPolling(state.message || "WebVNC bridge unavailable");
             return;
@@ -1376,18 +1799,14 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
             scheduleRetry(state.message || "waiting for an available WebVNC observer slot");
             return;
           }
-          if (target === "macos" && !password) {
-            stopPolling(missingVNCCredentialMessage);
-            return;
-          }
           setStatus(retryAttempt ? "bridge connected; opening viewer" : "connecting");
           clearDesktopThemeSyncState();
-          rfb = new RFB(screen, wsURL.toString(), options);
+          rfb = new RFB(screen, wsURL.toString(), rfbOptions());
           rfb.showDotCursor = true;
           rfb.focusOnClick = true;
           rfb.scaleViewport = true;
-          rfb.resizeSession = false;
           rfb.viewOnly = true;
+          rfb.resizeSession = false;
           if (target === "macos") {
             rfb.compressionLevel = 1;
             rfb.qualityLevel = 2;
@@ -1396,6 +1815,7 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
             rfb.qualityLevel = 6;
           }
           rfb.addEventListener("connect", () => {
+            if (!current()) return;
             connected = true;
             retryAttempt = 0;
             setStatus("connected", "ok");
@@ -1407,6 +1827,7 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
             }, 1500);
           });
           rfb.addEventListener("clipboard", (event) => {
+            if (!current()) return;
             remoteClipboardText = event.detail?.text || "";
             if (copyRemoteBtn) {
               copyRemoteBtn.disabled = !remoteClipboardText;
@@ -1416,10 +1837,9 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
             }
           });
           rfb.addEventListener("disconnect", () => {
-            if (stopped) return;
+            if (!current()) return;
             const wasConnected = connected;
-            connected = false;
-            clearDesktopThemeSyncState();
+            retireConnection();
             if (!wasConnected && (authenticationFailed || credentialsSent)) {
               stopPolling(authenticationFailed ? failedVNCCredentialMessage : "VNC authentication timed out; reopen WebVNC from crabbox webvnc status");
               return;
@@ -1427,6 +1847,7 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
             scheduleRetry(wasConnected ? "VNC bridge disconnected" : "waiting for VNC bridge");
           });
           rfb.addEventListener("credentialsrequired", (event) => {
+            if (!current()) return;
             const types = event.detail?.types || ["password"];
             const values = {};
             if (types.includes("username")) {
@@ -1447,19 +1868,26 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
             rfb.sendCredentials(values);
           });
           rfb.addEventListener("securityfailure", () => {
+            if (!current()) return;
             authenticationFailed = true;
+            const historyState = window.history.state;
+            if (historyState && typeof historyState === "object" && historyState.crabboxWebVNCCredentials?.id === credentialStorageID) {
+              const nextHistoryState = { ...historyState };
+              delete nextHistoryState.crabboxWebVNCCredentials;
+              window.history.replaceState(nextHistoryState, "", window.location.href);
+            }
             stopPolling(failedVNCCredentialMessage);
           });
         } catch (error) {
+          if (!current()) return;
           scheduleRetry(error instanceof Error ? error.message : String(error));
         }
       }
       window.addEventListener("beforeunload", () => {
         stopped = true;
         window.clearTimeout(retryTimer);
-        window.clearInterval(statusTimer);
-        window.clearTimeout(desktopThemeTimer);
-        rfb?.disconnect();
+        retireConnection();
+        reuseChannel?.close();
       });
       const takeoverBtn = document.getElementById("vnc-takeover");
       takeoverBtn?.addEventListener("click", async () => {
@@ -1474,7 +1902,6 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
         window.clearTimeout(retryTimer);
         retryAttempt = 0;
         stopped = false;
-        try { rfb?.disconnect(); } catch (_) {}
         connect();
       });
       const fullscreenBtn = document.getElementById("vnc-fullscreen");
@@ -1509,11 +1936,21 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       function normalizedShareUser(value) {
         return String(value || "").trim().toLowerCase();
       }
-      function shareableWebVNCURL() {
+      async function shareableWebVNCURL() {
         const url = new URL(window.location.href);
+        if (!username && !password) {
+          url.hash = "";
+          return url.toString();
+        }
+        const response = await fetch(handoffURL, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.message || body.error || "VNC handoff failed");
         const linkFragment = new URLSearchParams();
-        if (username) linkFragment.set("username", username);
-        if (password) linkFragment.set("password", password);
+        linkFragment.set("handoff", body.ticket);
         url.hash = linkFragment.toString();
         return url.toString();
       }
@@ -1687,7 +2124,7 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
       });
       shareCopyLinkBtn?.addEventListener("click", async () => {
         try {
-          await writeClipboardText(shareableWebVNCURL());
+          await writeClipboardText(await shareableWebVNCURL());
           setShareStatus("WebVNC link copied", "ok");
         } catch (error) {
           setShareStatus(error instanceof Error ? error.message : String(error), "bad");
@@ -1785,7 +2222,22 @@ export function portalVNC(lease: LeaseRecord, options: { canManage?: boolean } =
         window.clearTimeout(copyResetTimer);
         copyResetTimer = window.setTimeout(() => { delete copyBtn.dataset.state; }, 1200);
       });
-      connect();
+      async function startViewer() {
+        if (await reuseExistingWebVNCTab()) {
+          const cleanURL = new URL(window.location.href);
+          cleanURL.hash = "";
+          window.history.replaceState(null, "", cleanURL);
+          setStatus("WebVNC continued in the existing tab", "ok");
+          try { window.open("", reuseWindowName)?.focus(); } catch (_) {}
+          reuseChannel?.close();
+          window.close();
+          return;
+        }
+        window.name = reuseWindowName;
+        portalReadyForReuse = true;
+        connect();
+      }
+      void startViewer();
     </script>`,
     200,
     nonce,
@@ -1799,7 +2251,7 @@ export function portalError(title: string, message: string, status = 400): Respo
       <section class="panel error">
         <h1>${escapeHTML(title)}</h1>
         <p>${escapeHTML(message)}</p>
-        <a class="button secondary" href="/portal">back to portal</a>
+        <a class="oc-action oc-action-outline" href="/portal">back to portal</a>
       </section>
     </main>`,
     status,
@@ -1822,8 +2274,8 @@ export function portalCode(lease: LeaseRecord): Response {
         actions: `
           <span id="code-status" class="status-pill">checking bridge</span>
           <button id="code-reload" class="icon-btn" type="button" title="reload" aria-label="reload">${reloadIcon}</button>
-          <a class="button secondary" href="/portal">leases</a>
-          <a class="button secondary" href="/portal/logout">log out</a>
+          <a class="oc-action oc-action-outline" href="/portal">leases</a>
+          ${portalLogoutButton()}
         `,
       })}
       <section class="screen code-wait-screen" aria-label="Code bridge waiting state">
@@ -1925,6 +2377,57 @@ export function portalCode(lease: LeaseRecord): Response {
   );
 }
 
+export function portalCodeBootstrapHandoff(action: URL, ticket: string): Response {
+  const nonce = scriptNonce();
+  const actionURL = action.toString();
+  const contentSecurityPolicy = [
+    "default-src 'none'",
+    "base-uri 'none'",
+    `form-action ${action.origin}`,
+    "frame-ancestors 'none'",
+    `script-src 'nonce-${nonce}'`,
+    `style-src 'nonce-${nonce}'`,
+  ].join("; ");
+  return new Response(
+    `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Opening Code</title>
+  <style nonce="${nonce}">
+    /* Palette: vendored carapace v0.6.1 neutral product tokens. */
+    :root { color-scheme: dark light; font: 16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #0d0b0b; color: #f4f1ef; }
+    form { text-align: center; }
+    button { font: inherit; font-weight: 700; padding: .55rem 1rem; border: 1px solid transparent; border-radius: .5rem; background: #ff8a5f; color: #15100e; cursor: pointer; }
+    @media (prefers-color-scheme: light) {
+      body { background: #fbfaf7; color: #171514; }
+      button { background: #d75a37; color: #fffdfa; }
+    }
+  </style>
+</head>
+<body>
+  <form id="code-bootstrap" method="post" action="${escapeHTML(actionURL)}" autocomplete="off">
+    <input type="hidden" name="ticket" value="${escapeHTML(ticket)}">
+    <p>Opening Code…</p>
+    <button type="submit">Continue</button>
+  </form>
+  <script nonce="${nonce}">document.getElementById("code-bootstrap").requestSubmit();</script>
+</body>
+</html>`,
+    {
+      headers: {
+        "cache-control": "no-store",
+        "content-security-policy": contentSecurityPolicy,
+        "content-type": "text/html; charset=utf-8",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+      },
+    },
+  );
+}
+
 export function codeBridgeCommand(lease: LeaseRecord): string {
   return ["crabbox", "code", "--id", lease.slug || lease.id, "--open"].map(shellArg).join(" ");
 }
@@ -1956,7 +2459,7 @@ function shellArg(value: string): string {
 }
 
 function leaseRow(
-  lease: LeaseRecord,
+  lease: PortalLeaseRecord,
   context: { admin: boolean; owner: string; org: string; canManage: boolean },
 ): string {
   const label = lease.slug || lease.id;
@@ -1981,7 +2484,7 @@ function leaseRow(
   });
   return `<tr data-filter-tags="${escapeHTML(["lease", filterValue, ownership, lease.provider, target].join(" "))}" data-filter-group-tags="${escapeHTML(groupTags)}">
     <td><a class="lease-link" href="${detailPath}"><strong>${escapeHTML(label)}</strong><small>${escapeHTML(subline)}</small></a></td>
-    <td><span class="pill" data-state="${escapeHTML(lease.state)}">${escapeHTML(lease.state)}</span></td>
+    <td><span class="${leaseStateBadge(lease.state)}" data-state="${escapeHTML(lease.state)}">${escapeHTML(lease.state)}</span></td>
     <td>${providerBadge(lease.provider)}</td>
     <td>${targetBadge(target, lease.windowsMode)}</td>
     <td>${escapeHTML(lease.class)}</td>
@@ -2189,7 +2692,7 @@ function macHostRow(
     : [host.region, host.availabilityZone].filter(Boolean).join(" · ");
   return `<tr class="capacity-row" data-filter-tags="${escapeHTML(tags.filter(Boolean).join(" "))}" data-filter-group-tags="${escapeHTML(groupTags)}">
     <td><a class="lease-link dedicated-link" href="${detailPath}"><span class="dedicated-mark" title="dedicated host" aria-label="dedicated host">${dedicatedHostIcon}</span><span><strong>${escapeHTML(shortHostID(host.id))}</strong><small>${escapeHTML(leaseMeta || host.id)}</small></span></a></td>
-    <td><span class="pill" data-tone="${stateTone}">${escapeHTML(host.state || "-")}</span></td>
+    <td><span class="${badgeClass(stateTone)}">${escapeHTML(host.state || "-")}</span></td>
     <td>${providerBadge(host.provider)}</td>
     <td>${targetBadge(host.target)}</td>
     <td><span title="${escapeHTML([host.availabilityZone, host.autoPlacement].filter(Boolean).join(" · ") || "Dedicated Host")}">${escapeHTML(host.instanceType || "dedicated")}</span></td>
@@ -2253,15 +2756,17 @@ function macHostStateTone(value: string): "ok" | "warn" | "bad" {
 }
 
 function externalRunnerLeaseRow(
-  runner: ExternalRunnerRecord,
+  runner: PortalExternalRunnerRecord,
   context: { admin: boolean; owner: string; org: string },
 ): string {
   const ownership = context.admin ? runnerOwnership(runner, context.owner, context.org) : "mine";
   const state = runner.stale ? "stale" : "active";
-  const subline =
-    context.admin && ownership === "system"
-      ? `${runner.id} · ${runner.owner || "unknown"}`
-      : [runner.repo, runner.workflow].filter(Boolean).join(" · ") || runner.id;
+  const subline = [
+    context.admin && ownership === "system" ? runner.owner || "unknown" : runner.repo,
+    runner.actionsWorkflowName || workflowBasename(runner.workflow),
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const jobRef = [runner.job, runner.ref].filter(Boolean).join(" / ") || "-";
   const actionState = externalRunnerActionState(runner);
   const actionsLinks = externalRunnerActionsLinks(runner);
@@ -2288,19 +2793,19 @@ function externalRunnerLeaseRow(
     state: actionState?.stuck ? [state, "stuck"] : state,
   });
   return `<tr class="external-row" data-filter-tags="${escapeHTML(filterTags.filter(Boolean).join(" "))}" data-filter-group-tags="${escapeHTML(groupTags)}">
-    <td><a class="lease-link" href="${escapeHTML(detailPath)}"><strong>${escapeHTML(runner.id)}</strong><small>${escapeHTML(subline)}</small></a></td>
-    <td><div class="state-stack"><span class="pill" data-tone="${runner.stale ? "warn" : runnerStatusTone(runner.status)}">${escapeHTML(runner.status || "-")}</span>${externalRunnerActionBadge(actionState)}</div></td>
+    <td><a class="lease-link" href="${escapeHTML(detailPath)}"><strong class="mono">${escapeHTML(runner.id)}</strong><small>${escapeHTML(subline || runner.id)}</small></a></td>
+    <td><div class="state-stack"><span class="${badgeClass(runner.stale ? "warn" : runnerStatusTone(runner.status))}">${escapeHTML(runner.status || "-")}</span>${externalRunnerActionBadge(actionState)}</div></td>
     <td>${providerBadge(runner.provider)}</td>
-    <td><span class="muted" title="Blacksmith owns runner host details">-</span></td>
-    <td><span title="${escapeHTML([runner.repo, runner.workflow, jobRef].filter(Boolean).join(" · "))}">${externalRunnerActionsCell(runner, actionsLinks)}</span></td>
-    <td>${externalRunnerAccessCell(runner, actionsLinks.length > 0)}</td>
+    <td><span class="muted" title="the provider owns runner host details">—</span></td>
+    <td><span class="job-ref" title="${escapeHTML([runner.actionsWorkflowName || workflowBasename(runner.workflow), jobRef].filter(Boolean).join(" · "))}">${escapeHTML(jobRef)}</span></td>
+    <td>${externalRunnerAccessCell(runner, actionsLinks)}</td>
     ${timeCell(runnerSortTime(runner))}
     <td></td>
   </tr>`;
 }
 
 function externalRunnerDetailPath(
-  runner: ExternalRunnerRecord,
+  runner: PortalExternalRunnerRecord,
   context?: { admin: boolean; owner: string; org: string },
 ): string {
   const path = `/portal/runners/${encodeURIComponent(runner.provider)}/${encodeURIComponent(runner.id)}`;
@@ -2309,7 +2814,14 @@ function externalRunnerDetailPath(
   }
   const params = new URLSearchParams();
   params.set("owner", runner.owner);
-  params.set("org", runner.org);
+  if (runner.portalOrgKind === "missing" || runner.portalOrgKind === "unsupported") {
+    params.set("orgKind", runner.portalOrgKind);
+  } else {
+    params.set("org", runner.org);
+    if (runner.portalOrgKind === "legacy") {
+      params.set("orgKind", runner.portalOrgKind);
+    }
+  }
   return `${path}?${params.toString()}`;
 }
 
@@ -2390,22 +2902,16 @@ function externalRunnerActionBadge(state: ExternalRunnerActionState | undefined)
   if (!state) {
     return "";
   }
-  return `<span class="pill action-pill" data-tone="${escapeHTML(state.tone)}" title="${escapeHTML(state.title)}">${escapeHTML(state.label)}</span>`;
+  return `<span class="${badgeClass(state.tone)} action-pill" title="${escapeHTML(state.title)}">${escapeHTML(state.label)}</span>`;
 }
 
-function externalRunnerActionsCell(runner: ExternalRunnerRecord, actionsLinks: string): string {
-  const label = runner.actionsWorkflowName || workflowBasename(runner.workflow) || "external";
-  const meta = [runner.job, runner.ref].filter(Boolean).join(" / ");
-  return `<div class="actions-stack">${actionsLinks || `<span class="muted">${escapeHTML(label)}</span>`}<small>${escapeHTML(meta || label)}</small></div>`;
-}
-
-function externalRunnerAccessCell(runner: ExternalRunnerRecord, hasActions: boolean): string {
-  const label = hasActions ? "no box access" : "no access";
+function externalRunnerAccessCell(runner: ExternalRunnerRecord, actionsLinks: string): string {
+  const label = actionsLinks ? "no box access" : "no access";
   const command = externalRunnerStopCommand(runner);
   const copy = command
     ? `<button class="icon-btn mini" type="button" title="copy stop command" aria-label="copy stop command" data-copy-value="${escapeHTML(command)}">${copyIcon}</button>`
     : "";
-  return `<div class="access-cell disabled-cell external-access" title="external runner; no Crabbox access data"><span>${label}</span>${copy}</div>`;
+  return `<div class="access-cell external-access" title="external runner; ${label}">${actionsLinks || `<span class="disabled-cell">—</span>`}<span class="sr-only">${label}</span>${copy}</div>`;
 }
 
 function externalRunnerStopCommand(runner: ExternalRunnerRecord): string {
@@ -2451,23 +2957,39 @@ function portalHeader(options: PortalHeaderOptions): string {
   const actions = `<div class="portal-actions">${themeToggleButton()}${options.actions?.trim() ?? ""}</div>`;
   return `<header class="${headerClass}">
     <div class="${metaClass}">
-      <h1>${portalBrand}</h1>
+      <a class="brand" href="/portal" aria-label="crabbox portal home"><span class="brand-mark" aria-hidden="true">${portalBrandMark}</span><h1>crabbox</h1></a>
       <p>${options.meta}</p>
     </div>
     ${actions}
   </header>`;
 }
 
-function leaseOwnership(lease: LeaseRecord, owner: string, org: string): "mine" | "system" {
-  return lease.owner === owner && lease.org === org ? "mine" : "system";
+function portalLogoutButton(): string {
+  return `<form method="post" action="/portal/logout"><button class="oc-action oc-action-outline" type="submit">log out</button></form>`;
+}
+
+function leaseOwnership(lease: PortalLeaseRecord, owner: string, org: string): "mine" | "system" {
+  const orgMatches = lease.portalOrgKind === "missing" ? org === "" : lease.org === org;
+  return lease.portalOrgKind !== "legacy" &&
+    lease.portalOrgKind !== "unsupported" &&
+    lease.owner === owner &&
+    orgMatches
+    ? "mine"
+    : "system";
 }
 
 function runnerOwnership(
-  runner: ExternalRunnerRecord,
+  runner: PortalExternalRunnerRecord,
   owner: string,
   org: string,
 ): "mine" | "system" {
-  return runner.owner === owner && runner.org === org ? "mine" : "system";
+  const orgMatches = runner.portalOrgKind === "missing" ? org === "" : runner.org === org;
+  return runner.portalOrgKind !== "legacy" &&
+    runner.portalOrgKind !== "unsupported" &&
+    runner.owner === owner &&
+    orgMatches
+    ? "mine"
+    : "system";
 }
 
 function runnerSortTime(runner: ExternalRunnerRecord): string {
@@ -2483,11 +3005,11 @@ function runRow(run: RunRecord): string {
   const subtitle = run.label || run.command.join(" ");
   return `<tr data-filter-tags="${escapeHTML([run.state, run.provider, run.target || "linux"].filter(Boolean).join(" "))}">
     <td><a class="lease-link" href="/portal/runs/${encodeURIComponent(run.id)}"><strong>${escapeHTML(run.id)}</strong><small>${escapeHTML(subtitle)}</small></a></td>
-    <td><span class="pill" data-tone="${stateTone}">${escapeHTML(run.state)}</span></td>
+    <td><span class="${badgeClass(stateTone)}">${escapeHTML(run.state)}</span></td>
     ${elapsedTimeCell(run.startedAt)}
     <td>${escapeHTML(formatDuration(run.durationMs))}</td>
     <td>${escapeHTML(runTelemetryCell(run.telemetry))}</td>
-    <td><div class="actions-cell"><a class="button secondary" href="/portal/runs/${encodeURIComponent(run.id)}/logs">logs</a><a class="button secondary" href="/portal/runs/${encodeURIComponent(run.id)}/events">events</a></div></td>
+    <td><div class="actions-cell"><a class="oc-action oc-action-outline" href="/portal/runs/${encodeURIComponent(run.id)}/logs">logs</a><a class="oc-action oc-action-outline" href="/portal/runs/${encodeURIComponent(run.id)}/events">events</a></div></td>
   </tr>`;
 }
 
@@ -2547,7 +3069,7 @@ function metaHTMLRow(label: string, value: string): string {
 
 function providerBadge(provider: string | undefined): string {
   const value = provider || "-";
-  return `<span class="icon-label" data-provider="${escapeHTML(value)}">${providerIcon(value)}<span>${escapeHTML(value)}</span></span>`;
+  return `<span class="icon-label" data-provider="${escapeHTML(value)}" title="${escapeHTML(value)}">${providerIcon(value)}<span>${escapeHTML(providerFilterLabel(value))}</span></span>`;
 }
 
 function targetBadge(target: string | undefined, windowsMode?: string): string {
@@ -2567,6 +3089,7 @@ function leaseTelemetryRows(telemetry: LeaseRecord["telemetry"]): string {
   }
   return [
     metaRow("load", telemetryLoad(telemetry)),
+    metaRow("cpu", telemetryCPUCount(telemetry.cpuCount)),
     metaRow(
       "memory",
       telemetryStorage(
@@ -2623,47 +3146,38 @@ function telemetrySamples(
   telemetry: LeaseRecord["telemetry"],
   history: LeaseRecord["telemetryHistory"],
 ): LeaseTelemetrySample[] {
-  const byTime = new Map<string, LeaseTelemetrySample>();
-  for (const sample of Array.isArray(history) ? history : []) {
-    if (sample?.capturedAt) {
-      byTime.set(sample.capturedAt, sample);
-    }
-  }
-  if (telemetry?.capturedAt) {
-    byTime.set(telemetry.capturedAt, telemetry);
-  }
-  return [...byTime.values()].toSorted((left, right) =>
-    left.capturedAt.localeCompare(right.capturedAt),
-  );
+  return orderedTelemetrySamples([...(Array.isArray(history) ? history : []), telemetry]);
 }
 
 type LeaseTelemetrySample = NonNullable<LeaseRecord["telemetry"]>;
 
 function telemetryHealthPills(telemetry: LeaseRecord["telemetry"]): string {
   if (!telemetry?.capturedAt) {
-    return `<span class="pill" data-tone="warn">no signal</span>`;
+    return `<span class="oc-badge oc-badge-warning">no signal</span>`;
   }
   const pills = [];
   const ageMs = Date.now() - Date.parse(telemetry.capturedAt);
   if (!Number.isFinite(ageMs) || ageMs > 10 * 60 * 1000) {
     pills.push(
-      `<span class="pill" data-tone="warn">stale ${escapeHTML(relativeTime(telemetry.capturedAt))}</span>`,
+      `<span class="oc-badge oc-badge-warning">stale ${escapeHTML(relativeTime(telemetry.capturedAt))}</span>`,
     );
   } else {
-    pills.push(`<span class="pill" data-tone="ok">live</span>`);
+    pills.push(`<span class="oc-badge oc-badge-success">live</span>`);
   }
   if ((telemetry.memoryPercent ?? 0) >= 85) {
     pills.push(
-      `<span class="pill" data-tone="bad">memory ${Math.round(telemetry.memoryPercent ?? 0)}%</span>`,
+      `<span class="oc-badge oc-badge-error">memory ${Math.round(telemetry.memoryPercent ?? 0)}%</span>`,
     );
   }
   if ((telemetry.diskPercent ?? 0) >= 85) {
     pills.push(
-      `<span class="pill" data-tone="bad">disk ${Math.round(telemetry.diskPercent ?? 0)}%</span>`,
+      `<span class="oc-badge oc-badge-error">disk ${Math.round(telemetry.diskPercent ?? 0)}%</span>`,
     );
   }
   if ((telemetry.load1 ?? 0) >= 16) {
-    pills.push(`<span class="pill" data-tone="warn">load ${telemetry.load1?.toFixed(1)}</span>`);
+    pills.push(
+      `<span class="oc-badge oc-badge-warning">load ${telemetry.load1?.toFixed(1)}</span>`,
+    );
   }
   return pills.join("");
 }
@@ -2798,15 +3312,7 @@ function runTelemetrySamples(telemetry: RunRecord["telemetry"]): LeaseTelemetryS
   if (!telemetry) {
     return [];
   }
-  const byTime = new Map<string, LeaseTelemetrySample>();
-  for (const sample of [telemetry.start, ...(telemetry.samples ?? []), telemetry.end]) {
-    if (sample?.capturedAt) {
-      byTime.set(sample.capturedAt, sample);
-    }
-  }
-  return [...byTime.values()].toSorted((left, right) =>
-    left.capturedAt.localeCompare(right.capturedAt),
-  );
+  return orderedTelemetrySamples([telemetry.start, ...(telemetry.samples ?? []), telemetry.end]);
 }
 
 function telemetryDelta(start: number | undefined, end: number | undefined): string | undefined {
@@ -2830,6 +3336,13 @@ function telemetryLoad(telemetry: LeaseRecord["telemetry"]): string | undefined 
   return `${telemetry.load1.toFixed(2)}${load5}${load15}`;
 }
 
+function telemetryCPUCount(count: number | undefined): string | undefined {
+  if (count === undefined) {
+    return undefined;
+  }
+  return `${count} vCPU${count === 1 ? "" : "s"}`;
+}
+
 function telemetryStorage(
   used: number | undefined,
   total: number | undefined,
@@ -2844,6 +3357,80 @@ function telemetryStorage(
 
 function providerIcon(provider: string): string {
   return providerIcons[provider] ?? genericProviderIcon;
+}
+
+// Tone-to-class mapping for the vendored carapace oc-badge family: status
+// color selection lives here in TS, not in attribute-matching CSS, so the
+// light/dark status palette comes entirely from carapace product tokens.
+function badgeClass(tone: string | undefined): string {
+  if (tone === "ok") {
+    return "oc-badge oc-badge-success";
+  }
+  if (tone === "warn") {
+    return "oc-badge oc-badge-warning";
+  }
+  if (tone === "bad") {
+    return "oc-badge oc-badge-error";
+  }
+  return "oc-badge oc-badge-neutral";
+}
+
+function leaseStateBadge(state: string): string {
+  const tone = state === "active" ? "ok" : state === "released" || state === "expired" ? "bad" : "";
+  return badgeClass(tone);
+}
+
+// Carapace chart contract (vendored data.css): the consumer precomputes SVG
+// geometry, the component owns size and color. Quiet columns, accent on the
+// newest period; runs arrive newest-first, so the rightmost bar is runs[0].
+function runDurationBars(runs: RunRecord[]): string {
+  const durations = runs.slice(0, 12).map((run) => Math.max(0, run.commandMs ?? 0));
+  if (durations.filter((value) => value > 0).length < 2) {
+    return "";
+  }
+  const chronological = durations.toReversed();
+  const max = Math.max(...chronological);
+  const height = 20;
+  const slot = 100 / chronological.length;
+  const barWidth = Math.max(1.5, slot - 1.5);
+  const rects = chronological
+    .map((value, index) => {
+      const barHeight = max > 0 ? Math.max(1.5, (value / max) * (height - 2)) : 1.5;
+      const current = index === chronological.length - 1 ? " oc-bars-current" : "";
+      return `<rect class="oc-bars-bar${current}" x="${(index * slot).toFixed(1)}" y="${(height - barHeight).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}"/>`;
+    })
+    .join("");
+  return `<svg class="oc-bars" viewBox="0 0 100 ${height}" preserveAspectRatio="none" aria-hidden="true">${rects}</svg>`;
+}
+
+// Duration direction is a genuine judgment (slower is worse), so the delta
+// carries an explicit data-tone instead of the neutral direction-only tint.
+function runDurationDelta(runs: RunRecord[]): string {
+  const latest = runs[0]?.commandMs;
+  const previous = runs[1]?.commandMs;
+  if (!latest || !previous) {
+    return "";
+  }
+  const pct = ((latest - previous) / previous) * 100;
+  if (Math.abs(pct) < 1) {
+    return "";
+  }
+  const tone = pct > 0 ? "negative" : "positive";
+  const arrow = pct > 0 ? "&#9650;" : "&#9660;";
+  return `<span class="oc-delta" data-tone="${tone}" title="latest run duration vs previous"><span class="oc-delta-arrow">${arrow}</span>${Math.abs(pct).toFixed(0)}%</span>`;
+}
+
+function providerSplitStrip(providers: PortalAdminProviderStatus[]): string {
+  const counts = new Map(
+    providers
+      .filter((provider) => provider.activeLeases > 0)
+      .map((provider) => [String(provider.provider), provider.activeLeases] as const),
+  );
+  const bar = tideBar(counts, (provider) => ({
+    tag: "a",
+    attrs: `href="/portal/admin/leases?provider=${encodeURIComponent(provider)}"`,
+  }));
+  return bar ? `<section class="admin-split">${bar}</section>` : "";
 }
 
 function runnerStatusTone(status: string): string {
@@ -2877,18 +3464,24 @@ function bridgeRow(
   action: string,
   bridgeLabel = "bridge",
   viewerLabel = "viewer",
+  coarse = false,
+  detail = "",
 ): string {
-  const status = enabled
-    ? bridgeConnected
-      ? viewerConnected
-        ? `${viewerLabel} active`
-        : `${bridgeLabel} ready`
-      : `waiting for ${bridgeLabel}`
-    : "unavailable";
-  const tone = enabled ? (bridgeConnected ? "ok" : "warn") : "";
+  const status = coarse
+    ? enabled
+      ? "active"
+      : "unavailable"
+    : enabled
+      ? bridgeConnected
+        ? viewerConnected
+          ? `${viewerLabel} active`
+          : `${bridgeLabel} ready`
+        : `waiting for ${bridgeLabel}`
+      : "unavailable";
+  const tone = enabled ? (coarse || bridgeConnected ? "ok" : "warn") : "";
   return `<div class="bridge-row">
-    <div><strong>${escapeHTML(label)}</strong><small>${escapeHTML(status)}</small></div>
-    <span class="pill" data-tone="${tone}">${escapeHTML(enabled ? (bridgeConnected ? "connected" : "waiting") : "off")}</span>
+    <div><strong>${escapeHTML(label)}</strong><small>${escapeHTML(status)}</small>${detail ? `<small>${escapeHTML(detail)}</small>` : ""}</div>
+    <span class="${badgeClass(tone)}">${escapeHTML(enabled ? (coarse ? "active" : bridgeConnected ? "connected" : "waiting") : "off")}</span>
     ${action}
   </div>`;
 }
@@ -2936,129 +3529,172 @@ function html(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="theme-color" content="#0b0d0f">
+  <meta name="theme-color" content="#0c0a09">
   <title>${escapeHTML(title)}</title>
   <script nonce="${pageNonce}">(function(){var s;try{s=localStorage.getItem('crabbox-theme-source')}catch(e){}var m=(s==='light'||s==='dark'||s==='system')?s:'system';var d=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches;document.documentElement.dataset.themeSource=m;document.documentElement.dataset.theme=m==='system'?(d?'dark':'light'):m})();</script>
+  <link rel="stylesheet" href="/portal/assets/carapace/carapace-core.css">
   <style>
+    /* Portal skin: warm harbor-at-night palette over vendored carapace tokens.
+       Portal tokens are the source of truth; carapace --oc-* tokens are
+       retargeted so vendored oc-action/oc-badge components match. */
+    html:root {
+      --bg:#0c0a09; --surface:#141110; --surface-2:#1a1614; --raised:#221d1a;
+      --line:#272220; --line-strong:#3b3430; --fg:#f6f1ed; --fg-2:#cbc1ba; --muted:#8d837d; --subtle:#625a55;
+      --accent:#ff7a50; --accent-ink:#ffb294; --accent-fg:#1a0f0a;
+      --ok:#4fc0a0; --warn:#e8a63c; --bad:#f06a4e; --info:#7aa7ff;
+      --p-aws:#f2a33a; --p-hetzner:#ef5d4c; --p-blacksmith:#a796f2; --p-azure:#5ea5ff; --p-gcp:#4fc0a0; --p-daytona:#e5c34a; --p-other:#8d837d;
+      --t-linux:#4fc0a0; --t-windows:#5ea5ff; --t-macos:#c3b4ec;
+      --glow:rgb(255 122 80 / 0.085); --grid-dot:rgb(255 240 230 / 0.045);
+      --panel-shadow:0 1px 0 rgb(255 255 255 / 0.025) inset, 0 24px 60px -32px rgb(0 0 0 / 0.7);
+      --oc-bg-page:var(--bg); --oc-bg-surface:var(--surface); --oc-bg-elevated:var(--raised); --oc-bg-recessed:#090807;
+      --oc-text-primary:var(--fg); --oc-text-secondary:var(--fg-2); --oc-text-muted:var(--muted); --oc-text-on-accent:var(--accent-fg);
+      --oc-border-subtle:var(--line); --oc-border-strong:var(--line-strong); --oc-border-accent:rgb(255 122 80 / 0.42);
+      --oc-accent-primary:var(--accent); --oc-accent-primary-hover:#ff946f; --oc-accent-primary-deep:#d75632;
+      --oc-accent-secondary:var(--ok); --oc-accent-secondary-deep:#2f8a75;
+      --oc-surface-accent-soft:rgb(255 122 80 / 0.1); --oc-surface-secondary-soft:rgb(79 192 160 / 0.12);
+      --oc-surface-interactive:rgb(255 240 230 / 0.06); --oc-focus-ring:rgb(255 122 80 / 0.6);
+      --oc-status-success-fg:var(--ok); --oc-status-success-bg:rgb(79 192 160 / 0.12);
+      --oc-status-warning-fg:var(--warn); --oc-status-warning-bg:rgb(232 166 60 / 0.12);
+      --oc-status-error-fg:var(--bad); --oc-status-error-bg:rgb(240 106 78 / 0.12);
+      --oc-status-info-fg:var(--info); --oc-status-info-bg:rgb(122 167 255 / 0.12);
+      --oc-font-body:ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+      --oc-font-mono:ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    }
+    html:root[data-theme="light"] {
+      --bg:#f6f2ed; --surface:#fffdfa; --surface-2:#faf5ef; --raised:#ffffff;
+      --line:#ebe2d9; --line-strong:#d9cbbf; --fg:#1b1512; --fg-2:#41372f; --muted:#7a6e66; --subtle:#a69a91;
+      --accent:#d9552d; --accent-ink:#b5401c; --accent-fg:#fffdfa;
+      --ok:#12806a; --warn:#a8650a; --bad:#c23d22; --info:#2365a8;
+      --p-aws:#c97a12; --p-hetzner:#d2402f; --p-blacksmith:#6f5bd0; --p-azure:#2d74d4; --p-gcp:#12806a; --p-daytona:#a8870f; --p-other:#8a7e76;
+      --t-linux:#12806a; --t-windows:#2d74d4; --t-macos:#7a63c4;
+      --glow:rgb(217 85 45 / 0.07); --grid-dot:rgb(60 30 10 / 0.06);
+      --panel-shadow:0 1px 2px rgb(60 35 15 / 0.04), 0 18px 44px -30px rgb(60 35 15 / 0.22);
+      --oc-bg-recessed:#f3ede6; --oc-border-accent:rgb(217 85 45 / 0.4); --oc-accent-primary-hover:#b5401c; --oc-accent-primary-deep:#b5401c;
+      --oc-surface-accent-soft:rgb(217 85 45 / 0.08); --oc-surface-interactive:rgb(60 30 10 / 0.05); --oc-focus-ring:rgb(217 85 45 / 0.5);
+      --oc-status-success-bg:rgb(18 128 106 / 0.1); --oc-status-warning-bg:rgb(168 101 10 / 0.1);
+      --oc-status-error-bg:rgb(194 61 34 / 0.1); --oc-status-info-bg:rgb(35 101 168 / 0.1);
+    }
+    /* Legacy aliases used by detail, VNC, and code pages. */
     :root {
-      color-scheme: dark;
-      --bg:#0b0d0f; --fg:#f3f5f7; --muted:#9ca3af; --line:#262b31; --line-soft:#1d2126;
-      --panel:#15181c; --panel-2:#0f1215; --accent:#38bdf8; --accent-fg:#001018; --accent-soft-fg:#bae6fd;
-      --bad:#f87171; --warn:#fbbf24; --ok:#34d399;
-      --inset:#0c0e10; --inset-deep:#080a0c; --hover:#1b1f24; --hover-active:#22272d; --hover-line:#3a4046;
-      --code-fg:#d1fae5; --danger-fg:#fecaca; --icon:#cbd5e1; --subtle:#6b7280; --arrow:#4b5563;
-      --ext-fg:#b6beca; --ext-badge:#8b949e; --ext-icon:#7c8490;
-      --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      --line-soft:color-mix(in srgb, var(--line) 62%, transparent);
+      --panel:var(--surface); --panel-2:var(--surface-2);
+      --accent-soft-fg:var(--accent-ink);
+      --inset:var(--oc-bg-recessed); --inset-deep:color-mix(in oklch, var(--oc-bg-recessed) 88%, oklch(0 0 0));
+      --hover:var(--oc-surface-interactive);
+      --hover-active:color-mix(in srgb, var(--fg) 11%, transparent);
+      --hover-line:var(--line-strong);
+      --code-fg:color-mix(in srgb, var(--ok) 55%, var(--fg));
+      --danger-fg:color-mix(in srgb, var(--bad) 60%, var(--fg));
+      --icon:var(--fg-2); --arrow:color-mix(in srgb, var(--muted) 55%, transparent);
+      --ext-fg:var(--fg-2); --ext-badge:var(--muted); --ext-icon:var(--muted);
+      --mono:var(--oc-font-mono); --sans:var(--oc-font-body);
     }
-    :root[data-theme="light"] {
-      color-scheme: light;
-      --bg:#f4f6f8; --fg:#1a1d22; --muted:#5c636e; --line:#d8dce2; --line-soft:#e7eaee;
-      --panel:#ffffff; --panel-2:#f1f3f6; --accent:#0284c7; --accent-fg:#ffffff; --accent-soft-fg:#0369a1;
-      --bad:#dc2626; --warn:#b45309; --ok:#047857;
-      --inset:#f1f3f6; --inset-deep:#e9ecf0; --hover:#eceef2; --hover-active:#e1e4e9; --hover-line:#b9bec7;
-      --code-fg:#0f5132; --danger-fg:#b42318; --icon:#5c636e; --subtle:#9aa1ab; --arrow:#b9bec7;
-      --ext-fg:#6b7280; --ext-badge:#8b929c; --ext-icon:#9aa1ab;
-    }
-    * { box-sizing: border-box; }
-    html { min-height:100%; background:var(--bg); }
-    body { margin:0; min-height:100vh; overflow-x:hidden; background:var(--bg); color:var(--fg); font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; transition:background-color .18s,color .18s; }
+    * { box-sizing:border-box; }
+    html { min-height:100%; background:var(--bg); -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+    body { position:relative; margin:0; min-height:100vh; overflow-x:hidden; color:var(--fg-2); font:13.5px/1.45 var(--sans); font-feature-settings:"cv11","ss01"; background:radial-gradient(1100px 520px at 12% -12%, var(--glow), transparent 62%), radial-gradient(900px 480px at 100% -20%, color-mix(in srgb, var(--glow) 60%, transparent), transparent 60%), var(--bg); background-attachment:fixed; transition:background-color .18s,color .18s; }
+    body::before { content:""; position:fixed; inset:0; z-index:-1; pointer-events:none; background-image:radial-gradient(circle at 1px 1px, var(--grid-dot) 1px, transparent 0); background-size:22px 22px; -webkit-mask-image:linear-gradient(180deg, #000, transparent 46%); mask-image:linear-gradient(180deg, #000, transparent 46%); }
+    h1, strong { color:var(--fg); }
     main { width:min(1180px, calc(100vw - 32px)); max-width:100%; margin:0 auto; padding:10px 0 22px; }
-    .portal-shell { width:min(1240px, calc(100vw - 16px)); max-width:100%; height:100dvh; display:grid; grid-template-rows:auto minmax(0,1fr); gap:8px; padding:6px 0 8px; overflow:hidden; }
-    .lease-shell { grid-template-rows:auto auto minmax(0,1fr); }
+    /* overflow:auto + a floored table row: tall viewports keep the app-like
+       fixed layout with internally scrolling tables, while short viewports
+       scroll the shell instead of silently clipping panels below the fold. */
+    .portal-shell { width:min(1280px, calc(100vw - 40px)); max-width:100%; height:100dvh; display:grid; grid-template-rows:auto minmax(240px,1fr); gap:14px; padding:0 0 14px; overflow:auto; }
+    .lease-shell { grid-template-rows:auto auto minmax(240px,1fr); }
     .run-shell { height:auto; min-height:100dvh; overflow:visible; grid-template-rows:auto; }
+    .portal-shell[data-view="home"] { height:auto; min-height:100dvh; display:flex; flex-direction:column; gap:16px; padding-bottom:48px; overflow:visible; }
     h1,h2,p { margin:0; }
-    h1 { font-size:20px; font-weight:700; }
-    h2 { font-size:12px; text-transform:uppercase; color:var(--muted); letter-spacing:0.04em; }
+    h1 { font-size:17px; font-weight:650; letter-spacing:-0.02em; }
+    h2 { color:var(--fg); font-size:13px; font-weight:600; letter-spacing:-0.005em; }
     a { color:inherit; }
     form { margin:0; }
     button { font:inherit; }
-    code { display:block; max-width:100%; overflow:auto; padding:9px 10px; border:1px solid var(--line); border-radius:6px; background:var(--inset); color:var(--code-fg); font-family:var(--mono); }
+    code { display:block; max-width:100%; overflow:auto; padding:9px 11px; border:1px solid var(--line); border-radius:8px; background:var(--inset); color:var(--code-fg); font-family:var(--mono); font-size:12.5px; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+    :focus-visible { outline:2px solid var(--oc-focus-ring); outline-offset:2px; }
     table { width:100%; border-collapse:collapse; table-layout:fixed; }
-    th,td { padding:7px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:middle; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.25; }
-    th { position:sticky; top:0; z-index:2; color:var(--muted); font-size:11px; font-weight:700; text-transform:uppercase; background:var(--panel); box-shadow:0 1px 0 var(--line); }
-    th[data-sortable] { cursor:pointer; user-select:none; }
-    th[data-sortable]::after { content:""; display:inline-block; width:0; height:0; margin-left:6px; vertical-align:middle; border-left:3px solid transparent; border-right:3px solid transparent; border-top:4px solid var(--arrow); opacity:0.75; }
+    th,td { padding:10px 12px; border-bottom:1px solid var(--line-soft); text-align:left; vertical-align:middle; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:1.3; }
+    th { position:sticky; top:0; z-index:2; color:var(--muted); font-size:11.5px; font-weight:500; letter-spacing:0.01em; background:var(--surface); border-bottom-color:var(--line); }
+    th:first-child,td:first-child { padding-left:18px; }
+    th:last-child,td:last-child { padding-right:18px; }
+    th[data-sortable] { cursor:pointer; user-select:none; transition:color .12s; }
+    th[data-sortable]:hover { color:var(--fg-2); }
+    th[data-sortable]::after { content:""; display:inline-block; width:0; height:0; margin-left:6px; vertical-align:middle; border-left:3px solid transparent; border-right:3px solid transparent; border-top:4px solid var(--arrow); opacity:0; transition:opacity .12s; }
+    th[data-sortable]:hover::after { opacity:0.8; }
     th[aria-sort="ascending"]::after { border-top:0; border-bottom:4px solid var(--accent); opacity:1; }
     th[aria-sort="descending"]::after { border-top-color:var(--accent); opacity:1; }
     td { font-size:13px; }
-    td small { display:block; color:var(--muted); margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .top { position:sticky; top:0; z-index:20; display:flex; justify-content:space-between; gap:12px; align-items:center; min-height:38px; margin:0; padding:4px 0; background:linear-gradient(180deg, var(--bg) 72%, color-mix(in srgb, var(--bg) 0%, transparent)); backdrop-filter:blur(10px); }
+    tbody tr { transition:background-color .12s; }
+    tbody tr:hover { background:color-mix(in srgb, var(--surface-2) 70%, transparent); }
+    tbody tr:last-child td { border-bottom:0; }
+    td small { display:block; color:var(--muted); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11.5px; }
+    .top { position:sticky; top:0; z-index:20; display:flex; justify-content:space-between; gap:16px; align-items:center; min-height:60px; margin:0; padding:10px 0; border-bottom:1px solid var(--line-soft); background:color-mix(in srgb, var(--bg) 82%, transparent); backdrop-filter:blur(14px) saturate(1.2); -webkit-backdrop-filter:blur(14px) saturate(1.2); }
     .portal-header-meta { flex:1 1 auto; min-width:0; overflow:hidden; }
+    .top .portal-header-meta { display:flex; align-items:center; gap:14px; }
     .portal-header-meta h1 { white-space:nowrap; }
-    .portal-header-meta p { font-size:12px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .portal-header-meta p { min-width:0; overflow:hidden; color:var(--muted); font-family:var(--mono); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+    .top .portal-header-meta p { padding-left:14px; border-left:1px solid var(--line); }
+    .brand { display:inline-flex; align-items:center; gap:10px; color:var(--fg); text-decoration:none; }
+    .brand-mark { display:grid; place-items:center; width:30px; height:30px; flex:0 0 30px; border-radius:9px; font-size:16px; line-height:1; background:radial-gradient(circle at 30% 25%, color-mix(in srgb, var(--accent) 40%, transparent), transparent 70%), color-mix(in srgb, var(--accent) 14%, var(--surface)); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent), 0 6px 18px -8px color-mix(in srgb, var(--accent) 70%, transparent); }
+    .vnc-bar .brand-mark { width:26px; height:26px; flex-basis:26px; font-size:14px; border-radius:8px; }
     .top p,.muted,.empty { color:var(--muted); }
-    .panel { min-width:0; border:1px solid var(--line); border-radius:8px; background:var(--panel); overflow:hidden; }
-    .admin-panel { border-color:color-mix(in srgb, var(--accent) 30%, var(--line)); background:linear-gradient(180deg, color-mix(in srgb, var(--accent) 8%, var(--panel)), var(--panel)); }
-    .admin-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px; background:var(--line-soft); border-bottom:1px solid var(--line); }
-    .admin-metric { min-width:0; padding:10px; background:var(--panel); }
-    .admin-metric span { display:block; margin-bottom:3px; color:var(--muted); font-size:10px; text-transform:uppercase; }
-    .admin-metric strong { display:block; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
-    .admin-actions { display:flex; gap:6px; flex-wrap:wrap; padding:8px 10px; background:color-mix(in srgb, var(--panel-2) 70%, transparent); }
-    .admin-shell { height:auto; min-height:100dvh; align-content:start; align-items:start; grid-template-rows:auto auto auto auto; overflow:visible; }
-    .admin-shell > * { width:100%; }
-    .admin-status-strip { display:grid; grid-template-columns:1.45fr 1.35fr repeat(4,minmax(0,.82fr)); gap:1px; border:1px solid var(--line); border-radius:8px; background:var(--line-soft); overflow:hidden; }
-    .admin-status-strip .admin-metric { min-height:54px; }
-    .admin-metric[data-tone="ok"] strong { color:var(--ok); }
-    .admin-metric[data-tone="warn"] strong { color:var(--warn); }
-    .admin-metric[data-tone="bad"] strong { color:var(--bad); }
-    .admin-tabs { display:flex; gap:1px; border:1px solid var(--line); border-radius:8px; background:var(--line-soft); overflow:hidden; }
-    .admin-tabs a { min-height:32px; display:inline-flex; align-items:center; justify-content:center; min-width:92px; padding:0 14px; background:var(--panel); color:var(--muted); text-decoration:none; font-size:12px; font-weight:800; text-transform:uppercase; }
-    .admin-tabs a[data-active="true"] { color:var(--fg); background:var(--panel-2); box-shadow:inset 0 -2px 0 var(--accent); }
-    .admin-tabs a:hover { color:var(--fg); background:var(--hover); }
-    .admin-kicker { color:var(--muted); font-size:10px; font-weight:800; text-transform:uppercase; }
-    .provider-status-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1px; background:var(--line-soft); }
-    .provider-status-card { min-width:0; display:grid; grid-template-rows:auto auto auto 1fr; gap:9px; padding:12px; background:var(--panel); border-top:2px solid transparent; }
-    .provider-status-card[data-tone="ok"] { border-top-color:var(--ok); }
-    .provider-status-card[data-tone="warning"] { border-top-color:var(--warn); }
-    .provider-status-card[data-tone="bad"] { border-top-color:var(--bad); }
-    .provider-status-card[data-tone="disabled"] { opacity:0.58; border-top-color:var(--line); }
-    .provider-status-head { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:9px; align-items:center; }
-    .provider-favicon { width:24px; height:24px; display:grid; place-items:center; border:1px solid var(--line); border-radius:6px; background:var(--panel-2); color:var(--icon); }
-    .provider-favicon svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-    .provider-favicon[data-provider="aws"] { color:#fbbf24; }
-    .provider-favicon[data-provider="azure"] { color:#60a5fa; }
-    .provider-favicon[data-provider="gcp"] { color:#34d399; }
-    .provider-favicon[data-provider="hetzner"] { color:#f87171; }
-    .provider-status-title { min-width:0; display:grid; gap:1px; }
-    .provider-status-title strong,.provider-status-title span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .provider-status-title > span { display:flex; gap:6px; align-items:center; color:var(--muted); font-size:11px; }
-    .traffic-light { width:10px; height:10px; border-radius:50%; background:var(--muted); box-shadow:0 0 0 3px color-mix(in srgb, currentColor 16%, transparent); }
-    .traffic-light[data-tone="ok"] { color:var(--ok); background:var(--ok); }
-    .traffic-light[data-tone="warning"] { color:var(--warn); background:var(--warn); }
-    .traffic-light[data-tone="bad"] { color:var(--bad); background:var(--bad); }
-    .traffic-light[data-tone="disabled"] { color:var(--muted); background:var(--muted); }
-    .provider-status-meta { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; margin:0; background:var(--line-soft); border:1px solid var(--line-soft); }
-    .provider-status-meta div { min-width:0; padding:7px 8px; background:var(--panel-2); }
-    .provider-status-meta dt { margin:0 0 2px; color:var(--muted); font-size:10px; text-transform:uppercase; }
-    .provider-status-meta dd { margin:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .provider-status-card p { margin:0; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
-    .provider-status-actions { display:flex; gap:6px; flex-wrap:wrap; align-self:end; }
-    .provider-status-actions a,.provider-status-actions button { min-height:24px; display:inline-flex; align-items:center; padding:0 7px; border:1px solid var(--line); border-radius:6px; color:var(--muted); background:transparent; text-decoration:none; font-size:11px; font-weight:700; }
-    .provider-status-actions a:hover { color:var(--fg); background:var(--hover); border-color:var(--hover-line); }
-    .provider-status-actions button:disabled { opacity:0.55; cursor:not-allowed; }
-    .admin-full-panel { min-height:0; max-height:none; }
-    .admin-filter-row { display:flex; gap:6px; flex-wrap:wrap; padding:8px 10px; border-bottom:1px solid var(--line); background:var(--panel-2); }
-    .admin-filter-chip { min-height:26px; display:inline-flex; align-items:center; gap:6px; padding:0 9px; border:1px solid var(--line); border-radius:6px; color:var(--muted); text-decoration:none; font-size:12px; font-weight:700; }
-    .admin-filter-chip svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-    .admin-filter-chip[data-active="true"] { color:var(--fg); background:var(--hover-active); border-color:var(--hover-line); }
-    .admin-filter-chip:hover { color:var(--fg); background:var(--hover); }
-    .admin-user-table th:nth-child(2),.admin-user-table td:nth-child(2),.admin-user-table th:nth-child(3),.admin-user-table td:nth-child(3) { text-align:right; }
-    .admin-lease-table th:last-child,.admin-lease-table td:last-child { width:42px; text-align:right; }
-    .admin-eject-form { display:flex; justify-content:flex-end; }
-    .admin-eject { width:28px; height:28px; display:grid; place-items:center; border:1px solid transparent; border-radius:7px; background:transparent; color:var(--subtle); cursor:pointer; }
-    .admin-eject:hover,.admin-eject:focus-visible { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); background:color-mix(in srgb, var(--bad) 12%, transparent); }
-    .admin-nav-link { gap:6px; }
-    .section-head { display:flex; justify-content:space-between; align-items:center; min-height:34px; padding:7px 10px; border-bottom:1px solid var(--line); }
+    .panel { min-width:0; border:1px solid var(--line); border-radius:14px; background:var(--surface); overflow:hidden; box-shadow:var(--panel-shadow); }
+    .section-head { display:flex; justify-content:space-between; align-items:center; gap:12px; min-height:46px; padding:12px 18px; border-bottom:1px solid var(--line-soft); }
+    .section-head > span { color:var(--muted); font-family:var(--mono); font-size:11.5px; white-space:nowrap; }
     .section-actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; min-width:0; color:var(--muted); }
     .section-actions span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .button { display:inline-flex; align-items:center; justify-content:center; min-height:28px; padding:0 10px; border-radius:7px; border:1px solid transparent; background:var(--accent); color:var(--accent-fg); text-decoration:none; font-size:12px; font-weight:700; white-space:nowrap; cursor:pointer; }
-    .button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); font-weight:500; }
-    .button.secondary:hover { background:var(--hover); border-color:var(--hover-line); }
-    .button.action { min-width:56px; border:1px solid color-mix(in srgb, var(--accent) 42%, var(--line)); background:color-mix(in srgb, var(--accent) 10%, transparent); color:var(--accent-soft-fg); }
-    .button.action:hover { background:color-mix(in srgb, var(--accent) 16%, transparent); border-color:color-mix(in srgb, var(--accent) 58%, var(--line)); }
-    .button:disabled { opacity:0.45; cursor:not-allowed; }
-    .button.danger { border:1px solid color-mix(in srgb, var(--bad) 42%, var(--line)); background:color-mix(in srgb, var(--bad) 18%, transparent); color:var(--danger-fg); cursor:pointer; }
-    .button[data-state="ok"] { border-color:color-mix(in srgb, var(--ok) 45%, var(--line)); color:var(--ok); background:color-mix(in srgb, var(--ok) 12%, transparent); }
+    .fleet-panel .section-head { border-bottom:0; padding-bottom:6px; }
+    /* Admin mode: a slim scope banner instead of a dashboard panel. */
+    .admin-bar { display:flex; align-items:center; gap:14px; min-height:42px; padding:6px 8px 6px 6px; border:1px solid color-mix(in srgb, var(--accent) 26%, var(--line)); border-radius:12px; background:linear-gradient(90deg, color-mix(in srgb, var(--accent) 9%, var(--surface)), var(--surface) 60%); font-size:12.5px; }
+    .admin-bar-mode { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 10px; border-radius:8px; background:color-mix(in srgb, var(--accent) 16%, transparent); color:var(--accent-ink); font-weight:600; white-space:nowrap; }
+    .admin-bar-scope { min-width:0; overflow:hidden; color:var(--muted); text-overflow:ellipsis; white-space:nowrap; }
+    .admin-bar-scope strong { font-family:var(--mono); font-size:12px; font-weight:500; }
+    .admin-bar-links { display:flex; gap:2px; margin-left:auto; }
+    .admin-bar-links a { display:inline-flex; align-items:center; height:28px; padding:0 9px; border-radius:7px; color:var(--fg-2); font-family:var(--mono); font-size:11.5px; text-decoration:none; white-space:nowrap; }
+    .admin-bar-links a::after { content:"↗"; margin-left:4px; color:var(--subtle); }
+    .admin-bar-links a:hover { background:var(--hover); color:var(--fg); }
+    /* Fleet readouts: an instrument cluster of clickable filter presets. */
+    .fleet-overview { border:1px solid var(--line); border-radius:14px; background:var(--surface); box-shadow:var(--panel-shadow); overflow:hidden; }
+    .fleet-tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(168px,1fr)); gap:1px; background:var(--line-soft); }
+    .fleet-tile { position:relative; display:grid; gap:4px; min-width:0; padding:16px 18px 15px; border:0; background:var(--surface); color:inherit; text-align:left; cursor:pointer; transition:background-color .14s; }
+    a.fleet-tile { text-decoration:none; }
+    .fleet-tile::after { content:""; position:absolute; left:18px; right:18px; bottom:0; height:2px; border-radius:2px 2px 0 0; background:var(--accent); transform:scaleX(0); transform-origin:left; transition:transform .22s cubic-bezier(.2,.7,.2,1); }
+    .fleet-tile:hover { background:var(--surface-2); }
+    .fleet-tile[aria-pressed="true"] { background:var(--surface-2); }
+    .fleet-tile[aria-pressed="true"]::after { transform:scaleX(1); }
+    .fleet-tile-label { color:var(--muted); font-size:12px; white-space:nowrap; }
+    .fleet-tile-value { color:var(--fg); font-family:var(--mono); font-size:32px; font-weight:500; line-height:1.1; letter-spacing:-0.04em; font-variant-numeric:tabular-nums; }
+    .fleet-tile[data-tone="accent"] .fleet-tile-value { color:var(--accent-ink); }
+    .fleet-tile[data-tone="warn"] .fleet-tile-value { color:var(--warn); }
+    .fleet-tile[data-tone="quiet"] .fleet-tile-value { color:var(--subtle); }
+    .fleet-tile-detail { overflow:hidden; color:var(--muted); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+    .tide { display:grid; gap:10px; padding:14px 18px 14px; border-top:1px solid var(--line-soft); }
+    .tide-head { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; }
+    .tide-head span:last-child { font-family:var(--mono); font-size:11.5px; }
+    .tide-bar { display:flex; gap:3px; height:8px; }
+    .tide-segment { min-width:4px; flex-basis:0; border-radius:3px; background:var(--seg, var(--p-other)); transition:filter .15s, opacity .15s; }
+    .tide:has(.tide-key:hover) .tide-segment { opacity:0.35; }
+    .tide-legend { display:flex; flex-wrap:wrap; gap:4px; margin:0 -8px -4px; }
+    .tide-key { display:inline-flex; align-items:center; gap:7px; height:28px; padding:0 9px; border:1px solid transparent; border-radius:8px; background:transparent; color:var(--fg-2); font-size:12.5px; cursor:pointer; }
+    .tide-key:hover { background:var(--hover); }
+    .tide-key[aria-pressed="true"] { border-color:var(--line-strong); background:var(--surface-2); color:var(--fg); }
+    .tide-key strong { font-family:var(--mono); font-size:12px; font-weight:500; font-variant-numeric:tabular-nums; }
+    .tide-key small { color:var(--subtle); font-family:var(--mono); font-size:11px; }
+    .tide-swatch { width:8px; height:8px; border-radius:2px; background:var(--seg, var(--p-other)); }
+    [data-provider="aws"] { --seg:var(--p-aws); }
+    [data-provider="hetzner"] { --seg:var(--p-hetzner); }
+    [data-provider="blacksmith-testbox"] { --seg:var(--p-blacksmith); }
+    [data-provider="azure"] { --seg:var(--p-azure); }
+    [data-provider="gcp"] { --seg:var(--p-gcp); }
+    [data-provider="daytona"] { --seg:var(--p-daytona); }
+    /* Buttons come from the vendored carapace oc-action family. Portal rules
+       keep operational density and add a neutral outline and a danger action. */
+    .oc-action { min-height:32px; padding:0 12px; border-radius:9px; font-size:12.5px; font-weight:550; white-space:nowrap; }
+    .oc-action-secondary { min-width:56px; }
+    .oc-action-outline { gap:6px; border-color:var(--line); background:transparent; color:var(--fg-2); font-weight:500; }
+    .oc-action-outline:hover { background:var(--hover); border-color:var(--hover-line); color:var(--fg); }
+    .oc-action-danger { border-color:color-mix(in srgb, var(--bad) 52%, var(--line)); background:color-mix(in srgb, var(--bad) 14%, transparent); color:color-mix(in srgb, var(--bad) 68%, var(--fg)); }
+    .oc-action[data-state="ok"] { border-color:color-mix(in srgb, var(--ok) 45%, var(--line)); color:var(--ok); background:color-mix(in srgb, var(--ok) 12%, transparent); }
+    .admin-nav-link svg { color:var(--accent-ink); }
     .portal-dialog { width:min(460px, calc(100vw - 28px)); padding:0; border:1px solid var(--line); border-radius:12px; background:var(--panel); color:var(--fg); box-shadow:0 24px 90px rgba(0,0,0,0.58); overflow:hidden; }
     .portal-dialog::backdrop { background:rgba(0,0,0,0.58); backdrop-filter:blur(2px); }
     .portal-dialog[data-fallback-modal="true"] { position:fixed; top:50%; left:50%; z-index:101; display:block; max-height:calc(100dvh - 28px); margin:0; transform:translate(-50%,-50%); }
@@ -3067,7 +3703,7 @@ function html(
     body[data-portal-dialog-open="true"] { overflow:hidden; }
     .portal-dialog-form { display:grid; }
     .portal-dialog-head { padding:17px 18px 13px; border-bottom:1px solid var(--line); background:var(--panel-2); }
-    .portal-dialog-head small { display:block; margin-bottom:3px; color:var(--muted); font-size:10px; font-weight:800; letter-spacing:0.06em; text-transform:uppercase; }
+    .portal-dialog-head small { display:block; margin-bottom:3px; color:var(--muted); font-size:11px; letter-spacing:0.05em; font-weight:800; letter-spacing:0.06em; text-transform:uppercase; }
     .portal-dialog-head h2 { color:var(--fg); font-size:18px; letter-spacing:0; text-transform:none; }
     .portal-dialog-body { display:grid; gap:13px; padding:16px 18px; }
     .portal-dialog-message { color:var(--muted); line-height:1.55; white-space:pre-wrap; }
@@ -3076,9 +3712,6 @@ function html(
     .portal-dialog-input textarea { width:100%; min-height:112px; resize:vertical; padding:10px 11px; border:1px solid var(--line); border-radius:8px; background:var(--inset); color:var(--fg); font:13px/1.45 var(--mono); }
     .portal-dialog-input textarea:focus { outline:2px solid color-mix(in srgb, var(--accent) 35%, transparent); outline-offset:1px; border-color:color-mix(in srgb, var(--accent) 58%, var(--line)); }
     .portal-dialog-actions { display:flex; justify-content:flex-end; gap:8px; padding:12px 18px 16px; border-top:1px solid var(--line); background:var(--panel-2); }
-    .lease-link { display:block; min-width:0; text-decoration:none; overflow:hidden; text-overflow:ellipsis; }
-    .lease-link strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .mono { font-family:var(--mono); }
     .detail-grid { display:grid; grid-template-columns:minmax(0,1.1fr) minmax(280px,0.9fr); gap:8px; min-height:0; }
     .detail-card { min-width:0; }
     .meta-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:0; margin:0; }
@@ -3089,31 +3722,34 @@ function html(
     .telemetry-strip-head { display:flex; justify-content:space-between; align-items:center; gap:8px; color:var(--muted); font-size:11px; text-transform:uppercase; }
     .telemetry-strip-head div { display:flex; gap:4px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
     .telemetry-line { display:grid; grid-template-columns:58px minmax(0,1fr) 52px; gap:8px; align-items:center; min-height:24px; font-size:12px; }
-    .telemetry-line > span:first-child { color:var(--muted); text-transform:uppercase; font-size:10px; }
+    .telemetry-line > span:first-child { color:var(--muted); text-transform:uppercase; font-size:11px; letter-spacing:0.05em; }
     .telemetry-line > span:last-child { text-align:right; font-family:var(--mono); color:var(--code-fg); }
     .telemetry-chart { width:100%; height:24px; display:block; overflow:visible; }
     .telemetry-chart polyline { fill:none; stroke:var(--accent); stroke-width:1.8; vector-effect:non-scaling-stroke; }
     .stop-form { padding:10px; }
     .bridge-grid { display:grid; gap:0; }
     .bridge-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:8px; align-items:center; padding:9px 10px; border-bottom:1px solid var(--line-soft); }
-    .bridge-row small { display:block; color:var(--muted); margin-top:2px; }
+    /* Label cell must survive wide siblings: keep it shrinkable and truncate
+       status/detail lines instead of letting them collide with the badge. */
+    .bridge-row > div { min-width:0; }
+    .bridge-row small { display:block; color:var(--muted); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .access-commands { display:grid; gap:8px; padding:10px; border-top:1px solid var(--line-soft); }
     .run-artifacts { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; padding:10px; }
     .run-shell .detail-grid { grid-template-columns:minmax(0,1fr) minmax(260px,0.42fr); }
     .run-shell .meta-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
     .run-shell .meta-grid div { padding:6px 10px; }
-    .run-shell .meta-grid dt { margin-bottom:2px; font-size:10px; }
+    .run-shell .meta-grid dt { margin-bottom:2px; font-size:11px; letter-spacing:0.05em; }
     .run-shell .meta-grid dd { font-size:13px; }
     .runner-shell .detail-grid { grid-template-columns:minmax(0,1fr) minmax(260px,0.64fr); }
     .detail-note { margin:0; padding:12px 14px; color:var(--muted); line-height:1.45; }
     .run-artifact-card .run-artifacts { gap:6px; padding:8px; }
-    .run-artifact-card .button { width:100%; }
+    .run-artifact-card .oc-action { width:100%; }
     .run-artifact-card .result-grid { grid-column:1 / -1; }
     .run-telemetry-panel { border-top:1px solid var(--line-soft); background:var(--panel-2); }
     .run-telemetry-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); }
     .run-metric { min-width:0; padding:7px 10px; border-right:1px solid var(--line-soft); }
     .run-metric:last-child { border-right:0; }
-    .run-metric span { display:block; color:var(--muted); font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }
+    .run-metric span { display:block; color:var(--muted); font-size:11px; letter-spacing:0.05em; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }
     .run-metric strong { display:block; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
     .run-metric small { display:block; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:11px; }
     .run-metric[data-muted="true"] { grid-column:1 / -1; }
@@ -3129,53 +3765,6 @@ function html(
     .failure-list li { padding:10px; border-bottom:1px solid var(--line-soft); }
     .failure-list small { display:block; color:var(--muted); margin-top:2px; }
     .failure-list p { margin-top:8px; color:var(--danger-fg); }
-    .pill { display:inline-flex; align-items:center; justify-content:center; min-height:22px; padding:0 7px; border-radius:999px; border:1px solid var(--line); color:var(--muted); background:var(--panel-2); font-size:11px; white-space:nowrap; }
-    .admin-pill { color:var(--accent-soft-fg); border-color:color-mix(in srgb, var(--accent) 42%, var(--line)); background:color-mix(in srgb, var(--accent) 12%, transparent); }
-    .pill[data-tone="ok"],.pill[data-state="active"] { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 35%, var(--line)); }
-    .pill[data-tone="warn"] { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 35%, var(--line)); }
-    .pill[data-tone="bad"],.pill[data-state="released"],.pill[data-state="expired"] { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); }
-    .icon-label { display:inline-flex; align-items:center; gap:7px; min-width:0; }
-    .icon-label svg { width:14px; height:14px; flex:0 0 14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; color:var(--icon); }
-    .icon-label span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .icon-label[data-provider="aws"] svg { color:#fbbf24; }
-    .icon-label[data-provider="azure"] svg { color:#60a5fa; }
-    .icon-label[data-provider="hetzner"] svg { color:#ef4444; }
-    .icon-label[data-provider="blacksmith-testbox"] svg { color:#a78bfa; }
-    .icon-label[data-target="linux"] svg { color:#34d399; }
-    .icon-label[data-target="windows"] svg { color:#38bdf8; }
-    .icon-label[data-target="macos"] svg { color:#d8b4fe; }
-    .actions-cell { display:flex; align-items:center; gap:5px; flex-wrap:nowrap; }
-    .access-cell { display:flex; align-items:center; gap:5px; min-width:0; }
-    .disabled-cell { color:var(--subtle); font-size:12px; }
-    .state-stack { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
-    .action-pill { max-width:100%; overflow:hidden; text-overflow:ellipsis; }
-    .actions-stack { display:grid; gap:2px; min-width:0; }
-    .actions-stack small { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:10px; }
-    .external-access { flex-wrap:nowrap; }
-    .external-access span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .capacity-row { background:color-mix(in srgb, var(--panel-2) 18%, transparent); }
-    .dedicated-link { display:grid; grid-template-columns:18px minmax(0,1fr); align-items:center; }
-    .dedicated-link .dedicated-mark { display:inline-flex; width:18px; height:18px; color:#fbbf24; }
-    .dedicated-link .dedicated-mark svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-    .access-icon { display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; border-radius:6px; border:1px solid var(--line); color:var(--icon); background:var(--inset); text-decoration:none; }
-    .access-icon svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-    .access-icon[data-access="vscode"] { color:#d8b4fe; }
-    .access-icon[data-access="vnc"] { color:#38bdf8; }
-    .access-icon:hover { border-color:var(--hover-line); background:var(--hover); }
-    .lease-release-form { display:flex; justify-content:flex-end; }
-    .lease-release { color:var(--muted); cursor:pointer; }
-    .lease-release[data-release-kind="managed"], .lease-release[data-release-kind="adapter"] { color:var(--bad); }
-    .lease-release:hover,.lease-release:focus-visible { border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); background:color-mix(in srgb, var(--bad) 12%, transparent); }
-    .lease-release:disabled { opacity:0.5; cursor:wait; }
-    .table-panel { min-height:0; display:grid; grid-template-rows:auto auto minmax(0,1fr) auto; overflow:hidden; }
-    .command-panel,.log-panel { min-height:0; overflow:hidden; }
-    .run-shell .table-panel { max-height:55dvh; }
-    .run-shell .log-panel { max-height:34dvh; }
-    .table-scroll { min-height:0; overflow:auto; }
-    .table-tools { display:grid; grid-template-columns:minmax(180px,320px) minmax(0,1fr) auto; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line-soft); background:var(--panel-2); }
-    .table-search { width:100%; height:28px; padding:0 9px; border:1px solid var(--line); border-radius:7px; background:var(--inset); color:var(--fg); font:inherit; font-size:12px; }
-    .table-search::placeholder { color:var(--subtle); }
-    .table-search:focus { outline:2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset:1px; border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); }
     .share-shell { height:auto; min-height:100dvh; align-content:start; grid-auto-rows:max-content; }
     .share-shell-embedded { width:100%; min-height:0; padding:0; gap:8px; }
     .share-shell .panel { align-self:start; }
@@ -3183,36 +3772,6 @@ function html(
     .share-form input,.share-form select { height:32px; min-width:0; padding:0 10px; border:1px solid var(--line); border-radius:7px; background:var(--inset); color:var(--fg); font:inherit; font-size:12px; }
     .share-form input:focus,.share-form select:focus { outline:2px solid color-mix(in srgb, var(--accent) 34%, transparent); outline-offset:1px; border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); }
     .share-form input { flex:1; }
-    .table-filters { display:flex; align-items:center; gap:3px; min-width:0; overflow-x:auto; padding:2px; border:1px solid var(--line); border-radius:7px; background:var(--inset); scrollbar-width:none; }
-    .table-filters::-webkit-scrollbar { display:none; }
-    .table-filter { flex:0 0 auto; min-height:22px; padding:0 7px; border:0; border-radius:5px; background:transparent; color:var(--muted); cursor:pointer; font:inherit; font-size:11px; }
-    .table-filter[aria-pressed="true"] { background:var(--panel); color:var(--fg); }
-    .table-filters-selects { display:grid; grid-template-columns:repeat(4,minmax(112px,1fr)); gap:6px; padding:0; border:0; background:transparent; overflow:visible; }
-    .table-filter-select { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:6px; min-width:0; }
-    .table-filter-select span { color:var(--muted); font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; }
-    .table-filter-select select { width:100%; height:28px; min-width:0; padding:0 8px; border:1px solid var(--line); border-radius:7px; background:var(--inset); color:var(--fg); font:inherit; font-size:12px; }
-    .table-filter-select select:focus { outline:2px solid color-mix(in srgb, var(--accent) 34%, transparent); outline-offset:1px; border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); }
-    .table-count { color:var(--muted); font-size:12px; white-space:nowrap; }
-    .table-footer { display:flex; justify-content:flex-end; align-items:center; gap:6px; min-height:36px; padding:5px 8px; background:var(--panel-2); }
-    .table-page { min-width:64px; color:var(--muted); font-size:12px; text-align:center; }
-    tr[hidden] { display:none; }
-    .external-row { color:var(--muted); background:color-mix(in srgb, var(--panel-2) 58%, transparent); }
-    .external-row td { border-bottom-color:var(--line-soft); }
-    .external-row .lease-link { color:var(--ext-fg); pointer-events:none; }
-    .external-row .lease-link strong::after { content:"external"; display:inline-flex; margin-left:8px; min-height:18px; align-items:center; padding:0 6px; border:1px solid var(--line); border-radius:999px; color:var(--ext-badge); font-size:10px; font-weight:700; text-transform:uppercase; vertical-align:middle; }
-    .external-row .icon-label svg { color:var(--ext-icon); }
-    .external-row .pill { opacity:0.82; }
-    .row-links { display:inline-flex; align-items:center; gap:5px; min-width:0; }
-    .row-link { display:inline-flex; align-items:center; min-height:22px; padding:0 7px; border:1px solid color-mix(in srgb, var(--accent) 36%, var(--line)); border-radius:6px; color:var(--accent-soft-fg); background:color-mix(in srgb, var(--accent) 9%, transparent); text-decoration:none; font-size:11px; font-weight:700; }
-    .row-link.secondary { color:var(--icon); border-color:var(--line); background:var(--inset); font-weight:600; }
-    .row-link:hover { border-color:color-mix(in srgb, var(--accent) 58%, var(--line)); background:color-mix(in srgb, var(--accent) 14%, transparent); }
-    .lease-table th:nth-child(1) { width:25%; }
-    .lease-table th:nth-child(2) { width:86px; }
-    .lease-table th:nth-child(3),.lease-table th:nth-child(4) { width:104px; }
-    .lease-table th:nth-child(5) { width:82px; }
-    .lease-table th:nth-child(6) { width:118px; }
-    .lease-table th:nth-child(7) { width:148px; }
-    .lease-table th:nth-child(8),.lease-table td:nth-child(8) { width:40px; padding-left:4px; padding-right:4px; text-align:right; }
     .run-table th:nth-child(2) { width:104px; }
     .run-table th:nth-child(3) { width:112px; }
     .run-table th:nth-child(4) { width:92px; }
@@ -3222,7 +3781,7 @@ function html(
     .event-table th:nth-child(2) { width:24%; }
     .event-table th:nth-child(3) { width:96px; }
     .event-table th:nth-child(4) { width:150px; }
-    .vnc-page { width:100vw; height:100vh; padding:0 12px 10px; display:grid; grid-template-rows:auto minmax(0,1fr) auto; gap:10px; overflow:auto; }
+    .vnc-page { width:100vw; height:100vh; padding:0 12px 10px; display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:auto minmax(0,1fr) auto; gap:10px; overflow:auto; }
     .vnc-bar { position:sticky; top:0; z-index:10; display:flex; align-items:center; justify-content:space-between; gap:14px; min-height:42px; margin:0 -12px; padding:6px 16px; border-bottom:1px solid var(--line); background:color-mix(in srgb, var(--panel) 92%, transparent); box-shadow:0 8px 24px rgba(0,0,0,0.25); }
     .vnc-meta { display:flex; align-items:baseline; gap:12px; min-width:0; }
     .vnc-meta h1 { font-size:18px; font-weight:700; letter-spacing:-0.01em; white-space:nowrap; }
@@ -3230,12 +3789,16 @@ function html(
     .vnc-meta .vnc-id { font-family:var(--mono); font-size:11px; opacity:0.85; }
     .vnc-meta .vnc-dot { width:3px; height:3px; border-radius:50%; background:var(--hover-line); flex-shrink:0; }
     .portal-actions { display:flex; align-items:center; justify-content:flex-end; gap:6px; flex-shrink:0; flex-wrap:wrap; }
-    .status-pill { display:inline-flex; align-items:center; gap:8px; height:32px; padding:0 12px 0 11px; border-radius:8px; background:var(--panel-2); border:1px solid var(--line); font-size:12px; color:var(--muted); white-space:nowrap; transition:color 0.2s, border-color 0.2s; }
-    .status-pill::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; box-shadow:0 0 0 3px color-mix(in srgb, currentColor 18%, transparent); flex-shrink:0; }
+    .vnc-bar .portal-actions { flex-shrink:1; max-width:100%; }
+    .status-pill { display:inline-flex; align-items:center; gap:8px; height:32px; padding:0 12px 0 11px; border-radius:7px; background:var(--panel-2); border:1px solid var(--line); font-size:12px; color:var(--muted); white-space:nowrap; transition:color 0.2s, border-color 0.2s; }
     .status-pill[data-tone="ok"] { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 35%, var(--line)); }
     .status-pill[data-tone="warn"] { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 35%, var(--line)); }
     .status-pill[data-tone="bad"] { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); }
     .vnc-control { min-width:112px; transition:background 0.15s,border-color 0.15s,color 0.15s; }
+    #vnc-sizing { width:142px; height:32px; padding:0 8px; font-size:12px; }
+    .vnc-display { min-width:0; min-height:0; display:flex; flex-direction:column; }
+    .vnc-display > .screen { flex:1; }
+    .vnc-sizing-notice { margin:0 0 8px; color:var(--warn); font-size:12px; overflow-wrap:anywhere; }
     .vnc-control[data-role="controller"]:disabled { opacity:1; cursor:default; color:var(--fg); border-color:var(--line); background:var(--panel-2); }
     .vnc-control[data-role="observer"] { color:var(--accent-soft-fg); border-color:color-mix(in srgb, var(--accent) 38%, var(--line)); background:color-mix(in srgb, var(--accent) 8%, transparent); }
     .icon-btn { display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; padding:0; border-radius:8px; background:transparent; color:var(--fg); border:1px solid var(--line); cursor:pointer; transition:background 0.15s, border-color 0.15s, color 0.15s; }
@@ -3259,7 +3822,7 @@ function html(
     .code-wait-card h2 { margin:0; font-size:22px; letter-spacing:0; }
     .code-wait-card p { max-width:62ch; color:var(--muted); font-size:14px; line-height:1.55; }
     .vnc-bridge { display:flex; align-items:center; gap:10px; padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
-    .vnc-bridge-label { font-size:10px; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); flex-shrink:0; padding-left:4px; }
+    .vnc-bridge-label { font-size:11px; letter-spacing:0.05em; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); flex-shrink:0; padding-left:4px; }
     .vnc-bridge-cmd { display:block; flex:1; min-width:0; padding:6px 10px; border:none; border-radius:5px; background:transparent; color:var(--code-fg); font-family:var(--mono); font-size:13px; overflow-x:auto; white-space:nowrap; }
     .vnc-share-dialog { width:min(640px, calc(100vw - 36px)); max-height:min(720px, calc(100dvh - 48px)); padding:0; border:1px solid var(--line); border-radius:12px; background:var(--panel); color:var(--fg); box-shadow:0 24px 90px rgba(0,0,0,0.58); overflow:hidden; }
     .vnc-share-dialog::backdrop { background:rgba(0,0,0,0.58); backdrop-filter:blur(2px); }
@@ -3273,7 +3836,7 @@ function html(
     .vnc-share-section { display:grid; gap:8px; }
     .vnc-share-list { display:grid; gap:2px; }
     .vnc-share-person,.vnc-share-access-row { display:grid; grid-template-columns:36px minmax(0,1fr) auto; gap:12px; align-items:center; min-height:48px; }
-    .vnc-share-avatar { display:grid; place-items:center; width:36px; height:36px; border-radius:50%; border:1px solid color-mix(in srgb, var(--accent) 32%, var(--line)); background:color-mix(in srgb, var(--accent) 13%, var(--panel-2)); color:var(--accent-soft-fg); font-size:10px; font-weight:800; text-transform:uppercase; }
+    .vnc-share-avatar { display:grid; place-items:center; width:36px; height:36px; border-radius:50%; border:1px solid color-mix(in srgb, var(--accent) 32%, var(--line)); background:color-mix(in srgb, var(--accent) 13%, var(--panel-2)); color:var(--accent-soft-fg); font-size:11px; letter-spacing:0.05em; font-weight:800; text-transform:uppercase; }
     .vnc-share-person-main,.vnc-share-access-text { min-width:0; }
     .vnc-share-person-main strong,.vnc-share-access-text strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
     .vnc-share-person-main span,.vnc-share-access-text span { display:block; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:12px; }
@@ -3292,8 +3855,189 @@ function html(
     .command-row small { display:block; color:var(--muted); margin-bottom:4px; text-transform:uppercase; font-size:11px; }
     .command-row code { min-width:0; white-space:pre; }
     .error { margin-top:20vh; padding:24px; display:grid; gap:12px; }
+    .lease-link { display:block; min-width:0; text-decoration:none; overflow:hidden; text-overflow:ellipsis; }
+    .lease-link strong { display:block; overflow:hidden; color:var(--fg); font-size:13.5px; font-weight:560; text-overflow:ellipsis; white-space:nowrap; transition:color .12s; }
+    .lease-link strong.mono { font-size:12.5px; font-weight:500; letter-spacing:-0.01em; }
+    .lease-link small { font-family:var(--mono); color:var(--subtle); }
+    a.lease-link:hover strong { color:var(--accent-ink); }
+    .mono { font-family:var(--mono); }
+    /* Badges come from the vendored carapace oc-badge family. Outside tables
+       they are soft pills; inside tables they collapse to a dot + label so a
+       column of states reads as a calm signal instead of a wall of boxes. */
+    .oc-badge { min-height:22px; padding:2px 9px; border-radius:999px; border-color:transparent; font-size:11.5px; font-weight:550; }
+    .oc-badge-neutral { background:var(--hover); color:var(--fg-2); }
+    .oc-badge-accent { color:var(--accent-ink); border-color:transparent; background:color-mix(in srgb, var(--accent) 14%, transparent); }
+    .oc-badge-accent::before { display:none; }
+    .oc-badge::before { display:none; }
+    td .oc-badge { min-height:0; padding:0; border:0; background:transparent; font-size:12.5px; font-weight:500; }
+    td .oc-badge-neutral { color:var(--muted); }
+    td .oc-badge-error { color:color-mix(in srgb, var(--bad) 80%, var(--muted)); }
+    td .oc-badge.action-pill { color:var(--muted); font-size:11.5px; }
+    td .oc-badge-warning.action-pill { color:var(--warn); }
+    .state-stack { display:grid; justify-items:start; gap:2px; min-width:0; line-height:1.25; }
+    td .state-stack .oc-badge.action-pill { max-width:100%; font-size:11.5px; }
+    .icon-label { display:inline-flex; align-items:center; gap:8px; min-width:0; }
+    .icon-label svg { width:15px; height:15px; flex:0 0 15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; color:var(--seg, var(--icon)); }
+    .icon-label span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .icon-label[data-target="linux"] svg { color:var(--t-linux); }
+    .icon-label[data-target="windows"] svg { color:var(--t-windows); }
+    .icon-label[data-target="macos"] svg { color:var(--t-macos); }
+    .actions-cell { display:flex; align-items:center; gap:5px; flex-wrap:nowrap; }
+    .access-cell { display:flex; align-items:center; gap:4px; min-width:0; }
+    .disabled-cell { color:var(--subtle); font-size:12px; }
+    .job-ref { color:var(--fg-2); font-family:var(--mono); font-size:12px; }
+    .runs-trend { display:flex; align-items:center; gap:10px; color:var(--muted); }
+    .runs-trend .oc-bars { width:96px; height:18px; }
+    .action-pill { max-width:100%; overflow:hidden; text-overflow:ellipsis; }
+    .actions-stack { display:grid; gap:2px; min-width:0; }
+    .actions-stack small { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:11px; }
+    .external-access { flex-wrap:nowrap; }
+    .external-access .icon-btn.mini { opacity:0; transition:opacity .12s; }
+    tr:hover .external-access .icon-btn.mini,.external-access .icon-btn.mini:focus-visible,.external-access .icon-btn.mini[data-state="ok"] { opacity:1; }
+    .dedicated-link { display:grid; grid-template-columns:22px minmax(0,1fr); align-items:center; }
+    .dedicated-link .dedicated-mark { display:inline-flex; width:18px; height:18px; color:var(--p-aws); }
+    .dedicated-link .dedicated-mark svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .access-icon { display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border-radius:8px; border:1px solid var(--line); color:var(--fg-2); background:transparent; text-decoration:none; transition:background-color .12s, border-color .12s, color .12s; }
+    .access-icon svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .access-icon[data-access="vscode"] { color:var(--t-macos); }
+    .access-icon[data-access="vnc"] { color:var(--t-windows); }
+    .access-icon:hover { border-color:var(--hover-line); background:var(--raised); color:var(--fg); }
+    .lease-release-form { display:flex; justify-content:flex-end; }
+    .lease-release { border-color:transparent; color:var(--subtle); cursor:pointer; opacity:0.6; }
+    tr:hover .lease-release,.lease-release:focus-visible { opacity:1; color:var(--bad); }
+    .lease-release:hover,.lease-release:focus-visible { border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); background:color-mix(in srgb, var(--bad) 12%, transparent); color:var(--bad); }
+    .lease-release:disabled { opacity:0.5; cursor:wait; }
+    .table-panel { min-height:0; display:grid; grid-template-rows:auto auto minmax(0,1fr) auto; overflow:hidden; }
+    .portal-shell[data-view="home"] .table-panel { display:block; }
+    .command-panel,.log-panel { min-height:0; overflow:hidden; }
+    .run-shell .table-panel { max-height:55dvh; }
+    .run-shell .log-panel { max-height:34dvh; }
+    .table-scroll { min-height:0; overflow:auto; border-top:1px solid var(--line-soft); }
+    .machine-table { min-width:900px; }
+    .machine-table th:nth-child(1) { width:18%; }
+    .machine-table th:nth-child(2) { width:16%; }
+    .machine-table th:nth-child(3) { width:22%; }
+    .machine-table th:nth-child(4) { width:14%; }
+    .machine-table th:nth-child(5) { width:18%; }
+    .machine-table td { white-space:normal; overflow-wrap:anywhere; }
+    .machine-table small { color:var(--muted); font-size:11.5px; }
+    .machine-table .lease-link small { display:block; }
+    .machine-leases { display:grid; gap:6px; }
+    /* Toolbar: search, a segmented state switch, compact filter chips. */
+    .table-tools { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px 18px 14px; }
+    .table-search-wrap { position:relative; display:flex; align-items:center; flex:1 1 240px; max-width:360px; }
+    .table-search-wrap svg { position:absolute; left:10px; width:15px; height:15px; fill:none; stroke:var(--muted); stroke-width:1.9; stroke-linecap:round; pointer-events:none; }
+    .table-search { width:100%; height:34px; padding:0 10px 0 32px; border:1px solid var(--line); border-radius:9px; background:var(--inset); color:var(--fg); font:inherit; font-size:13px; transition:border-color .12s, box-shadow .12s; }
+    .table-search::placeholder { color:var(--subtle); }
+    .table-search:focus { outline:0; border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+    .table-search::-webkit-search-cancel-button { filter:grayscale(1); opacity:0.6; }
+    .table-filters { display:flex; align-items:center; gap:6px; min-width:0; flex-wrap:wrap; }
+    .table-filters[hidden] { display:none; }
+    .segmented { display:inline-flex; gap:2px; padding:3px; border:1px solid var(--line); border-radius:10px; background:var(--inset); }
+    .table-filter { flex:0 0 auto; height:26px; padding:0 11px; border:0; border-radius:7px; background:transparent; color:var(--muted); cursor:pointer; font:inherit; font-size:12.5px; transition:color .12s, background-color .12s; }
+    .table-filter:hover { color:var(--fg); }
+    .table-filter[aria-pressed="true"] { background:var(--raised); color:var(--fg); box-shadow:0 1px 2px rgb(0 0 0 / 0.25), inset 0 0 0 1px var(--line); }
+    .table-filter-select { position:relative; display:inline-flex; min-width:0; }
+    .table-filter-select select { height:34px; min-width:0; padding:0 30px 0 11px; border:1px solid var(--line); border-radius:9px; background:transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none' stroke='%238d837d' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m1 1 4 4 4-4'/%3E%3C/svg%3E") no-repeat right 11px center; color:var(--fg-2); font:inherit; font-size:12.5px; cursor:pointer; appearance:none; -webkit-appearance:none; transition:border-color .12s, background-color .12s; }
+    .table-filter-select select:hover { border-color:var(--line-strong); }
+    .table-filter-select select:focus-visible { outline:0; border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+    .table-filter-select[data-active="true"] select { border-color:color-mix(in srgb, var(--accent) 45%, var(--line)); background-color:color-mix(in srgb, var(--accent) 9%, transparent); color:var(--accent-ink); }
+    .table-filter-select option { background:var(--surface); color:var(--fg); }
+    .table-meta { display:flex; align-items:center; gap:12px; margin-left:auto; }
+    .table-reset { height:26px; padding:0 4px; border:0; background:transparent; color:var(--accent-ink); cursor:pointer; font-size:12.5px; text-decoration:underline; text-decoration-color:color-mix(in srgb, var(--accent) 40%, transparent); text-underline-offset:3px; }
+    .table-reset[hidden] { display:none; }
+    .table-count { color:var(--muted); font-family:var(--mono); font-size:11.5px; white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .table-footer { display:flex; justify-content:flex-end; align-items:center; gap:6px; min-height:48px; padding:8px 18px; border-top:1px solid var(--line-soft); }
+    .table-footer[hidden] { display:none; }
+    .table-range { margin-right:auto; color:var(--muted); font-family:var(--mono); font-size:11.5px; font-variant-numeric:tabular-nums; }
+    .table-page { min-width:52px; color:var(--muted); font-family:var(--mono); font-size:11.5px; text-align:center; }
+    .icon-btn.pager svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round; }
+    .icon-btn.pager:disabled { opacity:0.35; cursor:default; background:transparent; }
+    tr[hidden] { display:none; }
+    td.empty { padding:56px 18px; text-align:center; white-space:normal; }
+    td.empty strong { display:block; margin-bottom:6px; font-size:15px; font-weight:600; }
+    td.empty span { color:var(--muted); }
+    td.empty code { display:inline; padding:1px 6px; border-radius:5px; font-size:12px; }
+    .external-row td { border-bottom-color:var(--line-soft); }
+    .external-row .lease-link strong::after { content:"external"; display:inline-block; margin-left:8px; vertical-align:1px; padding:1px 6px; border-radius:5px; background:var(--hover); color:var(--muted); font-family:var(--sans); font-size:10.5px; font-weight:500; letter-spacing:0; }
+    .row-links { display:inline-flex; align-items:center; gap:4px; min-width:0; }
+    .row-link { display:inline-flex; align-items:center; height:24px; padding:0 8px; border:1px solid color-mix(in srgb, var(--accent) 30%, var(--line)); border-radius:7px; color:var(--accent-ink); background:color-mix(in srgb, var(--accent) 8%, transparent); text-decoration:none; font-size:11.5px; font-weight:550; transition:background-color .12s, border-color .12s; }
+    .row-link::after { content:"↗"; margin-left:3px; opacity:0.6; font-size:10px; }
+    .row-link.secondary { color:var(--fg-2); border-color:var(--line); background:transparent; font-weight:500; }
+    .row-link:hover { border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); background:color-mix(in srgb, var(--accent) 14%, transparent); }
+    .row-link.secondary:hover { border-color:var(--line-strong); background:var(--hover); }
+    .lease-table th:nth-child(1) { width:30%; }
+    .lease-table th:nth-child(2) { width:150px; }
+    .lease-table th:nth-child(3) { width:120px; }
+    .lease-table th:nth-child(4) { width:104px; }
+    .lease-table th:nth-child(5) { width:104px; }
+    .lease-table th:nth-child(6) { width:150px; }
+    .lease-table th:nth-child(7),.lease-table td:nth-child(7) { width:92px; text-align:right; }
+    .lease-table td:nth-child(7) { color:var(--muted); font-family:var(--mono); font-size:11.5px; font-variant-numeric:tabular-nums; }
+    .lease-table th:nth-child(8),.lease-table td:nth-child(8) { width:56px; padding-left:4px; text-align:right; }
+    /* Admin pages: underline tabs, readout strip, provider cards. */
+    .admin-shell { height:auto; min-height:100dvh; align-content:start; align-items:start; grid-template-rows:auto auto auto auto; overflow:visible; }
+    .admin-shell > * { width:100%; }
+    .admin-tabs { display:flex; gap:22px; border-bottom:1px solid var(--line); }
+    .admin-tabs a { display:inline-flex; align-items:center; height:38px; margin-bottom:-1px; border-bottom:2px solid transparent; color:var(--muted); text-decoration:none; font-size:13px; font-weight:500; transition:color .12s, border-color .12s; }
+    .admin-tabs a[data-active="true"] { color:var(--fg); border-bottom-color:var(--accent); }
+    .admin-tabs a:hover { color:var(--fg); }
+    .admin-status-strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:1px; border:1px solid var(--line); border-radius:14px; background:var(--line-soft); overflow:hidden; box-shadow:var(--panel-shadow); }
+    .admin-metric { min-width:0; padding:13px 16px; background:var(--surface); }
+    .admin-metric span { display:block; margin-bottom:4px; color:var(--muted); font-size:12px; }
+    .admin-metric strong { display:block; min-width:0; overflow-wrap:anywhere; font-family:var(--mono); font-size:13px; font-weight:500; line-height:1.4; }
+    /* Detail pages: retire the old uppercase label voice. */
+    .meta-grid dt,.result-grid dt,.command-row small,.telemetry-strip-head,.telemetry-line > span:first-child,.run-metric span,.vnc-bridge-label,.code-wait-kicker,.portal-dialog-head small { text-transform:none; letter-spacing:0; font-size:12px; font-weight:500; }
+    .meta-grid div { padding:10px 18px; }
+    .meta-grid dd { color:var(--fg); }
+    .admin-metric[data-tone="ok"] strong { color:var(--ok); }
+    .admin-metric[data-tone="warn"] strong { color:var(--warn); }
+    .admin-metric[data-tone="bad"] strong { color:var(--bad); }
+    .admin-kicker { color:var(--muted); font-size:12px; font-weight:500; }
+    .provider-status-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; padding:14px; }
+    .provider-status-card { min-width:0; display:grid; grid-template-rows:auto auto auto 1fr; gap:12px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--surface-2); }
+    .provider-status-card[data-tone="warning"] { border-color:color-mix(in srgb, var(--warn) 38%, var(--line)); }
+    .provider-status-card[data-tone="bad"] { border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); background:linear-gradient(180deg, color-mix(in srgb, var(--bad) 7%, var(--surface-2)), var(--surface-2) 55%); }
+    .provider-status-card[data-tone="disabled"] { opacity:0.55; }
+    .provider-status-head { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:10px; align-items:center; }
+    .provider-favicon { width:32px; height:32px; display:grid; place-items:center; border-radius:9px; background:color-mix(in srgb, var(--seg, var(--icon)) 14%, transparent); color:var(--seg, var(--icon)); }
+    .provider-favicon svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .provider-status-title { min-width:0; display:grid; gap:2px; }
+    .provider-status-title strong,.provider-status-title span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .provider-status-title > span { display:flex; gap:6px; align-items:center; color:var(--muted); font-size:12px; }
+    .traffic-light { display:none; }
+    .provider-status-meta { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:0; border-block:1px solid var(--line-soft); }
+    .provider-status-meta div { min-width:0; padding:9px 0; }
+    .provider-status-meta dt { margin:0 0 2px; color:var(--muted); font-size:11.5px; }
+    .provider-status-meta dd { margin:0; overflow:hidden; color:var(--fg); font-family:var(--mono); font-size:14px; text-overflow:ellipsis; white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .provider-status-card p { margin:0; color:var(--muted); font-size:12.5px; overflow-wrap:anywhere; }
+    .provider-status-card[data-tone="bad"] p { color:var(--danger-fg); }
+    .provider-status-actions { display:flex; gap:4px; flex-wrap:wrap; align-self:end; }
+    .provider-status-actions a,.provider-status-actions button { min-height:26px; display:inline-flex; align-items:center; padding:0 9px; border:1px solid var(--line); border-radius:7px; color:var(--fg-2); background:transparent; text-decoration:none; font-size:12px; }
+    .provider-status-actions a:hover { color:var(--fg); background:var(--hover); border-color:var(--hover-line); }
+    .provider-status-actions button:disabled { opacity:0.5; cursor:not-allowed; }
+    .admin-full-panel { min-height:0; max-height:none; }
+    .admin-filter-row { display:flex; gap:6px; flex-wrap:wrap; padding:10px 18px; border-bottom:1px solid var(--line-soft); }
+    .admin-filter-chip { min-height:30px; display:inline-flex; align-items:center; gap:7px; padding:0 11px; border:1px solid var(--line); border-radius:9px; color:var(--fg-2); text-decoration:none; font-size:12.5px; }
+    .admin-filter-chip svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; color:var(--seg, var(--icon)); }
+    .admin-filter-chip[data-active="true"] { color:var(--fg); background:var(--surface-2); border-color:var(--line-strong); }
+    .admin-filter-chip:hover { color:var(--fg); background:var(--hover); }
+    .admin-user-table th:nth-child(2),.admin-user-table td:nth-child(2),.admin-user-table th:nth-child(3),.admin-user-table td:nth-child(3) { text-align:right; font-family:var(--mono); }
+    .admin-lease-table th:last-child,.admin-lease-table td:last-child { width:56px; text-align:right; }
+    .admin-eject-form { display:flex; justify-content:flex-end; }
+    .admin-eject { width:28px; height:28px; display:grid; place-items:center; border:1px solid transparent; border-radius:8px; background:transparent; color:var(--subtle); cursor:pointer; }
+    .admin-eject:hover,.admin-eject:focus-visible { color:var(--bad); border-color:color-mix(in srgb, var(--bad) 45%, var(--line)); background:color-mix(in srgb, var(--bad) 12%, transparent); }
+    .admin-split { border:1px solid var(--line); border-radius:14px; background:var(--surface); box-shadow:var(--panel-shadow); }
+    .admin-split .tide { border-top:0; }
+    a.tide-key { text-decoration:none; }
+    @keyframes portal-rise { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+    .portal-shell[data-view="home"] > .admin-bar,.portal-shell[data-view="home"] > .fleet-overview,.portal-shell[data-view="home"] > .fleet-panel { animation:portal-rise .45s cubic-bezier(.2,.7,.2,1) both; }
+    .portal-shell[data-view="home"] > .fleet-overview { animation-delay:.05s; }
+    .portal-shell[data-view="home"] > .fleet-panel { animation-delay:.1s; }
+    @media (prefers-reduced-motion: reduce) {
+      *,*::before,*::after { animation:none !important; transition:none !important; }
+    }
     @media (max-width: 980px) {
-      .admin-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
       .admin-status-strip { grid-template-columns:repeat(2,minmax(0,1fr)); }
       .admin-two-col { grid-template-columns:1fr; }
       .run-shell .detail-grid { grid-template-columns:1fr; }
@@ -3302,12 +4046,19 @@ function html(
       .run-telemetry-trends { grid-template-columns:1fr; }
       .run-telemetry-trends .telemetry-line { border-right:0; border-bottom:1px solid var(--line-soft); }
       .run-telemetry-trends .telemetry-line:last-child { border-bottom:0; }
+      .lease-table th:nth-child(4),.lease-table td:nth-child(4),.lease-table th:nth-child(5),.lease-table td:nth-child(5) { display:none; }
+      .table-meta { margin-left:0; }
     }
     @media (max-width: 760px) {
       main { width:min(100vw - 20px, 1180px); padding:10px 0; }
-      .portal-shell { width:min(100vw - 12px, 1180px); height:auto; min-height:100dvh; overflow:visible; }
+      .portal-shell { width:calc(100vw - 24px); height:auto; min-height:100dvh; overflow:visible; }
       .lease-shell,.run-shell { grid-template-rows:auto; }
       th:nth-child(4),td:nth-child(4),th:nth-child(6),td:nth-child(6){ display:none; }
+      .lease-table th:nth-child(3),.lease-table td:nth-child(3) { display:none; }
+      .lease-table th:nth-child(1) { width:auto; }
+      .lease-table th:nth-child(2) { width:104px; }
+      .lease-table th:nth-child(7),.lease-table td:nth-child(7) { width:76px; padding-left:4px; }
+      .lease-table th:nth-child(8),.lease-table td:nth-child(8) { width:40px; }
       .detail-grid { grid-template-columns:1fr; }
       .meta-grid { grid-template-columns:1fr; }
       .run-shell .meta-grid { grid-template-columns:1fr; }
@@ -3316,20 +4067,30 @@ function html(
       .result-grid { grid-template-columns:1fr; }
       .bridge-row { grid-template-columns:1fr; align-items:start; }
       .table-panel { max-height:none; }
-      .table-scroll { max-height:65dvh; }
-      .table-tools { grid-template-columns:1fr; align-items:stretch; }
-      .table-filters { justify-content:stretch; }
-      .table-filter { flex:1; }
-      .table-filters-selects { grid-template-columns:repeat(2,minmax(0,1fr)); }
-      .table-filter-select { grid-template-columns:1fr; gap:2px; }
-      .table-footer { justify-content:space-between; }
-      .top{align-items:flex-start;}
+      .table-scroll { max-height:none; }
+      .table-tools { padding:6px 12px 12px; }
+      .table-search-wrap { max-width:none; flex-basis:100%; }
+      .segmented { width:100%; }
+      .segmented .table-filter { flex:1; padding:0 6px; }
+      .table-filters { width:100%; }
+      .table-filter-select { flex:1 1 calc(50% - 6px); }
+      .table-filter-select select { width:100%; }
+      th:first-child,td:first-child { padding-left:12px; }
+      th:last-child,td:last-child { padding-right:12px; }
+      .top { align-items:center; min-height:54px; }
+      .top .portal-header-meta p { display:none; }
+      .fleet-tiles { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .fleet-tile { padding:13px 14px; }
+      .fleet-tile-value { font-size:26px; }
+      .tide { padding:12px 14px; }
+      .admin-bar { flex-wrap:wrap; gap:6px 10px; }
+      .admin-bar-scope { flex:1 1 60%; }
+      .admin-bar-links { margin-left:0; flex-wrap:wrap; }
       .vnc-bar { flex-wrap:wrap; gap:8px; min-height:0; padding:6px 10px; margin:0 -12px; }
       .vnc-meta { flex-wrap:wrap; gap:4px 10px; }
       .vnc-meta p .vnc-id { display:none; }
       .portal-actions { gap:6px; }
-      .portal-actions .button { min-height:30px; padding:0 10px; }
-      .admin-grid { grid-template-columns:1fr; }
+      .portal-actions .oc-action { min-height:30px; padding:0 10px; }
       .admin-status-strip { grid-template-columns:1fr; }
       .provider-lease-list li { grid-template-columns:1fr; align-items:start; }
       .vnc-share-dialog { width:calc(100vw - 20px); }
@@ -3358,8 +4119,8 @@ function html(
         </label>
       </div>
       <div class="portal-dialog-actions">
-        <button id="portal-dialog-cancel" class="button secondary" type="button">cancel</button>
-        <button id="portal-dialog-confirm" class="button" type="button">confirm</button>
+        <button id="portal-dialog-cancel" class="oc-action oc-action-outline" type="button">cancel</button>
+        <button id="portal-dialog-confirm" class="oc-action oc-action-primary" type="button">confirm</button>
       </div>
     </div>
   </dialog>
@@ -3377,7 +4138,7 @@ function html(
           `frame-ancestors ${options.frameAncestors ?? "'none'"}`,
           "img-src 'self' data: blob:",
           `script-src ${scriptSource}`,
-          "style-src 'unsafe-inline'",
+          "style-src 'self' 'unsafe-inline'",
         ].join("; "),
         "content-type": "text/html; charset=utf-8",
       },
@@ -3411,7 +4172,7 @@ function portalEnhancementsScript(): string {
       btn.setAttribute("title", "Theme: " + source);
     });
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", dark ? "#0b0d0f" : "#f4f6f8");
+    if (meta) meta.setAttribute("content", dark ? "#0c0a09" : "#f6f2ed");
     window.dispatchEvent(new CustomEvent("crabbox-theme-change", { detail: { source, mode } }));
   }
   applyTheme(themeRoot.dataset.themeSource || storedTheme());
@@ -3678,13 +4439,43 @@ function portalEnhancementsScript(): string {
     filters.className = "table-filters";
     filters.hidden = filterButtons.length === 0 && filterGroups.length === 0;
     const filterControls = [];
+    function segmented(options, current, onPick, label) {
+      const wrap = document.createElement("div");
+      wrap.className = "segmented";
+      wrap.setAttribute("role", "group");
+      wrap.setAttribute("aria-label", label);
+      const buttons = options.map((option) => {
+        const button = document.createElement("button");
+        button.className = "table-filter";
+        button.type = "button";
+        button.dataset.value = option.value;
+        button.textContent = option.value === "all" ? "all" : option.label;
+        button.addEventListener("click", () => onPick(option.value));
+        wrap.append(button);
+        return button;
+      });
+      return { wrap, sync(value) { buttons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.value === value))); } };
+    }
     if (filterGroups.length > 0) {
       filters.classList.add("table-filters-selects");
       filterGroups.forEach((group) => {
+        const initial = group.options.some((option) => option.value === group.defaultValue)
+          ? group.defaultValue
+          : "all";
+        selectedGroups.set(group.key, initial);
+        const pick = (value) => {
+          selectedGroups.set(group.key, value);
+          page = 1;
+          apply();
+        };
+        if (group.key === "state") {
+          const control = segmented(group.options, initial, pick, group.label + " filter");
+          filters.prepend(control.wrap);
+          filterControls.push({ group, sync: control.sync });
+          return;
+        }
         const label = document.createElement("label");
         label.className = "table-filter-select";
-        const labelText = document.createElement("span");
-        labelText.textContent = group.label;
         const select = document.createElement("select");
         select.setAttribute("aria-label", group.label + " filter");
         group.options.forEach((option) => {
@@ -3693,50 +4484,89 @@ function portalEnhancementsScript(): string {
           element.textContent = option.label;
           select.append(element);
         });
-        select.value = group.options.some((option) => option.value === group.defaultValue)
-          ? group.defaultValue
-          : "all";
-        selectedGroups.set(group.key, select.value);
-        select.addEventListener("change", () => {
-          selectedGroups.set(group.key, select.value);
-          page = 1;
-          apply();
-        });
-        label.append(labelText, select);
+        select.value = initial;
+        select.addEventListener("change", () => pick(select.value));
+        label.append(select);
         filters.append(label);
-        filterControls.push({ group, select });
-      });
-    } else {
-      filterButtons.forEach((filter) => {
-        const button = document.createElement("button");
-        button.className = "table-filter";
-        button.type = "button";
-        button.textContent = filter.label;
-        button.addEventListener("click", () => {
-          selectedFilter = filter.value;
-          page = 1;
-          apply();
+        filterControls.push({
+          group,
+          sync(value) {
+            select.value = value;
+            label.dataset.active = String(value !== "all");
+          },
         });
-        filters.append(button);
-        filterControls.push({ ...filter, button });
       });
+    } else if (filterButtons.length > 0) {
+      const control = segmented(filterButtons, selectedFilter, (value) => {
+        selectedFilter = value;
+        page = 1;
+        apply();
+      }, "filter");
+      filters.append(control.wrap);
+      filterControls.push({ sync: () => control.sync(selectedFilter) });
     }
+    const reset = document.createElement("button");
+    reset.className = "table-reset";
+    reset.type = "button";
+    reset.textContent = "reset";
+    reset.hidden = true;
+    reset.addEventListener("click", () => {
+      filterGroups.forEach((group) => selectedGroups.set(group.key, group.defaultValue));
+      selectedFilter = table.dataset.filterDefault || "all";
+      input.value = "";
+      query = "";
+      page = 1;
+      apply();
+    });
     const count = document.createElement("span");
     count.className = "table-count";
-    tools.append(input, filters, count);
+    const searchWrap = document.createElement("label");
+    searchWrap.className = "table-search-wrap";
+    searchWrap.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>';
+    searchWrap.append(input);
+    const meta = document.createElement("div");
+    meta.className = "table-meta";
+    meta.append(reset, count);
+    tools.append(searchWrap, filters, meta);
+    const presets = filterGroups.length > 0 && index === 0
+      ? Array.from(document.querySelectorAll("[data-filter-preset]"))
+      : [];
+    function parsePreset(element) {
+      const values = new Map();
+      (element.dataset.filterPreset || "").split(",").forEach((pair) => {
+        const at = pair.indexOf(":");
+        if (at > 0) values.set(pair.slice(0, at), pair.slice(at + 1));
+      });
+      return values;
+    }
+    presets.forEach((element) => {
+      element.addEventListener("click", () => {
+        const values = parsePreset(element);
+        const already = element.getAttribute("aria-pressed") === "true";
+        filterGroups.forEach((group) => {
+          selectedGroups.set(group.key, already ? group.defaultValue : values.get(group.key) || "all");
+        });
+        page = 1;
+        apply();
+      });
+    });
     const footer = document.createElement("div");
     footer.className = "table-footer";
+    const range = document.createElement("span");
+    range.className = "table-range";
     const prev = document.createElement("button");
-    prev.className = "button secondary";
+    prev.className = "icon-btn pager";
     prev.type = "button";
-    prev.textContent = "prev";
+    prev.setAttribute("aria-label", "previous page");
+    prev.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 6-6 6 6 6"/></svg>';
     const pageLabel = document.createElement("span");
     pageLabel.className = "table-page";
     const next = document.createElement("button");
-    next.className = "button secondary";
+    next.className = "icon-btn pager";
     next.type = "button";
-    next.textContent = "next";
-    footer.append(prev, pageLabel, next);
+    next.setAttribute("aria-label", "next page");
+    next.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 6 6 6-6 6"/></svg>';
+    footer.append(range, prev, pageLabel, next);
     const tableScroll = document.createElement("div");
     tableScroll.className = "table-scroll";
     table.before(tools);
@@ -3809,11 +4639,23 @@ function portalEnhancementsScript(): string {
       generatedEmpty.hidden = dataRows.length === 0 || filtered.length > 0;
       if (originalEmpty) originalEmpty.hidden = dataRows.length > 0;
       filterControls.forEach((filter) => {
-        if (filter.button) {
-          filter.button.setAttribute("aria-pressed", String(filter.value === selectedFilter));
-        }
+        filter.sync(filter.group ? selectedGroups.get(filter.group.key) || "all" : selectedFilter);
+      });
+      const dirty = query !== "" ||
+        filterGroups.some((group) => (selectedGroups.get(group.key) || "all") !== group.defaultValue) ||
+        (filterGroups.length === 0 && selectedFilter !== (table.dataset.filterDefault || "all"));
+      reset.hidden = !dirty;
+      presets.forEach((element) => {
+        const values = parsePreset(element);
+        const match = filterGroups.every(
+          (group) => (selectedGroups.get(group.key) || "all") === (values.get(group.key) || "all"),
+        );
+        element.setAttribute("aria-pressed", String(match && query === ""));
       });
       count.textContent = dataRows.length ? filtered.length + " of " + dataRows.length : "0";
+      range.textContent = filtered.length
+        ? (start + 1) + "–" + Math.min(start + pageSize, filtered.length) + " of " + filtered.length
+        : "nothing matches";
       pageLabel.textContent = page + " / " + pages;
       prev.disabled = page <= 1;
       next.disabled = page >= pages;
@@ -3878,6 +4720,12 @@ function compactAge(value: string | undefined): string {
 
 function leaseSortTime(lease: LeaseRecord): string {
   return lease.endedAt || lease.releasedAt || lease.updatedAt || lease.expiresAt || lease.createdAt;
+}
+
+function portalSSHAddress(lease: LeaseRecord): string {
+  if (!lease.sshPort) return "pending";
+  const user = lease.provider === "daytona" ? "<token>" : lease.sshUser || "crabbox";
+  return `${user}@${lease.host || "host"}:${lease.sshPort}`;
 }
 
 function formatDuration(value: number | undefined): string {

@@ -7,28 +7,43 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-func (b *backend) execContext(ctx context.Context) (context.Context, context.CancelFunc) {
+func (b *backend) execTimeout() (time.Duration, error) {
 	if b.cfg.AgentSandbox.ExecTimeoutSecs == 0 {
-		return context.WithCancel(ctx)
+		return 0, nil
 	}
-	return context.WithTimeout(ctx, time.Duration(b.cfg.AgentSandbox.ExecTimeoutSecs)*time.Second)
+	if timeout, ok := shared.SecondsWithGrace(int64(b.cfg.AgentSandbox.ExecTimeoutSecs), 0); ok {
+		return timeout, nil
+	}
+	return 0, core.Exit(2, "agent-sandbox execution timeout exceeds the supported duration range")
+}
+
+func (b *backend) execContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	timeout, err := b.execTimeout()
+	if err != nil {
+		return nil, nil, err
+	}
+	if timeout == 0 {
+		child, cancel := context.WithCancel(ctx)
+		return child, cancel, nil
+	}
+	child, cancel := context.WithTimeout(ctx, timeout)
+	return child, cancel, nil
 }
 
 func (b *backend) cleanupContext(context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), agentSandboxCleanupTimeout)
 }
 
-func (b *backend) now() time.Time {
-	if b.rt.Clock != nil {
-		return b.rt.Clock.Now()
-	}
-	return time.Now()
-}
-
 func (b *backend) execShell(ctx context.Context, client kubernetesClient, ready sandboxReadiness, command string) error {
-	execCtx, cancel := b.execContext(ctx)
+	execCtx, cancel, err := b.execContext(ctx)
+	if err != nil {
+		return err
+	}
 	defer cancel()
 	if err := b.execPod(execCtx, client, ready, podExecRequest{
 		Command: []string{"sh", "-lc", command},
@@ -36,29 +51,34 @@ func (b *backend) execShell(ctx context.Context, client kubernetesClient, ready 
 		Stderr:  b.rt.Stderr,
 	}); err != nil {
 		if code, ok := remoteExitStatus(err); ok {
-			return exit(code, "agent-sandbox exec %q exited %d", command, code)
+			return core.Exit(code, "agent-sandbox exec %q exited %d", command, code)
 		}
 		return err
 	}
 	return nil
 }
 
-func (b *backend) runCommand(ctx context.Context, client kubernetesClient, ready sandboxReadiness, req RunRequest, workdir string) (int, error) {
-	command, err := buildCommand(req.Command, req.ShellMode)
+func (b *backend) runCommand(ctx context.Context, client kubernetesClient, ready sandboxReadiness, req core.RunRequest, workdir string) (int, error) {
+	req.Observation.Phase(core.RunPhaseCommand)
+	stdout, stderr := req.Observation.CommandWriters(b.rt.Stdout, b.rt.Stderr, core.RunOutputProvider)
+	intent, err := core.ParseCommandIntent(req.Command, req.ShellMode, req.CommandLiteralArgs)
 	if err != nil {
 		return 0, err
 	}
 	if req.EnvSummary || strings.TrimSpace(os.Getenv("CRABBOX_ENV_ALLOW")) != "" {
-		printEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, req.Env)
+		core.PrintEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, req.Env)
 	}
-	script := remoteCommandScript(workdir, req.Env, command)
-	execCtx, cancel := b.execContext(ctx)
+	script := shared.ShellWorkspaceCommand(workdir, req.Env, intent, "bash", "-lc")
+	execCtx, cancel, err := b.execContext(ctx)
+	if err != nil {
+		return 2, err
+	}
 	defer cancel()
 	err = b.execPod(execCtx, client, ready, podExecRequest{
 		Command: []string{"sh", "-s"},
 		Stdin:   strings.NewReader(script),
-		Stdout:  b.rt.Stdout,
-		Stderr:  b.rt.Stderr,
+		Stdout:  stdout,
+		Stderr:  stderr,
 	})
 	if err == nil {
 		return 0, nil
@@ -89,62 +109,4 @@ func remoteExitStatus(err error) (int, bool) {
 		return code, true
 	}
 	return 0, false
-}
-
-func buildCommand(command []string, shellMode bool) ([]string, error) {
-	if len(command) == 0 {
-		return nil, errors.New("missing command")
-	}
-	if shellMode {
-		return []string{"bash", "-lc", strings.Join(command, " ")}, nil
-	}
-	if shouldUseShell(command) || leadingEnvAssignment(command) {
-		if len(command) == 1 {
-			return []string{"bash", "-lc", command[0]}, nil
-		}
-		return []string{"bash", "-lc", shellScriptFromArgv(command)}, nil
-	}
-	return command, nil
-}
-
-func leadingEnvAssignment(command []string) bool {
-	return len(command) > 1 && strings.Contains(command[0], "=") && !strings.HasPrefix(command[0], "-")
-}
-
-func remoteCommandScript(workdir string, env map[string]string, command []string) string {
-	var b strings.Builder
-	b.WriteString("mkdir -p ")
-	b.WriteString(shellQuote(workdir))
-	b.WriteString(" && cd ")
-	b.WriteString(shellQuote(workdir))
-	for key, value := range env {
-		if !validShellEnvName(key) {
-			continue
-		}
-		b.WriteString(" && export ")
-		b.WriteString(key)
-		b.WriteString("=")
-		b.WriteString(shellQuote(value))
-	}
-	b.WriteString(" && exec ")
-	b.WriteString(shellScriptFromArgv(command))
-	return b.String()
-}
-
-func validShellEnvName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i, r := range name {
-		if i == 0 {
-			if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_') {
-				return false
-			}
-			continue
-		}
-		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-			return false
-		}
-	}
-	return true
 }

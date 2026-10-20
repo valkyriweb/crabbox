@@ -2,25 +2,92 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import { awsLaunchCandidates } from "../src/aws";
+import { azureProvisioningCandidatesForConfig } from "../src/azure";
 import {
   awsMacOSInstanceTypeCandidates,
   awsARM64InstanceTypeCandidatesForClass,
+  awsInstanceTypeCandidatesForArchitectureClass,
   awsInstanceTypeCandidatesForClass,
   awsInstanceTypeCandidatesForTargetClass,
   azureARM64VMSizeCandidatesForClass,
+  azureFullCachingSeriesEligible,
   azureWindowsVMSizeCandidatesForClass,
+  azureVMSizeCandidatesForArchitectureClass,
   azureVMSizeCandidatesForClass,
   azureVMSizeCandidatesForTargetClass,
   gcpMachineTypeCandidatesForClass,
+  gcpBootDiskTypeForMachineType,
+  gcpHyperdiskOnlyFamilies,
   leaseConfig,
+  parseTarget,
   serverTypeCandidatesForClass,
   serverTypeForClass,
   serverTypeForProviderClass,
   sshPorts,
   validCIDRs,
 } from "../src/config";
+import { gcpProvisioningCandidatesForConfig } from "../src/gcp";
+import { hetznerProvisioningCandidatesForConfig } from "../src/hetzner";
 
 describe("machine class config", () => {
+  it("normalizes optional resource minimums without changing unconstrained config", () => {
+    const input = { provider: "aws" as const, sshPublicKey: "ssh-ed25519 test" };
+    expect(leaseConfig({ ...input, capacity: { minVCPUs: 0, minMemoryMiB: 0 } })).toEqual(
+      leaseConfig(input),
+    );
+    expect(
+      leaseConfig({ ...input, capacity: { minVCPUs: 4, minMemoryMiB: 15360 } })
+        .capacityRequirements,
+    ).toEqual({ minVCPUs: 4, minMemoryMiB: 15360 });
+    expect(() => leaseConfig({ ...input, provider: "azure", capacity: { minVCPUs: 4 } })).toThrow(
+      /provider=aws and target=linux/,
+    );
+    expect(() => leaseConfig({ ...input, target: "windows", capacity: { minVCPUs: 4 } })).toThrow(
+      /provider=aws and target=linux/,
+    );
+  });
+
+  it.each([-1, 1.5, NaN, Infinity, 2147483648, "4", null])(
+    "rejects invalid capacity minimum %s",
+    (value) => {
+      for (const name of ["minVCPUs", "minMemoryMiB"] as const) {
+        expect(() =>
+          leaseConfig({
+            provider: "aws",
+            sshPublicKey: "ssh-ed25519 test",
+            capacity: { [name]: value as number },
+          }),
+        ).toThrow(/must be an integer/);
+      }
+    },
+  );
+
+  it("parses an AWS stock image source", () => {
+    expect(
+      leaseConfig({
+        provider: "aws",
+        sshPublicKey: "ssh-ed25519 test",
+        awsUseStockImage: true,
+      }).awsUseStockImage,
+    ).toBe(true);
+  });
+
+  it("uses active vCPUs for constrained Azure full-caching sizes", () => {
+    expect(azureFullCachingSeriesEligible("Standard_E8-4ds_v5")).toBe(false);
+    expect(azureFullCachingSeriesEligible("Standard_E16-8ds_v5")).toBe(true);
+  });
+
+  const classCandidateSelectors = [
+    serverTypeCandidatesForClass,
+    (value: string) => awsInstanceTypeCandidatesForArchitectureClass("amd64", value),
+    awsARM64InstanceTypeCandidatesForClass,
+    (value: string) => azureVMSizeCandidatesForArchitectureClass("amd64", value),
+    azureARM64VMSizeCandidatesForClass,
+    azureWindowsVMSizeCandidatesForClass,
+    gcpMachineTypeCandidatesForClass,
+  ];
+
   it("maps known classes to preferred Hetzner candidates", () => {
     expect(serverTypeForClass("beast")).toBe("ccx63");
     expect(serverTypeCandidatesForClass("beast")).toEqual([
@@ -36,6 +103,47 @@ describe("machine class config", () => {
     expect(serverTypeCandidatesForClass("cpx62")).toEqual(["cpx62"]);
   });
 
+  it("preserves uppercase, padded, and unknown class literals", () => {
+    for (const machineClass of ["", "FAST", " fast ", "custom-shape", "constructor", "__proto__"]) {
+      for (const selector of classCandidateSelectors) {
+        expect(selector(machineClass)).toEqual([machineClass]);
+      }
+    }
+    for (const machineClass of ["FAST", " fast ", "custom-shape"]) {
+      expect(
+        awsLaunchCandidates({
+          serverType: "",
+          serverTypeExplicit: false,
+          class: machineClass,
+          target: "linux",
+          windowsMode: "normal",
+          architecture: "amd64",
+        }),
+      ).toEqual([machineClass, "t3.small"]);
+    }
+  });
+
+  it("returns fresh candidate arrays for known and custom classes", () => {
+    for (const selector of classCandidateSelectors) {
+      for (const machineClass of ["tiny", "custom-shape"]) {
+        const candidates = selector(machineClass);
+        const saved = [...candidates];
+        candidates[0] = "mutated";
+        expect(selector(machineClass)).toEqual(saved);
+      }
+    }
+  });
+
+  it("preserves runtime-invalid class values without coercion", () => {
+    for (const selector of classCandidateSelectors) {
+      for (const value of [null, undefined, {}, Symbol("fixture")]) {
+        const candidates = selector(value as unknown as string);
+        expect(candidates).toHaveLength(1);
+        expect(candidates[0]).toBe(value);
+      }
+    }
+  });
+
   it("maps known classes to preferred AWS candidates", () => {
     expect(serverTypeForProviderClass("aws", "beast")).toBe("c7a.48xlarge");
     expect(awsInstanceTypeCandidatesForClass("beast")).toEqual([
@@ -49,6 +157,7 @@ describe("machine class config", () => {
       "m7a.32xlarge",
       "c7a.24xlarge",
       "c7a.16xlarge",
+      "t3.small",
     ]);
   });
 
@@ -102,17 +211,430 @@ describe("machine class config", () => {
     ]);
   });
 
+  it("rejects unsupported canonical selectors without treating classes as native types", () => {
+    expect(awsInstanceTypeCandidatesForTargetClass("windows", "fast", "normal", "arm64")).toEqual(
+      [],
+    );
+    expect(azureVMSizeCandidatesForTargetClass("windows", "fast", "wsl2", "arm64")).toEqual([]);
+    expect(awsInstanceTypeCandidatesForTargetClass("windows", "FAST", "normal", "arm64")).toEqual([
+      "FAST",
+    ]);
+    expect(azureVMSizeCandidatesForTargetClass("windows", " custom ", "wsl2", "arm64")).toEqual([
+      " custom ",
+    ]);
+  });
+
+  it("uses only concrete stored types for unsupported canonical selectors", () => {
+    const storedType = "stored-native-type";
+    const awsConfig = {
+      serverType: storedType,
+      serverTypeExplicit: false,
+      class: "standard",
+      target: "windows" as const,
+      windowsMode: "normal" as const,
+      architecture: "arm64" as const,
+    };
+    const azureConfig = {
+      serverType: storedType,
+      serverTypeExplicit: false,
+      class: "standard",
+      target: "windows" as const,
+      windowsMode: "wsl2" as const,
+      architecture: "arm64" as const,
+      azureSnapshot: "",
+      azureOSDisk: "managed",
+    };
+    const gcpConfig = {
+      serverType: storedType,
+      serverTypeExplicit: false,
+      class: "standard",
+      target: "linux" as const,
+      architecture: "arm64" as const,
+    };
+    const hetznerConfig = { ...gcpConfig };
+
+    expect(awsLaunchCandidates(awsConfig)).toEqual([storedType]);
+    expect(azureProvisioningCandidatesForConfig(azureConfig)).toEqual([storedType]);
+    expect(gcpProvisioningCandidatesForConfig(gcpConfig)).toEqual([storedType]);
+    expect(hetznerProvisioningCandidatesForConfig(hetznerConfig)).toEqual([storedType]);
+
+    expect(awsLaunchCandidates({ ...awsConfig, serverType: awsConfig.class })).toEqual([]);
+    expect(
+      azureProvisioningCandidatesForConfig({ ...azureConfig, serverType: azureConfig.class }),
+    ).toEqual([]);
+    expect(
+      gcpProvisioningCandidatesForConfig({ ...gcpConfig, serverType: gcpConfig.class }),
+    ).toEqual([]);
+    expect(
+      hetznerProvisioningCandidatesForConfig({
+        ...hetznerConfig,
+        serverType: hetznerConfig.class,
+      }),
+    ).toEqual([]);
+
+    const matchedCandidates = [
+      awsLaunchCandidates({
+        ...awsConfig,
+        target: "linux",
+        windowsMode: "normal",
+        architecture: "amd64",
+      }),
+      azureProvisioningCandidatesForConfig({
+        ...azureConfig,
+        target: "linux",
+        windowsMode: "normal",
+        architecture: "amd64",
+      }),
+      gcpProvisioningCandidatesForConfig({ ...gcpConfig, architecture: "amd64" }),
+      hetznerProvisioningCandidatesForConfig({ ...hetznerConfig, architecture: "amd64" }),
+    ];
+    for (const candidates of matchedCandidates) {
+      expect(candidates[0]).toBe(storedType);
+    }
+
+    const literalMatchedCandidates = [
+      awsLaunchCandidates({
+        ...awsConfig,
+        serverType: awsConfig.class,
+        target: "linux",
+        windowsMode: "normal",
+        architecture: "amd64",
+      }),
+      azureProvisioningCandidatesForConfig({
+        ...azureConfig,
+        serverType: azureConfig.class,
+        target: "linux",
+        windowsMode: "normal",
+        architecture: "amd64",
+      }),
+      gcpProvisioningCandidatesForConfig({
+        ...gcpConfig,
+        serverType: gcpConfig.class,
+        architecture: "amd64",
+      }),
+      hetznerProvisioningCandidatesForConfig({
+        ...hetznerConfig,
+        serverType: hetznerConfig.class,
+        architecture: "amd64",
+      }),
+    ];
+    for (const candidates of literalMatchedCandidates) {
+      expect(candidates).not.toContain("standard");
+    }
+
+    expect(
+      hetznerProvisioningCandidatesForConfig({
+        ...hetznerConfig,
+        serverType: hetznerConfig.class,
+        serverTypeExplicit: true,
+        architecture: "amd64",
+      }),
+    ).toEqual(["standard"]);
+    expect(
+      hetznerProvisioningCandidatesForConfig({
+        ...hetznerConfig,
+        serverType: hetznerConfig.class,
+        serverTypeExplicit: true,
+      }),
+    ).toEqual(["standard"]);
+  });
+
+  it("matches Go stored-type and custom-class candidate order", () => {
+    const storedType = "stored-native-type";
+    const explicitType = " exact-native-type ";
+    const providers: {
+      name: string;
+      candidates: (
+        machineClass: string,
+        serverType: string,
+        explicit: boolean,
+        missingSelector: boolean,
+      ) => string[];
+      customWant: string[];
+      uppercaseWant: string[];
+      paddedWant: string[];
+      standardType: string;
+      fastType: string;
+    }[] = [
+      {
+        name: "AWS",
+        candidates: (machineClass, serverType, explicit, missingSelector) =>
+          awsLaunchCandidates({
+            class: machineClass,
+            serverType,
+            serverTypeExplicit: explicit,
+            target: missingSelector ? "windows" : "linux",
+            windowsMode: "normal",
+            architecture: missingSelector ? "arm64" : "amd64",
+          }),
+        customWant: [storedType, "custom-shape", "t3.small"],
+        uppercaseWant: [storedType, "FAST", "t3.small"],
+        paddedWant: [storedType, " fast ", "t3.small"],
+        standardType: "c7a.8xlarge",
+        fastType: "c7a.16xlarge",
+      },
+      {
+        name: "Azure",
+        candidates: (machineClass, serverType, explicit, missingSelector) =>
+          azureProvisioningCandidatesForConfig({
+            class: machineClass,
+            serverType,
+            serverTypeExplicit: explicit,
+            target: missingSelector ? "windows" : "linux",
+            windowsMode: missingSelector ? "wsl2" : "normal",
+            architecture: missingSelector ? "arm64" : "amd64",
+            azureSnapshot: "",
+            azureOSDisk: "managed",
+          }),
+        customWant: [storedType, "custom-shape"],
+        uppercaseWant: [storedType, "FAST"],
+        paddedWant: [storedType, " fast "],
+        standardType: "Standard_D32ads_v6",
+        fastType: "Standard_D64ads_v6",
+      },
+      {
+        name: "GCP",
+        candidates: (machineClass, serverType, explicit, missingSelector) =>
+          gcpProvisioningCandidatesForConfig({
+            class: machineClass,
+            serverType,
+            serverTypeExplicit: explicit,
+            target: "linux",
+            architecture: missingSelector ? "arm64" : "amd64",
+          }),
+        customWant: [storedType, "custom-shape"],
+        uppercaseWant: [storedType, "FAST"],
+        paddedWant: [storedType, " fast "],
+        standardType: "c4-standard-32",
+        fastType: "c4-standard-64",
+      },
+      {
+        name: "Hetzner",
+        candidates: (machineClass, serverType, explicit, missingSelector) =>
+          hetznerProvisioningCandidatesForConfig({
+            class: machineClass,
+            serverType,
+            serverTypeExplicit: explicit,
+            target: "linux",
+            architecture: missingSelector ? "arm64" : "amd64",
+          }),
+        customWant: [storedType, "custom-shape"],
+        uppercaseWant: [storedType, "FAST"],
+        paddedWant: [storedType, " fast "],
+        standardType: "ccx33",
+        fastType: "ccx43",
+      },
+    ];
+
+    for (const provider of providers) {
+      for (const scenario of [
+        { machineClass: "custom-shape", want: provider.customWant },
+        { machineClass: "FAST", want: provider.uppercaseWant },
+        { machineClass: " fast ", want: provider.paddedWant },
+      ]) {
+        expect({
+          provider: provider.name,
+          machineClass: scenario.machineClass,
+          candidates: provider.candidates(scenario.machineClass, storedType, false, false),
+        }).toEqual({
+          provider: provider.name,
+          machineClass: scenario.machineClass,
+          candidates: scenario.want,
+        });
+      }
+      for (const scenario of [
+        {
+          machineClass: "fast",
+          placeholder: "beast",
+          wantFirst: provider.fastType,
+        },
+        {
+          machineClass: "standard",
+          placeholder: "fast",
+          wantFirst: provider.standardType,
+        },
+      ]) {
+        expect({
+          provider: provider.name,
+          candidates: provider.candidates(
+            scenario.machineClass,
+            scenario.placeholder,
+            false,
+            false,
+          )[0],
+        }).toEqual({ provider: provider.name, candidates: scenario.wantFirst });
+      }
+      for (const rawStoredType of ["FAST", " fast ", "custom-native-type"]) {
+        expect({
+          provider: provider.name,
+          storedType: rawStoredType,
+          candidates: provider.candidates("standard", rawStoredType, false, false)[0],
+        }).toEqual({
+          provider: provider.name,
+          storedType: rawStoredType,
+          candidates: rawStoredType,
+        });
+      }
+      expect({
+        provider: provider.name,
+        candidates: provider.candidates("standard", storedType, false, true),
+      }).toEqual({ provider: provider.name, candidates: [storedType] });
+      expect({
+        provider: provider.name,
+        candidates: provider.candidates("standard", "", false, true),
+      }).toEqual({ provider: provider.name, candidates: [] });
+      expect({
+        provider: provider.name,
+        candidates: provider.candidates("standard", explicitType, true, true),
+      }).toEqual({ provider: provider.name, candidates: [explicitType] });
+      expect({
+        provider: provider.name,
+        candidates: provider.candidates("standard", "fast", true, true),
+      }).toEqual({ provider: provider.name, candidates: ["fast"] });
+      expect({
+        provider: provider.name,
+        candidates: provider.candidates("fast", "beast", false, true),
+      }).toEqual({ provider: provider.name, candidates: [] });
+      expect({
+        provider: provider.name,
+        candidates: provider.candidates("custom-shape", " stored-native-type ", false, false)[0],
+      }).toEqual({ provider: provider.name, candidates: " stored-native-type " });
+    }
+
+    expect(
+      awsLaunchCandidates({
+        class: " custom-mac-type ",
+        serverType: storedType,
+        serverTypeExplicit: false,
+        target: "macos",
+        windowsMode: "normal",
+        architecture: "amd64",
+      }),
+    ).toEqual([storedType, " custom-mac-type ", ...awsMacOSInstanceTypeCandidates]);
+  });
+
+  it("preserves provider-specific empty and whitespace explicit-type handling", () => {
+    const config = {
+      class: "standard",
+      serverTypeExplicit: true,
+      target: "linux" as const,
+      architecture: "amd64" as const,
+    };
+    for (const serverType of ["", "   "]) {
+      expect(gcpProvisioningCandidatesForConfig({ ...config, serverType })).toEqual(
+        serverType ? [serverType] : gcpMachineTypeCandidatesForClass(config.class),
+      );
+      expect(hetznerProvisioningCandidatesForConfig({ ...config, serverType })).toEqual(
+        serverTypeCandidatesForClass(config.class),
+      );
+    }
+  });
+
+  it("keeps custom class pass-through outside static selector coverage", () => {
+    for (const machineClass of ["FAST", " fast ", "custom-shape"]) {
+      expect(
+        gcpProvisioningCandidatesForConfig({
+          serverType: machineClass,
+          serverTypeExplicit: false,
+          class: machineClass,
+          target: "linux",
+          architecture: "arm64",
+        }),
+      ).toEqual([machineClass]);
+      expect(
+        hetznerProvisioningCandidatesForConfig({
+          serverType: machineClass,
+          serverTypeExplicit: false,
+          class: machineClass,
+          target: "linux",
+          architecture: "arm64",
+        }),
+      ).toEqual([machineClass]);
+    }
+  });
+
+  it("matches the Go boot disk family set and machine class disk compatibility", () => {
+    const source = readFileSync(new URL("../../internal/cli/gcp.go", import.meta.url), "utf8");
+    const familySet = source.match(
+      /var gcpHyperdiskOnlyFamilies = map\[string\]struct\{\}\{([\s\S]*?)\n\}/,
+    );
+    expect(familySet).not.toBeNull();
+    const families = [...familySet![1]!.matchAll(/"([a-z0-9-]+)":/g)].map((match) => match[1]!);
+    expect([...gcpHyperdiskOnlyFamilies].toSorted()).toEqual(families.toSorted());
+    for (const family of families) {
+      expect(
+        gcpBootDiskTypeForMachineType(`zones/z/machineTypes/${family.toUpperCase()}-standard-4`),
+      ).toBe("hyperdisk-balanced");
+    }
+    for (const machineType of [
+      "c4n-standard-4",
+      "m4n-megamem-28",
+      "x5-688-12t-metal",
+      "a3-ultragpu-8g",
+    ]) {
+      expect(gcpBootDiskTypeForMachineType(machineType)).toBe("hyperdisk-balanced");
+    }
+    for (const machineType of ["a3-megagpu-8g", "a3-highgpu-8g", "a3-edgegpu-8g"]) {
+      expect(gcpBootDiskTypeForMachineType(machineType)).toBe("pd-balanced");
+    }
+    for (const family of [
+      "c3",
+      "c3d",
+      "h3",
+      "m1",
+      "m2",
+      "m3",
+      "z3",
+      "n2",
+      "n2d",
+      "e2",
+      "n1",
+      "t2a",
+      "t2d",
+      "c2",
+      "c2d",
+      "a2",
+      "g2",
+      "unknown",
+    ]) {
+      expect(gcpBootDiskTypeForMachineType(`${family}-standard-4`)).toBe("pd-balanced");
+    }
+    for (const name of ["tiny", "small", "standard", "fast", "large", "beast"]) {
+      for (const candidate of gcpMachineTypeCandidatesForClass(name)) {
+        expect(candidate).toMatch(/^(c4|c3|n2|n2d)-/);
+        expect(gcpBootDiskTypeForMachineType(candidate)).toBe(
+          candidate.startsWith("c4-") ? "hyperdisk-balanced" : "pd-balanced",
+        );
+      }
+    }
+  });
+
   it("matches the Go CLI machine class tables", () => {
-    const go = readFileSync(new URL("../../internal/cli/config.go", import.meta.url), "utf8");
-    const goAzure = readFileSync(new URL("../../internal/cli/azure.go", import.meta.url), "utf8");
-    const goGCP = readFileSync(new URL("../../internal/cli/gcp.go", import.meta.url), "utf8");
-    const classes = ["standard", "fast", "large", "beast"];
-    const hetzner = parseGoStringArrayCases(goFunctionBody(go, "serverTypeCandidatesForClass"));
+    const goAWS = readFileSync(
+      new URL("../../internal/providers/aws/provider.go", import.meta.url),
+      "utf8",
+    );
+    const goAzure = readFileSync(
+      new URL("../../internal/providers/azure/provider.go", import.meta.url),
+      "utf8",
+    );
+    const goGCP = readFileSync(
+      new URL("../../internal/providers/gcp/provider.go", import.meta.url),
+      "utf8",
+    );
+    const goHetzner = readFileSync(
+      new URL("../../internal/providers/hetzner/provider.go", import.meta.url),
+      "utf8",
+    );
+    const classes = ["tiny", "small", "standard", "fast", "large", "beast"];
+    const hetzner = parseGoStringArrayCases(
+      goFunctionBody(goHetzner, "serverTypeCandidatesForClass"),
+    );
     const awsLinux = parseGoStringArrayCases(
-      goFunctionBody(go, "awsInstanceTypeCandidatesForArchitectureClass"),
+      goFunctionBody(goAWS, "awsInstanceTypeCandidatesForClass"),
     );
     const azureLinux = parseGoStringArrayCases(
-      goFunctionBody(goAzure, "azureVMSizeCandidatesForArchitectureClass"),
+      goFunctionBody(goAzure, "azureVMSizeCandidatesForClass"),
     );
     const azureLinuxARM64 = parseGoStringArrayCases(
       goFunctionBody(goAzure, "azureARM64VMSizeCandidatesForClass"),
@@ -121,19 +643,38 @@ describe("machine class config", () => {
       goFunctionBody(goAzure, "azureWindowsVMSizeCandidatesForClass"),
     );
     const awsLinuxARM64 = parseGoStringArrayCases(
-      goFunctionBody(go, "awsARM64InstanceTypeCandidatesForClass"),
+      goFunctionBody(goAWS, "awsARM64InstanceTypeCandidatesForClass"),
     );
     const gcp = parseGoStringArrayCases(goFunctionBody(goGCP, "gcpMachineTypeCandidatesForClass"));
-    const awsTarget = goFunctionBody(go, "awsInstanceTypeCandidatesForTargetModeArchitectureClass");
-    const awsWSL2 = parseGoStringArrayCases(
-      goSwitchAfter(awsTarget, "if windowsMode == windowsModeWSL2"),
+    const awsWindows = parseGoStringArrayCases(
+      goFunctionBody(goAWS, "awsWindowsInstanceTypeCandidatesForClass"),
     );
-    const awsWindows = parseGoStringArrayCases(goSwitchAfter(awsTarget, "switch class", 1));
+    const awsWSL2 = parseGoStringArrayCases(
+      goFunctionBody(goAWS, "awsWSL2InstanceTypeCandidatesForClass"),
+    );
 
     for (const name of classes) {
       expect(serverTypeCandidatesForClass(name)).toEqual(hetzner[name]);
-      expect(awsInstanceTypeCandidatesForClass(name)).toEqual(awsLinux[name]);
-      expect(awsARM64InstanceTypeCandidatesForClass(name)).toEqual(awsLinuxARM64[name]);
+      expect(
+        awsLaunchCandidates({
+          serverType: "",
+          serverTypeExplicit: false,
+          class: name,
+          target: "linux",
+          windowsMode: "normal",
+          architecture: "amd64",
+        }),
+      ).toEqual(awsLinux[name]);
+      expect(
+        awsLaunchCandidates({
+          serverType: "",
+          serverTypeExplicit: false,
+          class: name,
+          target: "linux",
+          windowsMode: "normal",
+          architecture: "arm64",
+        }),
+      ).toEqual(awsLinuxARM64[name]);
       expect(azureVMSizeCandidatesForClass(name)).toEqual(azureLinux[name]);
       expect(azureARM64VMSizeCandidatesForClass(name)).toEqual(azureLinuxARM64[name]);
       expect(azureWindowsVMSizeCandidatesForClass(name)).toEqual(azureWindows[name]);
@@ -144,16 +685,39 @@ describe("machine class config", () => {
       expect(azureVMSizeCandidatesForTargetClass("windows", name, "normal", "arm64")).toEqual(
         azureLinuxARM64[name],
       );
-      expect(azureVMSizeCandidatesForTargetClass("windows", name, "wsl2", "arm64")).toEqual([name]);
-      expect(awsInstanceTypeCandidatesForTargetClass("windows", name)).toEqual(awsWindows[name]);
-      expect(awsInstanceTypeCandidatesForTargetClass("windows", name, "wsl2")).toEqual(
-        awsWSL2[name],
-      );
+      expect(azureVMSizeCandidatesForTargetClass("windows", name, "wsl2", "arm64")).toEqual([]);
+      expect(
+        awsLaunchCandidates({
+          serverType: "",
+          serverTypeExplicit: false,
+          class: name,
+          target: "windows",
+          windowsMode: "normal",
+          architecture: "amd64",
+        }),
+      ).toEqual(awsWindows[name]);
+      expect(
+        awsLaunchCandidates({
+          serverType: "",
+          serverTypeExplicit: false,
+          class: name,
+          target: "windows",
+          windowsMode: "wsl2",
+          architecture: "amd64",
+        }),
+      ).toEqual(awsWSL2[name]);
       expect(gcpMachineTypeCandidatesForClass(name)).toEqual(gcp[name]);
     }
-    expect(awsInstanceTypeCandidatesForTargetClass("macos", "standard")).toEqual(
-      awsMacOSInstanceTypeCandidates,
-    );
+    expect(
+      awsLaunchCandidates({
+        serverType: "",
+        serverTypeExplicit: false,
+        class: "standard",
+        target: "macos",
+        windowsMode: "normal",
+        architecture: "amd64",
+      }),
+    ).toEqual(awsMacOSInstanceTypeCandidates);
   });
 });
 
@@ -177,46 +741,254 @@ function goFunctionBody(source: string, name: string): string {
   throw new Error(`unterminated Go function ${name}`);
 }
 
-function goSwitchAfter(source: string, marker: string, occurrence = 0): string {
-  let cursor = -1;
-  for (let index = 0; index <= occurrence; index += 1) {
-    cursor = source.indexOf(marker, cursor + 1);
-    expect(cursor).toBeGreaterThanOrEqual(0);
-  }
-  const open = source.indexOf("{", cursor);
-  expect(open).toBeGreaterThanOrEqual(0);
-  let depth = 0;
-  for (let index = open; index < source.length; index += 1) {
-    const char = source[index];
-    if (char === "{") {
-      depth += 1;
-    } else if (char === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        return source.slice(open + 1, index);
-      }
-    }
-  }
-  throw new Error(`unterminated Go switch after ${marker}`);
-}
-
 function parseGoStringArrayCases(source: string): Record<string, string[]> {
   const out: Record<string, string[]> = {};
-  const pattern = /case "([^"]+)":\s*return \[\]string\{([^}]*)\}/g;
-  for (const match of source.matchAll(pattern)) {
-    const key = match[1];
-    const body = match[2];
-    if (key === undefined || body === undefined) {
+  let pendingKeys: string[] | undefined;
+  let arrayValues: string[] | undefined;
+  let caseLines: string[] | undefined;
+
+  const finishArray = () => {
+    if (pendingKeys === undefined || arrayValues === undefined) {
+      return;
+    }
+    for (const key of pendingKeys) {
+      out[key] = arrayValues;
+    }
+    pendingKeys = undefined;
+    arrayValues = undefined;
+  };
+
+  for (const sourceLine of source.split("\n")) {
+    let line = sourceLine;
+    if (pendingKeys !== undefined && arrayValues !== undefined) {
+      if (isGoCaseStart(line)) {
+        pendingKeys = undefined;
+        arrayValues = undefined;
+      } else {
+        if (scanGoStringArrayLine(line, 0, arrayValues, pendingKeys)) {
+          finishArray();
+        }
+        continue;
+      }
+    }
+
+    const startsCase = isGoCaseStart(line);
+    if (caseLines !== undefined && startsCase) {
+      caseLines = undefined;
+    }
+    if (caseLines !== undefined) {
+      caseLines.push(line);
+      const state = scanGoCaseLine(line);
+      if (state === "invalid") {
+        caseLines = undefined;
+        continue;
+      }
+      if (state === "continued") {
+        continue;
+      }
+      line = caseLines.join("\n");
+      caseLines = undefined;
+    } else if (startsCase) {
+      const state = scanGoCaseLine(line);
+      if (state === "invalid") {
+        continue;
+      }
+      if (state === "continued") {
+        caseLines = [line];
+        continue;
+      }
+    }
+
+    const caseClause = startsCase || line.includes("\n") ? parseGoCaseClause(line) : undefined;
+    if (caseClause !== undefined) {
+      pendingKeys = caseClause.keys;
+      line = caseClause.remainder;
+    } else if (pendingKeys === undefined) {
       continue;
     }
-    out[key] = [...body.matchAll(/"([^"]+)"/g)].map((item) => item[1]).filter(isString);
+
+    const returnLine = line.trimStart();
+    const prefix = "return []string{";
+    if (returnLine.length === 0) {
+      continue;
+    }
+    if (!returnLine.startsWith(prefix)) {
+      pendingKeys = undefined;
+      continue;
+    }
+
+    arrayValues = [];
+    if (scanGoStringArrayLine(returnLine, prefix.length, arrayValues, pendingKeys)) {
+      finishArray();
+    }
+  }
+
+  if (arrayValues !== undefined) {
+    throw new Error(`unterminated []string return for case ${pendingKeys?.join(", ")}`);
   }
   return out;
 }
 
-function isString(value: string | undefined): value is string {
-  return value !== undefined;
+function isGoCaseStart(line: string): boolean {
+  const trimmed = line.trimStart();
+  return trimmed.startsWith("case") && isGoWhitespace(trimmed[4]);
 }
+
+function scanGoCaseLine(line: string): "complete" | "continued" | "invalid" {
+  let quoted = false;
+  let escaped = false;
+  for (const char of line) {
+    if (quoted) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        quoted = false;
+      }
+    } else if (char === '"') {
+      quoted = true;
+    } else if (char === ":") {
+      return "complete";
+    }
+  }
+  return quoted ? "invalid" : "continued";
+}
+
+function parseGoCaseClause(line: string): { keys: string[]; remainder: string } | undefined {
+  const trimmed = line.trimStart();
+  if (!isGoCaseStart(trimmed)) {
+    return undefined;
+  }
+
+  const keys: string[] = [];
+  let index = "case".length;
+  while (index < trimmed.length) {
+    while (isGoWhitespace(trimmed[index])) {
+      index += 1;
+    }
+    const key = readGoQuotedString(trimmed, index);
+    if (key === undefined) {
+      return undefined;
+    }
+    keys.push(key.value);
+    index = key.next;
+
+    while (isGoWhitespace(trimmed[index])) {
+      index += 1;
+    }
+    if (trimmed[index] === ":") {
+      return { keys, remainder: trimmed.slice(index + 1) };
+    }
+    if (trimmed[index] !== ",") {
+      return undefined;
+    }
+    index += 1;
+  }
+  return undefined;
+}
+
+function readGoQuotedString(
+  source: string,
+  start: number,
+): { value: string; next: number } | undefined {
+  if (source[start] !== '"') {
+    return undefined;
+  }
+  const value: string[] = [];
+  let escaped = false;
+  for (let index = start + 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (escaped) {
+      value.push(char);
+      escaped = false;
+    } else if (char === "\\") {
+      value.push(char);
+      escaped = true;
+    } else if (char === '"') {
+      return { value: value.join(""), next: index + 1 };
+    } else {
+      value.push(char);
+    }
+  }
+  return undefined;
+}
+
+function scanGoStringArrayLine(
+  line: string,
+  start: number,
+  values: string[],
+  keys: string[],
+): boolean {
+  for (let index = start; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === "}") {
+      return true;
+    }
+    if (char !== '"') {
+      continue;
+    }
+
+    const value = readGoQuotedString(line, index);
+    if (value === undefined) {
+      throw new Error(`unterminated quoted string in []string return for case ${keys.join(", ")}`);
+    }
+    values.push(value.value);
+    index = value.next - 1;
+  }
+  return false;
+}
+
+function isGoWhitespace(char: string | undefined): boolean {
+  return char === " " || char === "\t" || char === "\r" || char === "\n";
+}
+
+describe("parseGoStringArrayCases", () => {
+  it("parses a single case key", () => {
+    expect(parseGoStringArrayCases('case "tiny": return []string{"first", "second"}')).toEqual({
+      tiny: ["first", "second"],
+    });
+  });
+
+  it("preserves multiple case keys in source order", () => {
+    const parsed = parseGoStringArrayCases(`
+      case "small",
+        "standard":
+        return []string{"shared"}
+    `);
+    expect(Object.keys(parsed)).toEqual(["small", "standard"]);
+    expect(parsed).toEqual({ small: ["shared"], standard: ["shared"] });
+  });
+
+  it("parses multiline string arrays", () => {
+    expect(
+      parseGoStringArrayCases(`
+        case "large":
+          return []string{
+            "first",
+            "second",
+          }
+      `),
+    ).toEqual({ large: ["first", "second"] });
+  });
+
+  it("ignores a long unterminated case key without matching a later return", () => {
+    const malformed = `case "${"x".repeat(100_000)}\nreturn []string{"wrong"}`;
+    expect(parseGoStringArrayCases(malformed)).toEqual({});
+  });
+
+  it("does not associate valid cases with malformed predecessors", () => {
+    const parsed = parseGoStringArrayCases(`
+      case "unclosed-array":
+        return []string{
+      case "good":
+        return []string{"right"}
+      case "unclosed-key
+        ": return []string{"wrong"}
+    `);
+    expect(parsed).toEqual({ good: ["right"] });
+  });
+});
 
 describe("lease config", () => {
   it("requires an ssh public key", () => {
@@ -236,9 +1008,9 @@ describe("lease config", () => {
     expect(config.desktopEnv).toBe("xfce");
     expect(config.browser).toBe(false);
     expect(config.code).toBe(false);
-    expect(config.ttlSeconds).toBe(86_400);
-    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: 0 }).ttlSeconds).toBe(5400);
-    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: -1 }).ttlSeconds).toBe(5400);
+    expect(config.ttlSeconds).toBe(14_400);
+    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: 0 }).ttlSeconds).toBe(1800);
+    expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: -1 }).ttlSeconds).toBe(1800);
     expect(leaseConfig({ sshPublicKey: "ssh-ed25519 test", ttlSeconds: 42.9 }).ttlSeconds).toBe(42);
     expect(
       leaseConfig({ sshPublicKey: "ssh-ed25519 test", idleTimeoutSeconds: 0 }).idleTimeoutSeconds,
@@ -249,7 +1021,7 @@ describe("lease config", () => {
     expect(
       leaseConfig({ sshPublicKey: "ssh-ed25519 test", idleTimeoutSeconds: 999_999 })
         .idleTimeoutSeconds,
-    ).toBe(86_400);
+    ).toBe(1800);
     expect(
       leaseConfig({ sshPublicKey: "ssh-ed25519 test", idleTimeoutSeconds: 42.9 })
         .idleTimeoutSeconds,
@@ -443,6 +1215,59 @@ describe("lease config", () => {
     expect(config.os).toBe("ubuntu:26.04");
   });
 
+  it("uses Daytona snapshot-managed SSH defaults", () => {
+    const config = leaseConfig({
+      provider: "daytona",
+      sshPublicKey: "ssh-ed25519 test",
+    });
+    expect(config.serverType).toBe("snapshot");
+    expect(config.sshUser).toBe("daytona");
+    expect(config.sshPort).toBe("22");
+    expect(config.sshFallbackPorts).toEqual([]);
+    expect(config.workRoot).toBe("/home/daytona/crabbox");
+    expect(serverTypeForProviderClass("daytona", "beast")).toBe("snapshot");
+    expect(() =>
+      leaseConfig({
+        provider: "daytona",
+        serverType: "large",
+        serverTypeExplicit: true,
+        sshPublicKey: "ssh-ed25519 test",
+      }),
+    ).toThrow("takes CPU, memory, and disk from the configured Daytona snapshot");
+    expect(() =>
+      leaseConfig({
+        provider: "daytona",
+        desktop: true,
+        sshPublicKey: "ssh-ed25519 test",
+      }),
+    ).toThrow("supports SSH, sync, and run only");
+  });
+
+  it("validates and normalizes AWS lease regions", () => {
+    const config = leaseConfig({
+      provider: "aws",
+      sshPublicKey: "ssh-ed25519 test",
+      awsRegion: " US-EAST-1 ",
+      capacity: { regions: ["EU-WEST-1", "eu-west-1", ""] },
+    });
+    expect(config.awsRegion).toBe("us-east-1");
+    expect(config.capacityRegions).toEqual(["eu-west-1"]);
+    expect(() =>
+      leaseConfig({
+        provider: "aws",
+        sshPublicKey: "ssh-ed25519 test",
+        awsRegion: "evil.example/",
+      }),
+    ).toThrow("awsRegion must be an AWS region name");
+    expect(() =>
+      leaseConfig({
+        provider: "aws",
+        sshPublicKey: "ssh-ed25519 test",
+        capacity: { regions: ["eu-west-1", "evil.example/"] },
+      }),
+    ).toThrow("capacity.regions entry must be an AWS region name");
+  });
+
   it("uses Azure defaults when requested", () => {
     const config = leaseConfig({
       provider: "azure",
@@ -453,7 +1278,29 @@ describe("lease config", () => {
     expect(config.serverType).toBe("Standard_D192ds_v6");
     expect(config.azureLocation).toBe("eastus");
     expect(config.azureImage).toBe("Canonical:offer:sku:latest");
+    expect(config.azureImageExplicit).toBe(true);
     expect(config.azureOSDisk).toBe("managed");
+
+    const operatorDefault = leaseConfig(
+      {
+        provider: "azure",
+        sshPublicKey: "ssh-ed25519 test",
+      },
+      { azureImage: "Contoso:operator-default:server:latest" },
+    );
+    expect(operatorDefault.azureImage).toBe("Contoso:operator-default:server:latest");
+    expect(operatorDefault.azureImageExplicit).toBe(true);
+
+    const requestedOS = leaseConfig(
+      {
+        provider: "azure",
+        os: "ubuntu:24.04",
+        sshPublicKey: "ssh-ed25519 test",
+      },
+      { azureImage: "Contoso:operator-default:server:latest" },
+    );
+    expect(requestedOS.azureImage).toBe("Canonical:ubuntu-24_04-lts:server:latest");
+    expect(requestedOS.azureImageExplicit).toBe(false);
   });
 
   it("uses Azure ARM defaults when requested", () => {
@@ -481,12 +1328,12 @@ describe("lease config", () => {
     expect(config.azureImage).toBe("Canonical:ubuntu-26_04-lts:server-arm64:latest");
   });
 
-  it("filters Azure defaults for ephemeral-preview full caching", () => {
+  it("filters Azure defaults for ephemeral full caching", () => {
     const arm = leaseConfig({
       provider: "azure",
       architecture: "arm64",
       class: "standard",
-      azureOSDisk: "ephemeral-preview",
+      azureOSDisk: "ephemeral",
       sshPublicKey: "ssh-ed25519 test",
     });
     expect(arm.serverType).toBe("Standard_D32pds_v6");
@@ -494,7 +1341,7 @@ describe("lease config", () => {
       provider: "azure",
       target: "windows",
       class: "standard",
-      azureOSDisk: "ephemeral-preview",
+      azureOSDisk: "ephemeral",
       sshPublicKey: "ssh-ed25519 test",
     });
     expect(windows.serverType).toBe("Standard_D8ads_v6");
@@ -504,7 +1351,7 @@ describe("lease config", () => {
       class: "standard",
       azureSnapshot:
         "/subscriptions/sub/resourceGroups/crabbox-leases/providers/Microsoft.Compute/snapshots/checkpoint-azure",
-      azureOSDisk: "ephemeral-preview",
+      azureOSDisk: "ephemeral",
       sshPublicKey: "ssh-ed25519 test",
     });
     expect(snapshot.serverType).toBe("Standard_D2ads_v6");
@@ -586,6 +1433,7 @@ describe("lease config", () => {
       { azureWindowsARM64Image: "Contoso:windows-arm64:server:latest" },
     );
     expect(defaultImage.azureImage).toBe("Contoso:windows-arm64:server:latest");
+    expect(defaultImage.azureImageExplicit).toBe(false);
 
     const emptyRequestImage = leaseConfig(
       {
@@ -599,6 +1447,7 @@ describe("lease config", () => {
       { azureWindowsARM64Image: "Contoso:windows-arm64:server:latest" },
     );
     expect(emptyRequestImage.azureImage).toBe("Contoso:windows-arm64:server:latest");
+    expect(emptyRequestImage.azureImageExplicit).toBe(false);
   });
 
   it("rejects Azure Windows ARM64 leases without an explicit ARM64 image", () => {
@@ -712,34 +1561,25 @@ describe("lease config", () => {
   });
 
   it("normalizes Azure OS disk requests", () => {
-    expect(
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "MANAGED",
-        sshPublicKey: "ssh-ed25519 test",
-      }).azureOSDisk,
-    ).toBe("managed");
-    expect(
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "ephemeral-preview",
-        sshPublicKey: "ssh-ed25519 test",
-      }).azureOSDisk,
-    ).toBe("ephemeral-preview");
-    expect(
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "auto",
-        sshPublicKey: "ssh-ed25519 test",
-      }).azureOSDisk,
-    ).toBe("managed");
-    expect(() =>
-      leaseConfig({
-        provider: "azure",
-        azureOSDisk: "premium",
-        sshPublicKey: "ssh-ed25519 test",
-      }),
-    ).toThrow("azureOSDisk must be auto, managed, ephemeral, or ephemeral-preview");
+    for (const [azureOSDisk, expected] of [
+      ["MANAGED", "managed"],
+      ["ephemeral", "ephemeral"],
+      [" EPHEMERAL ", "ephemeral"],
+      ["auto", "managed"],
+    ]) {
+      expect(
+        leaseConfig({ provider: "azure", azureOSDisk, sshPublicKey: "ssh-ed25519 test" })
+          .azureOSDisk,
+      ).toBe(expected);
+    }
+    for (const [azureOSDisk, message] of [
+      ["ephemeral-preview", "azureOSDisk=ephemeral-preview has been removed; use ephemeral"],
+      ["premium", "azureOSDisk must be auto, managed, or ephemeral"],
+    ]) {
+      expect(() =>
+        leaseConfig({ provider: "azure", azureOSDisk, sshPublicKey: "ssh-ed25519 test" }),
+      ).toThrow(message);
+    }
   });
 
   it("uses Worker Azure OS disk defaults when the request omits one", () => {
@@ -773,6 +1613,16 @@ describe("lease config", () => {
     expect(config.gcpNetwork).toBe("");
     expect(config.gcpTags).toEqual([]);
     expect(config.gcpRootGB).toBe(0);
+  });
+
+  it("uses Hetzner Ubuntu 26.04 by default while preserving explicit images", () => {
+    const input = { provider: "hetzner" as const, sshPublicKey: "ssh-ed25519 test" };
+    expect(leaseConfig(input).image).toBe("ubuntu-26.04");
+    expect(leaseConfig({ ...input, os: "ubuntu:26.04" }).image).toBe("ubuntu-26.04");
+    expect(leaseConfig({ ...input, os: "ubuntu:24.04" }).image).toBe("ubuntu-24.04");
+    expect(leaseConfig({ ...input, os: "ubuntu:26.04", image: "custom-image" }).image).toBe(
+      "custom-image",
+    );
   });
 
   it("maps explicit portable OS selectors", () => {
@@ -859,6 +1709,31 @@ describe("lease config", () => {
     expect(leaseConfig({ hostID: "h-compat", sshPublicKey: "ssh-ed25519 test" }).hostID).toBe(
       "h-compat",
     );
+  });
+
+  it.each([
+    ["linux", ["", "   ", "linux", " UBUNTU "]],
+    ["macos", ["mac", "macos", " DARWIN ", "osx"]],
+    ["windows", ["win", " WINDOWS "]],
+  ] as const)("parses %s target aliases without changing lease validation", (target, aliases) => {
+    for (const alias of aliases) {
+      expect(parseTarget(alias)).toBe(target);
+      expect(
+        leaseConfig({
+          provider: "aws",
+          target: alias,
+          sshPublicKey: "ssh-ed25519 test",
+          ...(target === "macos" ? { capacity: { market: "on-demand" } } : {}),
+        }).target,
+      ).toBe(target);
+    }
+  });
+
+  it("keeps invalid target parsing nonthrowing and lease errors unchanged", () => {
+    expect(parseTarget("freebsd")).toBeUndefined();
+    expect(() =>
+      leaseConfig({ provider: "aws", target: "freebsd", sshPublicKey: "ssh-ed25519 test" }),
+    ).toThrow("target must be linux, macos, or windows");
   });
 
   it("allows AWS Windows leases", () => {

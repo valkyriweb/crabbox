@@ -1,0 +1,46 @@
+package lume
+
+import (
+	"flag"
+	"path"
+	"strings"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func registerFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return core.RegisterLumeConfigFlags(fs, defaults.Lume)
+}
+
+func applyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	if ok, err := core.ApplyProviderConfigFlags[core.LumeConfigFlagValues](cfg, fs, values, &cfg.Lume, providerName); !ok || err != nil {
+		return err
+	}
+	if core.ProviderNameMatches(cfg.Provider, Provider{}) {
+		applyDefaults(cfg)
+		return validateConfig(cfg)
+	}
+	return nil
+}
+
+func validateConfig(cfg *core.Config) error {
+	if strings.TrimSpace(cfg.Lume.CLIPath) == "" {
+		return core.Exit(2, "lume CLI path must not be empty")
+	}
+	if strings.TrimSpace(cfg.Lume.Base) == "" {
+		return core.Exit(2, "lume base VM must not be empty")
+	}
+	if strings.TrimSpace(cfg.Lume.Storage) == "ephemeral" {
+		return core.Exit(2, "lume storage \"ephemeral\" is not supported because Lume excludes ephemeral VMs from inventory")
+	}
+	if !validPOSIXUser.MatchString(cfg.Lume.User) {
+		return core.Exit(2, "lume user %q is not a valid POSIX account name", cfg.Lume.User)
+	}
+	cfg.Lume.WorkRoot = path.Clean(strings.TrimSpace(cfg.Lume.WorkRoot))
+	cfg.WorkRoot = cfg.Lume.WorkRoot
+	userHome := "/Users/" + cfg.Lume.User
+	if !path.IsAbs(cfg.Lume.WorkRoot) || !strings.HasPrefix(cfg.Lume.WorkRoot, userHome+"/") {
+		return core.Exit(2, "lume work root must be beneath /Users/%s", cfg.Lume.User)
+	}
+	return nil
+}

@@ -2,13 +2,13 @@
 
 Read this when you stand up, audit, or operate a self-hosted Crabbox broker: the
 Cloudflare or Node.js/PostgreSQL coordinator, its secrets, the brokered providers
-(Hetzner, AWS, Azure, GCP), and the network front door.
+(Hetzner, AWS, Azure, GCP, Daytona), and the network front door.
 
 Crabbox runs in three modes (see [How It Works](how-it-works.md)). A *broker* is
 only required for **brokered mode**, where lease lifecycle, cost limits, cleanup,
 sharing, and `crabbox usage` are owned by the coordinator. Direct and delegated
-providers run straight from the CLI and need none of this. The four brokerable
-providers are `hetzner`, `aws`, `azure`, and `gcp`; even those run direct unless a
+providers run straight from the CLI and need none of this. The five brokerable
+providers are `hetzner`, `aws`, `azure`, `gcp`, and `daytona`; even those run direct unless a
 coordinator URL is configured.
 
 Use neutral placeholders below — `broker.example.com`, `example-org`,
@@ -60,6 +60,13 @@ https://crabbox-coordinator.example.workers.dev     # workers.dev fallback for h
   application, for service-token automation behind an outer Cloudflare gate.
 - The workers.dev URL is useful for Cloudflare `/v1/health` checks if custom DNS is
   disrupted.
+
+Point each CLI configuration directly at the final canonical or
+Access-protected origin it should authenticate to. Credentialed Go requests
+follow only same-origin redirects, and the curl fallback follows no redirects;
+do not use a cross-origin redirecting alias as `CRABBOX_COORDINATOR`. Additional
+workers.dev or custom domains remain useful as independently verified health
+endpoints.
 
 Node deployments should put TLS termination and WebSocket-capable ingress in
 front of port `8080` (or `PORT`). Health checks use `/v1/health`; readiness
@@ -158,7 +165,7 @@ Required service settings:
 DATABASE_URL                         # PostgreSQL connection string
 PORT                                 # optional; default 8080
 CRABBOX_PUBLIC_URL                   # canonical external origin
-CRABBOX_CODE_ORIGIN_TEMPLATE         # optional https://{lease}.code.example.com isolation route
+CRABBOX_CODE_ORIGIN_TEMPLATE         # required for browser Code; https://{lease}.code.example.com
 CRABBOX_SHUTDOWN_TIMEOUT_MS          # optional; default 120000
 ```
 
@@ -209,16 +216,19 @@ Homepage URL: https://broker.example.com
 Callback URL: https://broker.example.com/v1/auth/github/callback
 ```
 
-The coordinator derives the callback from `CRABBOX_PUBLIC_URL` (falling back to
-the request origin). Inject the OAuth app values through the runtime's secret
-mechanism:
+The coordinator derives the callback from the required `CRABBOX_PUBLIC_URL` and
+rejects callbacks from other origins before code exchange. Inject the OAuth app
+values through the runtime's secret mechanism:
 
 ```text
 CRABBOX_GITHUB_CLIENT_ID
 CRABBOX_GITHUB_CLIENT_SECRET
-CRABBOX_SESSION_SECRET            # signs cbxu_ user tokens; falls back to CRABBOX_SHARED_TOKEN
+CRABBOX_PUBLIC_URL               # canonical HTTPS coordinator origin
+CRABBOX_SESSION_SECRET            # signs cbxu_ user tokens; required and distinct from CRABBOX_SHARED_TOKEN
 CRABBOX_GITHUB_ALLOWED_ORG       # or CRABBOX_GITHUB_ALLOWED_ORGS (comma-separated)
 CRABBOX_GITHUB_ALLOWED_TEAMS     # optional: restrict to org teams (alias CRABBOX_GITHUB_ALLOWED_TEAM)
+CRABBOX_GITHUB_REVOKED_USERS     # optional: deny listed github:<numeric-id> owners; mutable selectors fail closed
+CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS # optional: positive-cache TTL, default 300, max 3600
 ```
 
 ### Cloudflare Access (optional)
@@ -253,10 +263,10 @@ CRABBOX_TAILSCALE_CLIENT_ID
 CRABBOX_TAILSCALE_CLIENT_SECRET
 CRABBOX_TAILSCALE_TAILNET=-              # or an explicit tailnet/org
 CRABBOX_TAILSCALE_TAGS=tag:crabbox      # requested-tag allowlist/default
-CRABBOX_TAILSCALE_INSTALL_MODE=package  # or pinned
-CRABBOX_TAILSCALE_VERSION=1.98.4        # pinned mode
-CRABBOX_TAILSCALE_SHA256_AMD64=...      # pinned mode
-CRABBOX_TAILSCALE_SHA256_ARM64=...      # pinned mode
+CRABBOX_TAILSCALE_INSTALL_MODE=package  # package (default) or pinned static archive
+CRABBOX_TAILSCALE_VERSION=1.98.4        # static archive version
+CRABBOX_TAILSCALE_SHA256_AMD64=...      # amd64 archive checksum
+CRABBOX_TAILSCALE_SHA256_ARM64=...      # arm64 archive checksum
 ```
 
 For one tag, assign the same tag to the OAuth client. For multiple tags, either
@@ -298,7 +308,8 @@ Provider credentials live in coordinator secret injection, never in repo
 config. Configure at least one brokered provider before inviting users.
 Per-provider details are in
 [Hetzner](features/hetzner.md), [AWS](features/aws.md),
-[Azure](features/azure.md), and the [provider docs](providers/README.md).
+[Azure](features/azure.md), [Daytona](features/daytona.md), and the
+[provider docs](providers/README.md).
 
 ### Hetzner
 
@@ -320,15 +331,19 @@ default, can launch managed Windows and WSL2 targets, and can launch EC2 Mac
 instances on an operator-provided Dedicated Host. The direct CLI provider remains
 available with `--provider aws` when no broker is configured.
 
-Brokered credentials and host pinning (coordinator secrets):
+Brokered credentials and host pinning for existing static-key deployments:
 
 ```text
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN                # optional
-CRABBOX_HOST_ID                  # optional; pins a brokered host such as an EC2 Mac Dedicated Host
+CRABBOX_HOST_ID                  # optional; admin-only except owner reactivation of a retained Mac instance
 CRABBOX_AWS_MAC_HOST_ID          # optional legacy AWS alias for CRABBOX_HOST_ID
 ```
+
+The Node coordinator can use the AWS default credential chain instead. The
+dedicated ECS private-workspace deployment uses temporary task-role credentials
+and rejects static access keys.
 
 AWS-specific coordinator settings (all optional unless noted):
 
@@ -341,7 +356,7 @@ CRABBOX_AWS_INSTANCE_PROFILE
 CRABBOX_AWS_ROOT_GB
 CRABBOX_AWS_SSH_CIDRS                     # comma-separated SSH source CIDRs
 CRABBOX_AWS_ORPHAN_SWEEP_ENABLED         # defaults on when AWS broker credentials exist
-CRABBOX_AWS_ORPHAN_SWEEP_DELETE          # set 1 to terminate confirmed orphan instances
+CRABBOX_AWS_ORPHAN_SWEEP_DELETE          # set 1 to terminate coordinator-owned orphan instances
 CRABBOX_AWS_ORPHAN_SWEEP_INTERVAL_SECONDS
 CRABBOX_AWS_ORPHAN_SWEEP_GRACE_SECONDS
 ```
@@ -352,10 +367,39 @@ launches one-time instances, tags instances and volumes with lease metadata, and
 terminates non-kept instances after the command.
 
 SSH ingress is source-scoped. If `CRABBOX_AWS_SSH_CIDRS` is set, those CIDRs are
-added; otherwise the CLI sends its detected outbound IPv4 `/32`, and the Worker
-falls back to `CF-Connecting-IP` (`/32` or `/128`). Crabbox revokes any legacy
-managed `0.0.0.0/0` SSH rule when it touches the managed security group. Supplying
+pinned and authoritative: detected and request-source CIDRs are not added.
+Otherwise, brokered leases combine the CLI-detected outbound IPv4 `/32`, when
+available, with the coordinator-authenticated request source (`/32` or `/128`).
+Later IPv6 requests preserve existing IPv4 ingress. Direct AWS leases detect the
+client's outbound IPv4 `/32`. Crabbox revokes any legacy managed `0.0.0.0/0` SSH
+rule when it touches the managed security group. Supplying
 `CRABBOX_AWS_SECURITY_GROUP_ID` makes network policy your responsibility.
+
+#### Dedicated SSM-only private workspace service
+
+[`deploy/aws/ecs-fargate-coordinator.yaml`](../deploy/aws/ecs-fargate-coordinator.yaml)
+deploys a single-replica Node/PostgreSQL coordinator for API-managed private
+Linux workspaces. It owns its ECS cluster/service, task roles, workspace
+instance role/profile, retained SSM log group, internal HTTPS load balancer, CloudWatch
+logging, and separate controller/workspace/load-balancer security groups. It
+expects existing VPC/subnet routing, an ACM certificate and canonical hostname,
+an immutable coordinator image digest, a TLS-verified PostgreSQL database, and
+Secrets Manager references for the database URL and route-scoped workspace
+bearer.
+
+This path is intentionally not the normal SSH lease policy above. Server-side
+configuration pins one AWS account and Region, an exact x86_64 instance
+allowlist, resource ceilings, one private subnet, one no-ingress/TCP-443-egress
+security group, an encrypted gp3 root size, and SSM bootstrap/logging. The task
+role is resolved through the Node AWS default credential chain; the task
+definition contains no reusable static AWS key. Startup remains unready on
+identity, placement, instance-type, subnet, security-group, launch-permission,
+SSM, or database preflight failure.
+
+Client-side labels and Region hints are metadata and cannot select this
+placement. The dedicated service URL does. See
+[Private AWS Workspaces](features/aws-private-workspaces.md) for configuration,
+the client API, separate AWS-GO gate, live canary, and retirement order.
 
 #### AWS IAM
 
@@ -363,12 +407,17 @@ Grant the Worker AWS principal EC2 launch/list/tag/terminate permissions for
 instances, key pairs, and managed security groups, plus the image lifecycle
 permissions (`CreateImage`, `DeregisterImage`, `RegisterImage`,
 `DescribeSnapshots`, `DeleteSnapshot`, `DescribeFastSnapshotRestores`,
-`EnableFastSnapshotRestores`) and `servicequotas:GetServiceQuota`. The image
+`EnableFastSnapshotRestores`), `ec2:DescribeInstanceTypes`, and
+`servicequotas:GetServiceQuota`. The image
 permissions cover `crabbox image`, native AWS checkpoints, macOS image bake
-validation, and Fast Snapshot Restore promotion. Service Quotas access is
-best-effort: when available, Crabbox skips known quota-impossible instance types
-before calling `RunInstances`; when missing, launch errors are still classified
-after the call.
+validation, and Fast Snapshot Restore promotion. Quota admission and readiness
+use the default vCPU count returned by EC2 for each exact instance type,
+including bare metal. Metadata and Service Quotas reads are best-effort for
+ordinary launches: when both are available, Crabbox skips known quota-impossible
+instance types before calling `RunInstances`; when either is missing, launch
+errors are still classified after the call. Readiness reports unknown metadata
+and recommends only instance types with a known vCPU count. Private workspace
+resource caps still require successful metadata inspection.
 
 Print the baseline provider policy with:
 
@@ -424,6 +473,34 @@ SDK credentials plus `CRABBOX_AZURE_*` / `CRABBOX_GCP_*` placement settings
 (location/region, resource group or project, image, network). See
 [Azure](features/azure.md) and the per-provider docs for the full set.
 
+### Daytona
+
+Brokered Daytona uses one coordinator-only API key:
+
+```text
+DAYTONA_CRABBOX_KEY
+```
+
+Optional coordinator settings:
+
+```text
+CRABBOX_DAYTONA_API_URL             # default https://app.daytona.io/api
+CRABBOX_DAYTONA_ORGANIZATION_ID     # only when the credential requires an organization
+CRABBOX_DAYTONA_SNAPSHOT            # optional snapshot name; Daytona default when empty
+CRABBOX_DAYTONA_TARGET              # optional Daytona compute target
+CRABBOX_DAYTONA_USER                # default daytona
+CRABBOX_DAYTONA_WORK_ROOT           # default /home/daytona/crabbox
+CRABBOX_DAYTONA_SSH_GATEWAY_HOST    # fallback host when sshCommand omits one
+CRABBOX_DAYTONA_SSH_ACCESS_MINUTES  # minimum token TTL; default 120
+```
+
+The Worker creates labelled Linux sandboxes, waits for `started`, mints SSH
+access for the lease, refreshes access before expiry, and verifies exact lease
+ownership before deletion. The SSH token is returned only to an authorized
+lease client and is redacted from the portal. Daytona does not support
+coordinator workspaces, ready pools, desktop/browser/code, Tailscale, or native
+image lifecycle.
+
 ## Machine Classes
 
 Leases request a *class* rather than a hardcoded instance type; the broker
@@ -435,6 +512,8 @@ command can override with `--class`. The default class is `beast`.
 Hetzner server types per class:
 
 ```text
+tiny      ccx13, cpx22, cx23
+small     ccx23, cpx32, cx33
 standard  ccx33, cpx62, cx53
 fast      ccx43, cpx62, cx53
 large     ccx53, ccx43, cpx62, cx53
@@ -445,18 +524,24 @@ AWS instance types per class:
 
 ```text
 Linux
+tiny      m7a.large, m7i.large, c7a.xlarge, c7i.xlarge
+small     c7a.2xlarge, c7i.2xlarge, m7a.xlarge, m7i.xlarge, c7a.xlarge
 standard  c7a.8xlarge, c7i.8xlarge, m7a.8xlarge, m7i.8xlarge, c7a.4xlarge
 fast      c7a.16xlarge, c7i.16xlarge, m7a.16xlarge, m7i.16xlarge, c7a.12xlarge, c7a.8xlarge
 large     c7a.24xlarge, c7i.24xlarge, m7a.24xlarge, m7i.24xlarge, r7a.24xlarge, c7a.16xlarge, c7a.12xlarge
 beast     c7a.48xlarge, c7i.48xlarge, m7a.48xlarge, m7i.48xlarge, r7a.48xlarge, c7a.32xlarge, ...
 
 Windows
+tiny      m7a.large, m7i.large, t3.large
+small     c7a.2xlarge, c7i.2xlarge, m7a.xlarge, m7i.xlarge, t3.xlarge
 standard  m7i.large, m7a.large, t3.large
 fast      m7i.xlarge, m7a.xlarge, t3.xlarge
 large     m7i.2xlarge, m7a.2xlarge, t3.2xlarge
 beast     m7i.4xlarge, m7a.4xlarge, m7i.2xlarge
 
 Windows WSL2
+tiny      m8i.large, m8i-flex.large, c8i.xlarge, r8i.large
+small     c8i.2xlarge, m8i.xlarge, m8i-flex.xlarge, r8i.large, c8i.xlarge
 standard  m8i.large, m8i-flex.large, c8i.large, r8i.large
 fast      m8i.xlarge, m8i-flex.xlarge, c8i.xlarge, r8i.xlarge
 large     m8i.2xlarge, m8i-flex.2xlarge, c8i.2xlarge, r8i.2xlarge
@@ -538,6 +623,10 @@ Node/PostgreSQL prerequisites:
 - one always-on service replica;
 - TLS ingress with WebSocket upgrades and health/readiness probes.
 
+For a dedicated AWS-owned deployment with SSM-only private workspaces, use the
+[ECS Fargate template and runbook](features/aws-private-workspaces.md) instead
+of assembling a reusable shared control plane.
+
 Pick an auth model:
 
 - **Browser login** — create the GitHub OAuth app (above) and set
@@ -554,7 +643,10 @@ Recommended limits for a small installation:
 ```text
 CRABBOX_MAX_ACTIVE_LEASES=2
 CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER=1
-CRABBOX_CAPACITY_ADMIN_OWNERS=alice@example.com,bob@example.com
+CRABBOX_MAX_CHECKPOINTS=8
+CRABBOX_MAX_CHECKPOINTS_PER_OWNER=4
+CRABBOX_MAX_CHECKPOINTS_PER_ORG=8
+CRABBOX_CAPACITY_ADMIN_OWNERS=github:12345,github:67890
 CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN=4
 CRABBOX_MAX_MONTHLY_USD=25
 CRABBOX_MAX_MONTHLY_USD_PER_OWNER=10
@@ -566,6 +658,19 @@ also available. Over-limit lease creation returns HTTP 429
 `cost_limit_exceeded`. Cost is the hourly rate (`CRABBOX_COST_RATES_JSON`
 override -> provider live price -> built-in defaults) times TTL; see
 [Cost And Usage](features/cost-usage.md).
+
+Managed checkpoint caps default to 64 globally
+(`CRABBOX_MAX_CHECKPOINTS`), 16 per owner
+(`CRABBOX_MAX_CHECKPOINTS_PER_OWNER`), and 32 per organization
+(`CRABBOX_MAX_CHECKPOINTS_PER_ORG`). Active fork/shard claims default to 16 per
+checkpoint (`CRABBOX_MAX_CHECKPOINT_USE_CLAIMS`), 64 per owner
+(`CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER`), and 256 globally
+(`CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL`). Production Wrangler configuration
+sets all three checkpoint caps to 100; preview checkpoint caps remain
+20/10/20. Both configurations retain claim caps of 16/64/256. Invalid or zero
+values fall back to their finite defaults. These guardrails reject excess
+requests before provider mutation or claim/event creation; each checkpoint
+also retains only its latest 256 audit events.
 
 After deployment, point the CLI at the broker:
 
@@ -611,27 +716,31 @@ is in [Node.js And PostgreSQL](#node-js-and-postgresql).
 ```text
 # Providers (at least one set)
 HETZNER_TOKEN
-AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional)
-CRABBOX_HOST_ID / CRABBOX_AWS_MAC_HOST_ID (optional; pin a Mac Dedicated Host)
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional static compatibility; Node can use its default credential chain)
+CRABBOX_HOST_ID / CRABBOX_AWS_MAC_HOST_ID (optional; admin-only except owner reactivation of a retained Mac instance)
 AZURE_* / CRABBOX_AZURE_* (Azure)
 GCP_* / CRABBOX_GCP_* (GCP)
+DAYTONA_CRABBOX_KEY / CRABBOX_DAYTONA_* (Daytona)
 
 # Auth
 CRABBOX_SHARED_TOKEN, CRABBOX_SHARED_OWNER
 CRABBOX_ADMIN_TOKEN                       # admin routes + image promotion
 CRABBOX_GITHUB_CLIENT_ID, CRABBOX_GITHUB_CLIENT_SECRET
 CRABBOX_GITHUB_ALLOWED_ORG[S], CRABBOX_GITHUB_ALLOWED_TEAMS (optional)
-CRABBOX_GITHUB_ADMIN_OWNERS, CRABBOX_GITHUB_ADMIN_LOGINS (optional)
+CRABBOX_GITHUB_REVOKED_USERS, CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS (optional)
+CRABBOX_GITHUB_ADMIN_OWNERS               # optional github:<numeric-id> admin owners
 CRABBOX_SESSION_SECRET
 CRABBOX_DEFAULT_ORG
 CRABBOX_ACCESS_TEAM_DOMAIN, CRABBOX_ACCESS_AUD   # Cloudflare Access route
 CRABBOX_TRUSTED_USER_HEADER, CRABBOX_TRUSTED_USER_ORG
 CRABBOX_TRUSTED_PROXY_CIDRS              # Node runtime peer allowlist
 CRABBOX_PUBLIC_URL                       # canonical coordinator URL for OAuth callback
-CRABBOX_CODE_ORIGIN_TEMPLATE             # optional per-lease Code origin template
+CRABBOX_CODE_ORIGIN_TEMPLATE             # required for browser Code; per-lease HTTPS origin template
 
 # Cost / limits
 CRABBOX_MAX_ACTIVE_LEASES[_PER_OWNER|_PER_ORG]
+CRABBOX_MAX_CHECKPOINTS[_PER_OWNER|_PER_ORG]
+CRABBOX_MAX_CHECKPOINT_USE_CLAIMS[_PER_OWNER|_TOTAL]
 CRABBOX_MAX_MONTHLY_USD[_PER_OWNER|_PER_ORG]
 CRABBOX_COST_RATES_JSON, CRABBOX_EUR_TO_USD
 

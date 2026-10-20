@@ -1,12 +1,15 @@
-import { Pool } from "pg";
+import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from "pg";
 
-import type { CoordinatorStorage } from "../src/coordinator-runtime";
+import type { CoordinatorStorage, CoordinatorStorageView } from "../src/coordinator-runtime";
 
 const schema = "crabbox";
 const table = `${schema}.coordinator_kv`;
+const transactionAttempts = 12;
+const retryableTransactionErrorCodes = new Set(["40001", "40P01"]);
 
 export class PostgresCoordinatorStorage implements CoordinatorStorage {
   readonly pool: Pool;
+  private readonly view: PostgresCoordinatorStorageView;
 
   constructor(connectionString: string, pool?: Pool) {
     this.pool =
@@ -20,6 +23,7 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
           10_000,
         ),
       });
+    this.view = new PostgresCoordinatorStorageView(storageQuery(this.pool));
   }
 
   async initialize(): Promise<void> {
@@ -50,8 +54,114 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
     await this.pool.end();
   }
 
-  async get<T>(key: string): Promise<T | undefined> {
+  async get<T>(key: string, _options?: { noCache?: boolean }): Promise<T | undefined> {
+    return this.view.get<T>(key);
+  }
+
+  async put<T>(key: string, value: T, _options?: { noCache?: boolean }): Promise<void> {
+    await this.view.put(key, value);
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.view.delete(key);
+  }
+
+  async take<T>(key: string): Promise<T | undefined> {
     const result = await this.pool.query<{ encoded_value: unknown }>(
+      `
+        delete from ${table}
+        where key = $1
+        returning case
+          when value_text_updated_at = updated_at then value_text
+          else value::text
+        end as encoded_value
+      `,
+      [key],
+    );
+    const row = result.rows[0];
+    return row ? decodeStoredValue<T>(row.encoded_value) : undefined;
+  }
+
+  async list<T>(
+    options: NonNullable<Parameters<CoordinatorStorageView["list"]>[0]> = {},
+  ): Promise<Map<string, T>> {
+    return this.view.list<T>(options);
+  }
+
+  async transaction<T>(callback: (transaction: CoordinatorStorageView) => Promise<T>): Promise<T> {
+    const attempt = async (remaining: number): Promise<T> => {
+      try {
+        return await this.transactionAttempt(callback);
+      } catch (error) {
+        if (remaining > 1 && retryablePostgresTransactionError(error)) {
+          const retries = transactionAttempts - remaining;
+          const delay = Math.min(50, 2 ** Math.min(retries, 5)) + Math.floor(Math.random() * 8);
+          await new Promise<void>((resolve) => setTimeout(resolve, delay));
+          return attempt(remaining - 1);
+        }
+        throw error;
+      }
+    };
+    return attempt(transactionAttempts);
+  }
+
+  private async transactionAttempt<T>(
+    callback: (transaction: CoordinatorStorageView) => Promise<T>,
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    let releaseError: Error | undefined;
+    try {
+      await client.query("begin isolation level serializable");
+      const result = await callback(new PostgresCoordinatorStorageView(storageQuery(client)));
+      await client.query("commit");
+      return result;
+    } catch (error) {
+      try {
+        await client.query("rollback");
+      } catch (rollbackError) {
+        releaseError =
+          rollbackError instanceof Error
+            ? rollbackError
+            : new Error("PostgreSQL rollback failed", { cause: rollbackError });
+        const aggregate = new AggregateError(
+          [error, rollbackError],
+          "PostgreSQL transaction failed and rollback also failed",
+          { cause: error },
+        );
+        throw aggregate;
+      }
+      throw error;
+    } finally {
+      if (releaseError) {
+        client.release(releaseError);
+      } else {
+        client.release();
+      }
+    }
+  }
+}
+
+function retryablePostgresTransactionError(error: unknown): boolean {
+  if (error instanceof AggregateError || !error || typeof error !== "object") return false;
+  const code = "code" in error ? error.code : undefined;
+  return typeof code === "string" && retryableTransactionErrorCodes.has(code);
+}
+
+type StorageQuery = <T extends QueryResultRow>(
+  text: string,
+  values?: unknown[],
+) => Promise<QueryResult<T>>;
+
+function storageQuery(queryable: Pick<Pool | PoolClient, "query">): StorageQuery {
+  return async <T extends QueryResultRow>(text: string, values?: unknown[]) =>
+    await queryable.query<T>(text, values);
+}
+
+class PostgresCoordinatorStorageView implements CoordinatorStorageView {
+  constructor(private readonly query: StorageQuery) {}
+
+  async get<T>(key: string, _options?: { noCache?: boolean }): Promise<T | undefined> {
+    const result = await this.query<{ encoded_value: unknown }>(
       `
         select case
           when value_text_updated_at = updated_at then value_text
@@ -66,13 +176,13 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
     return row ? decodeStoredValue<T>(row.encoded_value) : undefined;
   }
 
-  async put<T>(key: string, value: T): Promise<void> {
+  async put<T>(key: string, value: T, _options?: { noCache?: boolean }): Promise<void> {
     const encoded = JSON.stringify(value);
     if (encoded === undefined) {
       throw new TypeError("coordinator storage cannot persist undefined");
     }
     const jsonbEncoded = jsonbCompatibleEncoding(encoded);
-    await this.pool.query(
+    await this.query(
       `
         insert into ${table} (key, value, value_text, value_text_updated_at)
         values ($1, $2::jsonb, $3, now())
@@ -87,11 +197,21 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
   }
 
   async delete(key: string): Promise<void> {
-    await this.pool.query(`delete from ${table} where key = $1`, [key]);
+    await this.query(`delete from ${table} where key = $1`, [key]);
   }
 
-  async list<T>({ prefix = "" }: { prefix?: string } = {}): Promise<Map<string, T>> {
-    const result = await this.pool.query<{ key: string; encoded_value: unknown }>(
+  async list<T>({
+    prefix = "",
+    limit,
+    startAfter,
+    end,
+    reverse,
+  }: NonNullable<Parameters<CoordinatorStorageView["list"]>[0]> = {}): Promise<Map<string, T>> {
+    const values: unknown[] = [`${escapeLike(prefix)}%`];
+    const afterClause = startAfter ? `and key > $${values.push(startAfter)}` : "";
+    const endClause = end === undefined ? "" : `and key < $${values.push(end)}`;
+    const limitClause = limit === undefined ? "" : `limit $${values.push(limit)}`;
+    const result = await this.query<{ key: string; encoded_value: unknown }>(
       `
         select key,
                case
@@ -100,9 +220,12 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
                end as encoded_value
         from ${table}
         where key like $1 escape '\\'
-        order by key
+        ${afterClause}
+        ${endClause}
+        order by key ${reverse ? "desc" : "asc"}
+        ${limitClause}
       `,
-      [`${escapeLike(prefix)}%`],
+      values,
     );
     return new Map(result.rows.map((row) => [row.key, decodeStoredValue<T>(row.encoded_value)]));
   }

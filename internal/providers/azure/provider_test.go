@@ -2,13 +2,218 @@ package azure
 
 import (
 	"flag"
+	"reflect"
+	"strings"
 	"testing"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
 
-func TestIsCrabboxAzureLeaseRequiresProviderTag(t *testing.T) {
+func TestAzureRejectsRemovedDiskMode(t *testing.T) {
+	for _, source := range []string{"config", "flag"} {
+		t.Run(source, func(t *testing.T) {
+			cfg := core.Config{Provider: "azure", Azure: core.AzureConfig{Backend: "vm"}}
+			if source == "config" {
+				cfg.Azure.OSDisk = "ephemeral-preview"
+			}
+			fs := flag.NewFlagSet("migration", flag.ContinueOnError)
+			values := (Provider{}).RegisterFlags(fs, cfg)
+			if source == "flag" {
+				if err := fs.Parse([]string{"--azure-os-disk=ephemeral-preview"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := (Provider{}).ApplyFlags(&cfg, fs, values)
+			if err == nil || !strings.Contains(err.Error(), "has been removed; use ephemeral") || !strings.Contains(err.Error(), "--azure-os-disk ephemeral") {
+				t.Fatalf("expected actionable migration error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestAzureFlatInputTracking(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw     string
+		accepted, bad bool
+	}{{"azure-backend", "vm", true, false}, {"azure-backend", "dynamic-sessions", true, false}, {"azure-backend", "invalid", false, true}, {"azure-os-disk", "managed", true, false}, {"azure-os-disk", "invalid", false, true}, {"azure-snapshot-sku", "Standard_LRS", true, false}, {"azure-snapshot-sku", "invalid", true, true}, {"azure-os-disk-sku", "Standard_LRS", true, false}, {"azure-os-disk-sku", "invalid", true, true}, {"azure-user-assigned-identity-resource-id", "/subscriptions/sub/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/worker", true, false}} {
+		t.Run(tc.name+"/"+tc.raw, func(t *testing.T) {
+			cfg := core.Config{Provider: "azure", Azure: core.AzureConfig{Backend: "vm"}}
+			fs := flag.NewFlagSet("metadata", flag.ContinueOnError)
+			v := (Provider{}).RegisterFlags(fs, cfg)
+			if err := fs.Parse([]string{"--" + tc.name + "=" + tc.raw}); err != nil {
+				t.Fatal(err)
+			}
+			err := (Provider{}).ApplyFlags(&cfg, fs, v)
+			if (err != nil) != tc.bad {
+				t.Fatalf("unexpected validation outcome: %v", err)
+			}
+			want := core.Config{Provider: "azure", Azure: core.AzureConfig{Backend: "vm"}}
+			if tc.accepted {
+				core.RecordProviderFlagInputs(&want, true, "azure")
+				switch tc.name {
+				case "azure-backend":
+					want.Azure.Backend = tc.raw
+					if tc.raw == "dynamic-sessions" {
+						want.Provider = "azure-dynamic-sessions"
+					}
+				case "azure-os-disk":
+					want.Azure.OSDisk = tc.raw
+					want.Azure.OSDiskExplicit = true
+				case "azure-snapshot-sku":
+					want.Azure.SnapshotSKU = tc.raw
+				case "azure-os-disk-sku":
+					want.Azure.OSDiskSKU = tc.raw
+				case "azure-user-assigned-identity-resource-id":
+					want.Azure.UserAssignedIdentityResourceID = tc.raw
+				}
+			}
+			if !reflect.DeepEqual(cfg, want) {
+				t.Fatal("accepted flat flags or partial state attributed incorrectly")
+			}
+		})
+	}
+	cfg := core.Config{Provider: "azure", Azure: core.AzureConfig{Backend: "vm"}}
+	fs := flag.NewFlagSet("wrong", flag.ContinueOnError)
+	(Provider{}).RegisterFlags(fs, cfg)
+	if err := fs.Parse([]string{"--azure-backend=vm"}); err != nil {
+		t.Fatal(err)
+	}
+	before := cfg
+	if err := (Provider{}).ApplyFlags(&cfg, fs, struct{}{}); err != nil || !reflect.DeepEqual(cfg, before) {
+		t.Fatal("wrong values object counted as input")
+	}
+}
+
+func TestPrepareLeaseClaimEndpointPreservesExactAzureIdentity(t *testing.T) {
+	provider := Provider{}
+	existing := core.LeaseClaim{
+		LeaseID:          "cbx_123456abcdef",
+		Slug:             "owned",
+		CloudID:          "crabbox-owned",
+		CloudImmutableID: "vmid-owned",
+		Labels: map[string]string{
+			"provider_key": core.ProviderKeyForLease("cbx_123456abcdef"),
+		},
+	}
+	server := core.Server{
+		CloudID:     "crabbox-owned",
+		ImmutableID: "vmid-owned",
+		Labels: map[string]string{
+			"lease":        existing.LeaseID,
+			"slug":         existing.Slug,
+			"provider_key": existing.Labels["provider_key"],
+		},
+	}
+	got, err := provider.PrepareLeaseClaimEndpoint(existing, "azure", existing.Slug, server, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CloudID != existing.CloudID || got.ImmutableID != existing.CloudImmutableID {
+		t.Fatalf("server=%+v, want exact existing Azure identity", got)
+	}
+}
+
+func TestPrepareLeaseClaimEndpointRejectsIdentityRetargeting(t *testing.T) {
+	provider := Provider{}
+	existing := core.LeaseClaim{
+		LeaseID:          "cbx_123456abcdef",
+		Slug:             "owned",
+		CloudID:          "crabbox-owned",
+		CloudImmutableID: "vmid-owned",
+		Labels: map[string]string{
+			"provider_key": core.ProviderKeyForLease("cbx_123456abcdef"),
+		},
+	}
+	base := core.Server{
+		CloudID:     existing.CloudID,
+		ImmutableID: existing.CloudImmutableID,
+		Labels: map[string]string{
+			"lease":        existing.LeaseID,
+			"slug":         existing.Slug,
+			"provider_key": existing.Labels["provider_key"],
+		},
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*core.Server)
+	}{
+		{name: "name", mutate: func(server *core.Server) { server.CloudID = "replacement" }},
+		{name: "immutable id", mutate: func(server *core.Server) { server.ImmutableID = "vmid-replacement" }},
+		{name: "provider key", mutate: func(server *core.Server) { server.Labels["provider_key"] = "wrong" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := base
+			server.Labels = map[string]string{}
+			for key, value := range base.Labels {
+				server.Labels[key] = value
+			}
+			test.mutate(&server)
+			_, err := provider.PrepareLeaseClaimEndpoint(existing, "azure", existing.Slug, server, true)
+			if err == nil || !strings.Contains(err.Error(), "refusing to rewrite Azure") {
+				t.Fatalf("err=%v, want identity retarget rejection", err)
+			}
+		})
+	}
+}
+
+func TestPrepareLeaseClaimEndpointDoesNotPromoteLegacyClaim(t *testing.T) {
+	existing := core.LeaseClaim{LeaseID: "cbx_123456abcdef", Slug: "legacy", CloudID: "crabbox-legacy"}
+	server := core.Server{
+		CloudID:     existing.CloudID,
+		ImmutableID: "vmid-later",
+		Labels: map[string]string{
+			"lease":        existing.LeaseID,
+			"slug":         existing.Slug,
+			"provider_key": core.ProviderKeyForLease(existing.LeaseID),
+		},
+	}
+	got, err := (Provider{}).PrepareLeaseClaimEndpoint(existing, "azure", existing.Slug, server, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ImmutableID != "" || got.Labels["provider_key"] != "" {
+		t.Fatalf("server=%+v, want legacy claim metadata left unpromoted", got)
+	}
+}
+
+func TestPrepareLeaseClaimEndpointDoesNotAdoptObservedCleanupBinding(t *testing.T) {
+	existing := core.LeaseClaim{
+		LeaseID: "cbx_123456abcdef", Slug: "owned",
+		CloudID: "crabbox-owned", CloudImmutableID: "vmid-owned",
+		Labels: map[string]string{"provider_key": core.ProviderKeyForLease("cbx_123456abcdef")},
+	}
+	server := core.Server{
+		CloudID: existing.CloudID, ImmutableID: existing.CloudImmutableID,
+		Labels: map[string]string{
+			"lease": existing.LeaseID, "slug": existing.Slug,
+			"provider_key":                  existing.Labels["provider_key"],
+			core.AzureCleanupBindingLabel:   "v1",
+			"_crabbox_azure_cleanup_nic_id": "observed-replacement",
+		},
+	}
+	got, err := (Provider{}).PrepareLeaseClaimEndpoint(existing, "azure", existing.Slug, server, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range got.Labels {
+		if strings.HasPrefix(key, "_crabbox_azure_cleanup_") {
+			t.Fatalf("unrecorded cleanup identity adopted: %s", key)
+		}
+	}
+	if server.Labels[core.AzureCleanupBindingLabel] != "v1" {
+		t.Fatal("endpoint preparation mutated the provider observation")
+	}
+}
+
+func TestIsCrabboxAzureLeaseRequiresCanonicalTags(t *testing.T) {
 	t.Parallel()
+	canonical := map[string]string{
+		"crabbox":    "true",
+		"created_by": "crabbox",
+		"provider":   "azure",
+		"lease":      "cbx_123456abcdef",
+		"slug":       "owned",
+	}
 	cases := []struct {
 		name   string
 		labels map[string]string
@@ -17,8 +222,9 @@ func TestIsCrabboxAzureLeaseRequiresProviderTag(t *testing.T) {
 		{name: "nil labels", labels: nil, want: false},
 		{name: "no crabbox tag", labels: map[string]string{"managed_by": "crabbox"}, want: false},
 		{name: "different provider", labels: map[string]string{"crabbox": "true", "provider": "aws"}, want: false},
-		{name: "tagged azure", labels: map[string]string{"crabbox": "true", "provider": "azure"}, want: true},
-		{name: "tagged no provider", labels: map[string]string{"crabbox": "true"}, want: true},
+		{name: "weak azure tags", labels: map[string]string{"crabbox": "true", "provider": "azure"}, want: false},
+		{name: "missing provider", labels: map[string]string{"crabbox": "true", "created_by": "crabbox", "lease": "cbx_123456abcdef", "slug": "owned"}, want: false},
+		{name: "canonical", labels: canonical, want: true},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -44,11 +250,48 @@ func TestProviderAppliesAzureOSDiskFlag(t *testing.T) {
 	if err := provider.ApplyFlags(&cfg, fs, values); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AzureOSDisk != core.AzureOSDiskManaged {
-		t.Fatalf("AzureOSDisk=%q want %q", cfg.AzureOSDisk, core.AzureOSDiskManaged)
+	if cfg.Azure.OSDisk != core.AzureOSDiskManaged {
+		t.Fatalf("AzureOSDisk=%q want %q", cfg.Azure.OSDisk, core.AzureOSDiskManaged)
 	}
-	if !cfg.AzureOSDiskExplicit {
+	if !cfg.Azure.OSDiskExplicit {
 		t.Fatal("AzureOSDiskExplicit=false, want true")
+	}
+}
+
+func TestProviderAppliesAzureSnapshotStorageFlags(t *testing.T) {
+	t.Parallel()
+	provider := Provider{}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	values := provider.RegisterFlags(fs, core.Config{})
+	if err := fs.Parse([]string{
+		"--azure-snapshot-sku", "premium_lrs",
+		"--azure-os-disk-sku", "Premium_LRS",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := core.Config{Provider: "azure"}
+	if err := provider.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Azure.SnapshotSKU != "Premium_LRS" || cfg.Azure.OSDiskSKU != "Premium_LRS" {
+		t.Fatalf("snapshot SKU=%q OS disk SKU=%q", cfg.Azure.SnapshotSKU, cfg.Azure.OSDiskSKU)
+	}
+}
+
+func TestProviderExplicitBackendRoutesToDynamicSessions(t *testing.T) {
+	t.Parallel()
+	provider := Provider{}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	values := provider.RegisterFlags(fs, core.Config{Azure: core.AzureConfig{Backend: core.AzureBackendVM}})
+	if err := fs.Parse([]string{"--azure-backend", "dynamic-sessions"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := core.Config{Provider: "azure", Azure: core.AzureConfig{Backend: core.AzureBackendVM}}
+	if err := provider.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "azure-dynamic-sessions" || cfg.Azure.Backend != core.AzureBackendDynamicSessions {
+		t.Fatalf("provider=%q backend=%q", cfg.Provider, cfg.Azure.Backend)
 	}
 }
 
@@ -57,9 +300,85 @@ func TestProviderValidatesConfiguredAzureOSDisk(t *testing.T) {
 	provider := Provider{}
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	values := provider.RegisterFlags(fs, core.Config{})
-	cfg := core.Config{Provider: "azure", AzureOSDisk: "premium"}
+	cfg := core.Config{Provider: "azure", Azure: core.AzureConfig{OSDisk: "premium"}}
 	if err := provider.ApplyFlags(&cfg, fs, values); err == nil {
 		t.Fatal("expected invalid configured Azure OS disk mode to fail")
+	}
+}
+
+func TestProviderSupportsDirectWindowsOSDiskCheckpoints(t *testing.T) {
+	t.Parallel()
+	capability, ok := (Provider{}).NativeCheckpointCapability(core.NativeCheckpointRequest{
+		Config: core.Config{TargetOS: core.TargetWindows, WindowsMode: core.WindowsModeNormal},
+		Server: core.Server{CloudID: "crabbox-source"},
+		Target: core.SSHTarget{TargetOS: core.TargetWindows, WindowsMode: core.WindowsModeNormal},
+	})
+	if !ok {
+		t.Fatal("expected Windows Azure checkpoint capability")
+	}
+	if capability.Kind != core.CheckpointKindAzureOS || !capability.Direct {
+		t.Fatalf("capability=%+v, want direct Azure OS disk snapshot", capability)
+	}
+}
+
+func TestProviderRejectsWindowsImageCheckpoints(t *testing.T) {
+	t.Parallel()
+	_, ok := (Provider{}).NativeCheckpointCapability(core.NativeCheckpointRequest{
+		Config:   core.Config{TargetOS: core.TargetWindows, WindowsMode: core.WindowsModeNormal},
+		Server:   core.Server{CloudID: "crabbox-source"},
+		Target:   core.SSHTarget{TargetOS: core.TargetWindows, WindowsMode: core.WindowsModeNormal},
+		Strategy: core.CheckpointStrategyImage,
+	})
+	if ok {
+		t.Fatal("Azure Windows leases must not advertise managed image checkpoints")
+	}
+}
+
+func TestProviderRejectsDirectWSL2OSDiskCheckpoints(t *testing.T) {
+	t.Parallel()
+	_, ok := (Provider{}).NativeCheckpointCapability(core.NativeCheckpointRequest{
+		Config: core.Config{TargetOS: core.TargetWindows, WindowsMode: core.WindowsModeWSL2},
+		Server: core.Server{CloudID: "crabbox-source"},
+		Target: core.SSHTarget{TargetOS: core.TargetWindows, WindowsMode: core.WindowsModeWSL2},
+	})
+	if ok {
+		t.Fatal("WSL2 Azure leases must not advertise native Windows snapshot forks")
+	}
+}
+
+func TestProviderAppliesWindowsSnapshotForkAzureScope(t *testing.T) {
+	t.Parallel()
+	cfg := core.Config{}
+	err := (Provider{}).ApplyNativeCheckpointForkConfig(core.NativeCheckpointForkRequest{
+		Config: &cfg,
+		Record: core.NativeCheckpointForkRecord{
+			Kind:     core.CheckpointKindAzureOS,
+			Resource: "/subscriptions/sub/resourceGroups/snapshot-rg/providers/Microsoft.Compute/snapshots/checkpoint",
+			Region:   "westus2",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Azure.Snapshot == "" || cfg.Azure.Location != "westus2" || cfg.Azure.ResourceGroup != "snapshot-rg" || cfg.Azure.Subscription != "sub" {
+		t.Fatalf("fork config=%+v", cfg)
+	}
+}
+
+func TestProviderReappliesOSDiskSKUAfterCheckpointProviderRewrite(t *testing.T) {
+	t.Parallel()
+	provider := Provider{}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	values := provider.RegisterFlags(fs, core.Config{})
+	if err := fs.Parse([]string{"--azure-os-disk-sku", "premium_lrs"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := core.Config{Provider: "azure"}
+	if err := provider.ApplyNativeCheckpointForkFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Azure.OSDiskSKU != "Premium_LRS" {
+		t.Fatalf("AzureOSDiskSKU=%q", cfg.Azure.OSDiskSKU)
 	}
 }
 
@@ -68,7 +387,7 @@ func TestProviderRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected azure provider to be registered: %v", err)
 	}
-	if got := provider.Name(); got != "azure" {
+	if got := provider.Spec().Name; got != "azure" {
 		t.Fatalf("provider name = %q, want %q", got, "azure")
 	}
 }

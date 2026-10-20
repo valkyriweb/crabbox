@@ -19,24 +19,31 @@ and Windows WSL2 when your subscription has credits or available quota. It
 follows the same ordered region fallback as AWS for brokered leases, while
 keeping Windows classes smaller than the large Linux-focused classes.
 
+Linux VMs install checksum-pinned TruffleHog 3.95.9 once during cloud-init.
+Windows WSL2 VMs install the matching Linux binary once while the managed WSL
+distro is created.
+Azure uses Marketplace images rather than Crabbox-promoted developer images, so
+there is no separate Azure image publication step. Brokered environments pick
+up bootstrap changes when the coordinator Worker is deployed; direct mode picks
+them up with the updated Crabbox CLI.
+
 This page covers the `azure` VM backend. Azure Container Apps dynamic sessions
 are a separate, delegated-run backend selected with `--azure-backend
-dynamic-sessions`; see the [providers overview](providers.md).
+dynamic-sessions`; see the [Provider Reference](../providers/README.md).
 
 ## Targets
 
 | Target | Brokered | Notes |
 | --- | --- | --- |
-| Linux | Yes | Cloud-init bootstrap, SSH, rsync, optional desktop/browser/code. |
+| Linux | Yes | Cloud-init bootstrap, SSH, rsync, pinned TruffleHog, optional desktop/browser/code. |
 | Windows native | Yes | Native Windows SSH/sync/run and optional desktop/VNC. No browser/code. |
-| Windows WSL2 | Yes | Nested-virtualization VM sizes; POSIX sync/run/actions hydration through WSL. |
+| Windows WSL2 | Yes | Nested-virtualization VM sizes; POSIX sync/run/actions hydration and pinned TruffleHog through WSL. |
 | macOS | No | Azure offers no managed macOS; use AWS EC2 Mac or a static SSH host. |
 
 ```sh
 crabbox warmup --provider azure --class beast
 crabbox warmup --provider azure --arch arm64 --class fast
 crabbox warmup --provider azure --class beast --azure-os-disk ephemeral
-crabbox warmup --provider azure --class beast --azure-os-disk ephemeral-preview
 crabbox run --provider azure --class standard -- pnpm test
 crabbox warmup --provider azure --target windows --class standard
 crabbox warmup --provider azure --target windows --desktop --class standard
@@ -50,6 +57,12 @@ crabbox vnc --id blue-lobster --open
 Each class maps to an ordered list of VM sizes. Crabbox falls back through the
 list when Azure rejects a SKU for capacity or quota. An explicit `--type` is
 exact and fails clearly when the SKU cannot be created.
+
+If Azure rejects a VM after its lease-owned public IP and NIC already exist,
+Crabbox verifies their canonical ownership and immutable identities, deletes
+both, and clears the durable cleanup claim before creating the next SKU's
+public IP. Unexplained NIC-only fragments and incomplete disk-backed resource
+sets remain fail-closed.
 
 Linux classes:
 
@@ -108,12 +121,37 @@ stateless leases that should use a local OS disk; provisioning fails if the
 selected SKU has no ephemeral OS support, and native Azure checkpoint/fork is
 unavailable.
 
-`azure.osDisk: ephemeral-preview` opts into Azure's public-preview
-full-caching mode for ephemeral OS disks. Crabbox sends Compute API
-`2025-04-01` with `diffDiskSettings.enableFullCaching: true`; for known
-Crabbox Azure fallback lists it skips 2-core, 4-core, and no-local-disk SKUs
-that the preview cannot support. `azure.osDisk: auto` is accepted for
-compatibility and resolves to managed.
+Managed Azure Windows leases using `windows.mode=normal` can also create direct
+OS-disk checkpoints for fast prepared-desktop reuse. Snapshot creation requires
+`crabbox checkpoint create --strategy disk-snapshot --no-reboot=false`; Crabbox
+restarts the source VM after the snapshot and rehydrates every fork with fresh
+SSH, Windows, and loopback-only VNC credentials. A per-fork deny-all network
+security group keeps the copied VM unreachable until credential rotation
+finishes, then Crabbox attaches the normal shared SSH allowlist.
+
+`azure.osDisk: ephemeral` selects generally available full caching. Crabbox
+sets `diffDiskSettings.enableFullCaching: true` with Compute API `2026-04-01`.
+Full caching requires at least eight active vCPUs and local storage greater than twice
+the OS disk size plus 1 GiB. Supported families are N/L/M/H, D/DC/E/Eb/EC v5-v7,
+and F v6-v7. Azure validates local storage capacity for the selected image.
+Crabbox filters known unsupported sizes from class fallback lists.
+See [Microsoft's prerequisites](https://learn.microsoft.com/en-us/azure/virtual-machines/ephemeral-os-disks#prerequisites-for-full-caching).
+
+`ephemeral-preview` is removed. Replace it with `ephemeral` in config, flags,
+and environment variables. Existing `ephemeral` settings now request full caching;
+small VMs and Fsv2 no longer qualify. `auto` still resolves to `managed`.
+
+Snapshot performance can be selected explicitly without changing those
+defaults. `azure.snapshotSKU` / `--azure-snapshot-sku` controls the storage SKU
+used when Crabbox creates an OS disk checkpoint. `azure.osDiskSKU` /
+`--azure-os-disk-sku` controls the managed disk created when a checkpoint is
+forked. For latency-sensitive Windows forks, use `Premium_LRS` for both:
+
+```sh
+crabbox checkpoint create --provider azure --target windows --id swift-crab \
+  --strategy disk-snapshot --no-reboot=false --azure-snapshot-sku Premium_LRS
+crabbox checkpoint fork chk_abcdef1234567890 --azure-os-disk-sku Premium_LRS
+```
 
 ## Quick Start With `az login`
 
@@ -194,6 +232,11 @@ group, set `azure.location` / `CRABBOX_AZURE_LOCATION` to the same region as the
 existing vnet and NSG, or pick distinct `azure.vnet`, `azure.subnet`, and
 `azure.nsg` names for a new region.
 
+A failed shared-infrastructure write retains its legacy fence. The next lease
+automatically resolves it once the resource group, location's vnet, and NSG read
+back as absent or in a settled provisioning state (`Succeeded`, `Failed`, or
+`Canceled`). A durable provisioning operation's fence is never taken over.
+
 The default location is `eastus`. The default Linux image is
 `Canonical:ubuntu-26_04-lts:server:latest`; native Windows defaults to
 `MicrosoftWindowsServer:windowsserver2022:2022-datacenter-smalldisk-g2:latest`.
@@ -229,13 +272,15 @@ back to the public IP. The default is `public`.
 
 ## Desktop
 
-Azure Linux desktop leases use the standard VNC path: Xvfb, a lightweight
-desktop session, x11vnc bound to `127.0.0.1:5900`, and an SSH local tunnel
-created by `crabbox vnc`. Azure native Windows desktop leases use the shared
+Azure Linux desktop leases use the standard VNC path: resize-capable TigerVNC,
+a lightweight XFCE session, VNC bound to `127.0.0.1:5900`, and an SSH local
+tunnel created by `crabbox vnc`. Azure native Windows desktop leases use the shared
 managed Windows bootstrap to install TightVNC, create the local `crabbox`
 administrator, enable auto-logon, and expose VNC only through an SSH tunnel.
+The OpenSSH, Git for Windows, and TightVNC downloads are pinned and SHA-256
+verified before extraction or execution.
 Azure WSL2 leases enable WSL, VirtualMachinePlatform, and HypervisorPlatform,
-update the WSL kernel, import the Ubuntu rootfs, and prepare the Linux-side
+update the WSL kernel, verify and import a versioned Ubuntu rootfs, and prepare the Linux-side
 `crabbox-ready` toolchain. Azure Windows does not provision browser/code
 targets.
 
@@ -246,9 +291,13 @@ Direct cleanup is best-effort through Crabbox lease tags. `crabbox cleanup
 unexpired leases, and cascade-deletes expired ones. The shared resource group,
 vnet, subnet, and NSG are preserved.
 
+Brokered Azure orphan cleanup uses the coordinator's canonical-resource checks;
+see [Lifecycle and cleanup](lifecycle-cleanup.md) for the fail-closed inventory,
+quarantine, and deletion rules.
+
 ## Related docs
 
-- [Providers](providers.md)
+- [Provider Reference](../providers/README.md)
 - [Capacity fallback](capacity-fallback.md)
 - [Linux VNC](vnc-linux.md)
 - [Windows VNC](vnc-windows.md)

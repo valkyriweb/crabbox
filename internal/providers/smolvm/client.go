@@ -5,14 +5,19 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type api interface {
@@ -29,10 +34,13 @@ type api interface {
 }
 
 type client struct {
-	apiKey string
-	base   string
-	http   *http.Client
+	apiKey   string
+	base     string
+	http     *http.Client
+	dataHTTP *http.Client
 }
+
+const smolvmControlTimeout = 60 * time.Second
 
 type createRequest struct {
 	Name       string                 `json:"name,omitempty"`
@@ -127,10 +135,10 @@ type smolvmExecCommandRequest struct {
 	TimeoutSeconds *int              `json:"timeoutSeconds,omitempty"`
 }
 
-var newAPI = func(cfg Config, rt Runtime) (api, error) {
+var newAPI = func(cfg core.Config, rt core.Runtime) (api, error) {
 	apiKey := strings.TrimSpace(cfg.Smolvm.APIKey)
 	if apiKey == "" {
-		return nil, exit(2, "provider=%s requires CRABBOX_SMOLVM_API_KEY, SMOLMACHINES_API_KEY, or SMK_API_KEY", providerName)
+		return nil, core.Exit(2, "provider=%s requires CRABBOX_SMOLVM_API_KEY, SMOLMACHINES_API_KEY, or SMK_API_KEY", providerName)
 	}
 
 	// There is no official Go SDK for the hosted smolfleet control plane
@@ -138,31 +146,46 @@ var newAPI = func(cfg Config, rt Runtime) (api, error) {
 	// server), so this client talks net/http directly to the documented
 	// OpenAPI, like other direct-API providers. If an official Go client
 	// appears, the transport can be swapped behind the api interface.
-	httpClient := rt.HTTP
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+	httpClient, dataHTTPClient := shared.ControlAndDataHTTPClients(rt.HTTP, smolvmControlTimeout)
+	base, err := smolvmEndpoint(cfg)
+	if err != nil {
+		return nil, err
 	}
-	base := blank(strings.TrimSpace(cfg.Smolvm.BaseURL), "https://api.smolmachines.com")
+	parsed, _ := url.Parse(base)
+	return &client{
+		apiKey: apiKey, base: base,
+		http:     shared.SecureHTTPClient(httpClient, parsed, smolvmRedirectError),
+		dataHTTP: shared.SecureHTTPClient(dataHTTPClient, parsed, smolvmRedirectError),
+	}, nil
+}
+
+func smolvmEndpoint(cfg core.Config) (string, error) {
+	base := core.Blank(strings.TrimSpace(cfg.Smolvm.BaseURL), core.SmolvmConfigDefaultBaseURL)
 	parsed, err := url.Parse(base)
 	if err != nil {
-		return nil, exit(2, "%s url %q is invalid", providerName, base)
+		return "", core.Exit(2, "%s url %q is invalid", providerName, base)
 	}
 	if parsed.User != nil {
-		return nil, exit(2, "%s url must not include userinfo", providerName)
+		return "", core.Exit(2, "%s url must not include userinfo", providerName)
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return nil, exit(2, "%s url %q is invalid", providerName, base)
+		return "", core.Exit(2, "%s url %q is invalid", providerName, base)
 	}
-	if parsed.Scheme != "https" && !isLoopbackHTTPURL(parsed) {
-		return nil, exit(2, "%s url %q must use https unless it targets localhost", providerName, base)
+	if parsed.Scheme != "https" && !shared.IsLoopbackHTTPURL(parsed) {
+		return "", core.Exit(2, "%s url %q must use https unless it targets localhost", providerName, base)
 	}
 	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		return nil, exit(2, "%s url %q must not include query or fragment components", providerName, base)
+		return "", core.Exit(2, "%s url %q must not include query or fragment components", providerName, base)
 	}
 	if !trustedSmolvmAPIHost(parsed) && !customSmolvmBaseURLAllowed() {
-		return nil, exit(2, "%s url host %q is not an official Smol Machines endpoint; set CRABBOX_SMOLVM_ALLOW_CUSTOM_BASE_URL=1 to send credentials to a custom control plane", providerName, parsed.Hostname())
+		return "", core.Exit(2, "%s url host %q is not an official Smol Machines endpoint; set CRABBOX_SMOLVM_ALLOW_CUSTOM_BASE_URL=1 to send credentials to a custom control plane", providerName, parsed.Hostname())
 	}
-	return &client{apiKey: apiKey, base: strings.TrimRight(parsed.String(), "/"), http: httpClient}, nil
+	base = strings.TrimRight(parsed.String(), "/")
+	return base, nil
+}
+
+func smolvmRedirectError(destination *url.URL) error {
+	return fmt.Errorf("%s refused cross-origin redirect to %s", providerName, destination.Redacted())
 }
 
 func trustedSmolvmAPIHost(parsed *url.URL) bool {
@@ -178,14 +201,6 @@ func customSmolvmBaseURLAllowed() bool {
 	default:
 		return false
 	}
-}
-
-func isLoopbackHTTPURL(parsed *url.URL) bool {
-	if parsed.Scheme != "http" {
-		return false
-	}
-	host := strings.ToLower(parsed.Hostname())
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func (c *client) CreateMachine(ctx context.Context, req createRequest) (machineData, error) {
@@ -259,7 +274,7 @@ func (c *client) Exec(ctx context.Context, machineID, command, folder string) (e
 		}
 		execReq.CWD = f
 	}
-	if err := c.doJSON(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/exec", nil, execReq, &result); err != nil {
+	if err := c.doDataJSON(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/exec", nil, execReq, &result); err != nil {
 		return execResult{}, err
 	}
 	// Hosted API uses exitCode; the local smolvm serve variant uses exit_code.
@@ -301,84 +316,68 @@ func (c *client) InjectArchive(ctx context.Context, machineID, localPath, target
 	if err != nil {
 		return err
 	}
-	b64 := base64.StdEncoding.EncodeToString(data)
-
-	// Direct API call: embed the base64 of the tgz in a heredoc inside the exec
-	// command string sent to /exec. The guest only needs sh + base64 + tar (no
-	// Python, no "installing" anything). This is a pure direct call to the
-	// smolfleet exec API with the payload in the request body.
-	// We use a distinctive delimiter that cannot appear in base64 output.
-	const eof = "CRABBOX_SYNC_B64_EOF_9f8e7d6c5b4a"
 	absTarget := targetDir
 	if !strings.HasPrefix(absTarget, "/") {
 		absTarget = "/workspace"
 	}
-	script := fmt.Sprintf(`cat > /tmp/crabbox-sync.tgz << '%s'
-%s
-%s
-base64 -d /tmp/crabbox-sync.tgz | tar -xzf - -C %s && rm -f /tmp/crabbox-sync.tgz
-echo "smolvm-direct-archive-extract: ok"
-`, eof, b64, eof, shellQuote(absTarget))
-
-	res, err := c.Exec(ctx, machineID, script, "")
-	if err != nil {
-		return fmt.Errorf("smolvm direct archive exec: %w", err)
-	}
-	if res.ExitCode != 0 {
-		msg := strings.TrimSpace(res.Error)
-		if msg == "" {
-			msg = strings.TrimSpace(res.Output)
-		}
-		return exit(res.ExitCode, "smolvm direct archive extract: %s", msg)
-	}
-	return nil
+	return c.withDecodedFile(ctx, machineID, data, "", `"${TMPDIR:-/tmp}"`,
+		"tar -xzf \"$upload_dir/payload\" -C "+core.ShellQuote(absTarget), "archive extract")
 }
 
 func (c *client) WriteFile(ctx context.Context, machineID, remotePath, content string) error {
-	// Direct API: write small text (e.g. env profile) via heredoc in a single
-	// /exec call. Pure shell, no Python or extra interpreters required.
 	absPath := remotePath
 	if !strings.HasPrefix(absPath, "/") {
 		absPath = "/workspace/" + strings.TrimLeft(absPath, "/")
 	}
-	b64 := base64.StdEncoding.EncodeToString([]byte(content))
-	const eof = "CRABBOX_WRITE_B64_EOF_4e2d8a7c9b1f"
-	tmpPath := "/tmp/crabbox-write-" + base64.RawURLEncoding.EncodeToString([]byte(filepath.Base(absPath))) + ".b64"
-	script := fmt.Sprintf(`mkdir -p %s && cat > %s << '%s'
-%s
-%s
-base64 -d %s > %s && rm -f %s
-echo "smolvm-direct-write: ok"
-`, shellQuote(filepath.Dir(absPath)), shellQuote(tmpPath), eof, b64, eof, shellQuote(tmpPath), shellQuote(absPath), shellQuote(tmpPath))
+	parent := core.ShellQuote(path.Dir(absPath))
+	// Stage beside the destination so publication stays on one filesystem.
+	prepare := "mkdir -p " + parent + "\n[ ! -d " + core.ShellQuote(absPath) + " ] || { echo 'file destination is a directory' >&2; exit 1; }\n"
+	return c.withDecodedFile(ctx, machineID, []byte(content), prepare, parent,
+		"mv -f \"$upload_dir/payload\" "+core.ShellQuote(absPath), "write")
+}
 
+// withDecodedFile owns only this exec's private staging directory. Its trap
+// cannot guarantee cleanup after SIGKILL or ambiguous remote HTTP completion.
+func (c *client) withDecodedFile(ctx context.Context, machineID string, data []byte, prepare, stagingParent, consume, operation string) error {
+	// Check decoding separately from consumption: POSIX pipelines only expose
+	// the last command's status, even when the decoder emitted partial data.
+	const eof = "CRABBOX_UPLOAD_B64_EOF"
+	script := "set -eu\nupload_umask=$(umask)\numask 077\n" + prepare +
+		"upload_dir=$(mktemp -d " + stagingParent + "/.crabbox-upload.XXXXXXXXXX)\n" +
+		`trap 'upload_status=$?; trap - 0; rm -rf -- "$upload_dir" || { echo "upload staging cleanup failed" >&2; [ "$upload_status" -ne 0 ] || upload_status=1; }; exit "$upload_status"' 0` + "\n" +
+		"trap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n" +
+		"base64 -d > \"$upload_dir/payload\" << '" + eof + "'\n" +
+		base64.StdEncoding.EncodeToString(data) + "\n" + eof + "\n" +
+		"umask \"$upload_umask\"\n" +
+		consume + "\n"
 	res, err := c.Exec(ctx, machineID, script, "")
 	if err != nil {
-		return fmt.Errorf("smolvm direct write exec: %w", err)
+		return fmt.Errorf("smolvm direct %s exec: %w", operation, err)
 	}
 	if res.ExitCode != 0 {
-		msg := strings.TrimSpace(res.Error)
-		if msg == "" {
-			msg = strings.TrimSpace(res.Output)
-		}
-		return exit(res.ExitCode, "smolvm direct write: %s", msg)
+		return commandExitError("smolvm direct "+operation, res)
 	}
 	return nil
 }
 
 func (c *client) doJSON(ctx context.Context, method, path string, query url.Values, body any, out any) error {
-	var input io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		input = bytes.NewReader(data)
+	return c.doJSONWithClient(ctx, c.http, method, path, query, body, out)
+}
+
+func (c *client) doDataJSON(ctx context.Context, method, path string, query url.Values, body any, out any) error {
+	httpClient := c.dataHTTP
+	if httpClient == nil {
+		httpClient = c.http
 	}
+	return c.doJSONWithClient(ctx, httpClient, method, path, query, body, out)
+}
+
+func (c *client) doJSONWithClient(ctx context.Context, httpClient *http.Client, method, path string, query url.Values, body any, out any) error {
 	u := c.base + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u, input)
+	req, err := shared.NewCompactJSONRequest(ctx, method, u, body)
 	if err != nil {
 		return err
 	}
@@ -386,13 +385,13 @@ func (c *client) doJSON(ctx context.Context, method, path string, query url.Valu
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.http.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apiError(resp)
+		return apiError(resp, c.apiKey)
 	}
 	if out == nil {
 		return nil
@@ -415,9 +414,9 @@ func (c *client) addHeaders(req *http.Request) {
 	req.Header.Set("Accept", "application/json")
 }
 
-func apiError(resp *http.Response) error {
+func apiError(resp *http.Response, apiKey string) error {
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-	msg := strings.TrimSpace(string(data))
+	msg := shared.RedactErrorSecrets(strings.TrimSpace(string(data)), apiKey)
 	if msg == "" {
 		msg = resp.Status
 	}
@@ -436,13 +435,10 @@ func commandExitError(prefix string, result execResult) error {
 	if msg == "" {
 		msg = "exit " + strconv.Itoa(result.ExitCode)
 	}
-	return exit(result.ExitCode, "%s: %s", prefix, msg)
+	return core.Exit(result.ExitCode, "%s: %s", prefix, msg)
 }
 
 func isNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "404") || strings.Contains(msg, "not found")
+	var apiErr *smolvmAPIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }

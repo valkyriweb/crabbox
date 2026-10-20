@@ -1,0 +1,440 @@
+# Scaleway Provider
+
+Read this when you are:
+
+- choosing `provider: scaleway`;
+- validating Scaleway SDK config and auth material discovery;
+- changing `internal/providers/scaleway` or guarded live smoke support.
+
+Scaleway is registered as a Linux-only **SSH lease** provider. The provider
+implements the normal Crabbox SSH, sync, cleanup, and Tailscale command
+surface for Scaleway Instances. It validates Scaleway SDK credentials plus
+non-secret provider config, creates per-lease Scaleway IAM SSH keys, provisions
+Instances with Crabbox ownership tags and cloud-init bootstrap, and deletes only
+resources whose live Scaleway tags still prove Crabbox ownership.
+
+Scaleway is **direct-only**. It does not run through the coordinator, so the
+local CLI must have Scaleway credentials and direct cleanup remains the
+operator's responsibility.
+
+## When To Use It
+
+Use Scaleway for simple Linux lease work when a Scaleway Instance is the desired
+execution surface and direct local credentials are acceptable. Prefer AWS,
+Azure, GCP, or Hetzner when you need a brokered team path, coordinator-side
+credentials, or integrated cloud cost accounting.
+
+## Commands
+
+SDK config and auth material discovery can be checked without creating
+resources:
+
+```sh
+crabbox doctor --provider scaleway
+```
+
+The provider is registered for the normal SSH-lease command surface:
+
+```sh
+crabbox warmup --provider scaleway --class standard
+crabbox run --provider scaleway --type DEV1-S -- pnpm test
+crabbox ssh --provider scaleway --id my-app
+crabbox stop --provider scaleway my-app
+crabbox cleanup --provider scaleway --dry-run
+```
+
+Fixed-lease orchestrators can pass `--lease-id cbx_abcdef123456` to `warmup`
+or `run`. Repeating the same request from the same local state reuses the
+original allocation; changes to the project, repository owner, or creation
+settings conflict. Fixed acquisition creates the Instance directly from the image,
+including the default public `ubuntu_noble` image, without reading or cloning its
+root snapshot. After attesting the Instance's lease and attempt tags, Crabbox
+requires the root's immutable creation time to equal the Instance's creation
+time, journals that evidence and the root ID, and publishes matching ownership tags on the disk
+and Instance. Interrupted tag publication resumes using that recorded disk ID.
+SSH key identity uses the parsed public key, so Scaleway's removal of the
+optional key comment does not change ownership. A failed acquisition that only
+created the IAM key can be stopped using the same local claim and stored key.
+`status`, `stop`, and normal lease commands accept that ID. Successful stop
+retains a terminal claim so the ID cannot allocate another machine. Keep the
+local claim and stored SSH key through recovery; images with additional volumes
+are rejected for fixed leases.
+
+The offline provider catalog advertises this support as `fixed-lease-id` in
+`crabbox providers --json` and `crabbox providers describe scaleway --json`.
+Use `crabbox providers --feature fixed-lease-id --json` to filter for providers
+that support caller-supplied lease IDs.
+
+### Fixed-Lease Recovery
+
+After server submission is journaled, replay searches the complete project
+inventory for the exact lease and attempt. A matching Instance recovers its
+root-volume identity even if the create response was lost. Foreign or conflicting
+ownership, multiple matching Instances, and failed inventory reads block recovery.
+Once the root ID is journaled, later attachments cannot replace it. Stop checks
+the recorded disk's project, zone, attachment, recorded creation time, and attempt
+tags before deletion,
+including retries after the Instance is gone.
+
+Scaleway has no server-create idempotency token. If a submitted request has no
+observable Instance, both replay and stop retain the unresolved claim and key;
+retry later. An empty inventory does not authorize a second create or terminal
+cleanup because the first request might still be in flight. This also applies
+to an interruption between durable admission and sending the request. A bound
+server ID never authorizes a replacement.
+
+Older fixed claims with a separately pre-created root remain releasable when its
+ID is recorded and the server is bound or has not been submitted. They cannot
+submit a new Instance using that disk. An older
+interrupted volume create with no recorded ID remains unresolved; finish recovery
+with the original CLI before upgrading. New acquisitions never pre-create disks.
+
+Those commands create, inspect, resolve, touch, release, and clean up Scaleway
+Instances through the local Scaleway SDK profile. They are cost-bearing when
+they create live Instances, so use `doctor` and `cleanup --dry-run` before
+running live workflows.
+
+## Live Smoke
+
+The provider-specific live smoke is guarded by `CRABBOX_LIVE=1` and an explicit
+provider selection. It builds `bin/crabbox` unless `CRABBOX_BIN` points at an
+existing binary, verifies the Crabbox-owned Scaleway inventory starts empty,
+creates one short-lived Instance, proves status, command execution, list JSON,
+cleanup, and final empty inventory.
+
+```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=scaleway CRABBOX_LIVE_COORDINATOR=0 scripts/live-smoke.sh
+# or, directly:
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=scaleway scripts/live-scaleway-smoke.sh
+```
+
+The script emits `classification=environment_blocked`,
+`classification=quota_blocked`, `classification=validation_failed`, or
+`classification=cleanup_failed` on stderr when a required credential, quota,
+provider response, or cleanup invariant blocks the smoke. `SCW_ACCESS_KEY` and
+`SCW_SECRET_KEY` are redacted from captured command output before printing.
+
+`--type` is the exact Scaleway Instances commercial type, such as `DEV1-S`.
+There is no separate Scaleway size flag for the generic lease commands.
+
+## Configuration
+
+An explicit class selects the corresponding [machine class](../commands/providers.md)
+instead of the inherited `DEV1-S` default. Explicit `scaleway.type`
+configuration or `--scaleway-type` still takes precedence over the class,
+and `--type` takes precedence over both.
+
+Primary Linux/amd64 sizes are:
+
+| Class | Commercial type | vCPU | RAM (GiB) |
+| --- | --- | --- | --- |
+| `tiny` | `DEV1-S` | 2 | 2 |
+| `small` | `DEV1-M` | 3 | 4 |
+| `standard` | `DEV1-L` | 4 | 8 |
+| `fast` | `PRO2-M` | 16 | 64 |
+| `large` | `PRO2-L` | 32 | 128 |
+| `beast` | `GP1-XL` | 48 | 256 |
+
+`standard` now selects `DEV1-L`, increasing size and cost from the old `DEV1-S`
+mapping. Use `--class tiny` or `--type DEV1-S` to keep the old size.
+`crabbox providers --json` also declares `PRO2-S` as a `standard` alternative;
+the backend currently creates the primary without automatically retrying that
+alternative. Omit `scaleway.type` to let the class select capacity.
+
+Local SDK/configuration failures retain their original error causes for
+diagnostics while keeping the public message redacted and exit code 3. Missing
+SDK configuration still falls back to environment-based credentials.
+
+```yaml
+provider: scaleway
+target: linux
+class: standard
+scaleway:
+  region: fr-par
+  zone: fr-par-1
+  image: ubuntu_noble
+  # type: DEV1-S # optional exact override; takes precedence over class
+  projectId: "<scaleway-project-id>"
+  organizationId: "<scaleway-organization-id>"
+  securityGroup: ""
+  sshCIDRs: []
+```
+
+Config keys under `scaleway:`:
+
+| Key | Maps to | Default | Notes |
+| --- | --- | --- | --- |
+| `region` | `cfg.Scaleway.Region` | `fr-par` | Scaleway region. |
+| `zone` | `cfg.Scaleway.Zone` | `fr-par-1` | Scaleway zone used for Instances and local image lookup. |
+| `image` | `cfg.Scaleway.Image` | `ubuntu_noble` | Scaleway image label or ID. |
+| `type` | `cfg.Scaleway.Type` | `DEV1-S` | Scaleway Instances commercial type. |
+| `projectId` | `cfg.Scaleway.ProjectID` | empty | Required through config, env, or the active Scaleway SDK profile before the SDK client is usable. |
+| `organizationId` | `cfg.Scaleway.OrganizationID` | empty | Optional override for SDK profile organization identity. |
+| `securityGroup` | `cfg.Scaleway.SecurityGroup` | empty | Optional existing Scaleway security group ID attached at Instance creation. Crabbox does not create or mutate security groups. |
+| `sshCIDRs` | `cfg.Scaleway.SSHCIDRs` | empty | Reserved for future security-group mutation. Non-empty values fail fast because this provider does not create ingress rules. |
+
+The active Scaleway SDK profile and `SCW_DEFAULT_REGION`/`SCW_DEFAULT_ZONE`
+select the location when Crabbox location settings are not explicit. A
+`scaleway.region`/`scaleway.zone` config value, matching `CRABBOX_SCALEWAY_*`
+environment override, or provider-specific flag takes precedence; the table
+defaults apply only when neither source selects a value.
+
+Provider-specific flags:
+
+```text
+--scaleway-region <region>
+--scaleway-zone <zone>
+--scaleway-image <image-label-or-id>
+--scaleway-type <commercial-type>
+--scaleway-project-id <project-id>
+--scaleway-organization-id <organization-id>
+--scaleway-security-group <security-group-id>
+--scaleway-ssh-cidrs <cidr[,cidr...]>
+```
+
+The portable `--os ubuntu:24.04` selector maps to `ubuntu_noble`. Other
+explicit portable OS selectors are rejected unless `scaleway.image`,
+`CRABBOX_SCALEWAY_IMAGE`, or `--scaleway-image` provides an explicit Scaleway
+image label or ID.
+
+Scaleway leases default to `root` on SSH port `22` with no fallback port.
+Explicit generic `ssh.user` and `ssh.port` values remain authoritative. The
+effective values appear in `crabbox config show` without retaining defaults
+from another provider when a command overrides the provider.
+
+Environment overrides:
+
+```text
+CRABBOX_SCALEWAY_REGION             Override the region
+CRABBOX_SCALEWAY_ZONE               Override the zone
+CRABBOX_SCALEWAY_IMAGE              Override the image label or ID
+CRABBOX_SCALEWAY_TYPE               Override the commercial type
+CRABBOX_SCALEWAY_PROJECT_ID         Override the project ID
+CRABBOX_SCALEWAY_ORGANIZATION_ID    Override the organization ID
+CRABBOX_SCALEWAY_SECURITY_GROUP     Override the security group ID
+CRABBOX_SCALEWAY_SSH_CIDRS          Comma-separated SSH CIDRs; currently fails fast when non-empty
+```
+
+### Input semantics
+
+The eight Crabbox settings use shared typed bindings. Nonempty file/environment
+strings retain their raw spelling until the provider's existing normalization
+phases. Accepted region, zone, image, and type inputs remain explicit even when
+equal to the default; visited empty flags also remain explicit. This preserves
+the SDK location precedence described above rather than inferring explicitness
+from the final value.
+
+The list sources intentionally differ. A nonempty YAML `sshCIDRs` list replaces
+the prior list without trimming; an omitted, null, or empty list leaves it alone.
+Environment input trims comma-separated items and drops blanks only when the
+environment text is nonempty. A visited `--scaleway-ssh-cidrs` flag uses its last
+scalar value, with an empty registration default independent of configured CIDRs.
+Its empty result is nil, whereas applied comma-only environment input produces
+an empty nonnil list (`null` versus `[]` in JSON). Order and duplicates are retained;
+`none` is an ordinary item, not a clearing token. Nonempty CIDR lists remain
+unsupported and are rejected before allocation; this refactor adds no ingress-rule
+management.
+
+## Credentials
+
+Crabbox uses the official Scaleway SDK config surfaces and environment profile.
+It does not store Scaleway secrets in Crabbox config and does not accept them as
+provider-specific flags. `doctor` proves that required auth material and
+project configuration are discoverable enough to construct the SDK client; it
+does not create resources or perform a live authorization probe.
+
+Supported Scaleway credential and profile inputs include:
+
+```text
+SCW_ACCESS_KEY
+SCW_SECRET_KEY
+SCW_DEFAULT_ORGANIZATION_ID
+SCW_DEFAULT_PROJECT_ID
+SCW_DEFAULT_REGION
+SCW_DEFAULT_ZONE
+SCW_PROFILE
+SCW_CONFIG_PATH
+```
+
+`SCW_ACCESS_KEY` and `SCW_SECRET_KEY`, or equivalent Scaleway SDK profile
+credentials, are required. A project ID is also required through
+`SCW_DEFAULT_PROJECT_ID`, `CRABBOX_SCALEWAY_PROJECT_ID`, or the active SDK
+profile's `default_project_id`.
+
+Do not pass Scaleway credentials as command-line arguments. Keep them in the
+environment, the Scaleway SDK config, or a local secret manager. Crabbox
+redacts configured Scaleway env values from SDK client errors before returning
+them.
+
+## Lifecycle
+
+The provider implements a direct Linux SSH lease over Scaleway Instances:
+
+1. Generate a per-lease SSH key under the Crabbox testbox key directory.
+2. Create the matching project-scoped Scaleway IAM SSH key.
+3. Create a Scaleway Instance with `region`, `zone`, `image`, `type`, project,
+   SSH key, optional security group, cloud-init user data, and Crabbox tags.
+4. Wait for a public IPv4 address and Crabbox SSH bootstrap readiness.
+5. Add ready-state Crabbox tags and claim the lease locally.
+6. Run normal Crabbox sync/run/ssh workflows over SSH.
+7. Update timeout tags on touch.
+8. Delete owned Scaleway Instances and managed IAM SSH keys on `stop`; `cleanup`
+   deletes only resources with complete Crabbox Scaleway ownership tags and an
+   exact project-, zone-, and server-bound local claim.
+
+New leases also record the root disk returned by the original Instance creation
+(or recovered from the exact fixed attempt before its initial disk binding)
+in their local recovery claim and Instance tags. `stop` deletes only this recorded
+disk after verifying its project, zone, identity, and detachment. Disks attached
+later are not adopted or deleted. A disk moved to another Instance, changed
+allocation metadata, or failed disk deletion retains the claim and access key.
+If the Instance is already gone, retry `stop <lease-or-slug>` to finish recorded
+disk cleanup; bulk `cleanup` scans Instances, not orphaned disks.
+
+The allocation contract is marked before creation and journaled locally before
+tag publication or destructive rollback. Outside the fixed-lease recovery path
+described above, an interrupted create with no recorded root identity stays
+unresolved rather than being mistaken for a legacy lease.
+An interrupted tag publication has a cleanup-only recovery path; it cannot
+authorize normal reuse or metadata updates. A crash between confirmed tag
+publication and its local acknowledgment can retain that pending state.
+Successful acquisition keeps that exact acknowledged claim snapshot through
+bootstrap, the acquisition observer, and the final ready-tag/claim transaction.
+An intervening claim change prevents ready publication and rollback; stale
+acquisition cannot overwrite the new owner's claim or delete its resources.
+
+Leases created before root-disk tracking retain their existing Instance/key
+cleanup contract and emit a warning that disk cleanup is not tracked. Crabbox
+never infers ownership of their currently attached or detached disks. Existing
+untracked disks require separate, explicit operator recovery.
+
+Public IPv4 readiness has a five-minute budget covering both API observations
+and waits. Earlier caller cancellation or deadlines take precedence; an
+already-canceled request does not start an observation. Immediate API errors
+retain their original cause rather than being reported as readiness timeouts.
+Interrupted observations retain the caller's custom cause and cancellation
+identity for diagnostics and run classification. Budget expiry retains deadline
+identity with the existing timeout message and exit code 5. Completed ready
+responses and typed API response errors take precedence over coincident stops.
+
+`list` uses all-pages Scaleway inventory. `resolve` may inspect complete,
+canonical live ownership tags without a claim, but reuse requires explicit
+supported `--reclaim` adoption. Recovery claims retain enough Scaleway identity
+to finish release or cleanup after interrupted acquire paths.
+
+## Ownership And Cleanup
+
+The foundation tag helpers encode intended ownership tags such as:
+
+```text
+crabbox
+crabbox:provider:scaleway
+crabbox:lease:cbx_abcdef123456
+crabbox:slug:my-app
+crabbox:target:linux
+crabbox:expires_at:<unix-seconds>
+```
+
+Read-only inventory requires a complete ownership predicate: Crabbox marker,
+provider marker, canonical lease id, slug, and Linux target. Reuse and deletion
+also require an exact local claim for the same Scaleway project, zone, lease,
+and server id. Resources with partial, foreign, malformed, claimless, or
+mismatched ownership are skipped or refused. A local claim alone is not enough
+for destructive release: Crabbox re-fetches the live Scaleway Instance by ID
+and validates current tags before deletion. If Scaleway confirms the Instance
+is already absent, release removes the managed SSH key and local claim
+idempotently.
+
+`crabbox cleanup --provider scaleway --dry-run` reports expired owned resources
+without deleting them. Use the Scaleway console or `scw` only for manual account
+inspection; do not treat manual cleanup as Crabbox lifecycle proof.
+
+## Guarded Live Smoke
+
+The guarded opt-in command builds `bin/crabbox`, verifies the current Scaleway
+Crabbox inventory is empty, creates a short-lived `DEV1-S` lease by default,
+waits for readiness, runs `echo ok`, verifies the active lease appears in
+`list --json`, stops it, runs `cleanup --dry-run`, and verifies the final
+inventory is empty.
+
+Run it only when live Scaleway credentials, IDs, region, zone, and quota are
+available:
+
+```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=scaleway scripts/live-scaleway-smoke.sh
+```
+
+Required environment:
+
+```text
+CRABBOX_LIVE=1
+CRABBOX_LIVE_PROVIDERS=scaleway
+SCW_ACCESS_KEY
+SCW_SECRET_KEY
+SCW_DEFAULT_ORGANIZATION_ID or CRABBOX_SCALEWAY_ORGANIZATION_ID
+SCW_DEFAULT_PROJECT_ID or CRABBOX_SCALEWAY_PROJECT_ID
+SCW_DEFAULT_REGION or CRABBOX_SCALEWAY_REGION
+SCW_DEFAULT_ZONE or CRABBOX_SCALEWAY_ZONE
+```
+
+Optional smoke defaults:
+
+```text
+CRABBOX_SCALEWAY_TYPE=DEV1-S
+CRABBOX_SCALEWAY_IMAGE=ubuntu_noble
+CRABBOX_SCALEWAY_CLEANUP_ATTEMPTS=65
+```
+
+Expected classifications:
+
+```text
+classification=environment_blocked reason=CRABBOX_LIVE_not_enabled
+classification=environment_blocked reason=scaleway_not_selected
+classification=environment_blocked reason=SCW_ACCESS_KEY_missing
+classification=environment_blocked reason=SCW_SECRET_KEY_missing
+classification=environment_blocked reason=SCW_DEFAULT_ORGANIZATION_ID_missing
+classification=environment_blocked reason=SCW_DEFAULT_PROJECT_ID_missing
+classification=quota_blocked
+classification=validation_failed
+classification=cleanup_failed
+classification=live_scaleway_smoke_passed
+```
+
+`environment_blocked` means local live gates, credentials, IDs, region, or zone
+are unavailable. `quota_blocked` means Scaleway rejected the create path with
+quota, capacity, rate-limit, or account-limit language. `validation_failed`
+means the smoke's safety checks failed, such as non-empty initial inventory or
+unexpected list JSON. `cleanup_failed` means the targeted stop retry loop could
+not prove cleanup. The script redacts the configured Scaleway access and secret
+keys from captured command output before printing.
+
+## Capabilities
+
+- **SSH** and **Crabbox sync**: implemented through the normal Linux SSH lease
+  path.
+- **Tailscale**: declared through the standard Linux cloud-init path.
+- **Desktop / browser / code**: not advertised.
+- **Cleanup**: implemented for Crabbox-owned Scaleway Instances and managed IAM
+  SSH keys.
+- **Coordinator**: never; direct CLI only.
+
+## Gotchas
+
+- `scaleway` has no aliases; use the canonical provider name.
+- `scaleway` is direct-only. Coordinator secrets and cost accounting do not
+  cover these Instances.
+- `crabbox doctor --provider scaleway` checks SDK config and auth material
+  discovery, but it does not create resources or prove credentials are
+  authorized.
+- `warmup`, `run`, `ssh`, `stop`, `list`, and `cleanup` are live command
+  surfaces that can create or delete Scaleway resources.
+- `--type` must be a valid Scaleway Instances commercial type such as `DEV1-S`.
+- `securityGroup` must name an existing Scaleway security group. Non-empty
+  `sshCIDRs` fails fast because this branch does not create or mutate Scaleway
+  firewall/security-group rules.
+
+## Related Docs
+
+- [Provider reference](README.md)
+- [Provider backends](../provider-backends.md)
+- [Operations](../operations.md)
