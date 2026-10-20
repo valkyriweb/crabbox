@@ -121,8 +121,8 @@ func herdrPluginPathWithin(path, root string) bool {
 		return false
 	}
 	within := func(p, r string) bool {
-		p, r = filepath.Clean(p), filepath.Clean(r)
-		return p == r || strings.HasPrefix(p, r+string(filepath.Separator))
+		rel, err := filepath.Rel(filepath.Clean(r), filepath.Clean(p))
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 	}
 	if within(path, root) {
 		return true

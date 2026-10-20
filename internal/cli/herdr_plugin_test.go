@@ -356,3 +356,24 @@ func installHerdrPluginTestBackend(t *testing.T) {
 	t.Cleanup(func() { testAWSBackendOverride = nil })
 	t.Setenv("CRABBOX_PROVIDER", "aws")
 }
+
+func TestHerdrPluginPathWithin(t *testing.T) {
+	for _, tc := range []struct {
+		path, root string
+		want       bool
+	}{
+		{"/plugins/herdr", "/plugins/herdr", true},
+		{"/plugins/herdr/bin", "/plugins/herdr/", true},
+		{"/plugins/herdr-other", "/plugins/herdr", false},
+		{"/plugins", "/plugins/herdr", false},
+		{"/tmp/project", "/", true},
+		{"relative/project", "/plugins/herdr", false},
+		{"/plugins/herdr/..", "/plugins/herdr", false},
+		{"/plugins/..herdr", "/plugins", true},
+		{"/anything", "", false},
+	} {
+		if got := herdrPluginPathWithin(tc.path, tc.root); got != tc.want {
+			t.Errorf("herdrPluginPathWithin(%q, %q) = %v, want %v", tc.path, tc.root, got, tc.want)
+		}
+	}
+}
