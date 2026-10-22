@@ -145,6 +145,22 @@ func loopbackSafeFallbackPorts(cfg Config, host string, fallback []string) []str
 	return []string{}
 }
 
+// loopbackSafeAdvertisedFallbackPorts drops an advertised port 22 for a
+// loopback host: on a port-forward it would reach the operator's own sshd.
+// Explicit ssh.fallbackPorts still apply.
+func loopbackSafeAdvertisedFallbackPorts(cfg Config, host string, advertised []string) []string {
+	if cfg.sshFallbackPortsExplicit || !isLoopbackSSHHost(host) {
+		return advertised
+	}
+	kept := make([]string, 0, len(advertised))
+	for _, port := range advertised {
+		if strings.TrimSpace(port) != "22" {
+			kept = append(kept, port)
+		}
+	}
+	return kept
+}
+
 func isLoopbackSSHHost(host string) bool {
 	host = strings.Trim(strings.TrimSpace(host), "[]")
 	if strings.EqualFold(host, "localhost") {

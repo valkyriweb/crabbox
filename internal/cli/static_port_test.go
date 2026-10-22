@@ -166,3 +166,28 @@ func openLoopbackSSHPort(t *testing.T) string {
 	}
 	return port
 }
+
+func TestLeaseTargetDropsAdvertisedPort22ForLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		name, host string
+		explicit   bool
+		want       []string
+	}{
+		{name: "loopback drops 22", host: "127.0.0.1", want: []string{"2022"}},
+		{name: "localhost drops 22", host: "localhost", want: []string{"2022"}},
+		{name: "public keeps 22", host: "203.0.113.10", want: []string{"22", "2022"}},
+		{name: "explicit config keeps 22", host: "127.0.0.1", explicit: true, want: []string{"22", "2022"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.sshFallbackPortsExplicit = tc.explicit
+			_, target, _ := leaseToServerTarget(CoordinatorLease{
+				ID: "cbx_abcdef123456", Provider: "aws", Host: tc.host, SSHPort: "2222",
+				SSHFallbackPorts: []string{"22", "2022"},
+			}, cfg)
+			if !reflect.DeepEqual(target.FallbackPorts, tc.want) {
+				t.Fatalf("fallback ports=%v, want %v", target.FallbackPorts, tc.want)
+			}
+		})
+	}
+}
