@@ -3377,24 +3377,7 @@ func TestRunCommandInjectsReservedMetadataIntoStaticSSH(t *testing.T) {
 	isolateRunTestUserDirs(t, dir)
 	logPath := installRecordingSSH(t, dir)
 	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			_ = conn.Close()
-		}
-	}()
-	_, sshPort, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
+	sshPort := openLoopbackSSHPort(t)
 	var stdout, stderr bytes.Buffer
 	args := []string{
 		"--provider", "ssh",
@@ -5874,7 +5857,7 @@ esac
 			}
 			writeReplacementListConfig(t, "crabbox.yaml", fmt.Sprintf("env:\n  allow: [CI, NODE_OPTIONS, BUILD_FLAVOR]\nresults:\n  junit: [old-report.xml]\n  auto: %t\nrun:\n  preflightTools: [cmake]\n", tc.auto))
 			writeReplacementListConfig(t, ".crabbox.yaml", "env:\n  allow: []\nresults:\n  junit: []\nrun:\n  preflightTools: []\n")
-			args := []string{"--provider", "ssh", "--static-host", "127.0.0.1", "--static-user", "runner", "--static-work-root", filepath.Join(dir, "remote"), "--no-sync", "--preflight"}
+			args := []string{"--provider", "ssh", "--static-host", "127.0.0.1", "--static-port", openLoopbackSSHPort(t), "--static-user", "runner", "--static-work-root", filepath.Join(dir, "remote"), "--no-sync", "--preflight"}
 			if runtime.GOOS == "darwin" {
 				args = append(args, "--target", "macos")
 			}

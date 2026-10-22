@@ -2,6 +2,7 @@ package cli
 
 import (
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -139,4 +140,29 @@ func TestStaticRemoteExplicitPortInputsNeverFallBack(t *testing.T) {
 			}
 		})
 	}
+}
+
+// openLoopbackSSHPort gives a static loopback test a listening port, since a
+// loopback static host never falls back to the machine's own port 22.
+func openLoopbackSSHPort(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
