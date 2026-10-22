@@ -115,6 +115,63 @@ func TestBrokeredReleaseNotFoundForgetsLocalClaim(t *testing.T) {
 	}
 }
 
+func TestBrokeredReleaseNotFoundKeepsClaimUnlessLeaseIsAbsent(t *testing.T) {
+	notFound := func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not_found"}`))
+	}
+	for _, tc := range []struct {
+		name    string
+		release func(http.ResponseWriter, *http.Request)
+		get     func(http.ResponseWriter, *http.Request, string)
+	}{
+		{
+			name:    "owner mismatch: release 404 but the lease still reads",
+			release: func(w http.ResponseWriter, _ *http.Request) { notFound(w) },
+			get: func(w http.ResponseWriter, _ *http.Request, id string) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"lease": CoordinatorLease{ID: id, Provider: brokeredReleaseTestProviderName, State: "active"}})
+			},
+		},
+		{
+			name:    "untyped catch-all 404",
+			release: func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) },
+			get:     func(w http.ResponseWriter, _ *http.Request, _ string) { notFound(w) },
+		},
+		{
+			name: "other 404 error code",
+			release: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":"machine_not_found"}`))
+			},
+			get: func(w http.ResponseWriter, _ *http.Request, _ string) { notFound(w) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			configureCoordinatorReleaseTestTiming(t, time.Second, 0)
+			const id = "cbx_abcdef12345a"
+			claimBrokeredReleaseTestLease(t, id, brokeredReleaseTestProviderName)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/release") {
+					tc.release(w, r)
+					return
+				}
+				tc.get(w, r, id)
+			}))
+			defer server.Close()
+			var stderr bytes.Buffer
+			backend := brokeredReleaseTestBackend(server, &stderr, brokeredReleaseTestProvider{}.Spec())
+			outcome, _ := backend.ReleaseLeaseWithOutcome(t.Context(), ReleaseLeaseRequest{Lease: LeaseTarget{LeaseID: id, Server: Server{Provider: brokeredReleaseTestProviderName}}, Force: true})
+			if outcome.ForgottenLocally {
+				t.Fatalf("outcome=%+v; want the claim kept", outcome)
+			}
+			if _, exists, err := ReadLeaseClaimWithPresence(id); err != nil || !exists {
+				t.Fatalf("claim exists=%t err=%v; want kept\n%s", exists, err, stderr.String())
+			}
+		})
+	}
+}
+
 func TestNonBrokeredReleaseNotFoundKeepsLocalClaim(t *testing.T) {
 	clearConfigEnv(t)
 	configureCoordinatorReleaseTestTiming(t, time.Second, 0)

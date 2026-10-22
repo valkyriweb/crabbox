@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -1286,7 +1287,7 @@ func (b *coordinatorLeaseBackend) releaseLease(ctx context.Context, req ReleaseL
 			return false, err
 		}
 		remove, err := b.releaseLeaseUnderClaimFence(ctx, req, outcome)
-		if err != nil && exists && b.spec.BrokeredOnly && isCoordinatorNotFoundError(err) {
+		if err != nil && exists && b.spec.BrokeredOnly && b.brokeredLeaseConfirmedAbsent(ctx, err, req.Lease.LeaseID) {
 			// Brokered-only providers (serve) run only what the coordinator
 			// assigns, so a lease the coordinator no longer has holds nothing remote.
 			fmt.Fprintf(b.rt.Stderr, "coordinator has no %s lease %s; removing local claim\n", b.spec.Name, req.Lease.LeaseID)
@@ -1295,6 +1296,27 @@ func (b *coordinatorLeaseBackend) releaseLease(ctx context.Context, req ReleaseL
 		}
 		return remove, err
 	}, syncControllerDirectory)
+}
+
+// brokeredLeaseConfirmedAbsent accepts only the lease route's typed
+// not_found answer, then confirms it with a lease read. The serve release
+// handler also answers not_found on an owner or org mismatch after the fleet
+// manage check passed; the lease read still finds such a lease, so the claim
+// stays.
+func (b *coordinatorLeaseBackend) brokeredLeaseConfirmedAbsent(ctx context.Context, err error, leaseID string) bool {
+	if !isCoordinatorLeaseNotFound(err, leaseID) {
+		return false
+	}
+	_, getErr := b.coord.GetLease(ctx, leaseID)
+	return isCoordinatorLeaseNotFound(getErr, leaseID)
+}
+
+func isCoordinatorLeaseNotFound(err error, leaseID string) bool {
+	var httpErr CoordinatorHTTPError
+	if !errors.As(err, &httpErr) || !strings.HasPrefix(httpErr.Path, "/v1/leases/"+url.PathEscape(leaseID)) {
+		return false
+	}
+	return coordinatorResponseErrorCode(err, http.StatusNotFound) == "not_found"
 }
 
 // brokeredReleaseObservationTimeout bounds the deferred-release wait for a
