@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"net/http"
@@ -339,5 +340,77 @@ func TestServeCapacityWaitConfigFile(t *testing.T) {
 	}
 	if cfg.Serve.CapacityWait != 3*time.Minute {
 		t.Fatalf("capacityWait=%s; want 3m", cfg.Serve.CapacityWait)
+	}
+}
+
+func TestCoordinatorStopBySlugReleasesCanonicalLeaseID(t *testing.T) {
+	if runParallelCLIContract(t, 0) {
+		return
+	}
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	installRecordingSSH(t, dir)
+	t.Setenv("CRABBOX_OWNER", "test@example.com")
+	const id = "cbx_abcdef12345b"
+	if err := ClaimLeaseTargetForConfig(id, "ended-slug", Config{Provider: "aws"}, Server{Provider: "aws"}, SSHTarget{}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var releasePaths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/release") {
+			releasePaths = append(releasePaths, r.URL.Path)
+			_ = json.NewEncoder(w).Encode(map[string]any{"lease": confirmedCoordinatorRelease(id, "aws")})
+			return
+		}
+		if strings.Contains(r.URL.Path, id) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"lease": confirmedCoordinatorRelease(id, "aws")})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not_found"}`))
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_TOKEN", "user-token")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var stderr bytes.Buffer
+	err := (App{Stdout: io.Discard, Stderr: &stderr}).stop(ctx, []string{"--provider", "aws", "--id", "ended-slug"})
+	if err != nil {
+		t.Fatalf("stop: %v\n%s", err, stderr.String())
+	}
+	if len(releasePaths) != 1 || releasePaths[0] != "/v1/leases/"+id+"/release" {
+		t.Fatalf("release paths=%v; want the canonical lease ID\n%s", releasePaths, stderr.String())
+	}
+}
+
+func TestBrokeredReleaseStillPendingAfterObservationKeepsClaim(t *testing.T) {
+	clearConfigEnv(t)
+	configureCoordinatorReleaseTestTiming(t, time.Second, 0)
+	old := brokeredReleaseObservationTimeout
+	brokeredReleaseObservationTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { brokeredReleaseObservationTimeout = old })
+	const id = "cbx_abcdef12345c"
+	claimBrokeredReleaseTestLease(t, id, brokeredReleaseTestProviderName)
+	deleting := true
+	pending := CoordinatorLease{ID: id, Provider: brokeredReleaseTestProviderName, State: "released", CleanupStartedAt: "2026-10-22T09:40:00Z", ReleaseDeletesServer: &deleting}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"lease": pending})
+	}))
+	defer server.Close()
+	var stderr bytes.Buffer
+	backend := brokeredReleaseTestBackend(server, &stderr, brokeredReleaseTestProvider{}.Spec())
+	outcome, err := backend.ReleaseLeaseWithOutcome(t.Context(), ReleaseLeaseRequest{Lease: LeaseTarget{LeaseID: id, Server: Server{Provider: brokeredReleaseTestProviderName}}, Force: true, DeferProviderCleanupObservation: true})
+	if err != nil {
+		t.Fatalf("release: %v\n%s", err, stderr.String())
+	}
+	if outcome.Terminal || outcome.ForgottenLocally {
+		t.Fatalf("outcome=%+v; want pending cleanup to stay non-terminal", outcome)
+	}
+	if _, exists, err := ReadLeaseClaimWithPresence(id); err != nil || !exists {
+		t.Fatalf("claim exists=%t err=%v; want kept while cleanup is pending", exists, err)
+	}
+	if !strings.Contains(stderr.String(), "remains pending") {
+		t.Fatalf("missing pending warning:\n%s", stderr.String())
 	}
 }

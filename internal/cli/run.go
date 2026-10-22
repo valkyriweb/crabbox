@@ -5438,7 +5438,10 @@ func (a App) stop(ctx context.Context, args []string) (stopErr error) {
 			// Release by canonical lease ID: the coordinator does not resolve a
 			// slug once the lease has ended, but the local claim still maps it.
 			if !IsCanonicalLeaseID(*id) {
-				if claim, ok, claimErr := ResolveLeaseClaimForProviderContext(ctx, *id, backend.Spec().Name); claimErr == nil && ok {
+				claim, ok, claimErr := ResolveLeaseClaimForProviderContext(ctx, *id, backend.Spec().Name)
+				if claimErr != nil {
+					fmt.Fprintf(a.Stderr, "warning: could not map %s to a canonical lease ID: %v\n", *id, claimErr)
+				} else if ok {
 					lease.LeaseID = claim.LeaseID
 				}
 			}
