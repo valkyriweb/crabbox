@@ -299,26 +299,30 @@ func TestBrokeredAcquisitionWaitsOnFullSizeCapacityRejection(t *testing.T) {
 					http.NotFound(w, r)
 					return
 				}
-				creates.Add(1)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusConflict)
-				_, _ = w.Write(body)
+				if creates.Add(1) == 1 {
+					_, _ = w.Write(body)
+					return
+				}
+				_, _ = io.WriteString(w, `{"error":"serve_capacity_unavailable","details":[{"online":false}]}`)
 			}))
 			defer server.Close()
 			cfg := baseConfig()
 			cfg.Provider = brokeredReleaseTestProviderName
 			cfg.Coordinator, cfg.CoordToken = server.URL, "synthetic-token"
-			cfg.Serve.CapacityWait = 20 * time.Millisecond
+			cfg.Serve.CapacityWait = time.Minute
 			var stderr bytes.Buffer
 			b := &coordinatorLeaseBackend{cfg: cfg, spec: brokeredReleaseTestProvider{}.Spec(), coord: mustNewCoordinatorClient(t, cfg), rt: Runtime{Stderr: &stderr}}
 			_, err = b.Acquire(t.Context(), AcquireRequest{})
-			if creates.Load() < 2 || !strings.Contains(stderr.String(), `phase="awaiting-capacity"`) {
-				t.Fatalf("creates=%d; want a capacity wait with retries\nerr=%.2000v\nstderr:\n%.2000s", creates.Load(), err, stderr.String())
+			if creates.Load() != 2 || !strings.Contains(stderr.String(), `phase="awaiting-capacity"`) {
+				t.Fatalf("creates=%d; want one capacity wait, then a fail-fast offline rejection\nerr=%.2000v\nstderr:\n%.2000s", creates.Load(), err, stderr.String())
 			}
 			if !isCoordinatorCapacityUnavailable(err) {
-				t.Fatalf("err=%.2000v; want the capacity rejection once the budget runs out", err)
+				t.Fatalf("err=%.2000v; want the final capacity rejection", err)
 			}
-			if rendered := err.Error(); len(rendered) >= len(body) || !strings.HasSuffix(rendered, "... (truncated)") {
+			rendered := decodeCoordinatorResponse(http.MethodPost, "/v1/leases", http.StatusConflict, bytes.NewReader(body), nil).Error()
+			if len(rendered) >= len(body) || !strings.HasSuffix(rendered, "... (truncated)") {
 				t.Fatalf("rendered error must stay capped: %.2000s", rendered)
 			}
 		})
