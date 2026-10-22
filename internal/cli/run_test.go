@@ -3377,10 +3377,29 @@ func TestRunCommandInjectsReservedMetadataIntoStaticSSH(t *testing.T) {
 	isolateRunTestUserDirs(t, dir)
 	logPath := installRecordingSSH(t, dir)
 	t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "missing.yaml"))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	_, sshPort, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
 	var stdout, stderr bytes.Buffer
 	args := []string{
 		"--provider", "ssh",
 		"--static-host", "127.0.0.1",
+		"--static-port", sshPort,
 		"--static-user", "runner",
 		"--static-work-root", "/tmp/crabbox-static-test",
 		"--no-sync",
