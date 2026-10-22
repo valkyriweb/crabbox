@@ -1,0 +1,68 @@
+name: Fork build (valkyriweb)
+
+# Fork-only, manual. Cross-builds unsigned controller + runtime pack and uploads
+# them to a fork GitHub release. No signing, notarization, or tap publication.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without leading v, e.g. 0.79.1-valky.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.repository == 'valkyriweb/crabbox'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-valky\.[0-9]+$ ]]
+          out="$RUNNER_TEMP/out"; tool="$RUNNER_TEMP/runtime-artifacts"
+          mkdir -p "$out/runtimes" "$out/dist"
+          go build -trimpath -o "$tool" ./scripts/runtime-artifacts
+          build_id=$("$tool" source-id --source-directory "$PWD")
+          [[ "$build_id" =~ ^[0-9a-f]{64}$ ]]
+          for p in darwin linux windows; do for a in amd64 arm64; do
+            n="$p-$a"; [[ "$p" != windows ]] || n+=.exe
+            CGO_ENABLED=0 GOOS=$p GOARCH=$a go build -trimpath \
+              -ldflags="-s -w -X github.com/openclaw/crabbox/internal/runner.BuildID=$build_id" \
+              -o "$out/runtimes/$n" ./cmd/crabbox-runtime
+          done; done
+          for target in darwin_arm64 linux_amd64; do
+            os=${target%_*}; arch=${target#*_}; d="$out/$target"
+            mkdir -p "$d/crabbox-runtime"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags="-s -w -X github.com/openclaw/crabbox/internal/cli.version=$VERSION -X github.com/openclaw/crabbox/internal/runtimeartifact.distribution=complete" \
+              -o "$d/crabbox" ./cmd/crabbox
+            cp "$out/runtimes/"* "$d/crabbox-runtime/"
+            "$tool" prepare --directory "$d/crabbox-runtime" --controller "$d/crabbox" \
+              --filesystem-build-id "$build_id" > "$d/crabbox-runtime/manifest.json.partial"
+            mv "$d/crabbox-runtime/manifest.json.partial" "$d/crabbox-runtime/manifest.json"
+            "$tool" verify --directory "$d/crabbox-runtime" --controller "$d/crabbox" \
+              --filesystem-build-id "$build_id" > /dev/null
+            tar -C "$d" -czf "$out/dist/crabbox_${VERSION}_${target}.tar.gz" crabbox crabbox-runtime
+          done
+          (cd "$out/dist" && sha256sum *.tar.gz > checksums.txt && cat checksums.txt)
+          echo "DIST=$out/dist" >> "$GITHUB_ENV"
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" "$DIST"/* -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease --title "v$VERSION (valkyriweb fork)" \
+            --notes "Unsigned fork build of $GITHUB_SHA. Not an openclaw release."
