@@ -65,11 +65,12 @@ type CoordinatorHTTPError struct {
 	responseUnredirected bool
 }
 
-// Message keeps the whole error body so structured rejections stay parseable
-// (serve capacity details list a full view for each of up to 64 donors); only
-// the rendered error is capped.
+// Message keeps the whole error body so structured rejections stay parseable;
+// only the rendered error is capped. A serve capacity rejection lists a view
+// of up to 64 donors, each built from a heartbeat of at most 32 KiB, so 4 MiB
+// leaves twice that bound.
 const (
-	coordinatorErrorBodyLimit    = 1 << 20
+	coordinatorErrorBodyLimit    = 4 << 20
 	coordinatorErrorDisplayLimit = 600
 )
 
