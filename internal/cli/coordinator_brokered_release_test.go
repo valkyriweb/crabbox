@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -240,6 +241,89 @@ func TestBrokeredAcquisitionWaitsForCapacity(t *testing.T) {
 			}
 			if tc.wantCalls > 1 && !strings.Contains(stderr.String(), `phase="awaiting-capacity"`) {
 				t.Fatalf("missing progress line:\n%s", stderr.String())
+			}
+		})
+	}
+}
+
+// The live coordinator attaches a full machine view per donor, so one busy
+// donor already pushes the rejection past the 600-byte display cap, and a full
+// fleet (worker/src/serve.ts maxMachines, label limits) passes 1 MiB.
+func TestBrokeredAcquisitionWaitsOnFullSizeCapacityRejection(t *testing.T) {
+	maxLabels := map[string]string{}
+	for i := range 32 {
+		maxLabels[fmt.Sprintf("%02d", i)+strings.Repeat("€", 62)] = strings.Repeat("€", 128)
+	}
+	for _, tc := range []struct {
+		name   string
+		donors int
+		labels map[string]string
+	}{
+		{name: "one donor", donors: 1},
+		{name: "64 donors with maximal labels", donors: 64, labels: maxLabels},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateTestUserDirs(t)
+			useFastCapacityWait(t)
+			details := make([]any, tc.donors)
+			for i := range details {
+				details[i] = map[string]any{
+					"availability":       map[string]any{"state": "available", "reasons": []string{}, "memoryPressure": "normal", "power": "ac"},
+					"image":              "docker.io/library/ubuntu@sha256:" + strings.Repeat("2", 64),
+					"machineID":          fmt.Sprintf("0572ef29-5f18-4b8e-a1ba-%012d", i),
+					"frontDoor":          map[string]any{"port": 2222, "hostKey": "ssh-ed25519 " + strings.Repeat("A", 68), "relay": true, "candidates": []map[string]any{{"address": "192.0.2.10", "kind": "external"}}},
+					"name":               fmt.Sprintf("donor-%02d", i),
+					"labels":             tc.labels,
+					"cpus":               8,
+					"memoryMB":           16384,
+					"maxLeases":          1,
+					"online":             true,
+					"freeCPUs":           0,
+					"allocatedLeases":    1,
+					"allocatedLeaseRefs": []map[string]any{{"id": "cbx_0123456789ab", "slug": "golden-shrimp-bfe9c67a", "state": "active"}},
+				}
+			}
+			body, err := json.Marshal(struct {
+				Error   string `json:"error"`
+				Details []any  `json:"details"`
+			}{"serve_capacity_unavailable", details})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(body) <= 600 || tc.labels != nil && len(body) <= 1<<20 {
+				t.Fatalf("fixture body is %d bytes; too small for this case", len(body))
+			}
+			var creates atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				if creates.Add(1) == 1 {
+					_, _ = w.Write(body)
+					return
+				}
+				_, _ = io.WriteString(w, `{"error":"serve_capacity_unavailable","details":[{"online":false}]}`)
+			}))
+			defer server.Close()
+			cfg := baseConfig()
+			cfg.Provider = brokeredReleaseTestProviderName
+			cfg.Coordinator, cfg.CoordToken = server.URL, "synthetic-token"
+			cfg.Serve.CapacityWait = time.Minute
+			var stderr bytes.Buffer
+			b := &coordinatorLeaseBackend{cfg: cfg, spec: brokeredReleaseTestProvider{}.Spec(), coord: mustNewCoordinatorClient(t, cfg), rt: Runtime{Stderr: &stderr}}
+			_, err = b.Acquire(t.Context(), AcquireRequest{})
+			if creates.Load() != 2 || !strings.Contains(stderr.String(), `phase="awaiting-capacity"`) {
+				t.Fatalf("creates=%d; want one capacity wait, then a fail-fast offline rejection\nerr=%.2000v\nstderr:\n%.2000s", creates.Load(), err, stderr.String())
+			}
+			if !isCoordinatorCapacityUnavailable(err) {
+				t.Fatalf("err=%.2000v; want the final capacity rejection", err)
+			}
+			rendered := decodeCoordinatorResponse(http.MethodPost, "/v1/leases", http.StatusConflict, bytes.NewReader(body), nil).Error()
+			if len(rendered) >= len(body) || !strings.HasSuffix(rendered, "... (truncated)") {
+				t.Fatalf("rendered error must stay capped: %.2000s", rendered)
 			}
 		})
 	}
