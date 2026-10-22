@@ -1283,9 +1283,21 @@ func (b *coordinatorLeaseBackend) releaseLease(ctx context.Context, req ReleaseL
 		if err := AuthorizeCheckpointRelease(authority, req.CheckpointID); err != nil {
 			return false, err
 		}
-		return b.releaseLeaseUnderClaimFence(ctx, req, outcome)
+		remove, err := b.releaseLeaseUnderClaimFence(ctx, req, outcome)
+		if err != nil && exists && b.spec.BrokeredOnly && isCoordinatorNotFoundError(err) {
+			// Brokered-only providers (serve) run only what the coordinator
+			// assigns, so a lease the coordinator no longer has holds nothing remote.
+			fmt.Fprintf(b.rt.Stderr, "coordinator has no %s lease %s; removing local claim\n", b.spec.Name, req.Lease.LeaseID)
+			outcome.ForgottenLocally = true
+			return true, cleanupReleasedCoordinatorLeaseArtifacts(ctx, b.rt.Stderr, req.Lease.LeaseID)
+		}
+		return remove, err
 	}, syncControllerDirectory)
 }
+
+// brokeredReleaseObservationTimeout bounds the deferred-release wait for a
+// serve donor heartbeat to confirm container removal.
+var brokeredReleaseObservationTimeout = 30 * time.Second
 
 func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Context, req ReleaseLeaseRequest, outcome *ReleaseLeaseOutcome) (bool, error) {
 	if req.Lease.LeaseID == "" {
@@ -1387,6 +1399,16 @@ func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Contex
 		}
 		if coordinatorProviderReleaseConfirmed(released) {
 			return finish()
+		}
+		if b.spec.BrokeredOnly && coordinatorReleaseCleanupPending(released) && !coordinatorReleaseCleanupFailed(released) {
+			// Serve donors confirm cleanup on their next heartbeat, so a short
+			// observation usually lets the local claim go with the lease.
+			observeCtx, cancel := context.WithTimeout(ctx, brokeredReleaseObservationTimeout)
+			observed, observeErr := observeCoordinatorReleaseCompletion(observeCtx, observationCoord, released, req.Lease.LeaseID, expectedProvider, release)
+			cancel()
+			if observeErr == nil && coordinatorProviderReleaseConfirmed(observed) {
+				return finish()
+			}
 		}
 		if coordinatorReleaseCleanupFailed(released) || coordinatorReleaseCleanupPending(released) || coordinatorExpiryCleanupCompleted(released) {
 			fmt.Fprintf(b.rt.Stderr, "warning: coordinator accepted release for %s; remote cleanup remains pending and local claim/SSH artifacts were preserved\n", req.Lease.LeaseID)
