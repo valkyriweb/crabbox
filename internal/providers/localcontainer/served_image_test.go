@@ -168,7 +168,7 @@ func servedImageFixture(id string) string {
 
 func TestServedPrepare(t *testing.T) {
 	for _, runtimeName := range []string{"docker", "podman"} {
-		for _, mode := range []string{"ready", "skip", "prepare", "reuse", "pull", "base-pull-failure", "base-inspect-failure", "probe-failure", "probe-output", "run-failure", "commit-failure", "inspect-failure", "config-mismatch", "cleanup-failure", "tag-cleanup-failure", "cancel", "nil-cmd", "empty-cmd", "nil-entrypoint", "empty-entrypoint"} {
+		for _, mode := range []string{"ready", "skip", "prepare", "reuse", "pull", "base-pull-failure", "base-inspect-failure", "probe-failure", "probe-output", "run-failure", "commit-failure", "inspect-failure", "config-mismatch", "cleanup-failure", "tag-cleanup-failure", "cancel", "nil-cmd", "empty-cmd", "nil-entrypoint", "empty-entrypoint", "image-container-env"} {
 			t.Run(runtimeName+"/"+mode, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
@@ -186,6 +186,9 @@ func TestServedPrepare(t *testing.T) {
 						if mode == "empty-"+field {
 							result = strings.Replace(result, `"`+name+`":`+value, `"`+name+`":[]`, 1)
 						}
+					}
+					if mode == "image-container-env" {
+						result = strings.Replace(result, `"Env":[`, `"Env":["container=oci",`, 1)
 					}
 					return result
 				}
@@ -257,7 +260,8 @@ func TestServedPrepare(t *testing.T) {
 						} else {
 							prepRuns++
 							temp = a[2]
-							if unset := strings.Contains(strings.Join(a, " "), "--unsetenv container"); unset != (runtimeName == "podman") {
+							wantUnset := runtimeName == "podman" && mode != "image-container-env"
+							if unset := len(a) > 4 && a[3] == "--unsetenv" && a[4] == "container"; unset != wantUnset {
 								t.Fatalf("runtime=%s unsetenv=%v args=%v", runtimeName, unset, a)
 							}
 							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
