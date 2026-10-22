@@ -8,18 +8,27 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 type testClock struct{}
 
 func (testClock) Now() time.Time { return time.Now() }
+
+type semaphoreRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f semaphoreRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 func testConfig(host string) core.Config {
 	cfg := core.BaseConfig()
@@ -53,16 +62,27 @@ func withWaitForRunningPollInterval(t *testing.T, interval time.Duration) {
 
 func TestProviderName(t *testing.T) {
 	p := Provider{}
-	if p.Name() != "semaphore" {
-		t.Errorf("name = %q, want semaphore", p.Name())
+	if p.Spec().Name != "semaphore" {
+		t.Errorf("name = %q, want semaphore", p.Spec().Name)
 	}
 }
 
 func TestProviderAliases(t *testing.T) {
 	p := Provider{}
-	aliases := p.Aliases()
+	aliases := p.Spec().Aliases
 	if len(aliases) != 1 || aliases[0] != "sem" {
 		t.Errorf("aliases = %v, want [sem]", aliases)
+	}
+}
+
+func TestProviderClaimScopeBindsNormalizedHostAndProject(t *testing.T) {
+	cfg := testConfig("Example.SemaphoreCI.com")
+	if got, want := (Provider{}).ClaimScope(cfg), "host:example.semaphoreci.com|project:my-project"; got != want {
+		t.Fatalf("scope=%q want=%q", got, want)
+	}
+	cfg.Semaphore.Project = ""
+	if got := (Provider{}).ClaimScope(cfg); got != "" {
+		t.Fatalf("scope=%q, want no incomplete provider scope", got)
 	}
 }
 
@@ -79,12 +99,190 @@ func TestProviderSpecIsSSHLease(t *testing.T) {
 
 // --- Flag registration ---
 
+func TestSemaphoreRegistrationOnlyFallbacksAndNoGuards(t *testing.T) {
+	cfg := core.BaseConfig()
+	if cfg.Semaphore != (core.SemaphoreConfig{}) {
+		t.Fatal("raw config defaults populated")
+	}
+	p := Provider{}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.String("class", "", "")
+	fs.String("type", "", "")
+	values := p.RegisterFlags(fs, cfg)
+	for name, want := range map[string]string{"semaphore-machine": "f1-standard-2", "semaphore-os-image": "ubuntu2204", "semaphore-idle-timeout": "30m", "semaphore-host": "", "semaphore-project": ""} {
+		if got := fs.Lookup(name).DefValue; got != want {
+			t.Fatalf("flag %s default=%q want=%q", name, got, want)
+		}
+	}
+	if fs.Lookup("semaphore-token") != nil {
+		t.Fatal("token flag introduced")
+	}
+	if d, err := time.ParseDuration(fs.Lookup("semaphore-idle-timeout").DefValue); err != nil || d != 30*time.Minute {
+		t.Fatalf("duration fallback literal=%s error=%v", d, err)
+	}
+	if err := p.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Semaphore != (core.SemaphoreConfig{}) {
+		t.Fatal("unvisited flag fallbacks leaked into raw config")
+	}
+	cfg.Semaphore = core.SemaphoreConfig{Host: "prior.semaphoreci.com", Token: "inert", Project: "prior", Machine: "prior", OSImage: "prior", IdleTimeout: "1h"}
+	before := cfg
+	if err := fs.Parse([]string{"--class=any", "--type=any"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []any{nil, struct{}{}, values} {
+		if err := p.ApplyFlags(&cfg, fs, v); err != nil {
+			t.Fatalf("unexpected sizing/semantic guard=%v", err)
+		}
+	}
+	if !reflect.DeepEqual(cfg, before) {
+		t.Fatal("unvisited values changed config")
+	}
+	if err := fs.Parse([]string{"--semaphore-host=", "--semaphore-project=", "--semaphore-machine=", "--semaphore-os-image=", "--semaphore-idle-timeout="}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	before.Semaphore = core.SemaphoreConfig{Token: "inert"}
+	core.RecordProviderFlagInputs(&before, true, "semaphore")
+	if !reflect.DeepEqual(cfg, before) {
+		t.Fatal("explicit empty flag or central source timing changed")
+	}
+}
+
+func TestSemaphoreBackendNormalizationAndProjectOrder(t *testing.T) {
+	cfg := core.Config{Semaphore: core.SemaphoreConfig{Host: "example/path"}}
+	if _, err := newBackend(Provider{}.Spec(), cfg, testRuntime(&http.Client{})); err == nil || !strings.Contains(err.Error(), "must be a host name") {
+		t.Fatalf("host normalization first=%v", err)
+	}
+	cfg.Semaphore.Host = " https://example.semaphoreci.com/ "
+	if _, err := newBackend(Provider{}.Spec(), cfg, testRuntime(&http.Client{})); err == nil || !strings.Contains(err.Error(), "semaphore.token") {
+		t.Fatalf("token requirement=%v", err)
+	}
+	cfg.Semaphore.Token = "  "
+	configured, err := newBackend(Provider{}.Spec(), cfg, testRuntime(&http.Client{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := configured.(*semaphoreBackend)
+	if b.cfg.Semaphore.Host != "example.semaphoreci.com" || b.cfg.Semaphore.Token != "  " {
+		t.Fatal("host normalization/raw token contract changed")
+	}
+	b.cfg.Semaphore.IdleTimeout = "later"
+	if _, err := b.Acquire(context.Background(), core.AcquireRequest{}); err == nil || err.Error() != "semaphore.project is required" {
+		t.Fatalf("project before timeout=%v", err)
+	}
+	b.cfg.Semaphore.Project = "project"
+	if _, err := b.Acquire(context.Background(), core.AcquireRequest{}); err == nil || err.Error() != `invalid semaphore idle timeout "later"` {
+		t.Fatalf("timeout after project=%v", err)
+	}
+	for _, raw := range []string{"", "15m", " ", "0s"} {
+		d, err := idleTimeout(core.Config{Semaphore: core.SemaphoreConfig{IdleTimeout: raw}})
+		switch raw {
+		case "":
+			if err != nil || d != 30*time.Minute {
+				t.Fatal("empty duration fallback changed")
+			}
+		case "15m":
+			if err != nil || d != 15*time.Minute {
+				t.Fatal("custom duration changed")
+			}
+		default:
+			if err == nil || err.Error() != fmt.Sprintf("invalid semaphore idle timeout %q", raw) {
+				t.Fatalf("duration error=%v", err)
+			}
+		}
+	}
+}
+
+func TestSemaphoreRecordedAcquireAndResolveFallbacks(t *testing.T) {
+	for _, tc := range []struct {
+		name, machine, image, idle, wantMachine, wantImage string
+		seconds                                            int
+	}{{"empty", "", "", "", "f1-standard-2", "ubuntu2204", 1800}, {"custom", "f1-standard-4", "ubuntu2404", "15m", "f1-standard-4", "ubuntu2404", 900}, {"raw whitespace", "  ", "  ", "", "  ", "  ", 1800}} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", root)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+			var routes []string
+			transport := semaphoreRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				routes = append(routes, req.Method+" "+req.URL.Path)
+				response := ""
+				switch req.Method + " " + req.URL.Path {
+				case "GET /api/v1alpha/projects/example":
+					response = `{"metadata":{"id":"project-example"}}`
+				case "POST /api/v1alpha/jobs":
+					defer req.Body.Close()
+					var body struct {
+						Spec struct {
+							Project string `json:"project_id"`
+							Agent   struct {
+								Machine struct {
+									Type  string `json:"type"`
+									Image string `json:"os_image"`
+								} `json:"machine"`
+							} `json:"agent"`
+							Commands []string `json:"commands"`
+						} `json:"spec"`
+					}
+					if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+						t.Fatal(err)
+					}
+					if body.Spec.Project != "project-example" || body.Spec.Agent.Machine.Type != tc.wantMachine || body.Spec.Agent.Machine.Image != tc.wantImage || len(body.Spec.Commands) != 1 || !strings.HasSuffix(body.Spec.Commands[0], fmt.Sprintf("sleep %d", tc.seconds)) {
+						t.Fatal("normal job request defaults changed")
+					}
+					response = `{"metadata":{"id":"job-example"}}`
+				case "GET /api/v1alpha/jobs/job-example":
+					response = `{"metadata":{"name":"crabbox testbox"},"status":{"state":"RUNNING","agent":{"ip":"192.0.2.25","ports":[{"name":"ssh","number":22}]}}}`
+				case "GET /api/v1alpha/jobs/job-example/debug_ssh_key":
+					response = `{"key":"inert-recorded-key-text"}`
+				default:
+					t.Fatalf("unexpected recorded route %s %s", req.Method, req.URL.Path)
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response))}, nil
+			})
+			cfg := core.Config{Provider: providerName, Semaphore: core.SemaphoreConfig{Host: "example.semaphoreci.com", Token: "inert", Project: "example", Machine: tc.machine, OSImage: tc.image, IdleTimeout: tc.idle}}
+			configured, err := newBackend(Provider{}.Spec(), cfg, testRuntime(&http.Client{Transport: transport}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := configured.(*semaphoreBackend)
+			target, err := b.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Name: "example", Root: t.TempDir()}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target.Server.ServerType.Name != tc.wantMachine || target.Server.Labels["os_image"] != tc.wantImage {
+				t.Fatal("acquisition display values changed")
+			}
+			key, err := os.ReadFile(target.SSH.Key)
+			if err != nil || string(key) != "inert-recorded-key-text" {
+				t.Fatal("recorded inert key not stored in temp state")
+			}
+			resolved, err := b.resolveByJobID(context.Background(), "job-example", true, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved.Server.ServerType.Name != tc.wantMachine {
+				t.Fatal("resolveByJobID display fallback changed")
+			}
+			wantRoutes := []string{"GET /api/v1alpha/projects/example", "POST /api/v1alpha/jobs", "GET /api/v1alpha/jobs/job-example", "GET /api/v1alpha/jobs/job-example/debug_ssh_key", "GET /api/v1alpha/jobs/job-example"}
+			if !reflect.DeepEqual(routes, wantRoutes) {
+				t.Fatalf("recorded route sequence=%v", routes)
+			}
+			t.Logf("recorded routes=%v machine=%q os=%q durationSeconds=%d", routes, tc.wantMachine, tc.wantImage, tc.seconds)
+		})
+	}
+}
+
 func TestRegisterAndApplyFlags(t *testing.T) {
 	cfg := core.BaseConfig()
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	values := registerFlags(fs, cfg)
+	values := (Provider{}).RegisterFlags(fs, cfg)
 	err := fs.Parse([]string{
 		"--semaphore-host", "myorg.semaphoreci.com",
 		"--semaphore-project", "my-app",
@@ -96,7 +294,9 @@ func TestRegisterAndApplyFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	applyFlagOverrides(&cfg, fs, values)
+	if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
 
 	if cfg.Semaphore.Host != "myorg.semaphoreci.com" {
 		t.Errorf("host = %q", cfg.Semaphore.Host)
@@ -121,10 +321,12 @@ func TestFlagsNotSetLeavesDefaults(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	values := registerFlags(fs, cfg)
+	values := (Provider{}).RegisterFlags(fs, cfg)
 	_ = fs.Parse([]string{}) // no flags
 
-	applyFlagOverrides(&cfg, fs, values)
+	if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
 
 	if cfg.Semaphore.Machine != "original" {
 		t.Errorf("machine changed to %q, should stay original", cfg.Semaphore.Machine)
@@ -164,12 +366,18 @@ func TestIdleTimeoutRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestWithDefault(t *testing.T) {
-	if withDefault("", "fallback") != "fallback" {
-		t.Error("empty should use fallback")
-	}
-	if withDefault("value", "fallback") != "value" {
-		t.Error("non-empty should use value")
+func TestFlagRegistrationFallbackKeepsRawNonemptyValues(t *testing.T) {
+	for _, raw := range []string{"", "value", "  "} {
+		cfg := core.Config{Semaphore: core.SemaphoreConfig{Machine: raw}}
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		(Provider{}).RegisterFlags(fs, cfg)
+		want := raw
+		if raw == "" {
+			want = "f1-standard-2"
+		}
+		if got := fs.Lookup("semaphore-machine").DefValue; got != want {
+			t.Fatalf("raw=%q default=%q want=%q", raw, got, want)
+		}
 	}
 }
 
@@ -222,6 +430,88 @@ func TestStripLeasePrefix(t *testing.T) {
 
 // --- API client tests with httptest ---
 
+func TestAPIClientRedactsTokenFromAllResponseErrors(t *testing.T) {
+	const token = "semaphore-secret-token"
+	tests := []struct {
+		name string
+		path string
+		call func(*apiClient, string) error
+	}{
+		{
+			name: "get with headers",
+			path: "/get-with-headers",
+			call: func(client *apiClient, path string) error {
+				_, _, err := client.getWithHeaders(context.Background(), path)
+				return err
+			},
+		},
+		{name: "get", path: "/get", call: func(client *apiClient, path string) error {
+			return client.get(context.Background(), path, nil)
+		}},
+		{name: "post", path: "/post", call: func(client *apiClient, path string) error {
+			return client.post(context.Background(), path, map[string]string{"value": "test"}, nil)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &apiClient{
+				host:  "semaphore.example.test",
+				token: token,
+				http: &http.Client{Transport: semaphoreRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if got := req.Header.Get("Authorization"); got != "Token "+token {
+						t.Fatalf("Authorization=%q", got)
+					}
+					return &http.Response{
+						StatusCode: http.StatusUnauthorized,
+						Body:       io.NopCloser(strings.NewReader("bad Authorization: Token " + token)),
+						Header:     make(http.Header),
+					}, nil
+				})},
+			}
+			err := tc.call(client, tc.path)
+			if err == nil {
+				t.Fatal("API call returned nil")
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Fatalf("API error leaked token: %v", err)
+			}
+			for _, want := range []string{tc.path, "401", "Token [redacted]"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("API error=%q, want %q", err, want)
+				}
+			}
+		})
+	}
+	if got := redactSemaphoreSecrets("keep body", " "); got != "keep body" {
+		t.Fatalf("empty secret changed response body: %q", got)
+	}
+}
+
+func TestAPIClientTLSRedactsReflectedToken(t *testing.T) {
+	const token = "semaphore-secret-token"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if got := req.Header.Get("Authorization"); got != "Token "+token {
+			t.Fatalf("Authorization=%q", got)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "bad "+req.Header.Get("Authorization"))
+	}))
+	defer server.Close()
+
+	client := &apiClient{
+		host:  strings.TrimPrefix(server.URL, "https://"),
+		token: token,
+		http:  server.Client(),
+	}
+	err := client.get(context.Background(), "/api/v1alpha/projects", nil)
+	if err == nil {
+		t.Fatal("API call returned nil")
+	}
+	if strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "Token [redacted]") {
+		t.Fatalf("TLS API error was not redacted: %v", err)
+	}
+}
+
 func TestCreateJob(t *testing.T) {
 	var receivedBody map[string]any
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -270,6 +560,104 @@ func TestCreateJob(t *testing.T) {
 	}
 	if machine["os_image"] != "ubuntu2204" {
 		t.Errorf("os_image = %v", machine["os_image"])
+	}
+}
+
+func TestAcquirePersistsExactScopedClaimOrRollsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		repository       bool
+		claimFailure     bool
+		rollbackStopFail bool
+	}{
+		{name: "repository scoped claim", repository: true},
+		{name: "repository independent claim"},
+		{name: "claim persistence failure rolls back", claimFailure: true},
+		{name: "failed rollback preserves recovery details", claimFailure: true, rollbackStopFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+			withWaitForRunningPollInterval(t, 0)
+			blockedClaims := filepath.Join(os.Getenv("XDG_STATE_HOME"), "crabbox", "claims")
+			stops := 0
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/v1alpha/projects/my-project":
+					json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]string{"id": "project-1"}})
+				case req.Method == http.MethodPost && req.URL.Path == "/api/v1alpha/jobs":
+					json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]string{"id": "job-created"}})
+				case req.Method == http.MethodGet && req.URL.Path == "/api/v1alpha/jobs/job-created":
+					json.NewEncoder(w).Encode(map[string]any{
+						"metadata": map[string]string{"name": "crabbox testbox"},
+						"status": map[string]any{
+							"state": "RUNNING",
+							"agent": map[string]any{
+								"ip": "192.0.2.25", "ports": []map[string]any{{"name": "ssh", "number": 22}},
+							},
+						},
+					})
+				case req.Method == http.MethodGet && req.URL.Path == "/api/v1alpha/jobs/job-created/debug_ssh_key":
+					if tc.claimFailure {
+						if err := os.WriteFile(blockedClaims, []byte("blocked"), 0o600); err != nil {
+							t.Error(err)
+						}
+					}
+					json.NewEncoder(w).Encode(map[string]string{"key": "test-private-key"})
+				case req.Method == http.MethodPost && req.URL.Path == "/api/v1alpha/jobs/job-created/stop":
+					stops++
+					if tc.rollbackStopFail {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					w.Write([]byte("{}"))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			host := strings.TrimPrefix(server.URL, "https://")
+			cfg := testConfig(host)
+			backend := &semaphoreBackend{
+				spec: Provider{}.Spec(), cfg: cfg, rt: testRuntime(server.Client()),
+				client: &apiClient{host: host, token: "tok", http: server.Client()},
+			}
+			req := core.AcquireRequest{}
+			if tc.repository {
+				req.Repo.Root = t.TempDir()
+			}
+			lease, err := backend.Acquire(context.Background(), req)
+			if tc.claimFailure {
+				if err == nil || !strings.Contains(err.Error(), "persist exact semaphore job ownership claim") || stops != 1 {
+					t.Fatalf("err=%v stops=%d, want one rollback after claim failure", err, stops)
+				}
+				keyPath, keyErr := core.TestboxKeyPath("sem_job-created")
+				if keyErr != nil {
+					t.Fatal(keyErr)
+				}
+				_, keyErr = os.Stat(keyPath)
+				if tc.rollbackStopFail {
+					if keyErr != nil || !strings.Contains(err.Error(), "job-created") || !strings.Contains(err.Error(), "SSH key retained") {
+						t.Fatalf("rollback failure err=%v keyErr=%v, want retained recovery details", err, keyErr)
+					}
+				} else if !os.IsNotExist(keyErr) {
+					t.Fatalf("rollback key err=%v, want removed key", keyErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, exists, claimErr := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+			if claimErr != nil || !exists || claim.ProviderScope != (Provider{}).ClaimScope(cfg) || claim.CloudID != "job-created" || claim.Labels["job_id"] != "job-created" {
+				t.Fatalf("claim=%#v exists=%v err=%v", claim, exists, claimErr)
+			}
+			if stops != 0 {
+				t.Fatalf("unexpected successful-acquisition rollback calls=%d", stops)
+			}
+		})
 	}
 }
 
@@ -475,6 +863,113 @@ func TestResolveProjectIDNotFound(t *testing.T) {
 	_, err := client.resolveProjectID(context.Background(), "missing")
 	if err == nil {
 		t.Error("expected error for missing project")
+	}
+}
+
+func TestResolveProjectIDRejectsUserinfoPaginationLink(t *testing.T) {
+	// Relative Link targets of the form `@attacker/...` used to be concatenated as
+	// `https://<configured-host>@attacker/...`, turning the configured host into
+	// URL userinfo and sending Authorization to an unrelated hostname.
+	const token = "test-authorization-marker"
+	var seen []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Host+"|"+r.URL.RequestURI()+"|"+r.Header.Get("Authorization"))
+		if r.URL.Path == "/api/v1alpha/projects/my-project" {
+			w.WriteHeader(400)
+			return
+		}
+		if r.URL.Path == "/api/v1alpha/projects" {
+			w.Header().Set("Link", `<@pagination-target.invalid/api/v1alpha/projects?page=2>; rel="next"`)
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"metadata": map[string]string{"name": "other", "id": "other-id"}},
+			})
+			return
+		}
+		// Safe resolution turns `@attacker/...` into a same-host path prefix `/@attacker/...`.
+		// Respond empty so pagination ends without treating it as a successful attacker hop.
+		if strings.HasPrefix(r.URL.Path, "/@") {
+			json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		t.Errorf("unexpected request host=%q path=%q", r.Host, r.URL.RequestURI())
+		w.WriteHeader(500)
+	}))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "https://")
+	client := &apiClient{host: host, token: token, http: server.Client()}
+
+	// After the fix, the crafted Link is resolved as a path on the configured
+	// host (or rejected). Project resolution may fail with not-found; either
+	// outcome is fine. The critical property is no request to the attacker host.
+	_, _ = client.resolveProjectID(context.Background(), "my-project")
+	for _, s := range seen {
+		if strings.Contains(strings.SplitN(s, "|", 2)[0], "pagination-target.invalid") {
+			t.Fatalf("request reached attacker host: %q (all=%v)", s, seen)
+		}
+	}
+	// Token must only appear on the TLS test server host, never as a separate
+	// request whose Host header is the attacker.
+	for _, s := range seen {
+		parts := strings.SplitN(s, "|", 3)
+		if len(parts) == 3 && parts[0] != host && strings.Contains(parts[2], token) {
+			t.Fatalf("token sent to non-configured host %q: %q", parts[0], s)
+		}
+	}
+}
+
+func TestResolvePaginationRefRejectsCrossOriginAndUserinfo(t *testing.T) {
+	client := &apiClient{host: "semaphore.example.test"}
+
+	path, err := client.resolvePaginationRef("/api/v1alpha/projects?page=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/api/v1alpha/projects?page=2" {
+		t.Fatalf("path=%q", path)
+	}
+
+	path, err = client.resolvePaginationRef("https://semaphore.example.test/api/v1alpha/projects?page=3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/api/v1alpha/projects?page=3" {
+		t.Fatalf("same-origin absolute path=%q", path)
+	}
+
+	if _, err := client.resolvePaginationRef("https://evil.example/api"); err == nil ||
+		!strings.Contains(err.Error(), "outside configured host") {
+		t.Fatalf("cross-origin err=%v", err)
+	}
+
+	// Authority-changing relative form that string-concat used to mis-route.
+	// Resolved against the base it becomes a path on the configured host; apiURL
+	// then keeps it same-origin. Ensure the dangerous concat form is not used by
+	// checking apiURL rejects explicit userinfo.
+	if _, err := client.apiURL("https://example-user@outside.invalid/api"); err == nil ||
+		!strings.Contains(err.Error(), "userinfo") && !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("userinfo URL err=%v", err)
+	}
+
+	// The original attack string must not produce an authority change when
+	// resolved and used via apiURL.
+	path, err = client.resolvePaginationRef("@pagination-target.invalid/api/v1alpha/projects?page=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := client.apiURL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Hostname() != "semaphore.example.test" {
+		t.Fatalf("hostname=%q, want configured host (endpoint=%q)", u.Hostname(), endpoint)
+	}
+	if u.User != nil {
+		t.Fatalf("userinfo present: %v", u.User)
 	}
 }
 
@@ -776,7 +1271,7 @@ func TestResolveStatusOnlyAllowsIncompleteSSHTarget(t *testing.T) {
 func TestResolveStatusKeepsReadySSHTarget(t *testing.T) {
 	for _, readyProbe := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ready_probe_%t", readyProbe), func(t *testing.T) {
-			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			testutil.IsolateUserDirs(t)
 			debugKeyHit := false
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" && r.URL.Path == "/api/v1alpha/jobs/job-123" {
@@ -908,6 +1403,16 @@ func TestReleaseRemovesClaimAndStoredKey(t *testing.T) {
 	if err := core.ClaimLeaseForRepoProvider(leaseID, "blue-lobster", providerName, "/repo", time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
+	legacyServer := core.Server{
+		CloudID: "job-release", Provider: providerName,
+		Labels: map[string]string{
+			"provider": providerName, "lease": leaseID, "slug": "blue-lobster",
+			"project": "my-project", "job_id": "job-release",
+		},
+	}
+	if err := core.UpdateLeaseClaimEndpoint(leaseID, legacyServer, core.SSHTarget{}); err != nil {
+		t.Fatal(err)
+	}
 	keyPath, err := storeSSHKey(leaseID, "test-key")
 	if err != nil {
 		t.Fatal(err)
@@ -915,6 +1420,13 @@ func TestReleaseRemovesClaimAndStoredKey(t *testing.T) {
 
 	stopped := false
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/api/v1alpha/jobs/job-release" {
+			json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]string{"name": "crabbox testbox blue-lobster"},
+				"status":   map[string]any{"state": "RUNNING"},
+			})
+			return
+		}
 		if r.Method == "POST" && r.URL.Path == "/api/v1alpha/jobs/job-release/stop" {
 			stopped = true
 			w.Write([]byte("{}"))
@@ -948,5 +1460,140 @@ func TestReleaseRemovesClaimAndStoredKey(t *testing.T) {
 		t.Fatal(err)
 	} else if found {
 		t.Fatal("lease claim still resolves after release")
+	}
+}
+
+func TestReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		claim         bool
+		legacy        bool
+		legacyProject bool
+		wrongHost     bool
+		wrongProject  bool
+		wrongJob      bool
+		changedOwner  bool
+		notRunning    bool
+		finished      bool
+		stopFails     bool
+		wantStop      bool
+		wantClaimLeft bool
+	}{
+		{name: "missing claim"},
+		{name: "wrong organization", claim: true, wrongHost: true, wantClaimLeft: true},
+		{name: "wrong project", claim: true, wrongProject: true, wantClaimLeft: true},
+		{name: "wrong job", claim: true, wrongJob: true, wantClaimLeft: true},
+		{name: "changed ownership", claim: true, changedOwner: true, wantClaimLeft: true},
+		{name: "job no longer running", claim: true, notRunning: true, wantClaimLeft: true},
+		{name: "failed stop preserves ownership", claim: true, stopFails: true, wantStop: true, wantClaimLeft: true},
+		{name: "exact claim", claim: true, wantStop: true},
+		{name: "verified legacy claim", claim: true, legacy: true, legacyProject: true, wantStop: true},
+		{name: "legacy claim without project fails closed", claim: true, legacy: true, wantClaimLeft: true},
+		{name: "legacy claim rejects changed ownership", claim: true, legacy: true, legacyProject: true, changedOwner: true, wantClaimLeft: true},
+		{name: "finished job safely clears exact claim", claim: true, finished: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
+			const leaseID, jobID, slug = "sem_job-owned", "job-owned", "blue-lobster"
+			stopCalls := 0
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/v1alpha/jobs/"+jobID:
+					name, state := "crabbox testbox blue-lobster", "RUNNING"
+					if tc.changedOwner {
+						name = "deployment"
+					}
+					if tc.notRunning {
+						state = "PENDING"
+					}
+					if tc.finished {
+						state = "FINISHED"
+					}
+					json.NewEncoder(w).Encode(map[string]any{
+						"metadata": map[string]string{"name": name},
+						"status":   map[string]any{"state": state},
+					})
+				case req.Method == http.MethodPost && req.URL.Path == "/api/v1alpha/jobs/"+jobID+"/stop":
+					stopCalls++
+					if tc.stopFails {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					w.Write([]byte("{}"))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			host := strings.TrimPrefix(server.URL, "https://")
+			cfg := testConfig(host)
+			job := core.Server{
+				CloudID: jobID, Provider: providerName,
+				Labels: map[string]string{
+					"provider": providerName, "lease": leaseID, "slug": slug,
+					"project": cfg.Semaphore.Project, "job_id": jobID,
+				},
+			}
+			if tc.claim {
+				claimCfg := cfg
+				claimJob := job
+				if tc.wrongHost {
+					claimCfg.Semaphore.Host = "another.semaphoreci.com"
+				}
+				if tc.wrongProject {
+					claimCfg.Semaphore.Project = "another-project"
+					claimJob.Labels = map[string]string{
+						"provider": providerName, "lease": leaseID, "slug": slug,
+						"project": "another-project", "job_id": jobID,
+					}
+				}
+				if tc.wrongJob {
+					claimJob.CloudID = "job-another"
+					claimJob.Labels = map[string]string{
+						"provider": providerName, "lease": leaseID, "slug": slug,
+						"project": cfg.Semaphore.Project, "job_id": "job-another",
+					}
+				}
+				var claimErr error
+				if tc.legacy {
+					claimErr = core.ClaimLeaseForRepoProvider(leaseID, slug, providerName, t.TempDir(), time.Minute, false)
+					if claimErr == nil && tc.legacyProject {
+						claimErr = core.UpdateLeaseClaimEndpoint(leaseID, claimJob, core.SSHTarget{})
+					}
+				} else {
+					claimErr = core.ClaimLeaseTargetForRepoConfig(leaseID, slug, claimCfg, claimJob, core.SSHTarget{}, t.TempDir(), time.Minute, false)
+				}
+				if claimErr != nil {
+					t.Fatal(claimErr)
+				}
+			}
+			keyPath, err := storeSSHKey(leaseID, "test-key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend := &semaphoreBackend{
+				spec: Provider{}.Spec(), cfg: cfg, rt: testRuntime(server.Client()),
+				client: &apiClient{host: host, token: "tok", http: server.Client()},
+			}
+			err = backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: leaseID, Server: job}})
+			wantSuccess := tc.claim && (!tc.legacy || tc.legacyProject) && !tc.wrongHost && !tc.wrongProject && !tc.wrongJob && !tc.changedOwner && !tc.notRunning && !tc.stopFails
+			if (err == nil) != wantSuccess {
+				t.Fatalf("err=%v wantSuccess=%v", err, wantSuccess)
+			}
+			if (stopCalls > 0) != tc.wantStop {
+				t.Fatalf("stopCalls=%d wantStop=%v", stopCalls, tc.wantStop)
+			}
+			_, claimExists, claimErr := core.ReadLeaseClaimWithPresence(leaseID)
+			if claimErr != nil || claimExists != tc.wantClaimLeft {
+				t.Fatalf("claim exists=%v err=%v want=%v", claimExists, claimErr, tc.wantClaimLeft)
+			}
+			_, keyErr := os.Stat(keyPath)
+			if wantSuccess && !os.IsNotExist(keyErr) || !wantSuccess && keyErr != nil {
+				t.Fatalf("key error=%v wantSuccess=%v", keyErr, wantSuccess)
+			}
+		})
 	}
 }

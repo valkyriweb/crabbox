@@ -1,5 +1,10 @@
 # sync-plan
 
+For native Git-backed Jujutsu workspaces, installed `jj` selects and snapshots
+the exact `@` tree. JSON output includes `source: "jj"`, the original workspace
+`root`, and the full selected `revision`; see
+[Jujutsu sync](../features/sync.md#jujutsu-workspaces).
+
 `crabbox sync-plan` prints the local sync manifest and its size hotspots
 without leasing a box. Use it to preview what `crabbox run` would upload
 before paying for a cold sync, or to confirm that artifacts dropped out of
@@ -8,9 +13,10 @@ the manifest after editing `.crabboxignore`.
 ```sh
 crabbox sync-plan
 crabbox sync-plan --limit 10
+crabbox sync-plan --json
 ```
 
-The command reads only your local Git checkout. It does not require a
+The command reads only your selected local sync source. It does not require a
 lease, does not call the broker, and does not call any provider API.
 
 ## What it reads
@@ -24,10 +30,51 @@ matches what an actual sync would ship:
 - `sync.exclude` patterns from config;
 - Crabbox's built-in cache/build excludes.
 
-Files matching any exclude are removed from the candidate set before the
-size accounting runs.
+Ordered exclude rules are applied before size accounting; a later `!pattern`
+can re-include a path matched by an earlier rule.
+
+Crabbox-owned built-ins for ambiguous artifact directory names (`dist`,
+`dist-runtime`, `coverage`, `playwright-report`, `test-results`, `.build`, and
+`target`) omit untracked output but do not silently remove Git-tracked regular
+files. Text output adds one bounded warning naming protected paths and matching
+patterns. Explicit `sync.exclude` and `.crabboxignore` rules remain
+authoritative for tracked files, including bare component-wide patterns.
+
+The same preflight rejects tracked non-gitlink paths hidden by sparse-checkout
+or `skip-worktree` state only when they remain in the effective manifest after
+`sync.include` and ordered excludes. On Git older than 2.41, an ambiguous
+missing in-scope path fails closed; out-of-scope paths do not affect the plan.
+Materialize the checkout, or intentionally adjust `sync.include`, ordered
+`sync.exclude`, or `.crabboxignore`; later reinclusion rules still determine
+effective scope. Ordinary SSH runs perform this scope check before lease work
+and independently rebuild the final manifest after acquisition.
+
+### Directory source
+
+With `sync.source: directory` and a nonempty `sync.include`, `sync-plan` uses the
+effective current directory, even below an outer Git checkout. Installed Git
+interprets source-tree `.gitignore` files using temporary metadata outside the
+source; no source repository is created or modified. The same shared manifest
+checks apply, and size guardrails cover the full candidate rather than a Git
+dirty delta. In-scope nested repositories are rejected, not silently traversed
+or omitted. See [directory source](../features/sync.md#explicit-directory-source)
+for ignore semantics and supported transports.
+
+Directory text output starts with `sync source=directory root=<absolute-path>`.
+JSON adds `"source": "directory"` and `"root": "<absolute-path>"`; Git-mode output
+is unchanged. Deleted tracked paths and the dirty delta remain empty because
+there is no source index or history.
 
 ## Output
+
+With `--git-seed-source local` (or `sync.gitSeedSource: local`), the preview also
+prepares and verifies the offline Git bundle in temporary local storage, then
+cleans it up. JSON adds `localGitSeed` with the selected HEAD/base, object format,
+object count, uncompressed object bytes, packed seed bytes, and SHA-256 digest.
+`guardrail.scope` becomes `candidate_and_git_objects`; a small dirty delta does
+not hide the complete-history transfer. Exclusions govern working files, not
+historical blobs. See [local Git metadata](../features/sync.md#opt-in-local-git-metadata)
+for scope, fixed preparation limits, and unsupported combinations.
 
 The first line reports the candidate file count and total size. If the
 checkout has tracked files that were deleted locally (and would be pruned
@@ -52,14 +99,60 @@ Directories are grouped at one level deep for top-level paths and two
 levels deep for nested paths (for example `internal/cli`), so deeply
 nested hotspots still roll up to a meaningful prefix.
 
+With `--json`, the command emits the same information in a stable
+machine-readable shape for CI checks and agent preflights:
+
+```json
+{
+  "candidate": { "files": 1843, "bytes": 327680000, "humanBytes": "312.5 MiB" },
+  "dirtyDelta": { "files": 12, "bytes": 524288, "humanBytes": "512.0 KiB" },
+  "deletedTrackedPaths": 2,
+  "protectedTrackedFiles": {
+    "count": 1,
+    "examples": [{ "path": "internal/web/dist/stub.html", "pattern": "dist" }]
+  },
+  "guardrail": {
+    "scope": "dirty_delta",
+    "files": 12,
+    "bytes": 524288,
+    "humanBytes": "512.0 KiB",
+    "limits": { "warnFiles": 0, "warnBytes": 0, "failFiles": 0, "failBytes": 0 },
+    "allowLarge": false,
+    "status": "ok"
+  },
+  "topFiles": [{ "path": "assets/demo.mp4", "bytes": 88604672, "humanBytes": "84.5 MiB" }],
+  "topDirs": [{ "path": "assets", "bytes": 147010355, "humanBytes": "140.2 MiB" }]
+}
+```
+
+`candidate` is the full manifest that would be present on the remote after
+sync. `dirtyDelta` is the locally changed/untracked/deleted path set. Ordinary
+SSH sync uses this delta for large-sync guardrails when it is non-empty;
+providers that enforce full-archive limits use the complete candidate even
+when only one file changed. Both size summaries remain visible.
+`protectedTrackedFiles` counts tracked regular files kept despite an ambiguous
+built-in exclude and includes up to five path-and-pattern examples.
+`guardrail.scope` is therefore either `dirty_delta` or `candidate`, matching
+the configured provider's ordinary workspace-sync preflight. This selection
+uses provider metadata locally; it does not configure or contact the provider.
+`guardrail.status` is `ok`, `warning`, or `failed`;
+warnings and failures are listed in `guardrail.reasons` when configured
+`sync.warn*` or `sync.fail*` thresholds are reached.
+
+The preview does not predict compressed upload limits, native service limits,
+authentication, or command-specific routes such as module execution. A later
+`run --no-sync` does not transfer the previewed workspace.
+
 ## Flags
 
 ```text
 --limit <n>   number of top files and directories to print (default 20)
+--json        print machine-readable JSON
+--git-seed-source <origin|local>  choose origin or explicit offline local objects
 ```
 
 `--limit` must be positive; `--limit 0` (or any non-positive value) is
-rejected with an error. There is no `--json` output for this command.
+rejected with an error.
 
 ## Use cases
 
@@ -67,6 +160,7 @@ rejected with an error. There is no `--json` output for this command.
 - find directories that quietly grew (`.cache/`, `dist/`, generated
   assets);
 - audit `.crabboxignore` and `sync.exclude` after adding new patterns.
+- gate CI or an agent workflow on sync size before provisioning a remote box.
 
 The numbers `sync-plan` prints are upper bounds. The actual rsync transfer
 depends on what already exists on the remote runner: a repeat sync after a

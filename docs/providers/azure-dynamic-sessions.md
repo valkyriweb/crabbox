@@ -156,7 +156,7 @@ azureDynamicSessions:
 | `endpoint` | `--azure-dynamic-sessions-endpoint` | `CRABBOX_AZURE_DYNAMIC_SESSIONS_ENDPOINT` | (required) |
 | `apiVersion` | `--azure-dynamic-sessions-api-version` | `CRABBOX_AZURE_DYNAMIC_SESSIONS_API_VERSION` | `2025-02-02-preview` |
 | `workdir` | `--azure-dynamic-sessions-workdir` | `CRABBOX_AZURE_DYNAMIC_SESSIONS_WORKDIR` | `/workspace/crabbox` |
-| `timeoutSecs` | `--azure-dynamic-sessions-timeout-secs` | `CRABBOX_AZURE_DYNAMIC_SESSIONS_TIMEOUT_SECS` | `1800` (falls back to `--ttl` when unset) |
+| `timeoutSecs` | `--azure-dynamic-sessions-timeout-secs` | `CRABBOX_AZURE_DYNAMIC_SESSIONS_TIMEOUT_SECS` | `1800` |
 
 The token uses `CRABBOX_AZURE_DYNAMIC_SESSIONS_TOKEN` (see
 [Authentication](#authentication)).
@@ -164,6 +164,32 @@ The token uses `CRABBOX_AZURE_DYNAMIC_SESSIONS_TOKEN` (see
 Legacy `azureDynamicSessions.pool` and
 `CRABBOX_AZURE_DYNAMIC_SESSIONS_POOL` values are rejected. The
 `endpoint` setting is already the pool-specific management endpoint.
+
+All five bindings share one typed declaration, including the legacy `pool`
+field so its existing client-time rejection is preserved. It gains no flag, and
+token discovery remains outside these bindings. Nonempty YAML strings override
+earlier values without trimming; omitted, null, and empty strings preserve them.
+Accepted endpoint inputs retain their source classification, with explicit
+endpoint flag visits recorded in the existing later phase.
+
+YAML `timeoutSecs` applies only when positive: zero and negative values leave the
+earlier value unchanged. Its environment parser keeps the earlier value on
+malformed input but accepts parsed zero/negative values, as do explicit flags.
+The effective timeout uses a positive configured value first, otherwise a
+positive `--ttl` rounded up to seconds, otherwise 1800 seconds. This does not
+replace nonpositive values with 1800 before checking TTL. Command timeouts are
+converted to wire milliseconds only when the deadline also fits existing
+deployed runners: at most 9223372036 whole seconds. Larger explicit values or
+TTL values whose ceiling exceeds that bound are rejected before run authentication
+or session acquisition, never truncated or saturated. TTL rounding does not
+overflow. The bundled Azure/Cloudflare runner also rejects direct positive
+`timeoutMs` values above 9223372036854 before creating a working directory or
+opening a command stream; nonpositive values retain the no-deadline policy. Status,
+stop, and cleanup do not require a command timeout.
+
+API-version, workdir, and final timeout fallbacks share the compiled defaults.
+Azure backend routing, Linux-only handling, endpoint/legacy-pool validation,
+authentication and session lifecycle remain unchanged.
 
 `workdir` must be an absolute path and may not be a broad system directory such
 as `/`, `/tmp`, `/usr`, or bare `/workspace`; pick a dedicated subdirectory.
@@ -178,6 +204,10 @@ as `/`, `/tmp`, `/usr`, or bare `/workspace`; pick a dedicated subdirectory.
   `/v1/files`, extracts it under `workdir`, then streams the command over
   `/v1/exec` (NDJSON event stream). `--no-sync` skips the upload, `--sync-only`
   stops after sync. Acquired-but-not-kept sessions are stopped after the run.
+  `--lease-output` records the session lease, whether it was reused or retained,
+  and the matching `crabbox stop` cleanup command.
+  API redirects are followed only when they remain on the configured endpoint's
+  origin, preventing credentials and request bodies from crossing trust boundaries.
 - **`status`** / **`list`** read `/.management/getSession` and
   `/.management/listSessions` and join them with local Crabbox claims. `status`
   can `--wait` for readiness.
@@ -187,6 +217,13 @@ as `/`, `/tmp`, `/usr`, or bare `/workspace`; pick a dedicated subdirectory.
 Sessions are tracked by **local claims** scoped to the endpoint. `run`,
 `status`, and `stop` accept kept Crabbox lease IDs or slugs only — raw Dynamic
 Sessions identifiers are rejected unless they are already claimed.
+
+Run cleanup completes before final timing is written. If stopping a newly
+created session fails or its original claim has changed, the claim and session
+remain available for recovery; an otherwise successful run now fails with exit
+code 1 instead of reporting a warning and success. Command exits and cancellation
+keep their original outcome when cleanup or timing output also fails. The cleanup
+timeout covers waiting for the claim lock as well as the stop request.
 
 ## Limitations
 
@@ -200,3 +237,8 @@ Sessions identifiers are rejected unless they are already claimed.
 - `--actions-runner` is rejected.
 - Sync is archive upload/extract, not rsync, so rsync-specific options
   (for example `--checksum`) are rejected.
+
+If a command stream ends before its completion event while the caller context is
+canceled, Crabbox reports cancellation rather than a missing-completion error.
+An accepted completion event and explicit stream-read errors retain their
+existing precedence.

@@ -1,24 +1,555 @@
 package cli
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
+
+func TestValidateAWSCleanupKeyPair(t *testing.T) {
+	name := "crabbox-cbx-123456abcdef"
+	owned := types.KeyPairInfo{
+		KeyName:   aws.String(name),
+		KeyPairId: aws.String("key-0123456789abcdef0"),
+		Tags: []types.Tag{
+			{Key: aws.String("crabbox"), Value: aws.String("true")},
+			{Key: aws.String("created_by"), Value: aws.String("crabbox")},
+		},
+	}
+	if keyPairID, err := validateAWSCleanupKeyPair(name, []types.KeyPairInfo{owned}); err != nil || keyPairID != "key-0123456789abcdef0" {
+		t.Fatalf("owned key id=%q err=%v", keyPairID, err)
+	}
+	unowned := owned
+	unowned.Tags = []types.Tag{{Key: aws.String("crabbox"), Value: aws.String("true")}}
+	_, err := validateAWSCleanupKeyPair(name, []types.KeyPairInfo{unowned})
+	if err == nil || !IsAWSCleanupKeyOwnershipError(err) {
+		t.Fatalf("unowned key error=%v", err)
+	}
+}
+
+func TestAWSFixedAttemptIdentityIsStableAndScopedToResolvedLaunch(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.AWSRegion = "us-east-1"
+	cfg.ServerType = "m7i.large"
+	cfg.Capacity.Market = "on-demand"
+	cfg.Capacity.AvailabilityZones = []string{"us-east-1a"}
+	first := awsFixedAttemptClientToken("cbx_abcdef123456", cfg, "ami-fixed", "sg-fixed", false)
+	second := awsFixedAttemptClientToken("cbx_abcdef123456", cfg, "ami-fixed", "sg-fixed", false)
+	if first != second || len(first) != 64 {
+		t.Fatalf("tokens first=%q second=%q", first, second)
+	}
+	drifted := cfg
+	drifted.ServerType = "m7i.xlarge"
+	if got := awsFixedAttemptClientToken("cbx_abcdef123456", drifted, "ami-fixed", "sg-fixed", false); got == first {
+		t.Fatal("server type drift did not change the fixed attempt token")
+	}
+
+	createdAt := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	left := DirectLeaseLabels(cfg, "cbx_abcdef123456", "fixed", "aws", "on-demand", true, createdAt)
+	right := DirectLeaseLabels(cfg, "cbx_abcdef123456", "fixed", "aws", "on-demand", true, createdAt)
+	leftData, err := json.Marshal(left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightData, err := json.Marshal(right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(leftData) != string(rightData) {
+		t.Fatalf("fixed create labels drifted:\n%s\n%s", leftData, rightData)
+	}
+}
+
+func TestAWSFixedAttemptAttestationIsNonCircularAndSecretFree(t *testing.T) {
+	attempt := AWSLaunchAttempt{
+		Region: "us-east-1", AvailabilityZone: "us-east-1a", SubnetID: "subnet-fixed",
+		ServerType: "m7i.large", Market: "on-demand", ImageID: "ami-fixed",
+		SecurityGroupID: "sg-fixed", HostID: "h-fixed", KeyPairID: "key-fixed",
+		ClientToken: "cbx-client-token", ParametersSHA256: strings.Repeat("a", 64),
+	}
+	first := AWSFixedAttemptAttestationLabels(attempt)
+	withDifferentParameters := attempt
+	withDifferentParameters.ParametersSHA256 = strings.Repeat("b", 64)
+	if second := AWSFixedAttemptAttestationLabels(withDifferentParameters); !maps.Equal(first, second) {
+		t.Fatalf("parameters hash changed pre-submit attestation: first=%v second=%v", first, second)
+	}
+	withDifferentImage := attempt
+	withDifferentImage.ImageID = "ami-other"
+	if second := AWSFixedAttemptAttestationLabels(withDifferentImage); maps.Equal(first, second) {
+		t.Fatal("launch tuple drift did not change attempt attestation")
+	}
+	for key, value := range first {
+		if strings.Contains(key, "client") && value == attempt.ClientToken {
+			t.Fatalf("attempt tag %s persisted raw client token", key)
+		}
+	}
+}
+
+func TestAWSMarketFallbackError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "spot capacity", err: errors.New("UnfulfillableCapacity: no Spot capacity"), want: true},
+		{name: "spot quota", err: errors.New("MaxSpotInstanceCountExceeded: quota"), want: true},
+		{name: "spot unsupported", err: errors.New("UnsupportedOperation: Spot is not supported"), want: true},
+		{name: "parameter independent", err: errors.New("InvalidParameterValue: invalid subnet"), want: false},
+		{name: "unsupported independent", err: errors.New("UnsupportedOperation: architecture is not supported"), want: false},
+		{name: "image independent", err: errors.New("no AWS AMI found in eu-west-1"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isAWSMarketFallbackError(test.err); got != test.want {
+				t.Fatalf("isAWSMarketFallbackError(%q) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+	if !isRetryableAWSProvisioningError(errors.New("UnfulfillableCapacity: no Spot capacity")) {
+		t.Fatal("UnfulfillableCapacity must remain eligible for type and market fallback")
+	}
+	var candidates []string
+	candidates = appendAWSMarketFallbackCandidate(candidates, "t3.small", errors.New("InvalidParameterValue: invalid subnet"))
+	candidates = appendAWSMarketFallbackCandidate(candidates, "t3.medium", errors.New("UnfulfillableCapacity: no Spot capacity"))
+	if len(candidates) != 1 || candidates[0] != "t3.medium" {
+		t.Fatalf("mixed market fallback candidates = %v, want [t3.medium]", candidates)
+	}
+}
+
+func TestAWSFixedPinnedAttemptBlocksBroadRegionFallback(t *testing.T) {
+	control := &AWSFixedCreateControl{PinnedAttempt: &AWSLaunchAttempt{ClientToken: "pinned"}}
+	err := errors.New("transport closed while waiting for capacity response")
+	if !isRetryableAWSRegionProvisioningError(err) {
+		t.Fatal("test error must exercise the broad region retry classifier")
+	}
+	if isRetryableAWSProvisioningError(err) {
+		t.Fatal("test error must remain ambiguous at the RunInstances classifier")
+	}
+	if shouldRetryAWSRegionAfterCreateError(err, control) {
+		t.Fatal("ambiguous fixed attempt advanced to another region")
+	}
+}
+
+func TestAWSFixedPinnedAttemptNeverResubmitsRunInstances(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 9))
+	var requests []string
+	var pinned AWSLaunchAttempt
+	persisted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if params.Get("Action") != "RunInstances" {
+			t.Fatalf("action=%q", params.Get("Action"))
+		}
+		if !persisted {
+			t.Fatal("RunInstances reached the provider before the attempt was persisted")
+		}
+		assertAWSFixedAttemptRequestTags(t, params, pinned)
+		requests = append(requests, params.Encode())
+		writeEC2XML(w, `<RunInstancesResponse><instancesSet><item><instanceId>i-fixed</instanceId><instanceType>m7i.large</instanceType><ipAddress>203.0.113.44</ipAddress><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>`)
+	}))
+	defer server.Close()
+
+	cfg := baseConfig()
+	cfg.AWSRootGB = 400
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetLinux
+	cfg.AWSRegion = "eu-west-1"
+	cfg.ServerType = "m7i.large"
+	cfg.ProviderKey = "crabbox-cbx-abcdef123456"
+	cfg.Capacity.Market = "on-demand"
+	createdAt := time.Date(2026, 8, 9, 12, 0, 0, 123, time.UTC)
+	control := &AWSFixedCreateControl{
+		CreatedAt: createdAt, IntentFingerprint: strings.Repeat("b", 64),
+		AccountID: "123456789012", KeyPairID: "key-fixed", FailedTokens: map[string]bool{},
+	}
+	control.BeforeAttempt = func(attempt AWSLaunchAttempt) error {
+		pinned = attempt
+		persisted = true
+		return nil
+	}
+	client := testAWSClient(server.URL)
+	if _, err := client.createServer(context.Background(), cfg, publicKey, "cbx_abcdef123456", "fixed", true, "ami-fixed", "sg-fixed", false, control); err != nil {
+		t.Fatal(err)
+	}
+
+	persisted = true
+	replay := &AWSFixedCreateControl{
+		CreatedAt: createdAt, IntentFingerprint: strings.Repeat("b", 64),
+		AccountID: "123456789012", KeyPairID: "key-fixed", PinnedAttempt: &pinned,
+		FailedTokens: map[string]bool{},
+	}
+	if _, err := client.createServer(context.Background(), cfg, publicKey, "cbx_abcdef123456", "fixed", true, "ami-fixed", "sg-fixed", false, replay); err == nil || !strings.Contains(err.Error(), "lease_id_conflict") {
+		t.Fatalf("pinned replay err=%v", err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("pinned replay reached RunInstances: requests=%d", len(requests))
+	}
+}
+
+func TestAWSFixedTerminalRunInstancesRejectionCleansKeyBeforeClearingAttempt(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 11))
+	const keyPairID = "key-terminal-rejection"
+	var actions []string
+	deleteDenied := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		action := params.Get("Action")
+		actions = append(actions, action)
+		switch action {
+		case "DescribeKeyPairs":
+			writeEC2Error(w, "InvalidKeyPair.NotFound", "missing", http.StatusBadRequest)
+		case "ImportKeyPair":
+			writeEC2XML(w, `<ImportKeyPairResponse><keyName>crabbox-test</keyName><keyPairId>`+keyPairID+`</keyPairId></ImportKeyPairResponse>`)
+		case "DescribeSecurityGroups":
+			writeEC2XML(w, `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-fixed</groupId></item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+		case "AuthorizeSecurityGroupIngress":
+			writeEC2XML(w, `<AuthorizeSecurityGroupIngressResponse />`)
+		case "RunInstances":
+			writeEC2Error(w, "Blocked", "encoded authorization detail must not escape", http.StatusBadRequest)
+		case "DeleteKeyPair":
+			if got := params.Get("KeyPairId"); got != keyPairID {
+				t.Fatalf("KeyPairId=%q, want %q", got, keyPairID)
+			}
+			if deleteDenied {
+				writeEC2Error(w, "UnauthorizedOperation", "encoded cleanup authorization detail must not escape", http.StatusForbidden)
+				return
+			}
+			writeEC2XML(w, `<DeleteKeyPairResponse><return>true</return></DeleteKeyPairResponse>`)
+		default:
+			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	persisted := false
+	cleared := false
+	newControl := func() *AWSFixedCreateControl {
+		control := &AWSFixedCreateControl{
+			CreatedAt: time.Now().UTC(), IntentFingerprint: strings.Repeat("b", 64),
+			AccountID: "123456789012", FailedTokens: map[string]bool{},
+		}
+		control.BeforeAttempt = func(AWSLaunchAttempt) error {
+			persisted = true
+			return nil
+		}
+		control.DefiniteFailure = func(AWSLaunchAttempt) error {
+			if got := actions[len(actions)-1]; got != "DeleteKeyPair" {
+				t.Fatalf("attempt cleared before support-resource cleanup: last action=%s", got)
+			}
+			cleared = true
+			return nil
+		}
+		return control
+	}
+	control := newControl()
+	cfg := baseConfig()
+	cfg.AWSRootGB = 400
+	cfg.Provider = "aws"
+	cfg.ProviderKey = "crabbox-test"
+	cfg.AWSAMI = "ami-fixed"
+	cfg.AWSSGID = "sg-fixed"
+	cfg.ServerType = "t3.medium"
+	cfg.ServerTypeExplicit = true
+	cfg.Capacity.Market = "on-demand"
+	cfg.SSHPort = "22"
+	cfg.SSHFallbackPorts = nil
+
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(
+		context.Background(), cfg, publicKey, "cbx_abcdef123456", "fixed", true, nil, control,
+	)
+	if err == nil || !strings.Contains(err.Error(), "AWS RunInstances rejected request (Blocked)") {
+		t.Fatalf("err=%v, want sanitized terminal rejection", err)
+	}
+	if strings.Contains(err.Error(), "encoded authorization detail") {
+		t.Fatalf("terminal rejection leaked provider detail: %v", err)
+	}
+	if !persisted || !cleared || control.PinnedAttempt != nil {
+		t.Fatalf("persisted=%t cleared=%t pinned=%#v", persisted, cleared, control.PinnedAttempt)
+	}
+	wantActions := []string{"DescribeKeyPairs", "ImportKeyPair", "DescribeSecurityGroups", "AuthorizeSecurityGroupIngress", "RunInstances", "DeleteKeyPair"}
+	if !slices.Equal(actions, wantActions) {
+		t.Fatalf("actions=%v, want %v", actions, wantActions)
+	}
+
+	actions = nil
+	persisted = false
+	cleared = false
+	deleteDenied = true
+	control = newControl()
+	_, _, err = testAWSClient(server.URL).createServerWithFallbackInRegion(
+		context.Background(), cfg, publicKey, "cbx_abcdef123457", "fixed", true, nil, control,
+	)
+	if err == nil || !strings.Contains(err.Error(), "AWS DeleteKeyPair rejected request (UnauthorizedOperation)") {
+		t.Fatalf("cleanup err=%v, want sanitized DeleteKeyPair rejection", err)
+	}
+	if strings.Contains(err.Error(), "encoded cleanup authorization detail") {
+		t.Fatalf("cleanup rejection leaked provider detail: %v", err)
+	}
+	if !persisted || cleared || control.PinnedAttempt == nil {
+		t.Fatalf("cleanup failure persisted=%t cleared=%t pinned=%#v", persisted, cleared, control.PinnedAttempt)
+	}
+	if !slices.Equal(actions, wantActions) {
+		t.Fatalf("cleanup failure actions=%v, want %v", actions, wantActions)
+	}
+}
+
+func TestAWSOrdinaryRunInstancesOmitsFixedAttemptTags(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 10))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name := range params {
+			if !strings.HasSuffix(name, ".Key") {
+				continue
+			}
+			if tag := params.Get(name); strings.HasPrefix(tag, "fixed_attempt_") {
+				t.Fatalf("ordinary RunInstances included fixed attempt tag %q", tag)
+			}
+		}
+		writeEC2XML(w, `<RunInstancesResponse><instancesSet><item><instanceId>i-ordinary</instanceId><instanceType>m7i.large</instanceType><ipAddress>203.0.113.45</ipAddress><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>`)
+	}))
+	defer server.Close()
+
+	cfg := baseConfig()
+	cfg.AWSRootGB = 400
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetLinux
+	cfg.AWSRegion = "eu-west-1"
+	cfg.ServerType = "m7i.large"
+	cfg.ProviderKey = "crabbox-cbx-abcdef123483"
+	cfg.Capacity.Market = "on-demand"
+	client := testAWSClient(server.URL)
+	if _, err := client.createServer(context.Background(), cfg, publicKey, "cbx_abcdef123483", "ordinary", true, "ami-ordinary", "sg-ordinary", false, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAWSRunInstancesUserDataPreservesOSTransportBoundary(t *testing.T) {
+	for _, target := range []string{targetLinux, targetWindows, targetMacOS} {
+		t.Run(target, func(t *testing.T) {
+			publicKey := "ssh-rsa " + strings.Repeat("a", 724)
+			var encodedUserData string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				params, err := url.ParseQuery(string(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := params.Get("Action"); got != "RunInstances" {
+					t.Fatalf("action=%q, want RunInstances", got)
+				}
+				encodedUserData = params.Get("UserData")
+				writeEC2XML(w, `<RunInstancesResponse><instancesSet><item><instanceId>i-user-data</instanceId><instanceType>m7i.large</instanceType><ipAddress>203.0.113.45</ipAddress><instanceState><name>pending</name></instanceState></item></instancesSet></RunInstancesResponse>`)
+			}))
+			defer server.Close()
+
+			cfg := baseConfig()
+			cfg.AWSRootGB = 400
+			cfg.Provider = "aws"
+			cfg.TargetOS = target
+			cfg.ServerType = "m7i.large"
+			cfg.ProviderKey = "crabbox-cbx-abcdef123484"
+			if target == targetLinux {
+				cfg.Desktop = true
+				cfg.Browser = true
+				cfg.Code = true
+				cfg.Tailscale.Enabled = true
+				cfg.Tailscale.AuthKey = "test-auth-key"
+				cfg.Tailscale.Hostname = "crabbox-user-data-test"
+			}
+			rawUserData := []byte(awsUserData(cfg, publicKey))
+			if _, err := testAWSClient(server.URL).createServer(context.Background(), cfg, publicKey, "cbx_abcdef123484", "user-data", true, "ami-test", "sg-test", false, nil); err != nil {
+				t.Fatal(err)
+			}
+			transportBytes, err := base64.StdEncoding.DecodeString(encodedUserData)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target != targetLinux {
+				if !bytes.Equal(transportBytes, rawUserData) {
+					t.Fatalf("%s user data changed before base64 encoding", target)
+				}
+				if len(transportBytes) >= 2 && transportBytes[0] == 0x1f && transportBytes[1] == 0x8b {
+					t.Fatalf("%s user data must not be gzip-compressed", target)
+				}
+				return
+			}
+			if len(rawUserData) <= awsEC2UserDataLimit {
+				t.Fatalf("Linux cloud-init is %d bytes, want more than the %d-byte EC2 limit", len(rawUserData), awsEC2UserDataLimit)
+			}
+			if len(transportBytes) > awsEC2UserDataLimit {
+				t.Fatalf("compressed user data is %d bytes, exceeds the %d-byte EC2 limit", len(transportBytes), awsEC2UserDataLimit)
+			}
+			reader, err := gzip.NewReader(bytes.NewReader(transportBytes))
+			if err != nil {
+				t.Fatalf("RunInstances user data is not valid gzip: %v", err)
+			}
+			if !reader.ModTime.IsZero() {
+				t.Fatalf("gzip header includes a nondeterministic modification time: %s", reader.ModTime)
+			}
+			decoded, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := reader.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(decoded, rawUserData) {
+				t.Fatal("decompressed RunInstances user data does not match exact Linux cloud-init")
+			}
+			again, err := awsRunInstancesUserData(cfg, publicKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if again != encodedUserData {
+				t.Fatal("gzip user data is not deterministic")
+			}
+		})
+	}
+}
+
+func TestAWSRunInstancesRejectsOversizedCompressedLinuxUserData(t *testing.T) {
+	var entropy bytes.Buffer
+	for index := 0; index < 1024; index++ {
+		digest := sha256.Sum256([]byte("crabbox-oversized-user-data-" + strconv.Itoa(index)))
+		entropy.Write(digest[:])
+	}
+	publicKey := "ssh-rsa " + base64.StdEncoding.EncodeToString(entropy.Bytes())
+	requested := false
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requested = true
+	}))
+	defer server.Close()
+
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.ServerType = "m7i.large"
+	cfg.ProviderKey = "crabbox-cbx-abcdef123485"
+	_, err := testAWSClient(server.URL).createServer(context.Background(), cfg, publicKey, "cbx_abcdef123485", "oversized", true, "ami-test", "sg-test", false, nil)
+	if err == nil || !strings.Contains(err.Error(), "EC2 user-data limit") || !strings.Contains(err.Error(), "16384 raw bytes") {
+		t.Fatalf("oversized user data error=%v, want clear EC2 raw user-data limit", err)
+	}
+	if requested {
+		t.Fatal("oversized Linux user data reached RunInstances")
+	}
+}
+
+func assertAWSFixedAttemptRequestTags(t *testing.T, params url.Values, attempt AWSLaunchAttempt) {
+	t.Helper()
+	expected := AWSFixedAttemptAttestationLabels(attempt)
+	found := map[string]string{}
+	for name := range params {
+		if !strings.HasSuffix(name, ".Key") {
+			continue
+		}
+		tag := params.Get(name)
+		if _, ok := expected[tag]; !ok {
+			continue
+		}
+		value := params.Get(strings.TrimSuffix(name, ".Key") + ".Value")
+		found[tag] = value
+	}
+	for key, value := range expected {
+		if actual, ok := found[key]; !ok {
+			t.Errorf("RunInstances missing fixed attempt tag %s", key)
+		} else if actual != value {
+			t.Errorf("RunInstances fixed attempt tag %s=%q, want %q", key, actual, value)
+		}
+	}
+}
+
+func TestAWSDeleteCleanupSSHKeyUsesValidatedImmutableID(t *testing.T) {
+	const (
+		name      = "crabbox-cbx-123456abcdef"
+		keyPairID = "key-0123456789abcdef0"
+	)
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		actions = append(actions, params.Get("Action"))
+		switch params.Get("Action") {
+		case "DescribeKeyPairs":
+			writeEC2XML(w, `<DescribeKeyPairsResponse><keySet><item><keyName>`+name+`</keyName><keyPairId>`+keyPairID+`</keyPairId><tagSet><item><key>crabbox</key><value>true</value></item><item><key>created_by</key><value>crabbox</value></item></tagSet></item></keySet></DescribeKeyPairsResponse>`)
+		case "DeleteKeyPair":
+			if got := params.Get("KeyPairId"); got != keyPairID {
+				t.Fatalf("KeyPairId=%q, want %q", got, keyPairID)
+			}
+			if got := params.Get("KeyName"); got != "" {
+				t.Fatalf("KeyName=%q, want empty immutable-id deletion", got)
+			}
+			writeEC2XML(w, `<DeleteKeyPairResponse><return>true</return></DeleteKeyPairResponse>`)
+		default:
+			writeEC2Error(w, "Unexpected", params.Get("Action"), http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	client := testAWSClient(server.URL)
+	resolvedID, err := client.ResolveCleanupSSHKeyID(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeleteCleanupSSHKeyID(context.Background(), resolvedID); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(actions, []string{"DescribeKeyPairs", "DeleteKeyPair"}) {
+		t.Fatalf("actions=%v", actions)
+	}
+}
 
 func TestAWSEnsureSSHKeyAcceptsMatchingExistingFingerprint(t *testing.T) {
 	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 1))
@@ -56,6 +587,89 @@ func TestAWSEnsureSSHKeyAcceptsMatchingExistingFingerprint(t *testing.T) {
 	}
 	if !slices.Equal(actions, []string{"DescribeKeyPairs"}) {
 		t.Fatalf("actions=%v, want DescribeKeyPairs only", actions)
+	}
+}
+
+func TestAWSCreateRollbackDeletesOnlyNewImmutableKeyID(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 1))
+	const keyPairID = "key-created-id"
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		action := params.Get("Action")
+		actions = append(actions, action)
+		switch action {
+		case "DescribeKeyPairs":
+			writeEC2Error(w, "InvalidKeyPair.NotFound", "missing", http.StatusBadRequest)
+		case "ImportKeyPair":
+			writeEC2XML(w, `<ImportKeyPairResponse><keyName>crabbox-test</keyName><keyPairId>`+keyPairID+`</keyPairId></ImportKeyPairResponse>`)
+		case "DescribeSecurityGroups":
+			writeEC2Error(w, "UnauthorizedOperation", "denied", http.StatusForbidden)
+		case "DeleteKeyPair":
+			if got := params.Get("KeyPairId"); got != keyPairID {
+				t.Fatalf("KeyPairId=%q, want %q", got, keyPairID)
+			}
+			if got := params.Get("KeyName"); got != "" {
+				t.Fatalf("KeyName=%q, want no name-based rollback", got)
+			}
+			writeEC2XML(w, `<DeleteKeyPairResponse><return>true</return></DeleteKeyPairResponse>`)
+		default:
+			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	cfg := Config{Provider: "aws", ProviderKey: "crabbox-test", AWSAMI: "ami-test", AWSSGID: "sg-test"}
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "rollback", false, nil, nil)
+	if err == nil {
+		t.Fatal("expected create failure")
+	}
+	if !slices.Equal(actions, []string{"DescribeKeyPairs", "ImportKeyPair", "DescribeSecurityGroups", "DeleteKeyPair"}) {
+		t.Fatalf("actions=%v", actions)
+	}
+}
+
+func TestAWSCreateRollbackPreservesMatchingUnmanagedKey(t *testing.T) {
+	publicKey := testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 1))
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		action := params.Get("Action")
+		actions = append(actions, action)
+		switch action {
+		case "DescribeKeyPairs":
+			writeEC2XML(w, `<DescribeKeyPairsResponse><keySet><item><keyName>crabbox-test</keyName><publicKey>`+publicKey+`</publicKey><keyPairId>key-unmanaged-id</keyPairId></item></keySet></DescribeKeyPairsResponse>`)
+		case "DescribeSecurityGroups":
+			writeEC2Error(w, "UnauthorizedOperation", "denied", http.StatusForbidden)
+		case "DeleteKeyPair":
+			t.Fatal("unmanaged key must not be deleted during rollback")
+		default:
+			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	cfg := Config{Provider: "aws", ProviderKey: "crabbox-test", AWSAMI: "ami-test", AWSSGID: "sg-test"}
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "rollback", false, nil, nil)
+	if err == nil {
+		t.Fatal("expected create failure")
+	}
+	if !slices.Equal(actions, []string{"DescribeKeyPairs", "DescribeSecurityGroups"}) {
+		t.Fatalf("actions=%v", actions)
 	}
 }
 
@@ -197,6 +811,165 @@ func TestApplyAWSRunInstanceTargetOptionsLeavesNativeWindowsDefault(t *testing.T
 	}
 }
 
+func TestAWSExactTypeQuotaRejectionPreservesQuotaGuidance(t *testing.T) {
+	launches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+			return
+		}
+		switch r.Form.Get("Action") {
+		case "DescribeKeyPairs":
+			writeEC2Error(w, "InvalidKeyPair.NotFound", "missing", http.StatusBadRequest)
+		case "ImportKeyPair":
+			writeEC2XML(w, `<ImportKeyPairResponse><keyName>quota-test</keyName><keyPairId>key-quota-test</keyPairId></ImportKeyPairResponse>`)
+		case "DescribeSecurityGroups":
+			writeEC2XML(w, `<DescribeSecurityGroupsResponse><securityGroupInfo><item><groupId>sg-quota-test</groupId></item></securityGroupInfo></DescribeSecurityGroupsResponse>`)
+		case "AuthorizeSecurityGroupIngress":
+			writeEC2XML(w, `<AuthorizeSecurityGroupIngressResponse />`)
+		case "RunInstances":
+			launches++
+			if r.Form.Get("InstanceType") != "t3.small" {
+				t.Errorf("unexpected fallback type: %s", r.Form.Get("InstanceType"))
+			}
+			writeEC2Error(w, "VcpuLimitExceeded", "regional quota exhausted", http.StatusBadRequest)
+		case "DeleteKeyPair":
+			writeEC2XML(w, `<DeleteKeyPairResponse><return>true</return></DeleteKeyPairResponse>`)
+		default:
+			t.Errorf("unexpected AWS action: %s", r.Form.Get("Action"))
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	cfg := baseConfig()
+	cfg.Provider, cfg.ProviderKey, cfg.ServerType, cfg.ServerTypeExplicit = "aws", "quota-test", "t3.small", true
+	cfg.AWSAMI, cfg.AWSSGID, cfg.Capacity.Market = "ami-quota-test", "sg-quota-test", "on-demand"
+	cfg.AWSRootGB = 400
+	_, _, err := testAWSClient(server.URL).createServerWithFallbackInRegion(
+		context.Background(), cfg, testOpenSSHPublicKey("ssh-ed25519", testBytes(32, 11)), "cbx_abcdef123456", "quota-test", false, nil, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "remove --type to allow class fallback (regional quota limits still apply)") || !strings.Contains(err.Error(), "VcpuLimitExceeded") {
+		t.Fatalf("err=%v, want quota rejection and bounded fallback guidance", err)
+	}
+	if launches != 1 {
+		t.Fatalf("launches=%d, want one exact-type attempt", launches)
+	}
+}
+
+func TestAWSCapacityDoctorUsesInstanceMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name, vcpus, wantStatus, wantNeeded string
+		quota                               int
+		denied                              bool
+	}{
+		{name: "below metal quota", vcpus: "192", quota: 191, wantStatus: "warning", wantNeeded: "192"},
+		{name: "exact metal quota", vcpus: "192", quota: 192, wantStatus: "ok", wantNeeded: "192"},
+		{name: "above metal quota", vcpus: "192", quota: 256, wantStatus: "ok", wantNeeded: "192"},
+		{name: "missing metadata", quota: 192, wantStatus: "skip", wantNeeded: "unknown"},
+		{name: "zero metadata", vcpus: "0", quota: 192, wantStatus: "skip", wantNeeded: "unknown"},
+		{name: "malformed metadata", vcpus: "invalid", quota: 192, wantStatus: "skip", wantNeeded: "unknown"},
+		{name: "denied metadata", denied: true, quota: 192, wantStatus: "skip", wantNeeded: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metadataReads, quotaReads := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.Header.Get("X-Amz-Target"), ".GetServiceQuota") {
+					quotaReads++
+					w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+					_ = json.NewEncoder(w).Encode(map[string]any{"Quota": map[string]any{"Value": tc.quota}})
+					return
+				}
+				if err := r.ParseForm(); err != nil {
+					t.Error(err)
+					return
+				}
+				if r.Form.Get("Action") != "DescribeInstanceTypes" || r.Form.Get("InstanceType.1") != "c7a.metal-48xl" {
+					t.Errorf("unexpected EC2 request: %v", r.Form)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				metadataReads++
+				if tc.denied {
+					writeEC2Error(w, "UnauthorizedOperation", "metadata denied", http.StatusForbidden)
+					return
+				}
+				item := ""
+				if tc.vcpus != "" {
+					item = "<item><instanceType>c7a.metal-48xl</instanceType><vCpuInfo><defaultVCpus>" + tc.vcpus + "</defaultVCpus></vCpuInfo></item>"
+				}
+				writeEC2XML(w, "<DescribeInstanceTypesResponse><instanceTypeSet>"+item+"</instanceTypeSet></DescribeInstanceTypesResponse>")
+			}))
+			defer server.Close()
+			client := testAWSClient(server.URL)
+			client.serviceQuotas = servicequotas.NewFromConfig(aws.Config{
+				Region: "eu-west-1", BaseEndpoint: aws.String(server.URL),
+				Credentials: credentials.NewStaticCredentialsProvider("test", "secret", ""),
+			})
+			cfg := defaultConfig()
+			cfg.Provider, cfg.TargetOS, cfg.ServerType = "aws", targetLinux, "c7a.metal-48xl"
+			cfg.AWSRegion = "us-east-1"
+			cfg.Capacity.Market, cfg.Capacity.Fallback = "spot", "on-demand-after-120s"
+			checks := client.CapacityDoctorChecks(context.Background(), cfg)
+			if len(checks) != 2 {
+				t.Fatalf("got %d checks, want both markets", len(checks))
+			}
+			for _, check := range checks {
+				if check.Details["region"] != "eu-west-1" || !strings.Contains(check.Message, "region=eu-west-1") {
+					t.Errorf("check=%+v, want the quota client's region", check)
+				}
+				if check.Status != tc.wantStatus || check.Details["default_needed_vcpus"] != tc.wantNeeded {
+					t.Errorf("check=%+v, want %s with needed=%s", check, tc.wantStatus, tc.wantNeeded)
+				}
+				if tc.wantStatus == "ok" {
+					for key, want := range map[string]string{
+						"capacity": "unknown", "quota_limit": "sufficient", "usage": "unchecked",
+						"hint": "check_regional_quota_usage",
+					} {
+						if check.Details[key] != want || !strings.Contains(check.Message, key+"="+want) {
+							t.Errorf("check=%+v, want %s=%s in text and details", check, key, want)
+						}
+					}
+				}
+				if check.Details["recommended_type"] != "" {
+					t.Errorf("recommended an undescribed type: %+v", check)
+				}
+			}
+			if metadataReads != 1 || quotaReads != 2 {
+				t.Errorf("reads metadata=%d quota=%d, want 1 and 2", metadataReads, quotaReads)
+			}
+		})
+	}
+}
+
+func TestAWSCapacityDoctorChecksMultiLetterStandardFamilies(t *testing.T) {
+	for _, serverType := range []string{"im4gn.16xlarge", "is4gen.8xlarge"} {
+		t.Run(serverType, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.ServerType = serverType
+			check := awsCapacityDoctorCheckForQuota(cfg, "on-demand", 32, true, nil, map[string]int{serverType: 96})
+			if check.Status != "warning" || check.Details["quota_code"] != awsOnDemandQuotaCode {
+				t.Fatalf("did not compare Standard instance against quota: %+v", check)
+			}
+		})
+	}
+}
+
+func TestAWSCapacityDoctorSkipsNonStandardQuotaFamilies(t *testing.T) {
+	for _, serverType := range []string{"g4dn.metal", "p5.48xlarge", "trn1.32xlarge", "inf2.48xlarge", "hpc7a.96xlarge"} {
+		t.Run(serverType, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.ServerType = serverType
+			check := awsCapacityDoctorCheckForQuota(cfg, "on-demand", 32, true, nil, map[string]int{serverType: 96})
+			if check.Status != "skip" || check.Details["hint"] != "unsupported_instance_quota" || check.Details["default_needed_vcpus"] != "96" {
+				t.Fatalf("compared a non-Standard instance against Standard quota: %+v", check)
+			}
+			if check.Details["quota_code"] != "" || check.Details["recommended_type"] != "" {
+				t.Fatalf("reported Standard quota or recommendation for a non-Standard instance: %+v", check)
+			}
+		})
+	}
+}
+
 func TestAWSCapacityDoctorCheckWarnsWhenQuotaBelowDefaultClass(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Provider = "aws"
@@ -204,7 +977,7 @@ func TestAWSCapacityDoctorCheckWarnsWhenQuotaBelowDefaultClass(t *testing.T) {
 	cfg.Class = "beast"
 	cfg.ServerType = serverTypeForConfig(cfg)
 
-	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 32, true, nil)
+	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 32, true, nil, map[string]int{cfg.ServerType: 192, "c7a.8xlarge": 32, "c7g.8xlarge": 32})
 
 	if check.Status != "warning" {
 		t.Fatalf("status=%q, want warning", check.Status)
@@ -223,6 +996,27 @@ func TestAWSCapacityDoctorCheckWarnsWhenQuotaBelowDefaultClass(t *testing.T) {
 	}
 }
 
+func TestAWSRecommendedClassForQuotaIncludesSmallClasses(t *testing.T) {
+	t.Parallel()
+	cfg := defaultConfig()
+	cfg.Provider = "aws"
+	cfg.TargetOS = targetLinux
+
+	for _, tt := range []struct {
+		limitVCPUs int
+		wantClass  string
+		wantType   string
+	}{
+		{limitVCPUs: 2, wantClass: "tiny", wantType: "m7a.large"},
+		{limitVCPUs: 8, wantClass: "small", wantType: "c7a.2xlarge"},
+	} {
+		gotClass, gotType := awsRecommendedClassForQuota(cfg, tt.limitVCPUs, map[string]int{"m7a.large": 2, "c7a.2xlarge": 8})
+		if gotClass != tt.wantClass || gotType != tt.wantType {
+			t.Fatalf("limit=%d got=(%q,%q) want=(%q,%q)", tt.limitVCPUs, gotClass, gotType, tt.wantClass, tt.wantType)
+		}
+	}
+}
+
 func TestAWSCapacityDoctorCheckRecommendsARM64Types(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Provider = "aws"
@@ -232,7 +1026,7 @@ func TestAWSCapacityDoctorCheckRecommendsARM64Types(t *testing.T) {
 	cfg.architectureExplicit = true
 	cfg.ServerType = serverTypeForConfig(cfg)
 
-	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 32, true, nil)
+	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 32, true, nil, map[string]int{cfg.ServerType: 192, "c7a.8xlarge": 32, "c7g.8xlarge": 32})
 
 	if check.Status != "warning" {
 		t.Fatalf("status=%q, want warning", check.Status)
@@ -242,20 +1036,20 @@ func TestAWSCapacityDoctorCheckRecommendsARM64Types(t *testing.T) {
 	}
 }
 
-func TestAWSCapacityDoctorCheckPassesWhenQuotaCoversDefaultClass(t *testing.T) {
+func TestAWSCapacityDoctorCheckRecommendsTinyClassForTwoVCPUQuota(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Provider = "aws"
 	cfg.TargetOS = targetLinux
 	cfg.Class = "beast"
 	cfg.ServerType = serverTypeForConfig(cfg)
 
-	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 256, true, nil)
+	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 2, true, nil, map[string]int{cfg.ServerType: 192, "m7a.large": 2})
 
-	if check.Status != "ok" {
-		t.Fatalf("status=%q, want ok", check.Status)
+	if check.Status != "warning" {
+		t.Fatalf("status=%q, want warning", check.Status)
 	}
-	if check.Details["hint"] != "quota_satisfies_default_class" {
-		t.Fatalf("hint=%q", check.Details["hint"])
+	if check.Details["recommended_class"] != "tiny" || check.Details["recommended_type"] != "m7a.large" {
+		t.Fatalf("recommendation=(%q,%q), want tiny/m7a.large", check.Details["recommended_class"], check.Details["recommended_type"])
 	}
 }
 
@@ -266,7 +1060,7 @@ func TestAWSCapacityDoctorCheckSkipsWhenQuotaUnknown(t *testing.T) {
 	cfg.Class = "beast"
 	cfg.ServerType = serverTypeForConfig(cfg)
 
-	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 0, false, nil)
+	check := awsCapacityDoctorCheckForQuota(cfg, "spot", 0, false, nil, map[string]int{cfg.ServerType: 192})
 
 	if check.Status != "skip" {
 		t.Fatalf("status=%q, want skip", check.Status)
@@ -292,6 +1086,37 @@ func TestAWSInstanceToServerPreservesHostID(t *testing.T) {
 	}
 }
 
+func TestAWSInstanceToServerReportsInstanceProfileAttachment(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		profile  *types.IamInstanceProfile
+		attached bool
+	}{
+		{name: "absent", attached: false},
+		{
+			name:     "attached",
+			profile:  &types.IamInstanceProfile{Arn: aws.String("arn:aws:iam::123456789012:instance-profile/worker")},
+			attached: true,
+		},
+		{
+			name:     "attached with incomplete metadata",
+			profile:  &types.IamInstanceProfile{},
+			attached: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := awsInstanceToServer(types.Instance{
+				InstanceId:         aws.String("i-1234567890abcdef0"),
+				IamInstanceProfile: tc.profile,
+				State:              &types.InstanceState{Name: types.InstanceStateNameRunning},
+			})
+			if got := server.ProviderMetadata["instanceProfileAttached"]; got != tc.attached {
+				t.Fatalf("instanceProfileAttached=%v, want %v", got, tc.attached)
+			}
+		})
+	}
+}
+
 func TestRetryableAWSSnapshotDeleteError(t *testing.T) {
 	for _, message := range []string{
 		"InvalidSnapshot.InUse: snapshot is currently in use by ami-123",
@@ -308,6 +1133,113 @@ func TestRetryableAWSSnapshotDeleteError(t *testing.T) {
 	}
 	if isRetryableAWSSnapshotDeleteError("AuthFailure: not authorized") {
 		t.Fatal("AuthFailure should not be retryable")
+	}
+}
+
+func TestAWSWaitForServerIPWaitsForCreatedInstanceVisibility(t *testing.T) {
+	const instanceID = "i-1234567890abcdef0"
+	describes := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+			return
+		}
+		if r.Form.Get("Action") != "DescribeInstances" || r.Form.Get("InstanceId.1") != instanceID {
+			t.Errorf("unexpected lookup: %v", r.Form)
+			writeEC2Error(w, "Unexpected", "wrong instance lookup", http.StatusBadRequest)
+			return
+		}
+		describes++
+		if describes == 1 {
+			writeEC2Error(w, "InvalidInstanceID.NotFound", "newly created instance has not propagated", http.StatusBadRequest)
+			return
+		}
+		writeEC2XML(w, `<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>`+instanceID+`</instanceId><instanceType>t3.micro</instanceType><ipAddress>203.0.113.44</ipAddress><instanceState><name>running</name></instanceState></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`)
+	}))
+	t.Cleanup(server.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	observed, err := testAWSClient(server.URL).WaitForServerIP(ctx, instanceID)
+	if err != nil {
+		t.Fatalf("newly created instance readiness stopped before visibility: %v", err)
+	}
+	if observed.CloudID != instanceID || observed.PublicNet.IPv4.IP != "203.0.113.44" || describes != 2 {
+		t.Fatalf("readiness=%+v describes=%d, want exact instance after propagation", observed, describes)
+	}
+}
+
+func TestAWSWaitForServerIPRejectsNonVisibilityErrors(t *testing.T) {
+	for _, code := range []string{"UnauthorizedOperation", "InvalidInstanceID.Malformed", ""} {
+		t.Run(code, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if code == "" {
+					writeEC2XML(w, `<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>`)
+				} else {
+					writeEC2Error(w, code, "InvalidInstanceID.NotFound text is not the API code", http.StatusBadRequest)
+				}
+			}))
+			t.Cleanup(server.Close)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			_, err := testAWSClient(server.URL).WaitForServerIP(ctx, "i-1234567890abcdef0")
+			if err == nil || calls != 1 || code != "" && awsAPIErrorCode(err) != code || code == "" && !strings.Contains(err.Error(), "aws instance not found") {
+				t.Fatalf("lookup err=%v calls=%d, want original error without retry", err, calls)
+			}
+		})
+	}
+}
+
+func TestAWSWaitForServerIPHonorsCallerCancellation(t *testing.T) {
+	for _, boundary := range []string{"cancel", "deadline", "in-flight deadline"} {
+		t.Run(boundary, func(t *testing.T) {
+			seen := make(chan struct{}, 1)
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen <- struct{}{}
+				if boundary == "in-flight deadline" {
+					select {
+					case <-r.Context().Done():
+					case <-release:
+						writeEC2Error(w, "UnauthorizedOperation", "test request released", http.StatusBadRequest)
+					}
+					return
+				}
+				writeEC2Error(w, "InvalidInstanceID.NotFound", "not visible yet", http.StatusBadRequest)
+			}))
+			t.Cleanup(server.Close)
+			t.Cleanup(func() { close(release) })
+			ctx, cancel := context.WithCancel(t.Context())
+			wantErr := context.Canceled
+			if boundary != "cancel" {
+				cancel()
+				ctx, cancel = context.WithTimeout(t.Context(), 200*time.Millisecond)
+				wantErr = context.DeadlineExceeded
+			}
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				_, err := testAWSClient(server.URL).WaitForServerIP(ctx, "i-1234567890abcdef0")
+				result <- err
+			}()
+			select {
+			case <-seen:
+			case <-time.After(2 * time.Second):
+				t.Fatal("readiness never issued its lookup")
+			}
+			if boundary == "cancel" {
+				cancel()
+			}
+			select {
+			case err := <-result:
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("readiness error=%v, want %v", err, wantErr)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("cancelled readiness waited for its next five-second poll")
+			}
+		})
 	}
 }
 
@@ -405,21 +1337,30 @@ func TestValidateImageCheckpointSourceRejectsMissingInstance(t *testing.T) {
 }
 
 func TestDeleteImageCheckpointRefusesNotFoundWithoutAccountID(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
-		}
-		if action := r.Form.Get("Action"); action != "DescribeImages" {
-			writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
-			return
-		}
-		writeEC2Error(w, "InvalidAMIID.NotFound", "image not found", http.StatusBadRequest)
-	}))
-	defer server.Close()
+	for _, absent := range []string{"not found", "empty response"} {
+		t.Run(absent, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Error(err)
+					return
+				}
+				if action := r.Form.Get("Action"); action != "DescribeImages" {
+					writeEC2Error(w, "Unexpected", action, http.StatusBadRequest)
+					return
+				}
+				if absent == "not found" {
+					writeEC2Error(w, "InvalidAMIID.NotFound", "image not found", http.StatusBadRequest)
+				} else {
+					writeEC2XML(w, `<DescribeImagesResponse><imagesSet/></DescribeImagesResponse>`)
+				}
+			}))
+			defer server.Close()
 
-	err := testAWSClient(server.URL).DeleteImageCheckpoint(context.Background(), "ami-12345678", nil, "")
-	if err == nil || !strings.Contains(err.Error(), "checkpoint record has no accountId") {
-		t.Fatalf("err=%v, want account guard error", err)
+			err := testAWSClient(server.URL).DeleteImageCheckpoint(context.Background(), "ami-12345678", nil, "", nil)
+			if err == nil || !strings.Contains(err.Error(), "checkpoint record has no accountId") {
+				t.Fatalf("err=%v, want account guard error", err)
+			}
+		})
 	}
 }
 
@@ -441,7 +1382,7 @@ func TestDeleteImageCheckpointRefusesAccountMismatchBeforeDescribe(t *testing.T)
 	}))
 	defer server.Close()
 
-	err := testAWSClient(server.URL).DeleteImageCheckpoint(context.Background(), "ami-12345678", nil, "123456789012")
+	err := testAWSClient(server.URL).DeleteImageCheckpoint(context.Background(), "ami-12345678", nil, "123456789012", nil)
 	if err == nil || !strings.Contains(err.Error(), "account mismatch") {
 		t.Fatalf("err=%v, want account mismatch", err)
 	}
@@ -654,6 +1595,7 @@ func TestAWSMacOSFallbackResolvesAMIForEachInstanceType(t *testing.T) {
 		region: "eu-west-1",
 	}
 	cfg := Config{
+		AWSRootGB:   400,
 		Provider:    "aws",
 		TargetOS:    targetMacOS,
 		ServerType:  "mac2.metal",
@@ -666,7 +1608,7 @@ func TestAWSMacOSFallbackResolvesAMIForEachInstanceType(t *testing.T) {
 		SSHPort: "22",
 	}
 
-	serverRecord, resolved, err := client.createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "mac-test", false, nil)
+	serverRecord, resolved, err := client.createServerWithFallbackInRegion(context.Background(), cfg, publicKey, "cbx_123", "mac-test", false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,7 +1626,7 @@ func TestAWSMacOSFallbackResolvesAMIForEachInstanceType(t *testing.T) {
 		name, architecture := awsMacOSAMIQueryForInstanceType(instanceType)
 		wantQueries = append(wantQueries, name+":"+architecture)
 	}
-	if !stringSlicesEqual(imageQueries, wantQueries) {
+	if !slices.Equal(imageQueries, wantQueries) {
 		t.Fatalf("image queries=%v, want %v", imageQueries, wantQueries)
 	}
 	if len(runTypes) != len(awsMacOSInstanceTypeCandidates()) || runTypes[0] != "mac2.metal" || runTypes[len(runTypes)-1] != "mac1.metal" {
@@ -794,4 +1736,59 @@ func writeEC2Error(w http.ResponseWriter, code, message string, status int) {
 	w.Header().Set("content-type", "text/xml")
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Response><Errors><Error><Code>` + code + `</Code><Message>` + message + `</Message></Error></Errors></Response>`))
+}
+
+func TestAWSMissingLinuxAMIAllowsRegionFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+			return
+		}
+		if r.Form.Get("Action") != "DescribeImages" || r.Form.Get("Owner.1") != awsUbuntuOwner || r.Form.Get("Filter.1.Value.1") != "arm64" {
+			t.Errorf("unexpected image query: %v", r.Form)
+		}
+		writeEC2XML(w, `<DescribeImagesResponse><imagesSet /></DescribeImagesResponse>`)
+	}))
+	defer server.Close()
+	cfg := baseConfig()
+	cfg.TargetOS, cfg.Architecture, cfg.OSImage = targetLinux, ArchitectureARM64, "ubuntu:26.04"
+	_, err := testAWSClient(server.URL).resolveAMI(context.Background(), cfg)
+	if err == nil || !isRetryableAWSRegionProvisioningError(err) || isAWSMarketFallbackError(err) {
+		t.Fatalf("missing regional image must allow region fallback without market fallback: %v", err)
+	}
+}
+
+func TestAWSWindowsOSSelectorAMI(t *testing.T) {
+	for _, selector := range []string{"", "ubuntu:26.04", "windows-server:2022", "windows-server:2025"} {
+		t.Run(selector, func(t *testing.T) {
+			var gotName, gotOwner, gotArch string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Error(err)
+					return
+				}
+				gotName, gotOwner, gotArch = r.Form.Get("Filter.2.Value.1"), r.Form.Get("Owner.1"), r.Form.Get("Filter.1.Value.1")
+				writeEC2XML(w, `<DescribeImagesResponse><imagesSet><item><imageId>ami-old</imageId><creationDate>2026-01-01</creationDate></item><item><imageId>ami-latest</imageId><creationDate>2026-09-01</creationDate></item></imagesSet></DescribeImagesResponse>`)
+			}))
+			defer server.Close()
+			cfg := baseConfig()
+			cfg.TargetOS, cfg.OSImage = targetWindows, selector
+			image, err := testAWSClient(server.URL).resolveAMI(context.Background(), cfg)
+			if err != nil || image != "ami-latest" {
+				t.Fatalf("image=%q err=%v", image, err)
+			}
+			year := "2025"
+			if selector == "windows-server:2022" {
+				year = "2022"
+			}
+			if gotName != "Windows_Server-"+year+"-English-Full-Base-*" || gotOwner != "amazon" || gotArch != "x86_64" {
+				t.Fatalf("unexpected query: name=%q owner=%q arch=%q", gotName, gotOwner, gotArch)
+			}
+			cfg.AWSAMI = "ami-pinned"
+			image, err = testAWSClient(server.URL).resolveAMI(context.Background(), cfg)
+			if err != nil || image != "ami-pinned" {
+				t.Fatalf("override: image=%q err=%v", image, err)
+			}
+		})
+	}
 }

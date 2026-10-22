@@ -41,8 +41,17 @@ env:
     - PROJECT_*
 ```
 
-Setting `env.allow` replaces the built-in default. Profile-scoped allowlists are
-also supported through the profile's own `env.allow`.
+Setting top-level `env.allow` replaces the inherited list, including the built-in
+default. Omitting it inherits the lower layer; `env: {allow: []}` clears all
+inherited names, including `CI` and `NODE_OPTIONS`. A higher nonempty list
+replaces that selection, and `--allow-env` can append names after a clear.
+
+Profile-scoped allowlists (`profiles.<name>.env.allow` and `envAllow`) are
+additive, including across files: an empty profile list adds nothing and does
+not clear earlier profile entries. Selecting a profile can therefore add names
+after a top-level clear. Clearing `env.allow` only controls allowlisted
+forwarding, not profile/preset literal values, reserved execution metadata, or
+capability-injected variables.
 
 ### `CRABBOX_ENV_ALLOW`
 
@@ -82,10 +91,30 @@ and value. If it is not set, nothing is forwarded — Crabbox does not invent
 values. Variables that match the allowlist but are unset locally simply do not
 appear in the forwarded set.
 
-Inline-allowlisted variables (those resolved from the local environment) are
-passed through the provider's remote-command transport. SSH-backed providers
-pass them as part of the SSH command itself, with quoting and escaping handled
-automatically so values containing shell metacharacters pass through safely.
+SSH-backed providers upload allowlisted values over SSH stdin into a private
+per-command file under `.crabbox/env-<random>/` in the workspace. The remote
+session loads that file; neither the SSH command nor the workspace-owner
+launcher contains the values, even encoded. POSIX targets (including WSL2) use
+a mode `0600` shell file inside a mode `0700` directory. Native Windows uses a
+PowerShell file in a directory restricted to the SSH account. Quoting, Unicode,
+empty strings, and multiline values are preserved. The file and its directory
+are removed after the command, including failure and cancellation; a failed
+cleanup emits a warning. If workspace ownership is lost, cleanup is refused;
+the private file remains until the lease is cleaned up with verified ownership.
+Preflight and `cache warm` use the same transport.
+
+Values containing a NUL byte are rejected before temporary command-env upload,
+because native process environments cannot represent them. The error names the
+variable without printing its value. Other values still obey the target OS's
+environment-size limits.
+
+These temporary values remain separate from reusable `--env-helper` profiles
+and are never retained by helper mode. Forwarding summaries report names and
+presence, with lengths for secret-shaped names. Crabbox does not add the
+transport contents to timing JSON, proof files, or failure-bundle metadata.
+Workloads can still expose their own environment through output or artifacts;
+inspect those before sharing.
+
 Delegated-run providers may use a provider-specific transport instead; for
 example, Docker Sandbox writes the selected values to a temporary local env file
 and passes only that file path to `sbx exec --env-file` so the values do not
@@ -121,8 +150,35 @@ a per-run file at `.crabbox/env/<run-or-lease-id>.env` inside the workdir
 removed after the run, and a one-line probe reports which names landed:
 
 ```text
-env profile remote=.crabbox/env/cbx_ab12cd34ef56.env vars=PROJECT_FOO=set,PROJECT_BAR=set
+env profile remote=.crabbox/env/run_ab12cd34ef56.env vars=PROJECT_FOO=set,PROJECT_BAR=set
 ```
+
+## Reserved execution metadata
+
+Every remote command receives three Crabbox-owned environment variables:
+
+```text
+CRABBOX_LEASE_ID  Stable ID for the lease or workspace used by the command.
+CRABBOX_RUN_ID    Unique ID for this crabbox run invocation.
+CRABBOX_SLUG      Friendly lease slug when available; empty otherwise.
+```
+
+`CRABBOX_LEASE_ID` and `CRABBOX_SLUG` can be empty when a delegated provider
+creates a fresh sandbox during the run itself, because the session does not
+exist yet when the command environment is assembled. Scripts that namespace
+external resources should fall back to `CRABBOX_RUN_ID`, which is always set.
+
+`CRABBOX_RUN_ID` uses the durable coordinator-issued run ID when the run is
+coordinator-backed. Without a coordinator, the CLI generates the same
+`run_<12 lowercase hex characters>` shape before dispatch. The value stays
+fixed across argv, shell, uploaded-script, job, and delegated execution within
+that invocation; a later `crabbox run` gets a new ID.
+
+These names are reserved and do not need to appear in `env.allow`. Crabbox
+applies them after ambient allowlist values, profile files, and profile or
+preset environment expansion, so user-supplied values cannot override the
+execution metadata. Matching names are removed from uploaded profile env before
+the remote file is sourced, then the Crabbox-owned values are injected inline.
 
 ## Reusable helpers: `--env-helper`
 

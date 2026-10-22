@@ -11,7 +11,7 @@ import (
 func (a App) ports(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("ports", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpAll())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	id := fs.String("id", "", "lease id or slug")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	var publish stringListFlag
@@ -26,10 +26,10 @@ func (a App) ports(ctx context.Context, args []string) error {
 	idFlagSet := flagWasSet(fs, "id")
 	setIDFromFirstArg(fs, id)
 	if strings.TrimSpace(*id) == "" || fs.NArg() > 1 || (idFlagSet && fs.NArg() > 0) {
-		return exit(2, "usage: crabbox ports --id <lease-id-or-slug> [--publish <spec>] [--unpublish <spec>] [--json]")
+		return Exit(2, "usage: crabbox ports --id <lease-id-or-slug> [--publish <spec>] [--unpublish <spec>] [--json]")
 	}
 	if len(publish) > 0 && len(unpublish) > 0 {
-		return exit(2, "--publish and --unpublish cannot be combined")
+		return Exit(2, "--publish and --unpublish cannot be combined")
 	}
 	cfg, err := loadPortsConfig(fs, *provider, providerFlags, targetFlags, *id)
 	if err != nil {
@@ -41,7 +41,7 @@ func (a App) ports(ctx context.Context, args []string) error {
 	}
 	portsBackend, ok := backend.(PortsBackend)
 	if !ok {
-		return exit(2, "provider=%s does not support ports; use a provider with native port publishing", backend.Spec().Name)
+		return Exit(2, "provider=%s does not support ports; use a provider with native port publishing", backend.Spec().Name)
 	}
 	output, err := portsBackend.Ports(ctx, PortsRequest{
 		Options:   leaseOptionsFromConfig(cfg),
@@ -62,7 +62,7 @@ func (a App) ports(ctx context.Context, args []string) error {
 		}
 		enc := json.NewEncoder(a.Stdout)
 		enc.SetEscapeHTML(false)
-		return enc.Encode(value)
+		return enc.Encode(nonNullJSONCollection(value))
 	}
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
@@ -83,6 +83,9 @@ func loadPortsConfig(fs *flag.FlagSet, provider string, providerFlags providerFl
 		return Config{}, err
 	}
 	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
+		return Config{}, err
+	}
+	if err := autoRouteClaimLeaseProvider(&cfg, fs, id); err != nil {
 		return Config{}, err
 	}
 	if err := autoRouteStaticLease(&cfg, fs, id); err != nil {

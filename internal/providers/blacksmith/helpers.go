@@ -1,7 +1,6 @@
 package blacksmith
 
 import (
-	"flag"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -19,17 +18,7 @@ var (
 	blacksmithSyncStartPattern = regexp.MustCompile(`(?i)^\s*Syncing(?:\.\.\.| from repo root:)`)
 	blacksmithSyncDonePattern  = regexp.MustCompile(`(?i)^\s*(Changes synced in|No changes to sync|Sync complete)\b`)
 	blacksmithStatusPollDelay  = 5 * time.Second
-	blacksmithCleanupAttempts  = 36
-	blacksmithCleanupDelay     = 5 * time.Second
-	blacksmithCleanupQuiet     = 12
 )
-
-type blacksmithFlagValues struct {
-	Org      *string
-	Workflow *string
-	Job      *string
-	Ref      *string
-}
 
 type blacksmithListItem struct {
 	ID       string `json:"id"`
@@ -41,34 +30,10 @@ type blacksmithListItem struct {
 	Created  string `json:"created"`
 }
 
-func registerBlacksmithFlags(fs *flag.FlagSet, defaults Config) blacksmithFlagValues {
-	return blacksmithFlagValues{
-		Org:      fs.String("blacksmith-org", defaults.Blacksmith.Org, "Blacksmith organization"),
-		Workflow: fs.String("blacksmith-workflow", defaults.Blacksmith.Workflow, "Blacksmith Testbox workflow file, name, or id"),
-		Job:      fs.String("blacksmith-job", defaults.Blacksmith.Job, "Blacksmith Testbox workflow job"),
-		Ref:      fs.String("blacksmith-ref", defaults.Blacksmith.Ref, "Blacksmith Testbox git ref"),
-	}
-}
-
-func applyBlacksmithFlagOverrides(cfg *Config, fs *flag.FlagSet, values blacksmithFlagValues) {
-	if flagWasSet(fs, "blacksmith-org") {
-		cfg.Blacksmith.Org = *values.Org
-	}
-	if flagWasSet(fs, "blacksmith-workflow") {
-		cfg.Blacksmith.Workflow = *values.Workflow
-	}
-	if flagWasSet(fs, "blacksmith-job") {
-		cfg.Blacksmith.Job = *values.Job
-	}
-	if flagWasSet(fs, "blacksmith-ref") {
-		cfg.Blacksmith.Ref = *values.Ref
-	}
-}
-
-func blacksmithWarmupArgs(cfg Config, publicKey string) ([]string, error) {
+func blacksmithWarmupArgs(cfg core.Config, publicKey string) ([]string, error) {
 	workflow := blacksmithWorkflow(cfg)
 	if workflow == "" {
-		return nil, exit(2, "blacksmith-testbox requires blacksmith.workflow or actions.workflow")
+		return nil, core.Exit(2, "blacksmith-testbox requires blacksmith.workflow or actions.workflow")
 	}
 	args := blacksmithBaseArgs(cfg)
 	args = append(args, "testbox", "warmup", workflow)
@@ -84,48 +49,42 @@ func blacksmithWarmupArgs(cfg Config, publicKey string) ([]string, error) {
 	for _, spec := range core.CacheVolumeStickyDiskSpecs(cfg.Cache.Volumes) {
 		args = append(args, "--sticky-disk", spec)
 	}
-	args = append(args, "--idle-timeout", fmt.Sprint(durationMinutesCeil(blacksmithIdleTimeout(cfg))))
+	args = append(args, "--idle-timeout", fmt.Sprint(core.DurationMinutesCeil(blacksmithIdleTimeout(cfg))))
 	return args, nil
 }
 
-func blacksmithRunArgs(cfg Config, leaseID, keyPath string, command []string, debug, shellMode bool) []string {
+func blacksmithRunArgs(cfg core.Config, leaseID, keyPath string, command []string, debug, shellMode bool) []string {
 	args := blacksmithBaseArgs(cfg)
 	args = append(args, "testbox", "run", "--id", leaseID)
+	if cfg.Blacksmith.WaitTimeout > 0 {
+		args = append(args, "--wait-timeout", cfg.Blacksmith.WaitTimeout.String())
+	}
 	if keyPath != "" {
 		args = append(args, "--ssh-private-key", keyPath)
 	}
 	if debug {
 		args = append(args, "--debug")
 	}
-	args = append(args, blacksmithCommandString(command, shellMode))
+	// The native CLI appends status/activity commands directly after this text.
+	// Quote the source for eval so heredocs, comments, and trailing whitespace
+	// cannot consume that suffix. The empty argument keeps option-like source
+	// portable without eval's non-POSIX "--", and retains the native shell.
+	args = append(args, "eval '' "+core.ShellQuote(blacksmithCommandString(command, shellMode)))
 	return args
 }
 
-func blacksmithStopArgs(cfg Config, leaseID string) []string {
+func blacksmithStopArgs(cfg core.Config, leaseID string) []string {
 	args := blacksmithBaseArgs(cfg)
 	return append(args, "testbox", "stop", "--id", leaseID)
 }
 
-func blacksmithListArgs(cfg Config) []string {
+func blacksmithListArgs(cfg core.Config) []string {
 	args := blacksmithBaseArgs(cfg)
 	return append(args, "testbox", "list")
 }
 
-func blacksmithListAllArgs(cfg Config) []string {
+func blacksmithListAllArgs(cfg core.Config) []string {
 	return append(blacksmithListArgs(cfg), "--all")
-}
-
-func blacksmithMatchesConfig(item blacksmithListItem, cfg Config) bool {
-	if workflow := blacksmithWorkflow(cfg); workflow != "" && item.Workflow != workflow {
-		return false
-	}
-	if job := blacksmithJob(cfg); job != "" && item.Job != job {
-		return false
-	}
-	if ref := blacksmithRef(cfg); ref != "" && item.Ref != ref {
-		return false
-	}
-	return true
 }
 
 func parseBlacksmithList(output string) []blacksmithListItem {
@@ -151,7 +110,7 @@ func parseBlacksmithList(output string) []blacksmithListItem {
 	return items
 }
 
-func blacksmithBaseArgs(cfg Config) []string {
+func blacksmithBaseArgs(cfg core.Config) []string {
 	args := []string{}
 	if cfg.Blacksmith.Org != "" {
 		args = append(args, "--org", cfg.Blacksmith.Org)
@@ -159,7 +118,7 @@ func blacksmithBaseArgs(cfg Config) []string {
 	return args
 }
 
-func blacksmithWorkflow(cfg Config) string {
+func blacksmithWorkflow(cfg core.Config) string {
 	if cfg.Blacksmith.Workflow != "" {
 		return cfg.Blacksmith.Workflow
 	}
@@ -169,7 +128,7 @@ func blacksmithWorkflow(cfg Config) string {
 	return ""
 }
 
-func blacksmithJob(cfg Config) string {
+func blacksmithJob(cfg core.Config) string {
 	if cfg.Blacksmith.Job != "" {
 		return cfg.Blacksmith.Job
 	}
@@ -179,7 +138,7 @@ func blacksmithJob(cfg Config) string {
 	return ""
 }
 
-func blacksmithRef(cfg Config) string {
+func blacksmithRef(cfg core.Config) string {
 	if cfg.Blacksmith.Ref != "" {
 		return cfg.Blacksmith.Ref
 	}
@@ -189,11 +148,11 @@ func blacksmithRef(cfg Config) string {
 	return ""
 }
 
-func blacksmithCanFallbackToActionsField(cfg Config) bool {
+func blacksmithCanFallbackToActionsField(cfg core.Config) bool {
 	return strings.TrimSpace(cfg.Blacksmith.Workflow) != "" || blacksmithCanFallbackToActionsWorkflow(cfg)
 }
 
-func blacksmithCanFallbackToActionsWorkflow(cfg Config) bool {
+func blacksmithCanFallbackToActionsWorkflow(cfg core.Config) bool {
 	workflow := strings.TrimSpace(cfg.Actions.Workflow)
 	if workflow == "" {
 		return false
@@ -212,15 +171,11 @@ func blacksmithLooksLikeGenericHydrateWorkflow(workflow string) bool {
 	return false
 }
 
-func blacksmithIdleTimeout(cfg Config) time.Duration {
+func blacksmithIdleTimeout(cfg core.Config) time.Duration {
 	if cfg.Blacksmith.IdleTimeout > 0 {
 		return cfg.Blacksmith.IdleTimeout
 	}
 	return cfg.IdleTimeout
-}
-
-func durationMinutesCeil(duration time.Duration) int {
-	return core.DurationMinutesCeil(duration)
 }
 
 func parseBlacksmithID(output string) string {
@@ -241,40 +196,24 @@ func blacksmithSyncTimeout(env func(string) string) time.Duration {
 	return 5 * time.Minute
 }
 
-func resolveBlacksmithLeaseID(identifier, repoRoot string, reclaim bool) (string, error) {
+func resolveBlacksmithDiscoveryID(identifier string) (string, error) {
 	if identifier == "" {
-		return "", exit(2, "blacksmith-testbox requires --id <tbx-id-or-slug>")
+		return "", core.Exit(2, "blacksmith-testbox requires --id <tbx-id-or-slug>")
 	}
 	if parseBlacksmithID(identifier) == identifier {
 		return identifier, nil
 	}
-	claim, ok, err := resolveLeaseClaim(identifier)
+	claim, ok, err := core.ResolveLeaseClaim(identifier)
 	if err != nil {
 		return "", err
 	}
 	if !ok {
-		return "", exit(4, "unknown blacksmith testbox %q", identifier)
+		return "", core.Exit(4, "unknown blacksmith testbox %q", identifier)
 	}
 	if claim.Provider != "" && claim.Provider != blacksmithTestboxProvider {
-		return "", exit(4, "%q is claimed by provider %s", identifier, claim.Provider)
-	}
-	if repoRoot != "" && claim.RepoRoot != "" && claim.RepoRoot != repoRoot && !reclaim {
-		return "", exit(2, "lease %s is claimed by repo %s; use --reclaim to claim it for %s", claim.LeaseID, claim.RepoRoot, repoRoot)
+		return "", core.Exit(4, "%q is claimed by provider %s", identifier, claim.Provider)
 	}
 	return claim.LeaseID, nil
-}
-
-func blacksmithClaimSlug(identifier, leaseID string) (string, error) {
-	for _, candidate := range []string{identifier, leaseID} {
-		claim, ok, err := resolveLeaseClaim(candidate)
-		if err != nil {
-			return "", err
-		}
-		if ok && claim.LeaseID == leaseID {
-			return claim.Slug, nil
-		}
-	}
-	return "", nil
 }
 
 func blacksmithCommandString(command []string, shellMode bool) string {
@@ -282,71 +221,7 @@ func blacksmithCommandString(command []string, shellMode bool) string {
 		return ""
 	}
 	if shellMode || len(command) == 1 {
-		return trimBlacksmithShellCommand(strings.Join(command, " "))
+		return strings.Join(command, " ")
 	}
-	if shouldUseShell(command) {
-		return shellScriptFromArgv(command)
-	}
-	parts := make([]string, 0, len(command))
-	seenCommand := false
-	for _, word := range command {
-		if !seenCommand && isShellEnvAssignment(word) {
-			key, value, _ := strings.Cut(word, "=")
-			parts = append(parts, key+"="+shellQuote(value))
-			continue
-		}
-		seenCommand = true
-		parts = append(parts, shellQuote(word))
-	}
-	return strings.Join(parts, " ")
-}
-
-func trimBlacksmithShellCommand(command string) string {
-	return strings.TrimRight(command, " \t\r\n")
-}
-
-func isShellEnvAssignment(word string) bool {
-	if word == "" {
-		return false
-	}
-	idx := strings.IndexByte(word, '=')
-	if idx <= 0 {
-		return false
-	}
-	for i, r := range word[:idx] {
-		if i == 0 {
-			if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_') {
-				return false
-			}
-			continue
-		}
-		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-			return false
-		}
-	}
-	return true
-}
-
-func flagWasSet(fs *flag.FlagSet, name string) bool {
-	return core.FlagWasSet(fs, name)
-}
-
-func exit(code int, format string, args ...any) core.ExitError {
-	return core.Exit(code, format, args...)
-}
-
-func resolveLeaseClaim(identifier string) (core.LeaseClaim, bool, error) {
-	return core.ResolveLeaseClaim(identifier)
-}
-
-func shouldUseShell(command []string) bool {
-	return core.ShouldUseShell(command)
-}
-
-func shellScriptFromArgv(command []string) string {
 	return core.ShellScriptFromArgv(command)
-}
-
-func shellQuote(s string) string {
-	return core.ShellQuote(s)
 }

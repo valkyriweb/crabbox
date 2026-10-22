@@ -90,7 +90,10 @@ The token is intentionally not exposed as a command-line flag because command
 arguments can appear in shell history and process listings. Repository-local
 config cannot override `loaderUrl` or `token`, and cannot change `egress` from
 `blocked` to `intercept`. Repository-local `cpuMs`, `subrequests`, and
-`timeoutSecs` values can tighten trusted limits but cannot loosen them.
+`timeoutSecs` values can tighten trusted limits but cannot loosen them. Positive
+timeouts must fit the local request budget including its five-second allowance;
+unrepresentable values are rejected. Zero disables local header/body timeouts and
+omits the wire timeout; positive local budgets retain their 30-second minimum.
 
 ## Deploy
 
@@ -211,10 +214,21 @@ runtime limits for a module invocation, not VM sizing knobs; `--class` and
 
 Completed non-kept runs remove their loader metadata automatically. Use `--keep`,
 `--keep-on-failure`, or `cacheMode: explicit` when lifecycle inspection must
-remain available after the invocation.
+remain available after the invocation. If the loader reports an uncertain
+lifecycle, Crabbox always keeps a local recovery claim marked
+`recovery=uncertain-lifecycle`, even without retention flags, so `list` and
+`cleanup` can reconcile the run later.
 
 Cleanup is local-claim cleanup. It is not a global Cloudflare account inventory
 sweeper.
+
+### Stop is not cancellation
+
+`crabbox stop` removes retained run metadata and its exact local claim; it does
+not terminate or cancel a running Dynamic Worker invocation. While execution is
+active, the Durable Object rejects the request with HTTP 409 and leaves both the
+workload and claim intact. Wait for the run to finish, then retry `stop` or use
+`cleanup` to reconcile its terminal metadata.
 
 ## Live smoke
 
@@ -278,7 +292,7 @@ mode-0600 temporary secrets file and removes the file during cleanup.
 ## Related docs
 
 - [Cloudflare Containers provider](cloudflare.md)
-- [Provider feature overview](../features/providers.md)
+- [Provider Reference](README.md)
 - [Configuration](../features/configuration.md)
 - [run](../commands/run.md)
 - [doctor](../commands/doctor.md)

@@ -1,0 +1,857 @@
+package crownest
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+const cleanupTimeout = 15 * time.Second
+const statusPollInterval = 250 * time.Millisecond
+
+func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
+	cfg.Provider = providerName
+	return &backend{spec: spec, cfg: cfg, rt: rt, newClient: newClient}
+}
+
+type backend struct {
+	spec      core.ProviderSpec
+	cfg       core.Config
+	rt        core.Runtime
+	newClient func(core.Config, core.Runtime) (client, error)
+}
+
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
+
+func (b *backend) client() (client, error) {
+	if b.newClient != nil {
+		return b.newClient(b.cfg, b.rt)
+	}
+	return newClient(b.cfg, b.rt)
+}
+
+func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
+	api, err := b.client()
+	if err != nil {
+		return core.DoctorResult{}, err
+	}
+	if err := api.Probe(ctx); err != nil {
+		return core.DoctorResult{}, err
+	}
+	return core.DoctorResult{
+		Provider: providerName,
+		Message:  "auth=ready api=ready mutation=false runtime=ready",
+	}, nil
+}
+
+func (b *backend) Warmup(ctx context.Context, req core.WarmupRequest) error {
+	if req.ActionsRunner {
+		return core.Exit(2, "--actions-runner is not supported for provider=%s", providerName)
+	}
+	if req.Options.Tailscale.Enabled {
+		return core.Exit(2, "provider=crownest is delegated-run only and does not support Tailscale options")
+	}
+	started := core.ClockNow(b.rt.Clock)
+	api, err := b.client()
+	if err != nil {
+		return err
+	}
+	leaseID, sandboxID, slug, err := b.createSandbox(ctx, api, req.Repo, req.Reclaim, req.RequestedSlug)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(b.rt.Stdout, "leased %s slug=%s provider=%s sandbox=%s\n", leaseID, slug, providerName, sandboxID)
+	if !req.Keep {
+		fmt.Fprintf(b.rt.Stderr, "warning: crownest warmup keeps the sandbox until explicit stop\n")
+	}
+	total := core.ClockNow(b.rt.Clock).Sub(started)
+	return shared.CompleteWarmup(b.rt, req.TimingJSON, shared.WarmupCompletion{
+		Provider: providerName,
+		LeaseID:  leaseID,
+		Slug:     slug,
+		Total:    total,
+	})
+}
+
+func (b *backend) Run(ctx context.Context, req core.RunRequest) (result core.RunResult, retErr error) {
+	if err := core.RejectDelegatedSyncOptionsForSpec(b.spec, req); err != nil {
+		return core.RunResult{}, err
+	}
+	if req.NoSync {
+		return core.RunResult{}, core.Exit(2, "provider=crownest requires archive sync; --no-sync is not supported")
+	}
+	if req.SyncOnly {
+		return core.RunResult{}, core.Exit(2, "provider=crownest uses archive sync; --sync-only is not supported")
+	}
+	if req.Options.Tailscale.Enabled {
+		return core.RunResult{}, core.Exit(2, "provider=crownest is delegated-run only and does not support Tailscale options")
+	}
+	started := core.ClockNow(b.rt.Clock)
+	api, err := b.client()
+	if err != nil {
+		return core.RunResult{}, err
+	}
+	scope := claimScope(api.BaseURL(), b.cfg)
+	leaseID, sandboxID, slug := "", "", ""
+	acquired := req.ID == ""
+	var unlockOperation func()
+	defer func() {
+		if unlockOperation != nil {
+			unlockOperation()
+		}
+	}()
+	lockAcquiredLease := func() error {
+		if !acquired || unlockOperation != nil || leaseID == "" {
+			return nil
+		}
+		var err error
+		unlockOperation, err = lockCrownestLeaseOperation(ctx, leaseID)
+		return err
+	}
+	if !acquired {
+		leaseID, _, _, err = resolveLeaseID(req.ID, "", false, 0, scope)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		unlockOperation, err = lockCrownestLeaseOperation(ctx, leaseID)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		leaseID, sandboxID, slug, err = resolveLeaseID(leaseID, req.Repo.Root, req.Reclaim, b.cfg.IdleTimeout, scope)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		if _, err := api.GetSandbox(ctx, sandboxID); err != nil {
+			return core.RunResult{}, err
+		}
+	}
+	keepSandbox := false
+	shouldStop := acquired && !req.Keep
+	var syncPhases []core.TimingPhase
+	var syncDuration time.Duration
+	var streamErr error
+	var cancelRunID string
+	commandRan, cancelActiveRun := false, false
+	defer func() {
+		result, retErr = shared.PinDelegatedRunFailure(result, retErr)
+		appendFailure := func(err error) {
+			result, retErr = shared.AppendDelegatedRunFailure(result, retErr, err, core.ExitCodeForError(err, 1))
+		}
+		if cancelActiveRun && (ctx.Err() != nil || streamErr != nil) {
+			cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			canceled, cancelErr := api.CancelWorkspaceRun(cancelCtx, cancelRunID, idempotencyKey("cancel", cancelRunID))
+			cancel()
+			if cancelErr != nil {
+				// Keep recovery bookkeeping until cancellation has been accepted.
+				shouldStop = false
+				if result.Session != nil {
+					result.Session.Kept = true
+				}
+				appendFailure(cancelErr)
+			} else if canceled.SandboxID != "" {
+				sandboxID = canceled.SandboxID
+			}
+		}
+		if cleanupErr := b.cleanupCreatedRun(ctx, api, leaseID, sandboxID, keepSandbox, &shouldStop); cleanupErr != nil {
+			if result.Session != nil {
+				result.Session.Kept = true
+			}
+			appendFailure(cleanupErr)
+		}
+		result.Total = core.ClockNow(b.rt.Clock).Sub(started)
+		result = core.FinalizeRunResult(result, retErr)
+		if !commandRan {
+			return
+		}
+		fmt.Fprintf(b.rt.Stderr, "crownest run summary sync=%s command=%s total=%s exit=%d\n",
+			syncDuration.Round(time.Millisecond), result.Command.Round(time.Millisecond), result.Total.Round(time.Millisecond), result.ExitCode)
+		if req.TimingJSON {
+			appendFailure(core.WriteTimingJSON(b.rt.Stderr, core.TimingReportWithRunResult(core.TimingReport{
+				Provider: providerName, LeaseID: leaseID, Slug: slug,
+				SyncDelegated: true, SyncMs: syncDuration.Milliseconds(), SyncPhases: syncPhases,
+				CommandMs: result.Command.Milliseconds(), TotalMs: result.Total.Milliseconds(),
+				ExitCode: result.ExitCode, Label: strings.TrimSpace(req.Label),
+			}, result, retErr)))
+		}
+	}()
+	intent, err := core.ParseCommandIntent(req.Command, req.ShellMode, req.CommandLiteralArgs)
+	if err != nil {
+		return core.RunResult{}, err
+	}
+	commandText := intent.ShellCommand("bash", "-lc")
+	commandEnv, stripped := commandEnv(req.Env)
+	if len(stripped) > 0 {
+		fmt.Fprintf(b.rt.Stderr, "warning: provider=crownest did not forward provider authentication variables: %s\n", strings.Join(stripped, ","))
+	}
+	if len(commandEnv) > 0 {
+		return core.RunResult{}, core.Exit(2, "provider=crownest does not support command environment forwarding yet; run without Crabbox env forwarding")
+	}
+	if req.EnvSummary || strings.TrimSpace(os.Getenv("CRABBOX_ENV_ALLOW")) != "" {
+		core.PrintEnvForwardingSummary(b.rt.Stderr, providerName, "not-forwarded", req.Options.EnvAllow, commandEnv)
+	}
+	archive, archiveSHA, archiveBytes, phases, duration, err := b.prepareArchive(ctx, req)
+	syncPhases, syncDuration = phases, duration
+	if err != nil {
+		return core.RunResult{Total: core.ClockNow(b.rt.Clock).Sub(started), SyncDelegated: true}, err
+	}
+	defer func() {
+		_ = archive.Close()
+		_ = os.Remove(archive.Name())
+	}()
+	metadata := map[string]string{
+		"crabbox.provider": providerName,
+		"crabbox.repo":     repoName(req.Repo),
+	}
+	if slug != "" {
+		metadata["crabbox.slug"] = slug
+	}
+	if leaseID != "" {
+		metadata["crabbox.lease"] = leaseID
+	}
+	keepSandbox = req.Keep || req.KeepOnFailure || !acquired
+	workspaceRun, err := api.CreateWorkspaceRun(ctx, createWorkspaceRunRequest{
+		Command:   commandText,
+		Keep:      keepSandbox,
+		Metadata:  metadata,
+		ProjectID: strings.TrimSpace(b.cfg.Crownest.ProjectID),
+		SandboxID: sandboxID,
+		Template:  strings.TrimSpace(b.cfg.Crownest.Template),
+		TimeoutMS: timeoutMS(b.cfg.Crownest.TimeoutSecs),
+		SourceMeta: map[string]string{
+			"repo": repoName(req.Repo),
+		},
+	}, idempotencyKey("create", shared.RandomSuffix()))
+	if err != nil {
+		if acquired && workspaceRun.SandboxID != "" {
+			return core.RunResult{}, b.cleanupCreateFailure(ctx, api, workspaceRun.SandboxID, err)
+		}
+		return core.RunResult{}, err
+	}
+	if workspaceRun.SandboxID != "" {
+		sandboxID = workspaceRun.SandboxID
+	}
+	if acquired && sandboxID != "" {
+		if err := b.claimAcquiredSandbox(ctx, api, req, leaseID, sandboxID, slug, &leaseID, &slug); err != nil {
+			return core.RunResult{}, err
+		}
+		if err := lockAcquiredLease(); err != nil {
+			return b.setupFailure(ctx, req, api, err, started, acquired, leaseID, sandboxID, slug, &shouldStop)
+		}
+	}
+	transfer, err := api.CreateArchiveTransfer(ctx, workspaceRun.ID, createArchiveTransferRequest{SHA256: archiveSHA, SizeBytes: archiveBytes}, idempotencyKey("transfer", workspaceRun.ID))
+	if err != nil {
+		return b.setupFailure(ctx, req, api, err, started, acquired, leaseID, sandboxID, slug, &shouldStop)
+	}
+	if transfer.MaxSizeBytes > 0 && archiveBytes > transfer.MaxSizeBytes {
+		return b.setupFailure(ctx, req, api, core.Exit(6, "crownest archive too large: %d > %d bytes", archiveBytes, transfer.MaxSizeBytes), started, acquired, leaseID, sandboxID, slug, &shouldStop)
+	}
+	if _, err := archive.Seek(0, io.SeekStart); err != nil {
+		return b.setupFailure(ctx, req, api, core.Exit(6, "rewind sync archive: %v", err), started, acquired, leaseID, sandboxID, slug, &shouldStop)
+	}
+	if err := api.UploadArchive(ctx, transfer, archive, archiveBytes); err != nil {
+		return b.setupFailure(ctx, req, api, err, started, acquired, leaseID, sandboxID, slug, &shouldStop)
+	}
+	if _, err := api.FinalizeArchive(ctx, workspaceRun.ID, finalizeArchiveRequest{SHA256: archiveSHA, SizeBytes: archiveBytes, UploadID: transfer.ID}, idempotencyKey("finalize", workspaceRun.ID)); err != nil {
+		return b.setupFailure(ctx, req, api, err, started, acquired, leaseID, sandboxID, slug, &shouldStop)
+	}
+	workspaceRun, err = api.StartWorkspaceRun(ctx, workspaceRun.ID, idempotencyKey("start", workspaceRun.ID))
+	if err != nil {
+		return b.setupFailure(ctx, req, api, err, started, acquired, leaseID, sandboxID, slug, &shouldStop)
+	}
+	if workspaceRun.SandboxID != "" {
+		sandboxID = workspaceRun.SandboxID
+	}
+	if acquired {
+		if err := b.claimAcquiredSandbox(ctx, api, req, leaseID, sandboxID, slug, &leaseID, &slug); err != nil {
+			return core.RunResult{}, err
+		}
+		if err := lockAcquiredLease(); err != nil {
+			return b.setupFailure(ctx, req, api, err, started, acquired, leaseID, sandboxID, slug, &shouldStop)
+		}
+	}
+	session := b.crownestRunSession(leaseID, slug, !acquired, req.Keep || !acquired)
+	commandStart := core.ClockNow(b.rt.Clock)
+	commandRan, cancelActiveRun = true, true
+	cancelRunID = workspaceRun.ID
+	req.Observation.Phase(core.RunPhaseCommand)
+	stdout, stderr := req.Observation.CommandWriters(b.rt.Stdout, b.rt.Stderr, core.RunOutputWorkload)
+	terminal, streamErr := b.streamRun(ctx, api, workspaceRun.ID, stdout, stderr)
+	commandDuration := core.ClockNow(b.rt.Clock).Sub(commandStart)
+	if terminal.ID == "" && ctx.Err() == nil {
+		if latest, getErr := api.GetWorkspaceRun(ctx, workspaceRun.ID); getErr == nil {
+			terminal = latest
+		}
+	}
+	if terminalWorkspaceRun(terminal) {
+		cancelActiveRun = false
+	}
+	terminalStatus := normalizedWorkspaceRunStatus(terminal.Status)
+	missingExitStatusFailure := terminal.ExitCode == nil && terminalWorkspaceRun(terminal) && terminalStatus != "succeeded"
+	exitCode := 0
+	if terminal.ExitCode != nil {
+		exitCode = *terminal.ExitCode
+	} else if missingExitStatusFailure {
+		exitCode = 1
+	}
+	result = core.RunResult{
+		Provider:      providerName,
+		LeaseID:       leaseID,
+		Slug:          slug,
+		CommandText:   commandText,
+		ExitCode:      exitCode,
+		Command:       commandDuration,
+		Total:         core.ClockNow(b.rt.Clock).Sub(started),
+		SyncDelegated: true,
+		Session:       session,
+	}
+	switch {
+	case ctx.Err() != nil:
+		retErr = ctx.Err()
+	case streamErr != nil:
+		retErr = shared.ExitErrorWithCause(1, fmt.Sprintf("crownest stream failed: %v", streamErr), streamErr)
+	case missingExitStatusFailure:
+		retErr = core.Exit(5, "crownest workspace run ended status=%s reason=%s class=%s without command exit code", core.Blank(terminalStatus, "unknown"), core.Blank(terminal.FailureReason, "unknown"), core.Blank(terminal.FailureClass, "unknown"))
+	case terminalStatus == "failed" && terminal.FailureReason != "command_exit":
+		retErr = core.Exit(5, "crownest workspace run failed reason=%s class=%s", core.Blank(terminal.FailureReason, "unknown"), core.Blank(terminal.FailureClass, "unknown"))
+	default:
+		result = core.FinalizeRunResult(result, nil)
+		if result.ExitCode != 0 {
+			retErr = core.ExitError{Code: result.ExitCode, Message: fmt.Sprintf("crownest run exited %d", result.ExitCode)}
+		}
+	}
+	if retErr != nil {
+		core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, leaseID, slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, &shouldStop)
+		if result.Session != nil {
+			result.Session.Kept = !shouldStop
+		}
+	}
+	return result, retErr
+}
+
+func (b *backend) claimAcquiredSandbox(ctx context.Context, api client, req core.RunRequest, currentLeaseID, sandboxID, currentSlug string, leaseID, slug *string) error {
+	if sandboxID == "" {
+		return core.Exit(5, "crownest workspace run did not report a sandbox id")
+	}
+	nextLeaseID := leasePrefix + sandboxID
+	if currentLeaseID == nextLeaseID && currentSlug != "" {
+		*leaseID = currentLeaseID
+		*slug = currentSlug
+		return nil
+	}
+	if currentLeaseID != "" && currentLeaseID != nextLeaseID {
+		return core.Exit(5, "crownest workspace run changed sandbox id from %s to %s", strings.TrimPrefix(currentLeaseID, leasePrefix), sandboxID)
+	}
+	allocatedSlug, err := core.AllocateClaimLeaseSlug(nextLeaseID, req.RequestedSlug)
+	if err != nil {
+		return b.cleanupCreateFailure(ctx, api, sandboxID, err)
+	}
+	if err := core.ClaimLeaseForRepoProviderScopePond(nextLeaseID, allocatedSlug, providerName, claimScope(api.BaseURL(), b.cfg), b.cfg.Pond, req.Repo.Root, b.cfg.IdleTimeout, req.Reclaim); err != nil {
+		return b.cleanupCreateFailure(ctx, api, sandboxID, err)
+	}
+	*leaseID = nextLeaseID
+	*slug = allocatedSlug
+	fmt.Fprintf(b.rt.Stderr, "leased %s slug=%s provider=%s sandbox=%s\n", nextLeaseID, allocatedSlug, providerName, sandboxID)
+	return nil
+}
+
+func (b *backend) setupFailure(ctx context.Context, req core.RunRequest, api client, cause error, started time.Time, acquired bool, leaseID, sandboxID, slug string, shouldStop *bool) (core.RunResult, error) {
+	if acquired && sandboxID != "" && leaseID == "" {
+		if err := b.claimAcquiredSandbox(ctx, api, req, leaseID, sandboxID, slug, &leaseID, &slug); err != nil {
+			return core.RunResult{Provider: providerName, ExitCode: 1, Total: core.ClockNow(b.rt.Clock).Sub(started), SyncDelegated: true}, errors.Join(cause, err)
+		}
+	}
+	if leaseID != "" {
+		core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, leaseID, slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, shouldStop)
+	}
+	return core.RunResult{
+		Provider:      providerName,
+		LeaseID:       leaseID,
+		Slug:          slug,
+		ExitCode:      1,
+		Total:         core.ClockNow(b.rt.Clock).Sub(started),
+		SyncDelegated: true,
+		Session:       b.crownestRunSession(leaseID, slug, !acquired, leaseID != "" && !*shouldStop),
+	}, cause
+}
+
+func (b *backend) crownestRunSession(leaseID, slug string, reused, kept bool) *core.RunSessionHandle {
+	if leaseID == "" {
+		return nil
+	}
+	return &core.RunSessionHandle{
+		Provider:       providerName,
+		LeaseID:        leaseID,
+		Slug:           slug,
+		Reused:         reused,
+		Kept:           kept,
+		CleanupCommand: crownestCleanupCommand(b.cfg, core.Blank(slug, leaseID)),
+	}
+}
+
+func crownestCleanupCommand(cfg core.Config, id string) string {
+	return "crabbox stop --provider " + providerName +
+		" --crownest-url " + core.ShellQuote(cfg.Crownest.APIURL) +
+		" --crownest-project-id " + core.ShellQuote(cfg.Crownest.ProjectID) +
+		" --crownest-template " + core.ShellQuote(cfg.Crownest.Template) +
+		" --id " + core.ShellQuote(id)
+}
+
+func (b *backend) List(ctx context.Context, req core.ListRequest) ([]core.LeaseView, error) {
+	api, err := b.client()
+	if err != nil {
+		return nil, err
+	}
+	claims, err := listCrownestLeaseClaims()
+	if err != nil {
+		return nil, err
+	}
+	views := make([]core.LeaseView, 0, len(claims))
+	scope := claimScope(api.BaseURL(), b.cfg)
+	for _, claim := range claims {
+		if claim.Provider != providerName || claim.ProviderScope != scope {
+			continue
+		}
+		state := "unknown"
+		if req.Refresh {
+			sb, err := api.GetSandbox(ctx, sandboxIDFromLease(claim.LeaseID))
+			if err != nil {
+				if isNotFound(err) {
+					state = "missing"
+				} else {
+					return nil, err
+				}
+			} else {
+				state = normalizedSandboxState(sb)
+			}
+		}
+		views = append(views, serverFromClaim(claim, state))
+	}
+	return views, nil
+}
+
+func (b *backend) Status(ctx context.Context, req core.StatusRequest) (core.StatusView, error) {
+	api, err := b.client()
+	if err != nil {
+		return core.StatusView{}, err
+	}
+	leaseID, sandboxID, slug, err := resolveLeaseID(req.ID, "", false, 0, claimScope(api.BaseURL(), b.cfg))
+	if err != nil {
+		return core.StatusView{}, err
+	}
+	wait := shared.NewContextStatusWait(ctx, req, func(id string) error {
+		return core.Exit(5, "timed out waiting for crownest sandbox %s to become ready", id)
+	})
+	defer wait.Close()
+	return wait.Poll(sandboxID, statusPollInterval, func(pollCtx context.Context) (core.StatusView, bool, error) {
+		sb, getErr := api.GetSandbox(pollCtx, sandboxID)
+		if getErr != nil {
+			if contextErr := wait.ContextError(sandboxID); contextErr != nil {
+				return core.StatusView{}, false, contextErr
+			}
+			return core.StatusView{}, false, getErr
+		}
+		state := normalizedSandboxState(sb)
+		view := core.StatusView{
+			ID:       leaseID,
+			Slug:     slug,
+			Provider: providerName,
+			TargetOS: targetLinux,
+			State:    state,
+			ServerID: sandboxID,
+			Ready:    isReadyState(state),
+			Labels: map[string]string{
+				"provider": providerName,
+				"lease":    leaseID,
+				"slug":     slug,
+				"state":    state,
+			},
+		}
+		if req.Wait && !view.Ready && isTerminalState(state) {
+			return core.StatusView{}, false, core.Exit(5, "crownest sandbox %s entered terminal state %q before becoming ready", sandboxID, state)
+		}
+		return view, false, nil
+	})
+}
+
+func (b *backend) Stop(ctx context.Context, req core.StopRequest) error {
+	api, err := b.client()
+	if err != nil {
+		return err
+	}
+	leaseID, sandboxID, _, err := resolveLeaseID(req.ID, "", false, 0, claimScope(api.BaseURL(), b.cfg))
+	if err != nil {
+		return err
+	}
+	unlockOperation, err := lockCrownestLeaseOperation(ctx, leaseID)
+	if err != nil {
+		return err
+	}
+	defer unlockOperation()
+	leaseID, sandboxID, _, err = resolveLeaseID(leaseID, "", false, 0, claimScope(api.BaseURL(), b.cfg))
+	if err != nil {
+		return err
+	}
+	if err := api.DeleteSandbox(ctx, sandboxID); err != nil {
+		if !isNotFound(err) || !b.cfg.Crownest.ForgetMissing {
+			return err
+		}
+		fmt.Fprintf(b.rt.Stderr, "warning: forgetting missing crownest sandbox=%s after explicit request\n", sandboxID)
+	}
+	core.RemoveLeaseClaim(leaseID)
+	fmt.Fprintf(b.rt.Stderr, "released lease=%s sandbox=%s\n", leaseID, sandboxID)
+	return nil
+}
+
+func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
+	api, err := b.client()
+	if err != nil {
+		return err
+	}
+	claims, err := listCrownestLeaseClaims()
+	if err != nil {
+		return err
+	}
+	scope := claimScope(api.BaseURL(), b.cfg)
+	now := core.ClockNow(b.rt.Clock).UTC()
+	return shared.CleanupSandboxClaims(ctx, req, claims, shared.SandboxClaimCleanup[sandbox]{
+		Provider:          providerName,
+		Runtime:           b.rt,
+		Now:               now,
+		MatchesScope:      func(claim core.LeaseClaim) bool { return claim.ProviderScope == scope },
+		Lock:              lockCrownestLeaseOperation,
+		SandboxID:         func(claim core.LeaseClaim) string { return sandboxIDFromLease(claim.LeaseID) },
+		Get:               api.GetSandbox,
+		Delete:            api.DeleteSandbox,
+		IsNotFound:        isNotFound,
+		ForgetMissing:     b.cfg.Crownest.ForgetMissing,
+		ForgetMissingHint: "crownest forget-missing",
+		Due:               crownestClaimCleanupDue,
+	})
+}
+
+func (b *backend) createSandbox(ctx context.Context, api client, repo core.Repo, reclaim bool, requestedSlug string) (string, string, string, error) {
+	sb, err := api.CreateSandbox(ctx, createSandboxRequest{
+		ProjectID: strings.TrimSpace(b.cfg.Crownest.ProjectID),
+		Template:  strings.TrimSpace(b.cfg.Crownest.Template),
+		TTLMS:     ttlMS(b.cfg),
+		Metadata: map[string]string{
+			"crabbox.provider": providerName,
+			"crabbox.repo":     repoName(repo),
+		},
+	})
+	if err != nil {
+		return "", "", "", err
+	}
+	leaseID := leasePrefix + sb.ID
+	slug, err := core.AllocateClaimLeaseSlug(leaseID, requestedSlug)
+	if err != nil {
+		return leaseID, sb.ID, "", b.cleanupCreateFailure(ctx, api, sb.ID, err)
+	}
+	if err := core.ClaimLeaseForRepoProviderScopePond(leaseID, slug, providerName, claimScope(api.BaseURL(), b.cfg), b.cfg.Pond, repo.Root, b.cfg.IdleTimeout, reclaim); err != nil {
+		return leaseID, sb.ID, slug, b.cleanupCreateFailure(ctx, api, sb.ID, err)
+	}
+	return leaseID, sb.ID, slug, nil
+}
+
+func (b *backend) cleanupCreateFailure(ctx context.Context, api client, sandboxID string, cause error) error {
+	if strings.TrimSpace(sandboxID) == "" {
+		return cause
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if err := api.DeleteSandbox(cleanupCtx, sandboxID); err != nil && !isNotFound(err) {
+		return errors.Join(cause, fmt.Errorf("crownest cleanup failed for sandbox %s; delete it in Crownest: %w", sandboxID, err))
+	}
+	return cause
+}
+
+func (b *backend) prepareArchive(ctx context.Context, req core.RunRequest) (*os.File, string, int64, []core.TimingPhase, time.Duration, error) {
+	start := core.ClockNow(b.rt.Clock)
+	syncCtx := ctx
+	cancel := func() {}
+	if b.cfg.Sync.Timeout > 0 {
+		syncCtx, cancel = context.WithTimeout(ctx, b.cfg.Sync.Timeout)
+	}
+	defer cancel()
+	excludes, err := core.SyncExcludes(req.Repo.Root, b.cfg)
+	if err != nil {
+		return nil, "", 0, nil, 0, err
+	}
+	manifestStart := core.ClockNow(b.rt.Clock)
+	manifest, err := core.BuildSyncManifestFiltered(req.Repo.Root, excludes, b.cfg.Sync.Includes)
+	if err != nil {
+		return nil, "", 0, nil, 0, core.Exit(6, "build sync file list: %v", err)
+	}
+	manifestDuration := core.ClockNow(b.rt.Clock).Sub(manifestStart)
+	preflightStart := core.ClockNow(b.rt.Clock)
+	if err := core.CheckSyncPreflight(manifest, b.cfg, req.ForceSyncLarge, b.rt.Stderr); err != nil {
+		return nil, "", 0, nil, 0, err
+	}
+	preflightDuration := core.ClockNow(b.rt.Clock).Sub(preflightStart)
+	archiveStart := core.ClockNow(b.rt.Clock)
+	archive, err := core.CreateSyncArchive(syncCtx, req.Repo, manifest, "crabbox-crownest-sync-*.tgz")
+	if err != nil {
+		return nil, "", 0, nil, 0, err
+	}
+	archiveDuration := core.ClockNow(b.rt.Clock).Sub(archiveStart)
+	sum, size, err := hashArchive(archive)
+	if err != nil {
+		_ = archive.Close()
+		_ = os.Remove(archive.Name())
+		return nil, "", 0, nil, 0, err
+	}
+	total := core.ClockNow(b.rt.Clock).Sub(start)
+	return archive, sum, size, []core.TimingPhase{
+		{Name: "manifest", Ms: manifestDuration.Milliseconds()},
+		{Name: "preflight", Ms: preflightDuration.Milliseconds()},
+		{Name: "archive", Ms: archiveDuration.Milliseconds()},
+		{Name: "crownest_sync", Ms: total.Milliseconds()},
+	}, total, nil
+}
+
+func hashArchive(file *os.File) (string, int64, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, core.Exit(6, "rewind sync archive: %v", err)
+	}
+	h := sha256.New()
+	size, err := io.Copy(h, file)
+	if err != nil {
+		return "", 0, core.Exit(6, "hash sync archive: %v", err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, core.Exit(6, "rewind sync archive: %v", err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), size, nil
+}
+
+func (b *backend) streamRun(ctx context.Context, api client, workspaceRunID string, stdout, stderr io.Writer) (workspaceRun, error) {
+	var afterSeq int64
+	for attempts := 0; attempts < 3; attempts++ {
+		body, err := api.StreamWorkspaceRunEvents(ctx, workspaceRunID, afterSeq)
+		if err != nil {
+			return workspaceRun{}, err
+		}
+		var terminal workspaceRun
+		err = readSSE(body, func(event streamEvent) error {
+			if event.Seq > afterSeq {
+				afterSeq = event.Seq
+			}
+			switch event.Type {
+			case "stdout":
+				_, _ = io.WriteString(stdout, event.Data)
+			case "stderr":
+				_, _ = io.WriteString(stderr, event.Data)
+			case "terminal":
+				terminal = event.WorkspaceRun
+			case "error":
+				return core.Exit(5, "crownest event error %s: %s", core.Blank(event.Code, "error"), event.Message)
+			}
+			return nil
+		})
+		_ = body.Close()
+		if terminal.ID != "" {
+			return terminal, nil
+		}
+		if err != nil {
+			return workspaceRun{}, err
+		}
+	}
+	return workspaceRun{}, core.Exit(5, "crownest event stream ended before terminal event")
+}
+
+func (b *backend) cleanupCreatedRun(ctx context.Context, api client, leaseID, sandboxID string, deleteSandbox bool, shouldStop *bool) error {
+	if !*shouldStop || sandboxID == "" {
+		return nil
+	}
+	*shouldStop = false
+	if deleteSandbox {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+		if err := api.DeleteSandbox(cleanupCtx, sandboxID); err != nil && !isNotFound(err) {
+			return fmt.Errorf("crownest delete failed for %s: %w", sandboxID, err)
+		}
+	}
+	if leaseID != "" {
+		core.RemoveLeaseClaim(leaseID)
+	}
+	return nil
+}
+
+func resolveLeaseID(id, repoRoot string, reclaim bool, idleTimeout time.Duration, scope string) (string, string, string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", "", "", core.Exit(2, "provider=crownest requires a Crabbox-created sandbox slug or lease id")
+	}
+	exactLeaseID := id
+	if !strings.HasPrefix(exactLeaseID, leasePrefix) {
+		exactLeaseID = leasePrefix + exactLeaseID
+	}
+	if claim, err := core.ReadLeaseClaim(exactLeaseID); err == nil && claim.LeaseID == exactLeaseID && claim.Provider == providerName {
+		return finishResolvedLease(claim, repoRoot, reclaim, idleTimeout, scope)
+	}
+	claims, err := listCrownestLeaseClaims()
+	if err != nil {
+		return "", "", "", err
+	}
+	var matched core.LeaseClaim
+	slug := core.NormalizeLeaseSlug(id)
+	for _, claim := range claims {
+		if claim.Provider != providerName {
+			continue
+		}
+		if claim.LeaseID == id || core.NormalizeLeaseSlug(claim.Slug) == slug {
+			if matched.LeaseID != "" {
+				return "", "", "", core.Exit(2, "multiple provider=%s claims match identifier %s", providerName, id)
+			}
+			matched = claim
+		}
+	}
+	if matched.LeaseID != "" {
+		return finishResolvedLease(matched, repoRoot, reclaim, idleTimeout, scope)
+	}
+	return "", "", "", core.Exit(4, "crownest sandbox %q is not claimed by Crabbox; use a Crabbox slug or %s<sandbox-id>", id, leasePrefix)
+}
+
+func finishResolvedLease(claim core.LeaseClaim, repoRoot string, reclaim bool, idleTimeout time.Duration, scope string) (string, string, string, error) {
+	return shared.FinishScopedLease(claim, shared.ScopedLeaseFinishOptions{
+		Provider: providerName, LeasePrefix: leasePrefix, RepoRoot: repoRoot,
+		Reclaim: reclaim, IdleTimeout: idleTimeout,
+		ValidateClaim: func(claim core.LeaseClaim) error {
+			if claim.ProviderScope != scope {
+				return core.Exit(4, "crownest lease %q belongs to a different API endpoint, project, or template", claim.LeaseID)
+			}
+			return nil
+		},
+	})
+}
+
+func serverFromClaim(claim core.LeaseClaim, state string) core.Server {
+	return shared.SandboxLeaseView(providerName, targetLinux, claim, sandboxIDFromLease(claim.LeaseID), sandboxIDFromLease(claim.LeaseID), state)
+}
+
+func sandboxIDFromLease(leaseID string) string {
+	return strings.TrimPrefix(leaseID, leasePrefix)
+}
+
+func claimScope(baseURL string, cfg core.Config) string {
+	return strings.Join([]string{
+		"endpoint:" + strings.TrimSpace(baseURL),
+		"project:" + strings.TrimSpace(cfg.Crownest.ProjectID),
+		"template:" + strings.TrimSpace(cfg.Crownest.Template),
+	}, "|")
+}
+
+func commandEnv(env map[string]string) (map[string]string, []string) {
+	if len(env) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(env))
+	var stripped []string
+	for name, value := range env {
+		if core.IsRunExecutionMetadataEnvName(name) {
+			continue
+		}
+		if isProviderAuthEnv(name) {
+			stripped = append(stripped, name)
+			continue
+		}
+		out[name] = value
+	}
+	sort.Strings(stripped)
+	if len(out) == 0 {
+		out = nil
+	}
+	return out, stripped
+}
+
+func isProviderAuthEnv(name string) bool {
+	return name == "CRABBOX_CROWNEST_API_KEY" ||
+		name == "CROWNEST_API_KEY" ||
+		name == "CROWNEST" ||
+		strings.HasPrefix(name, "CROWNEST_")
+}
+
+func crownestClaimCleanupDue(claim core.LeaseClaim, now time.Time) (bool, string) {
+	if claim.IdleTimeoutSeconds <= 0 {
+		return false, "idle-timeout-disabled"
+	}
+	lastUsedAt := strings.TrimSpace(claim.LastUsedAt)
+	if lastUsedAt == "" {
+		lastUsedAt = strings.TrimSpace(claim.ClaimedAt)
+	}
+	lastUsed, err := time.Parse(time.RFC3339, lastUsedAt)
+	if err != nil {
+		return false, "invalid-last-used"
+	}
+	deadline := lastUsed.Add(time.Duration(claim.IdleTimeoutSeconds) * time.Second)
+	if now.Before(deadline) {
+		return false, "idle-not-expired"
+	}
+	return true, "idle-expired"
+}
+
+func timeoutMS(timeoutSecs int) int64 {
+	if timeoutSecs <= 0 {
+		return 0
+	}
+	return int64(timeoutSecs) * int64(time.Second/time.Millisecond)
+}
+
+func ttlMS(cfg core.Config) int64 {
+	if cfg.TTL <= 0 {
+		return 0
+	}
+	return int64(cfg.TTL / time.Millisecond)
+}
+
+func normalizedSandboxState(sb sandbox) string {
+	return strings.ToLower(core.Blank(strings.TrimSpace(sb.Status), "unknown"))
+}
+
+func isReadyState(state string) bool {
+	switch strings.TrimSpace(strings.ToLower(state)) {
+	case "running", "ready", "started", "active":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTerminalState(state string) bool {
+	switch strings.TrimSpace(strings.ToLower(state)) {
+	case "terminated", "stopped", "failed", "error", "aborted", "killed", "deleted", "destroyed":
+		return true
+	default:
+		return false
+	}
+}
+
+func terminalWorkspaceRun(run workspaceRun) bool {
+	switch normalizedWorkspaceRunStatus(run.Status) {
+	case "succeeded", "failed", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizedWorkspaceRunStatus(status string) string {
+	return strings.TrimSpace(strings.ToLower(status))
+}
+
+func repoName(repo core.Repo) string {
+	if strings.TrimSpace(repo.Name) != "" {
+		return repo.Name
+	}
+	return repo.Root
+}

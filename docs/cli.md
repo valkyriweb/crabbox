@@ -39,33 +39,49 @@ Commands are grouped here for orientation. Each links to its detailed page under
 
 ```text
 crabbox warmup [lease flags]                 lease a box and wait until ready
+crabbox prewarm [lease flags]                lease and hydrate a reusable test-ready box
 crabbox run -- <command...>                  sync, run a remote command, stream output
 crabbox run --pool <key> -- <command...>     borrow a hydrated ready-pool lease
+crabbox run --timing-record=default -- <cmd> append timing to the local benchmark ledger
+crabbox watch -- <command...>                re-run on a warm lease when local files change
+crabbox bench run --providers a,b -- <cmd>   run a workload and record benchmark timings
 crabbox status --id <id>                     show lease state (--wait to block)
+crabbox heartbeat --id <id>                  refresh the lease idle deadline
 crabbox inspect --id <id>                     print lease/provider details
+crabbox claims list [--json]                  list unverified local claims without provider access
+crabbox claims prune [--older-than 7d] [--dry-run] [--json]  prune eligible stale local claims
 crabbox list                                  list machines (alias: crabbox pool list)
 crabbox share --id <id> [--user|--org]        grant access to a lease
 crabbox unshare --id <id> [--user|--org|--all]
 crabbox stop <id-or-slug>                     end a lease (alias: crabbox release)
-crabbox cleanup [--dry-run]                   sweep expired direct-provider machines
+crabbox pause <id-or-slug>                    pause a lease, keeping its state (provider-dependent)
+crabbox resume <id-or-slug>                   resume a previously paused lease
+crabbox cleanup [--dry-run]                   sweep expired direct-provider machines (alias: crabbox machine cleanup)
 crabbox pool ready [key]                      list hydrated broker ready-pool leases
 ```
 
-See [warmup](commands/warmup.md), [run](commands/run.md),
-[status](commands/status.md), [inspect](commands/inspect.md),
-[list](commands/list.md), [share](commands/share.md),
+See [warmup](commands/warmup.md), [prewarm](commands/prewarm.md),
+[run](commands/run.md), [watch](commands/watch.md),
+[status](commands/status.md), [heartbeat](commands/heartbeat.md), [inspect](commands/inspect.md),
+[claims](commands/claims.md), [list](commands/list.md), [share](commands/share.md),
 [unshare](commands/unshare.md), [stop](commands/stop.md),
+[pause](commands/pause.md), [resume](commands/resume.md),
 [cleanup](commands/cleanup.md), [pool](commands/pool.md).
 
 ### Run helpers and jobs
 
 ```text
 crabbox sync-plan [--limit <n>]              preview local sync manifest size hotspots
+crabbox shard --from <checkpoint-id> --count <n> -- <command...>
+                                                fork a checkpoint into parallel test shards
+crabbox cp --id <id> <src> SANDBOX:<dst>     copy files between host and a lease
+crabbox tunnel --id <id> [--local-port N] N  forward remote loopback port N over resolved SSH
 crabbox job list                              list repo-local configured jobs
 crabbox job run <name>                        run a configured job
 ```
 
-See [sync-plan](commands/sync-plan.md), [job](commands/job.md).
+See [sync-plan](commands/sync-plan.md), [shard](commands/shard.md),
+[cp](commands/cp.md), [tunnel](commands/tunnel.md), [job](commands/job.md).
 
 ### Observability
 
@@ -75,29 +91,35 @@ crabbox logs <run-id>                         print run logs
 crabbox events <run-id>                       print run events
 crabbox attach <run-id>                       follow events for an active run
 crabbox results <run-id>                      show test-result summaries
+crabbox receipt <run-id>                      retrieve and verify terminal evidence
+crabbox bench report [--json]                 aggregate local benchmark timing observations
 ```
 
 See [history](commands/history.md), [logs](commands/logs.md),
 [events](commands/events.md), [attach](commands/attach.md),
-[results](commands/results.md).
+[results](commands/results.md), [receipt](commands/receipt.md),
+[bench](commands/bench.md).
 
 ### Access and desktop
 
 ```text
 crabbox connect <id>                          open an interactive SSH session
+crabbox exec --id <id> -- <command>            execute without syncing under the current claim
 crabbox ssh --id <id>                          print the SSH command
+crabbox open --editor=zed --id <id>             prepare an editor handoff
 crabbox vnc --id <id> [--open]                 print/open SSH-tunneled VNC details
 crabbox webvnc --id <id> [--open]              bridge a desktop lease into the web portal
 crabbox code --id <id> [--open]                bridge a code lease into the web portal
 crabbox egress start --id <id>                 bridge lease traffic through this machine
+crabbox ports --id <id> [--publish <port>]     list, publish, or unpublish provider-native ports
 crabbox screenshot --id <id> [--output <png>]  capture a PNG from a desktop lease
 crabbox desktop launch|terminal|record|proof|doctor|click|paste|type|key
 ```
 
-See [connect](commands/connect.md), [ssh](commands/ssh.md), [vnc](commands/vnc.md),
-[webvnc](commands/webvnc.md), [code](commands/code.md),
-[egress](commands/egress.md), [screenshot](commands/screenshot.md),
-[desktop](commands/desktop.md).
+See [exec](commands/exec.md), [connect](commands/connect.md), [ssh](commands/ssh.md), [open](commands/open.md),
+[vnc](commands/vnc.md), [webvnc](commands/webvnc.md), [code](commands/code.md),
+[egress](commands/egress.md), [ports](commands/ports.md),
+[screenshot](commands/screenshot.md), [desktop](commands/desktop.md).
 
 ### Media and artifacts
 
@@ -122,7 +144,7 @@ See [cache](commands/cache.md).
 ### Checkpoints, capsules, images, Actions
 
 ```text
-crabbox checkpoint create|list|inspect|restore|fork|delete|prune
+crabbox checkpoint create|list|inspect|policy|restore|fork|delete|prune
 crabbox capsule from-actions|replay|inspect|promote
 crabbox image create|promote|fsr-status|delete
 crabbox actions hydrate|register|dispatch
@@ -130,6 +152,10 @@ crabbox actions hydrate|register|dispatch
 
 See [checkpoint](commands/checkpoint.md), [capsule](commands/capsule.md),
 [image](commands/image.md), [actions](commands/actions.md).
+
+Brokered native checkpoints support `checkpoint create --expire-unused-after
+<duration>`, `checkpoint policy <id> --manual|--expire-unused-after <duration>`,
+and `checkpoint list --local-only` for explicit offline inspection.
 
 ### Pond (peer discovery / SSH-mesh)
 
@@ -146,13 +172,18 @@ See [pond](commands/pond.md) and the [pond feature](features/pond.md).
 
 ```text
 crabbox providers                             show provider capabilities
+crabbox providers describe <provider>         show compiled run flags for one runnable provider
+crabbox preflight-tools [--json]              list accepted preflight names and target support offline
 crabbox usage [--scope user|org|all]          cost and usage estimates
+crabbox capacity [--json]                   self-owner admission count and limit
+crabbox marketplace status|quote              preview the credits gateway and smart-routing quotes
 crabbox admin leases|lease-audit|providers|hosts|release|delete
 crabbox admin aws-identity|aws-policy|mac-hosts
 ```
 
-See [providers](commands/providers.md), [usage](commands/usage.md),
-[admin](commands/admin.md).
+See [providers](commands/providers.md), [preflight-tools](commands/preflight-tools.md), [usage](commands/usage.md),
+[capacity](commands/capacity.md),
+[marketplace](commands/marketplace.md), [admin](commands/admin.md).
 
 ### Config and auth
 
@@ -215,9 +246,9 @@ transport to the provider's own API or CLI. For these, SSH-specific options
 (`ssh`, `desktop`, `vnc`, `code`, Actions hydration, `--checksum`, `--sync-only`)
 are unavailable or partly restricted, and sync timing is reported as `delegated`.
 Examples include `blacksmith-testbox`, `azure-dynamic-sessions`, `e2b`, `modal`,
-`islo`, `cloudflare`, `cloudflare-dynamic-workers`, `upstash-box`, `tensorlake`,
-and `wandb`. See
-[providers](features/providers.md) for the full adapter list and which surface
+`islo`, `cloudflare`, `cloudflare-dynamic-workers`, `crownest`, `upstash-box`,
+`tensorlake`, and `wandb`. See
+[providers](providers/README.md) for the full adapter list and which surface
 each one supports.
 
 Module-runtime delegated providers such as `cloudflare-dynamic-workers` run
@@ -309,6 +340,7 @@ sync:
   delete: true
   checksum: false
   gitSeed: true
+  gitOverlay: false
   fingerprint: true
   baseRef: main
   timeout: 15m
@@ -360,9 +392,11 @@ Managed provider targets are intentionally narrow:
   Windows for desktop/VNC; use WSL2 for Linux tooling on a Windows host.
 - AWS also supports EC2 Mac (`--target macos`) when an available Mac Dedicated
   Host exists in the selected region. Brokered mode can discover an available
-  host; direct mode requires `CRABBOX_HOST_ID` or `hostId`. `CRABBOX_AWS_MAC_HOST_ID`
-  and `aws.macHostId` remain AWS compatibility aliases. Azure has no managed
-  macOS target.
+  host; explicit brokered host pinning requires admin authentication unless the
+  owner is reactivating the retained instance from their own released lease.
+  Direct mode requires `CRABBOX_HOST_ID` or `hostId`. `CRABBOX_AWS_MAC_HOST_ID`
+  and `aws.macHostId` remain AWS compatibility aliases. Azure has no managed macOS
+  target.
 - Existing macOS and Windows machines belong on `provider: ssh`.
 
 Static macOS host:
@@ -404,6 +438,9 @@ hostId: h-0123456789abcdef0
 capacity:
   market: on-demand
 ```
+
+With a broker, explicit `hostId` selection requires admin authentication.
+Normal broker users omit it and use automatic available-host discovery.
 
 `crabbox warmup --market spot|on-demand` and `crabbox run --market spot|on-demand`
 override `capacity.market` for a single AWS lease, for temporary quota or capacity
@@ -451,7 +488,7 @@ CRABBOX_WINDOWS_MODE               normal|wsl2
 CRABBOX_DESKTOP                    request the desktop capability
 CRABBOX_BROWSER                    request the browser capability
 CRABBOX_NETWORK                    auto|tailscale|public
-CRABBOX_OWNER                      lease owner email
+CRABBOX_OWNER                      stable lease owner for shared-token automation
 CRABBOX_ORG                        owning org
 CRABBOX_PROFILE                    default profile
 CRABBOX_CONFIG                     path to an explicit config file
@@ -459,6 +496,7 @@ CRABBOX_DEFAULT_CLASS              default machine class
 CRABBOX_ARCH                       default CPU architecture (amd64|arm64)
 CRABBOX_SERVER_TYPE                provider server/instance type override
 CRABBOX_IDLE_TIMEOUT               idle expiry
+CRABBOX_CLAIMS_AUTO_PRUNE          daily local claim pruning after stop/release (default true; false disables)
 CRABBOX_TTL                        max lease lifetime
 CRABBOX_WORK_ROOT                  remote work root
 ```
@@ -472,6 +510,8 @@ CRABBOX_STATIC_HOST
 CRABBOX_STATIC_USER
 CRABBOX_STATIC_PORT
 CRABBOX_STATIC_WORK_ROOT
+CRABBOX_STATIC_START_COMMAND
+CRABBOX_STATIC_STOP_COMMAND
 CRABBOX_SSH_KEY
 CRABBOX_SSH_USER
 CRABBOX_SSH_PORT
@@ -488,7 +528,7 @@ CRABBOX_AWS_SUBNET_ID
 CRABBOX_AWS_INSTANCE_PROFILE
 CRABBOX_AWS_ROOT_GB
 CRABBOX_AWS_SSH_CIDRS
-CRABBOX_HOST_ID
+CRABBOX_HOST_ID                       brokered use requires admin auth except owned released hosts
 CRABBOX_AWS_MAC_HOST_ID            legacy AWS alias
 CRABBOX_CAPACITY_MARKET
 CRABBOX_CAPACITY_STRATEGY
@@ -515,9 +555,12 @@ Sync, env, results, cache:
 
 ```text
 CRABBOX_RESULTS_JUNIT
+CRABBOX_RESULTS_AUTO
+CRABBOX_RESULTS_FAIL_ON_FAILURES
 CRABBOX_SYNC_CHECKSUM
 CRABBOX_SYNC_DELETE
 CRABBOX_SYNC_GIT_SEED
+CRABBOX_SYNC_GIT_OVERLAY
 CRABBOX_SYNC_FINGERPRINT
 CRABBOX_SYNC_BASE_REF
 CRABBOX_SYNC_TIMEOUT
@@ -561,7 +604,7 @@ CRABBOX_ARTIFACTS_EXPIRES
 ```
 
 Provider-specific (read by individual adapters; see each provider page under
-[features/](features/README.md)):
+[providers/](providers/README.md)):
 
 ```text
 CRABBOX_BLACKSMITH_*               Blacksmith Testbox
@@ -623,4 +666,4 @@ No progress bars when stdout is not a TTY.
 - [Getting started](getting-started.md) — first run walkthrough.
 - [How it works](how-it-works.md) and [Architecture](architecture.md) — the
   CLI / broker / runner split.
-- [Providers](features/providers.md) — adapter list and per-provider surface.
+- [Providers](providers/README.md) — adapter list and per-provider surface.

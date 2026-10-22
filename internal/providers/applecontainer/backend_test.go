@@ -1,11 +1,15 @@
 package applecontainer
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -13,7 +17,37 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	_ "github.com/openclaw/crabbox/internal/providers/applemachine"
+	shared "github.com/openclaw/crabbox/internal/providers/shared"
 )
+
+func TestConcreteFlagInputAttribution(t *testing.T) {
+	for _, raw := range []string{"unvisited", "container", ""} {
+		t.Run(raw, func(t *testing.T) {
+			cfg := core.Config{Provider: "other", AppleContainer: core.AppleContainerConfig{CLIPath: "container"}}
+			want := cfg
+			fs := flag.NewFlagSet("inputs", flag.ContinueOnError)
+			values := (Provider{}).RegisterFlags(fs, cfg)
+			if raw != "unvisited" {
+				if err := fs.Parse([]string{"--apple-container-cli", raw}); err != nil {
+					t.Fatal(err)
+				}
+				want.AppleContainer.CLIPath = raw
+				core.RecordProviderFlagInputs(&want, true, "apple-container", "apple-machine")
+			}
+			if err := (Provider{}).ApplyFlags(&cfg, fs, values); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg, want) {
+				t.Fatalf("unexpected applied config: %#v", cfg)
+			}
+			before := cfg
+			if err := (Provider{}).ApplyFlags(&cfg, fs, struct{}{}); err != nil || !reflect.DeepEqual(cfg, before) {
+				t.Fatalf("foreign flag storage changed input: %v", err)
+			}
+		})
+	}
+}
 
 type recordingRunner struct {
 	calls     []core.LocalCommandRequest
@@ -109,16 +143,16 @@ func sampleInspectJSON(id, slug, lease string) string {
 
 func TestProviderSpecAndAliases(t *testing.T) {
 	p := Provider{}
-	if p.Name() != providerName {
-		t.Fatalf("Name=%q want %s", p.Name(), providerName)
+	if p.Spec().Name != providerName {
+		t.Fatalf("Name=%q want %s", p.Spec().Name, providerName)
 	}
 	for _, alias := range []string{"apple-container", "apple", "applecontainer"} {
 		got, err := core.ProviderFor(alias)
 		if err != nil {
 			t.Fatalf("ProviderFor(%q): %v", alias, err)
 		}
-		if got.Name() != providerName {
-			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Name())
+		if got.Spec().Name != providerName {
+			t.Fatalf("ProviderFor(%q).Name=%q", alias, got.Spec().Name)
 		}
 	}
 	spec := p.Spec()
@@ -140,9 +174,91 @@ func TestAliasDoesNotCollideWithLocalContainer(t *testing.T) {
 	// The bare "container" alias belongs to local-container; apple-container
 	// must not steal it. Cross-provider registry collisions are asserted in
 	// internal/providers/all; here we guard the provider's own alias set.
-	for _, alias := range (Provider{}).Aliases() {
+	for _, alias := range (Provider{}).Spec().Aliases {
 		if alias == "container" {
 			t.Fatalf("apple-container must not declare the 'container' alias")
+		}
+	}
+}
+
+func TestAppleContainerConfigFlags(t *testing.T) {
+	defaults := core.Config{AppleContainer: core.AppleContainerConfig{CLIPath: "tool", Image: "image-example", User: "user-example", WorkRoot: "/workspace/example", CPUs: 3, Memory: "6g", ExtraRunArgs: []string{"alpha", " beta "}}}
+	fs := flag.NewFlagSet("config", flag.ContinueOnError)
+	v := (Provider{}).RegisterFlags(fs, defaults)
+	want := map[string]string{"apple-container-cli": "tool", "apple-container-image": "image-example", "apple-container-user": "user-example", "apple-container-work-root": "/workspace/example", "apple-container-cpus": "3", "apple-container-memory": "6g", "apple-container-extra-run-args": "alpha  beta "}
+	got := map[string]string{}
+	fs.VisitAll(func(f *flag.Flag) { got[f.Name] = f.DefValue })
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("flag surface=%#v", got)
+	}
+	cfg := defaults
+	cfg.Provider = "unselected"
+	before := cfg
+	if err := (Provider{}).ApplyFlags(&cfg, fs, v); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg, before) {
+		t.Fatal("unvisited unselected flags changed config")
+	}
+	if err := fs.Parse([]string{"--apple-container-cli=~/literal", "--apple-container-image=image-example", "--apple-container-user=user-next", "--apple-container-work-root=/workspace/~/guest", "--apple-container-cpus=-2", "--apple-container-memory=8g", "--apple-container-extra-run-args=first", "--apple-container-extra-run-args=\"alpha beta\" a,b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Provider{}).ApplyFlags(&cfg, fs, v); err != nil {
+		t.Fatal(err)
+	}
+	wantConfig := core.AppleContainerConfig{CLIPath: "~/literal", Image: "image-example", User: "user-next", WorkRoot: "/workspace/~/guest", CPUs: -2, Memory: "8g", ExtraRunArgs: []string{"\"alpha", "beta\"", "a,b"}}
+	if !reflect.DeepEqual(cfg.AppleContainer, wantConfig) || !core.AppleContainerImageExplicit(cfg) || cfg.SSHUser != "user-next" || cfg.WorkRoot != "/workspace/~/guest" || core.IsWorkRootExplicit(&cfg) {
+		t.Fatal("flag values/accepted image/generic copies")
+	}
+	for _, raw := range []string{"", " \t "} {
+		c := defaults
+		c.Provider = "unselected"
+		f := flag.NewFlagSet("empty", flag.ContinueOnError)
+		values := (Provider{}).RegisterFlags(f, c)
+		if err := f.Parse([]string{"--apple-container-cli=", "--apple-container-image=", "--apple-container-user=", "--apple-container-work-root=", "--apple-container-cpus=0", "--apple-container-memory=", "--apple-container-extra-run-args=" + raw}); err != nil {
+			t.Fatal(err)
+		}
+		if err := (Provider{}).ApplyFlags(&c, f, values); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(c.AppleContainer, core.AppleContainerConfig{}) || !core.AppleContainerImageExplicit(c) || c.SSHUser != "" || c.WorkRoot != "" {
+			t.Fatal("visited empty flags must clear to nil without unselected defaults")
+		}
+	}
+	for _, name := range []string{"apple-container", "apple", "applecontainer", "APPLE", " apple-container "} {
+		c := core.Config{Provider: name, WindowsMode: "fixture", WorkRoot: "/workspace/generic", AppleContainer: core.AppleContainerConfig{Image: "image-example", CPUs: -2, Memory: "8g", ExtraRunArgs: []string{"token"}}}
+		f := flag.NewFlagSet(name, flag.ContinueOnError)
+		values := (Provider{}).RegisterFlags(f, c)
+		if err := (Provider{}).ApplyFlags(&c, f, values); err != nil {
+			t.Fatal(err)
+		}
+		selected := name == "apple-container" || name == "apple" || name == "applecontainer"
+		if selected {
+			if c.Provider != "apple-container" || c.TargetOS != core.TargetLinux || c.WindowsMode != "" || c.SSHFallbackPorts == nil || len(c.SSHFallbackPorts) != 0 || c.AppleContainer.CLIPath != "container" || c.AppleContainer.User != "crabbox" || c.AppleContainer.WorkRoot != "/workspace/generic" || c.ServerType != "image-example" {
+				t.Fatal("selected postdefaults projection")
+			}
+		} else if c.AppleContainer.CLIPath != "" || c.Provider != name || c.SSHFallbackPorts != nil {
+			t.Fatal("raw nonmatching selector ran defaults")
+		}
+		if c.AppleContainer.CPUs != -2 || c.AppleContainer.Memory != "8g" || !reflect.DeepEqual(c.AppleContainer.ExtraRunArgs, []string{"token"}) {
+			t.Fatal("postdefaults changed CPU/memory/list")
+		}
+	}
+	for _, foreign := range []any{nil, struct{}{}} {
+		c := core.Config{Provider: "apple-container"}
+		before := c
+		if err := (Provider{}).ApplyFlags(&c, flag.NewFlagSet("foreign", flag.ContinueOnError), foreign); err != nil || !reflect.DeepEqual(c, before) {
+			t.Fatal("foreign values must precede defaults")
+		}
+	}
+}
+
+func TestAppleContainerConfigDefaultsPolicy(t *testing.T) {
+	for _, tc := range []struct{ generic, provider, want string }{{"", "", "/work/crabbox"}, {" /work/crabbox ", "", "/work/crabbox"}, {" /workspace/custom ", "", " /workspace/custom "}, {"/workspace/generic", "  ", "  "}, {"/workspace/generic", "/workspace/provider", "/workspace/provider"}} {
+		cfg := core.Config{WorkRoot: tc.generic, AppleContainer: core.AppleContainerConfig{Image: "image-example", WorkRoot: tc.provider, CLIPath: " ", User: " "}}
+		applyDefaults(&cfg)
+		if cfg.AppleContainer.WorkRoot != tc.want || cfg.WorkRoot != tc.want || cfg.AppleContainer.CLIPath != " " || cfg.SSHUser != " " {
+			t.Fatal("raw defaults versus trimmed root classifier")
 		}
 	}
 }
@@ -234,6 +350,43 @@ func TestCreateContainerBuildsRunArgs(t *testing.T) {
 	}
 	if strings.Count(args, "--dns") != 1 {
 		t.Fatalf("custom DNS should not be duplicated:\n%s", args)
+	}
+	if strings.Contains(args, "--arch") {
+		t.Fatalf("implicit native architecture should not add --arch:\n%s", args)
+	}
+}
+
+func TestCreateContainerForwardsExplicitArchitecture(t *testing.T) {
+	for _, architecture := range []string{core.ArchitectureARM64, core.ArchitectureAMD64} {
+		t.Run(architecture, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			contents := "provider: apple-container\ntarget: linux\narchitecture: " + architecture + "\n"
+			if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CRABBOX_CONFIG", configPath)
+			cfg, err := core.LoadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.AppleContainer = core.AppleContainerConfig{
+				CLIPath:  "container",
+				Image:    "debian:bookworm",
+				User:     "runner",
+				WorkRoot: "/work/crabbox",
+			}
+			runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+				commandKey([]string{"run"}): {Stdout: "crabbox-blue\n"},
+			}}
+			b := newBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner}).(*backend)
+			if _, err := b.createContainer(context.Background(), b.configForRun(), "crabbox-blue", "cbx_123", "blue-lobster", "ssh-ed25519 AAAA test", true); err != nil {
+				t.Fatal(err)
+			}
+			args := recordedArgsForCommand(t, runner, "run")
+			if !strings.Contains(args, "--arch\n"+architecture) {
+				t.Fatalf("explicit architecture missing from run args:\n%s", args)
+			}
+		})
 	}
 }
 
@@ -364,7 +517,7 @@ func TestCreateContainerMountsCacheVolumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, volume := range cfg.Cache.Volumes {
-		want := "--volume\n" + filepath.Join(root, appleContainerCacheVolumeName(volume.Key)) + ":" + volume.Path
+		want := "--volume\n" + filepath.Join(root, shared.CacheVolumeName(volume.Key)) + ":" + volume.Path
 		if !strings.Contains(args, want) {
 			t.Fatalf("cache volume mount missing %q:\n%s", want, args)
 		}
@@ -378,8 +531,8 @@ func TestCreateContainerMountsCacheVolumes(t *testing.T) {
 }
 
 func TestAppleContainerCacheVolumeNameIsStableAndFilesystemSafe(t *testing.T) {
-	got := appleContainerCacheVolumeName("My App/linux node24 lock")
-	again := appleContainerCacheVolumeName("My App/linux node24 lock")
+	got := shared.CacheVolumeName("My App/linux node24 lock")
+	again := shared.CacheVolumeName("My App/linux node24 lock")
 	if got != again {
 		t.Fatalf("cache volume name unstable: %q then %q", got, again)
 	}
@@ -582,6 +735,332 @@ func TestRemoveContainerUsesDeleteForce(t *testing.T) {
 	}
 }
 
+func TestCleanupPreservesUnclaimedStoppedAppleContainer(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container cleanup only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"ls", "--all", "--format", "json"}): {Stdout: `[{
+			"status":"stopped",
+			"configuration":{
+				"id":"unclaimed-container",
+				"image":{"reference":"debian:bookworm"},
+				"labels":{"crabbox":"true","provider":"apple-container"}
+			}
+		}]`},
+	}}
+
+	if err := testBackend(runner).Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if commandWasCalled(runner.calls, "delete") {
+		t.Fatalf("Cleanup deleted unclaimed stopped container: %#v", runner.calls)
+	}
+}
+
+func TestCleanupDeletesStoppedAppleContainerWithExactClaim(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container cleanup only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_claimed_cleanup"
+	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(
+		leaseID,
+		"claimed-cleanup",
+		providerName,
+		"",
+		"",
+		t.TempDir(),
+		time.Minute,
+		false,
+		core.Server{CloudID: "claimed-container", Provider: providerName},
+		core.SSHTarget{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"ls", "--all", "--format", "json"}): {Stdout: `[{
+			"status":"stopped",
+			"configuration":{
+				"id":"claimed-container",
+				"image":{"reference":"debian:bookworm"},
+				"labels":{"crabbox":"true","provider":"apple-container","lease":"cbx_claimed_cleanup"}
+			}
+		}]`},
+	}}
+
+	if err := testBackend(runner).Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if !commandWasCalled(runner.calls, "delete") {
+		t.Fatalf("Cleanup preserved exactly claimed stopped container: %#v", runner.calls)
+	}
+}
+
+func TestShouldCleanupRequiresExactClaimBeforeStateDeletion(t *testing.T) {
+	now := time.Now().UTC()
+	server := core.Server{
+		CloudID: "claimed-container",
+		Status:  "stopped",
+		Labels: map[string]string{
+			"crabbox":  "true",
+			"provider": providerName,
+			"lease":    "cbx_claimed_container",
+		},
+	}
+	exactClaim := core.LeaseClaim{
+		LeaseID:  "cbx_claimed_container",
+		Provider: providerName,
+		CloudID:  "claimed-container",
+	}
+
+	if cleanup, reason := shouldCleanup(server, core.LeaseClaim{}, false, now); cleanup || reason != "missing claim" {
+		t.Fatalf("unclaimed cleanup=%v reason=%q, want false/missing claim", cleanup, reason)
+	}
+	conflictingClaim := exactClaim
+	conflictingClaim.CloudID = "other-container"
+	if cleanup, reason := shouldCleanup(server, conflictingClaim, true, now); cleanup || reason != "claim mismatch" {
+		t.Fatalf("conflicting cleanup=%v reason=%q, want false/claim mismatch", cleanup, reason)
+	}
+	if cleanup, reason := shouldCleanup(server, exactClaim, true, now); !cleanup || reason != "container state=stopped" {
+		t.Fatalf("exact cleanup=%v reason=%q, want true/container state=stopped", cleanup, reason)
+	}
+}
+
+func TestRequireExactAppleContainerClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_claimed_apple_container"
+	if err := requireExactAppleContainerClaim(leaseID, "owned-container"); err == nil || !strings.Contains(err.Error(), "no exact local claim") {
+		t.Fatalf("unclaimed error=%v, want exact-claim rejection", err)
+	}
+	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(
+		leaseID,
+		"claimed-apple-container",
+		providerName,
+		"",
+		"",
+		t.TempDir(),
+		time.Minute,
+		false,
+		core.Server{CloudID: "owned-container", Provider: providerName, Labels: map[string]string{"provider": providerName, "slug": "claimed-apple-container"}},
+		core.SSHTarget{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireExactAppleContainerClaim(leaseID, "other-container"); err == nil || !strings.Contains(err.Error(), "bound to container") {
+		t.Fatalf("mismatched container error=%v, want resource-binding rejection", err)
+	}
+	if err := requireExactAppleContainerClaim(leaseID, "owned-container"); err != nil {
+		t.Fatalf("claimed lease rejected: %v", err)
+	}
+}
+
+func TestResolveRawAppleContainerRequiresExplicitReclaimAndPersistsBinding(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container resolve only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"ls", "--all", "--format", "json"}):          {Stdout: sampleInspectJSON("raw-apple-container", "raw-apple", "cbx_raw_apple")},
+		commandKey([]string{"delete", "--force", "raw-apple-container"}): {},
+	}}
+	b := testBackend(runner)
+	repo := core.Repo{Root: t.TempDir()}
+	if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "raw-apple-container", Repo: repo}); err == nil || !strings.Contains(err.Error(), "explicit --reclaim") {
+		t.Fatalf("Resolve without reclaim error=%v", err)
+	}
+	if claim, err := core.ReadLeaseClaim("cbx_raw_apple"); err != nil {
+		t.Fatal(err)
+	} else if claim.LeaseID != "" {
+		t.Fatalf("non-reclaim resolve minted claim: %#v", claim)
+	}
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "raw-apple-container", Repo: repo, Reclaim: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := core.ReadLeaseClaim("cbx_raw_apple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.CloudID != "raw-apple-container" {
+		t.Fatalf("reclaim binding=%#v", claim)
+	}
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if !commandWasCalled(runner.calls, "delete") {
+		t.Fatalf("reclaimed container was not released: %#v", runner.calls)
+	}
+}
+
+func TestLegacyAppleContainerClaimRequiresReclaimBeforeStop(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container resolve only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_legacy_apple"
+	if err := core.ClaimLeaseForRepoProviderScopePond(leaseID, "legacy-apple", providerName, "", "", t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"ls", "--all", "--format", "json"}):             {Stdout: sampleInspectJSON("legacy-apple-container", "legacy-apple", leaseID)},
+		commandKey([]string{"delete", "--force", "legacy-apple-container"}): {},
+	}}
+	b := testBackend(runner)
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{LeaseID: leaseID, Server: core.Server{CloudID: "legacy-apple-container"}}}); err == nil || !strings.Contains(err.Error(), "explicit --reclaim") {
+		t.Fatalf("legacy direct stop error=%v", err)
+	}
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: leaseID, Repo: core.Repo{Root: t.TempDir()}, Reclaim: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.CloudID != "legacy-apple-container" {
+		t.Fatalf("legacy reclaim binding=%#v", claim)
+	}
+	if err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveReclaimDoesNotRetargetBoundAppleContainerClaim(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container resolve only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_bound_apple"
+	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(
+		leaseID,
+		"bound-apple",
+		providerName,
+		"",
+		"",
+		t.TempDir(),
+		time.Minute,
+		false,
+		core.Server{CloudID: "container-a", Provider: providerName, Labels: map[string]string{"provider": providerName, "slug": "bound-apple"}},
+		core.SSHTarget{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	listJSON := `[
+		{"status":"running","configuration":{"id":"container-b","image":{"reference":"debian:bookworm"},"labels":{"crabbox":"true","provider":"apple-container","lease":"cbx_bound_apple","slug":"bound-apple","state":"ready","ssh_user":"runner","work_root":"/work/crabbox"}},"networks":[{"address":"192.168.64.8/24"}]},
+		{"status":"running","configuration":{"id":"container-a","image":{"reference":"debian:bookworm"},"labels":{"crabbox":"true","provider":"apple-container","lease":"cbx_stale_label","slug":"stale-label","state":"ready","ssh_user":"runner","work_root":"/work/crabbox"}},"networks":[{"address":"192.168.64.7/24"}]}
+	]`
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"ls", "--all", "--format", "json"}): {Stdout: listJSON},
+	}}
+	b := testBackend(runner)
+	repo := core.Repo{Root: t.TempDir()}
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: leaseID, Repo: repo, Reclaim: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Server.CloudID != "container-a" || lease.LeaseID != leaseID {
+		t.Fatalf("exact claim resolved container=%q lease=%q, want container-a/%s", lease.Server.CloudID, lease.LeaseID, leaseID)
+	}
+	if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "container-b", Repo: repo, Reclaim: true}); err == nil || !strings.Contains(err.Error(), "bound to container") {
+		t.Fatalf("raw conflicting reclaim error=%v", err)
+	}
+	claim, err := core.ReadLeaseClaim(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.CloudID != "container-a" {
+		t.Fatalf("bound claim was retargeted: %#v", claim)
+	}
+}
+
+func TestResolveStatusOnlyAllowsClaimlessAppleContainerWithoutClaiming(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container resolve only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"ls", "--all", "--format", "json"}): {Stdout: sampleInspectJSON("status-apple", "status-apple", "cbx_status_apple")},
+	}}
+	b := testBackend(runner)
+	lease, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-apple", Repo: core.Repo{Root: t.TempDir()}, StatusOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Server.CloudID != "status-apple" {
+		t.Fatalf("status lease=%#v", lease)
+	}
+	if claim, err := core.ReadLeaseClaim("cbx_status_apple"); err != nil {
+		t.Fatal(err)
+	} else if claim.LeaseID != "" {
+		t.Fatalf("status-only resolve minted claim: %#v", claim)
+	}
+	if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(
+		"cbx_status_apple",
+		"status-apple",
+		providerName,
+		"",
+		"",
+		t.TempDir(),
+		time.Minute,
+		false,
+		lease.Server,
+		lease.SSH,
+	); err != nil {
+		t.Fatal(err)
+	}
+	before, err := core.ReadLeaseClaim("cbx_status_apple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "status-apple", Repo: core.Repo{Root: t.TempDir()}, StatusOnly: true}); err != nil {
+		t.Fatalf("owned status-only resolve: %v", err)
+	}
+	after, err := core.ReadLeaseClaim("cbx_status_apple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.RepoRoot != before.RepoRoot || after.LastUsedAt != before.LastUsedAt || after.CloudID != before.CloudID {
+		t.Fatalf("status-only resolve mutated claim: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestResolveReclaimRejectsMetadataLessAppleContainer(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container resolve only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"ls", "--all", "--format", "json"}): {Stdout: sampleInspectJSON("metadata-less", "", "")},
+	}}
+	b := testBackend(runner)
+	if _, err := b.Resolve(context.Background(), core.ResolveRequest{ID: "metadata-less", Repo: core.Repo{Root: t.TempDir()}, Reclaim: true}); err == nil || !strings.Contains(err.Error(), "no exact local claim") {
+		t.Fatalf("metadata-less reclaim error=%v", err)
+	}
+}
+
+func TestReleaseLeaseRejectsUnclaimedContainer(t *testing.T) {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("apple-container release only runs on macOS/Apple silicon")
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	runner := &recordingRunner{responses: map[string]core.LocalCommandResult{
+		commandKey([]string{"delete", "--force", "unclaimed-container"}): {},
+	}}
+	b := testBackend(runner)
+	err := b.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{
+		LeaseID: "cbx_unclaimed_apple_container",
+		Server:  core.Server{CloudID: "unclaimed-container"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "no exact local claim") {
+		t.Fatalf("ReleaseLease error=%v, want exact-claim rejection", err)
+	}
+	if commandWasCalled(runner.calls, "delete") {
+		t.Fatalf("unclaimed container reached delete: %#v", runner.calls)
+	}
+}
+
 func TestDoctorReportsMissingCLI(t *testing.T) {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		t.Skip("doctor CLI probe only exercised on macOS/Apple silicon")
@@ -660,6 +1139,27 @@ func TestDoctorRejectsIncompatibleRunCLI(t *testing.T) {
 		}
 		if _, err := testBackend(runner).Doctor(context.Background(), core.DoctorRequest{}); err == nil {
 			t.Fatal("doctor passed despite run lacking --dns")
+		}
+	})
+	t.Run("explicit architecture needs arch option", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(configPath, []byte("provider: apple-container\ntarget: linux\narchitecture: arm64\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CRABBOX_CONFIG", configPath)
+		cfg, err := core.LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner := &recordingRunner{
+			responses: map[string]core.LocalCommandResult{
+				commandKey([]string{"system", "status"}): {Stdout: "running\n"},
+				commandKey([]string{"run", "--help"}):    {Stdout: "OPTIONS:\n  -u, --user <user>\n  --label <label>\n  --dns <server>\n"},
+			},
+		}
+		b := newBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner}).(*backend)
+		if _, err := b.Doctor(context.Background(), core.DoctorRequest{}); err == nil || !strings.Contains(err.Error(), "--arch") {
+			t.Fatalf("doctor error=%v, want missing --arch", err)
 		}
 	})
 }
@@ -769,3 +1269,160 @@ func TestDecodeInspectToleratesObjectStatus(t *testing.T) {
 type errFake string
 
 func (e errFake) Error() string { return string(e) }
+
+func TestAppleContainerConfigShowSection(t *testing.T) {
+	projector, ok := any(Provider{}).(core.ProviderConfigShowProjector)
+	if !ok {
+		t.Fatal("real provider is missing passive config-show ownership")
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  core.AppleContainerConfig
+		want map[string]any
+		text string
+	}{
+		{name: "zero", cfg: core.AppleContainerConfig{CLIPath: "", Image: "", User: "", WorkRoot: "", CPUs: 0, Memory: "", ExtraRunArgs: []string{"internal-extra", " internal-extra "}}, want: map[string]any{"cliPath": "", "image": "", "user": "", "workRoot": "", "cpus": 0, "memory": ""}, text: "apple_container cli= image= user= work_root= cpus=0 memory=-\n"},
+		{name: "raw", cfg: core.AppleContainerConfig{CLIPath: " raw-cli ", Image: " raw-image ", User: " raw-user ", WorkRoot: "", CPUs: -2, Memory: "   ", ExtraRunArgs: []string{"internal-extra", " internal-extra "}}, want: map[string]any{"cliPath": " raw-cli ", "image": " raw-image ", "user": " raw-user ", "workRoot": "", "cpus": -2, "memory": "   "}, text: "apple_container cli= raw-cli  image= raw-image  user= raw-user  work_root= cpus=-2 memory=   \n"},
+		{name: "configured", cfg: core.AppleContainerConfig{CLIPath: "tool", Image: "image-example", User: "user-example", WorkRoot: "/workspace/example", CPUs: 3, Memory: "6g", ExtraRunArgs: []string{"internal-extra", " internal-extra "}}, want: map[string]any{"cliPath": "tool", "image": "image-example", "user": "user-example", "workRoot": "/workspace/example", "cpus": 3, "memory": "6g"}, text: "apple_container cli=tool image=image-example user=user-example work_root=/workspace/example cpus=3 memory=6g\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := core.Config{Provider: "unselected-display-test", AppleContainer: tc.cfg}
+			before, err := json.Marshal(cfg.AppleContainer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			section := projector.ConfigShowSection(cfg)
+			got := map[string]any{}
+			var fields []string
+			for _, field := range section.Fields {
+				got[field.JSONName] = field.JSONValue
+				fields = append(fields, field.TextName+"="+field.TextValue)
+			}
+			if section.JSONKey != "appleContainer" || section.TextLabel != "apple_container" || !reflect.DeepEqual(section.Providers, []string{"apple-container", "apple-machine"}) || len(section.Fields) != 6 {
+				t.Fatalf("section metadata=%#v", section)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("public fields=%#v want %#v", got, tc.want)
+			}
+			if line := section.TextLabel + " " + strings.Join(fields, " ") + "\n"; line != tc.text {
+				t.Fatalf("text=%q want %q", line, tc.text)
+			}
+			after, err := json.Marshal(cfg.AppleContainer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("projection mutated original config or slice contents")
+			}
+		})
+	}
+}
+
+func TestAppleContainerConfigShowSharedCanonicalCoverage(t *testing.T) {
+	owners := 0
+	coverage := map[string]int{}
+	for _, name := range core.RegisteredProviderNames() {
+		provider, err := core.ProviderFor(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		projector, ok := provider.(core.ProviderConfigShowProjector)
+		if !ok {
+			continue
+		}
+		section := projector.ConfigShowSection(core.Config{})
+		if section.JSONKey != "appleContainer" {
+			continue
+		}
+		owners++
+		if provider.Spec().Name != "apple-container" {
+			t.Fatalf("unexpected shared owner %s", provider.Spec().Name)
+		}
+		for _, canonical := range section.Providers {
+			coverage[canonical]++
+		}
+	}
+	if owners != 1 || !reflect.DeepEqual(coverage, map[string]int{"apple-container": 1, "apple-machine": 1}) {
+		t.Fatalf("shared owners=%d coverage=%v", owners, coverage)
+	}
+	machine, err := core.ProviderFor("apple-machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, duplicate := machine.(core.ProviderConfigShowProjector); duplicate {
+		t.Fatal("Machine must not emit a competing shared section")
+	}
+}
+
+func TestAppleContainerConfigShowCanonicalSelectionsOffline(t *testing.T) {
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "CRABBOX_") {
+			t.Setenv(name, "")
+		}
+	}
+	home := t.TempDir()
+	t.Chdir(home)
+	for _, name := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(name, home)
+	}
+	t.Setenv("PATH", t.TempDir())
+	configPath := filepath.Join(home, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(`target: linux
+appleContainer:
+  cliPath: tool
+  image: image-example
+  user: user-example
+  workRoot: /workspace/example
+  cpus: 3
+  memory: 6g
+  extraRunArgs: [internal-extra]
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	for _, selected := range []string{"apple-container", "apple-machine"} {
+		for _, format := range []string{"text", "json"} {
+			t.Run(selected+"/"+format, func(t *testing.T) {
+				var out, log bytes.Buffer
+				args := []string{"config", "show", "--provider", selected}
+				if format == "json" {
+					args = append(args, "--json")
+				}
+				if err := (core.App{Stdout: &out, Stderr: &log}).Run(t.Context(), args); err != nil || log.Len() != 0 {
+					t.Fatalf("config-only route: %v stderr=%s", err, &log)
+				}
+				if format == "json" {
+					var view map[string]any
+					if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+						t.Fatal(err)
+					}
+					want := map[string]any{"cliPath": "tool", "image": "image-example", "user": "user-example", "workRoot": "/workspace/example", "cpus": float64(3), "memory": "6g"}
+					if !reflect.DeepEqual(view["appleContainer"], want) || view["provider"] != selected {
+						t.Fatalf("selected shared section=%#v provider=%v", view["appleContainer"], view["provider"])
+					}
+					if _, duplicate := view["appleMachine"]; duplicate {
+						t.Fatal("duplicate Machine section")
+					}
+				} else {
+					want := "apple_container cli=tool image=image-example user=user-example work_root=/workspace/example cpus=3 memory=6g\n"
+					count := 0
+					for _, line := range strings.SplitAfter(out.String(), "\n") {
+						if strings.HasPrefix(line, "apple_container ") {
+							count++
+							if line != want {
+								t.Fatalf("shared text=%q want %q", line, want)
+							}
+						}
+					}
+					if count != 1 || strings.Contains(out.String(), "apple_machine ") {
+						t.Fatalf("shared text section count=%d", count)
+					}
+					if !strings.Contains(out.String(), "provider="+selected+" ") {
+						t.Fatalf("selected provider not retained: %s", &out)
+					}
+				}
+			})
+		}
+	}
+}

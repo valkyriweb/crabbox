@@ -1,0 +1,38 @@
+package orgo
+
+import (
+	"flag"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func init() {
+	core.RegisterProvider(Provider{})
+}
+
+type Provider struct{}
+
+func (Provider) Spec() core.ProviderSpec {
+	return core.ProviderSpec{
+		Aliases:          []string{"orgo-ai"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIKey),
+		Name:             providerName,
+		Family:           "orgo",
+		Kind:             core.ProviderKindDelegatedRun,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+	}
+}
+
+func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return RegisterOrgoProviderFlags(fs, defaults)
+}
+
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	return ApplyOrgoProviderFlags(cfg, fs, values)
+}
+
+func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	return NewOrgoBackend(p.Spec(), cfg, rt), nil
+}

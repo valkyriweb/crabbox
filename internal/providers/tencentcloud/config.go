@@ -1,0 +1,186 @@
+package tencentcloud
+
+import (
+	"net/url"
+	"strings"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+const (
+	// Class selection remains independent of configured runtime defaults.
+	defaultType        = "SA5.MEDIUM2"
+	defaultTagEndpoint = "https://tag.tencentcloudapi.com"
+	defaultSTSEndpoint = "https://sts.tencentcloudapi.com"
+)
+
+func cfgForRun(cfg core.Config) core.Config {
+	cfg.Provider = providerName
+	if cfg.TargetOS == "" {
+		cfg.TargetOS = core.TargetLinux
+	}
+	// Resolve intent before filling a native type; an empty result can be an
+	// unsupported explicit class and must not be replaced by the fallback.
+	resolvedType := serverTypeForConfig(cfg)
+	applyNativeDefaults(&cfg.TencentCloud)
+	cfg.TencentCloud.Type = resolvedType
+	if !core.IsSSHUserExplicit(&cfg) && (cfg.SSHUser == "" || cfg.SSHUser == core.BaseConfig().SSHUser) {
+		cfg.SSHUser = "ubuntu"
+	}
+	if !core.IsSSHPortExplicit(&cfg) && (cfg.SSHPort == "" || cfg.SSHPort == core.BaseConfig().SSHPort) {
+		cfg.SSHPort = "22"
+	}
+	cfg.SSHFallbackPorts = nil
+	cfg.ServerType = resolvedType
+	return cfg
+}
+
+func regionForConfig(cfg core.Config) string {
+	if value := strings.TrimSpace(cfg.TencentCloud.Region); value != "" {
+		return value
+	}
+	return core.TencentCloudRegionFallback
+}
+
+func zoneForConfig(cfg core.Config) string {
+	if value := strings.TrimSpace(cfg.TencentCloud.Zone); value != "" {
+		return value
+	}
+	return core.TencentCloudZoneFallback
+}
+
+func imageForConfig(cfg core.Config) string {
+	return strings.TrimSpace(cfg.TencentCloud.Image)
+}
+
+func serverTypeForConfig(cfg core.Config) string {
+	if cfg.ServerTypeExplicit && strings.TrimSpace(cfg.ServerType) != "" {
+		return strings.TrimSpace(cfg.ServerType)
+	}
+	if value := strings.TrimSpace(cfg.TencentCloud.Type); core.TencentCloudTypeWasExplicit(cfg) && value != "" {
+		return value
+	}
+	if core.ClassWasExplicit(cfg) {
+		return core.ProviderClassPrimaryTypeForProfiles(classProfiles, cfg, serverTypeForClass(cfg.Class))
+	}
+	if value := strings.TrimSpace(cfg.TencentCloud.Type); value != "" {
+		return value
+	}
+	return core.TencentCloudTypeFallback
+}
+
+func serverTypeForClass(class string) string {
+	if serverType, ok := providerClassType(class); ok {
+		return serverType
+	}
+	normalized := strings.ToLower(strings.TrimSpace(class))
+	if normalized != class {
+		if serverType, ok := providerClassType(normalized); ok {
+			return serverType
+		}
+	}
+	return defaultType
+}
+
+func providerClassType(class string) (string, bool) {
+	candidates, ok := core.ProviderClassCandidatesForProfiles(classProfiles, core.Config{
+		Provider: providerName, TargetOS: core.TargetLinux, Architecture: core.ArchitectureAMD64, Class: class,
+	})
+	if !ok {
+		return "", false
+	}
+	return candidates[0], true
+}
+
+func validateAcquireConfig(cfg core.Config) error {
+	if _, err := tencentCloudChargeType(cfg); err != nil {
+		return err
+	}
+	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
+		return core.Exit(2, "provider=tencentcloud only supports target=linux")
+	}
+	if strings.TrimSpace(regionForConfig(cfg)) == "" {
+		return core.Exit(2, "tencentcloud region is required")
+	}
+	if strings.TrimSpace(zoneForConfig(cfg)) == "" {
+		return core.Exit(2, "tencentcloud zone is required")
+	}
+	if strings.TrimSpace(imageForConfig(cfg)) == "" {
+		return core.Exit(2, "tencentcloud image is required; set tencentcloud.image, --tencentcloud-image, or CRABBOX_TENCENTCLOUD_IMAGE to a CVM image ID")
+	}
+	if strings.TrimSpace(serverTypeForConfig(cfg)) == "" {
+		return core.Exit(2, "tencentcloud type is required")
+	}
+	if cfg.TencentCloud.RootGB < 0 {
+		return core.Exit(2, "tencentcloud rootGB must be non-negative")
+	}
+	if cfg.TencentCloud.InternetMaxBandwidthOut < 0 {
+		return core.Exit(2, "tencentcloud internetMaxBandwidthOut must be non-negative")
+	}
+	if len(cfg.TencentCloud.SSHCIDRs) > 0 {
+		return core.Exit(2, "provider=tencentcloud does not yet manage security-group SSH CIDRs; attach a preconfigured tencentcloud.securityGroupId or remove tencentcloud.sshCIDRs")
+	}
+	return nil
+}
+
+func cvmEndpointForConfig(cfg core.Config) string {
+	if value := strings.TrimSpace(cfg.TencentCloud.APIEndpoint); value != "" {
+		return normalizeEndpoint(value)
+	}
+	return core.TencentCloudAPIEndpointFallback
+}
+
+func tagEndpointForConfig(cfg core.Config) string {
+	cvm := cvmEndpointForConfig(cfg)
+	if strings.Contains(cvm, ".intl.tencentcloudapi.com") {
+		return "https://tag.intl.tencentcloudapi.com"
+	}
+	return defaultTagEndpoint
+}
+
+func stsEndpointForConfig(cfg core.Config) string {
+	cvm := cvmEndpointForConfig(cfg)
+	if strings.Contains(cvm, ".intl.tencentcloudapi.com") {
+		return "https://sts.intl.tencentcloudapi.com"
+	}
+	return defaultSTSEndpoint
+}
+
+func normalizeEndpoint(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(value); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return value
+	}
+	return "https://" + strings.TrimPrefix(value, "//")
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	applyNativeDefaults(&cfg.TencentCloud)
+	core.ApplyLinuxConnectionDefaults(cfg, "ubuntu", "22")
+	cfg.SSHFallbackPorts = nil
+	return nil
+}
+
+func applyNativeDefaults(cfg *core.TencentCloudConfig) {
+	if cfg.Region == "" {
+		cfg.Region = core.TencentCloudRegionFallback
+	}
+	if cfg.Zone == "" {
+		cfg.Zone = core.TencentCloudZoneFallback
+	}
+	if cfg.Type == "" {
+		cfg.Type = core.TencentCloudTypeFallback
+	}
+	if cfg.RootGB == 0 {
+		cfg.RootGB = core.TencentCloudRootGBFallback
+	}
+	if cfg.InternetChargeType == "" {
+		cfg.InternetChargeType = core.TencentCloudInternetChargeTypeFallback
+	}
+	if cfg.InternetMaxBandwidthOut == 0 {
+		cfg.InternetMaxBandwidthOut = core.TencentCloudInternetMaxBandwidthOutFallback
+	}
+}

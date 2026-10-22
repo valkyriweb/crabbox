@@ -20,11 +20,27 @@ crabbox status --provider ssh --target macos --static-host mac-studio.local
 `--id` is optional: status resolves the configured static target or the local
 claim for the current repo.
 
+When `--provider` is omitted, an exact local claim or an unambiguous claimed
+slug selects its recorded provider before that provider is initialized. An
+explicit `--provider` still wins; a slug claimed by multiple providers asks
+you to pass a canonical lease ID or `--provider`, and an identifier without a
+local claim keeps the configured-provider fallback.
+
 Several delegated and direct providers resolve their own native identifiers in
 addition to the Crabbox lease ID and local slug:
 
 - `blacksmith-testbox` — accepts a `tbx_...` ID or local slug; derives a
-  normalized status view from `blacksmith testbox list --all`.
+  normalized status view from exact `blacksmith testbox status --id`, including
+  terminal rows absent from inventory. `--json` without `--wait` returns one
+  snapshot with native `state` and command-readiness `ready`; `completed` does
+  not establish GitHub settlement. `providerMetadata.runURL` exposes the valid
+  exact native GitHub association and `providerMetadata.remoteSettlement` is
+  `complete`, `pending`, or `unknown` (see [remote settlement](../providers/blacksmith-testbox.md#read-only-remote-settlement)).
+  Its readiness wait fails with code 5 on
+  `completed` or `hydration_failed`.
+- `blaxel` — accepts a Crabbox lease ID (`blx_<sandbox-id>`) or local slug,
+  verifies the local claim against Blaxel ownership labels, and reports the
+  sandbox state, endpoint, pond, and readiness.
 - `namespace-devbox` — accepts a lease ID, local slug, or existing Devbox name;
   prepares SSH through the Namespace CLI.
 - `namespace-instance` — accepts a lease ID, local slug, or Compute instance ID;
@@ -36,6 +52,9 @@ addition to the Crabbox lease ID and local slug:
 - `sprites` — resolves local claims, Sprites labels, and SSH readiness through
   `sprite proxy`.
 - `daytona` — resolves Crabbox labels and sandbox state through the Daytona API.
+- `coder` — accepts a Crabbox lease ID, local slug, Coder workspace name, or
+  `owner/workspace`; plain status reads Coder inventory without starting stopped
+  workspaces.
 - `islo` — accepts an `isb_...` ID, a Crabbox-created sandbox name, or a local
   slug.
 - `e2b` — accepts a lease ID, local slug, or a Crabbox-owned E2B sandbox ID in
@@ -49,19 +68,32 @@ addition to the Crabbox lease ID and local slug:
 
 ## Waiting for readiness
 
+For SSH leases, readiness uses the recorded target OS and Windows mode, even
+when the current configuration defaults to a different platform. You do not
+need to repeat the allocation's `--target` or `--windows-mode` flags. Explicit
+flags that contradict the recorded platform are rejected before guest probes.
+Linux leases retain their provider's bootstrap readiness gate.
+
 Plain status never modifies the lease. With `--wait`, status polls every five
 seconds until the box is ready or reaches a terminal state
 (`expired`, `failed`, `released`, `stopped`, `stopped_with_code`,
 `terminated`), and exits non-zero (code 5) if it times out (`--wait-timeout`,
 default `5m`) or the lease becomes terminal before it is ready. For direct
 SSH-lease providers, each poll while waiting also touches the lease to keep it
-from idling out.
+from idling out only when an exact local claim matches the configured provider
+scope and live resource identity. Claimless or mismatched resources remain
+strictly read-only while status waits.
+
+Windows WSL2 snapshots allow up to 30 seconds for WSL startup, SFTP negotiation,
+and the Linux ready check. Other SSH targets retain a four-second probe budget.
+Readiness is checked on every request; a failed probe reports `ready: false`
+even when an earlier request succeeded.
 
 ## Flags
 
 ```text
 --id <lease-id-or-slug>
---provider hetzner|aws|azure|azure-dynamic-sessions|gcp|proxmox|ssh|exe-dev|blacksmith-testbox|namespace-devbox|semaphore|sprites|daytona|islo|e2b|vercel-sandbox
+--provider hetzner|aws|azure|azure-dynamic-sessions|gcp|proxmox|ssh|exe-dev|blacksmith-testbox|blaxel|namespace-devbox|semaphore|sprites|tenki|coder|daytona|islo|e2b|vercel-sandbox
 --target linux|macos|windows
 --windows-mode normal|wsl2
 --static-host <host>
@@ -99,8 +131,28 @@ coordinator has retained recent samples (bounded to the latest 60 per lease) for
 portal trend charts. Under `--wait`, JSON is printed once the lease is ready or
 terminal rather than on every poll.
 
+An enrolled coordinator lease also includes its `lifetimePolicy`: mode,
+`source` (including `admin-canary`), effective compute stop deadline,
+confirmed-stop root-disk deletion deadline, retention duration, status,
+readiness, and owner-visible warnings. Text output appends the same lifetime
+summary. `lifetime_delete_after=-` means the retained-disk deadline has not yet
+been established by a confirmed stop. A distinct `DELETION:` warning describes
+permanent root-disk removal. See [lifecycle cleanup](../features/lifecycle-cleanup.md)
+and [`admin extend-lifetime`](admin.md#extend-lifetime).
+
+For Local Container, non-wait JSON status includes fresh read-only
+`diagnostic.memory.*` labels, as described in
+[`inspect`](inspect.md). These optional observations are not requested by
+`status --wait`, heartbeat, or other lifecycle callers, and do not change claims.
+
 ## See also
 
 - [`inspect`](inspect.md) — fuller lease and provider detail.
 - [`list`](list.md) — all machines for a provider.
 - [`warmup`](warmup.md) — lease a box and wait until ready.
+
+Lifetime output includes `remaining_lifetime`, `max_lifetime`, and the provider
+`runtime_extension` capability when known. JSON uses `remainingLifetime`,
+`maxLifetime`, and `leasePolicy`. `inspect` exposes the same policy. A provider
+with `runtimeExtension: false` requires choosing a longer `--ttl` at creation;
+[extend](extend.md) cannot move its native deadline.

@@ -26,18 +26,20 @@ resource.
 Class names are provider-neutral intent labels:
 
 ```text
+tiny      smoke checks and minimal repositories
+small     small repositories and light CI lanes
 standard  typical CI lane
 fast      more cores for parallel-friendly suites
 large     memory-heavy or many-process workloads
 beast     maximum capacity within the provider's family
 ```
 
-Each provider maps the four class names to an ordered list of concrete
+Each provider maps the six class names to an ordered list of concrete
 instance types. That list *is* the fallback chain: try the first; if it is
 rejected, try the next; and so on until one succeeds or the chain is exhausted.
 
-The full per-provider class tables (including AWS Windows, Windows WSL2, and
-macOS) live in [Providers](providers.md#machine-classes).
+Inspect the compiled per-provider class catalogs (including AWS Windows,
+Windows WSL2, and macOS) as shown in [Providers](providers.md#machine-classes).
 
 ## When Class Fallback Triggers
 
@@ -103,11 +105,14 @@ is `on-demand-after-120s`) enables the On-Demand retry pass; set it to `none`
 (or leave it empty) to never fall back.
 
 The On-Demand pass runs after every Spot candidate in the class chain has been
-tried and rejected — it reruns the same chain on On-Demand. AWS fallback fires
-on provider rejection. Azure also treats a slow Spot VM provisioning operation
-as a capacity miss after the configured `on-demand-after-*` duration, or after
-the default 120 seconds when on-demand fallback is disabled with `spot-only` or
-`none`.
+tried and rejected. AWS retries only the candidates whose individual failures
+are Spot-recoverable, including Spot capacity or quota errors and request errors
+that explicitly identify Spot as unsupported. Market-independent request or
+image errors, such as an invalid block-device mapping, are not retried on
+On-Demand. Azure
+also treats a slow Spot VM provisioning operation as a capacity miss after the
+configured `on-demand-after-*` duration, or after the default 120 seconds when
+on-demand fallback is disabled with `spot-only` or `none`.
 Slow Azure On-Demand creates are bounded too, so the coordinator can keep trying
 the class chain before the CLI lease wait expires.
 
@@ -123,7 +128,30 @@ config. It must be `spot` or `on-demand`. Reach for it when an account is
 temporarily out of Spot quota or when Spot interruption rates spike. The same
 value is also available as the `CRABBOX_CAPACITY_MARKET` environment variable.
 
+### Tencent Cloud Market Selection
+
+Tencent Cloud also honors explicit `spot` and `on-demand` choices, mapping them
+to CVM `SPOTPAID` and `POSTPAID_BY_HOUR`. This is selection only: Tencent does
+not perform market, instance-type, or region fallback, and `capacity.fallback`
+does not change that behavior. Spot requests use Tencent's default discounted
+bid without a Crabbox maximum-price override.
+
+An unconfigured Tencent lease keeps its historical hourly billing, independent
+of the generic `spot` default. After upgrading, an explicitly configured
+`capacity.market: spot`, environment override, CLI flag, or job market now
+requests interruptible Spot capacity; select `on-demand` to keep hourly billing.
+See the [Tencent Cloud provider guide](../providers/tencentcloud.md#capacity-market).
+
 ## AWS Capacity Hints
+
+Successfully provisioned brokered AWS, Azure, and GCP leases retain ordered `provisioningAttempts`, including
+failed candidates from earlier markets and regions or zones. Each record describes
+the actual attempted type, market, location, and provider-classified failure; AWS
+quota preflight rejections are recorded even when no instance launch was needed.
+These diagnostics do not authorize retry or cleanup: each provider still owns
+those decisions and its durable allocation claims.
+Failed brokered leases still report their terminal failure separately; this history
+is not a durable journal of unresolved provisioning or cleanup work.
 
 The brokered AWS path can preflight large requests against Service Quotas:
 
@@ -134,8 +162,9 @@ capacity:
 
 When `hints` is enabled (the shipped default), the broker checks the applied
 Spot or On-Demand vCPU quota for each candidate type before launching it.
-Candidates that exceed the quota are recorded as a quota attempt and skipped, so
-the chain spends launch attempts only on types the account can actually run.
+Candidates that exceed the quota are recorded as a quota attempt and skipped.
+Types that fit the quota ceiling still need enough unused regional quota; the
+preflight does not measure existing usage or Capacity Reservations.
 Brokered failures also emit advisory `CapacityHint` records (for example, when a
 large class is under capacity pressure) alongside `provisioningAttempts`.
 
@@ -152,7 +181,10 @@ crabbox doctor --provider aws
 ```
 
 It reports the applied EC2 vCPU quota for the relevant market(s) and warns when
-the default class needs more vCPUs than the account is allowed.
+the default class needs more vCPUs than the account is allowed. A sufficient
+ceiling reports `capacity=unknown quota_limit=sufficient usage=unchecked`.
+Removing an exact `--type` enables class fallback but does not free quota; a
+smaller type helps only when enough quota remains for it.
 
 ## Region And Availability Zone Routing
 
@@ -166,11 +198,26 @@ capacity:
     - eu-west-1b
 ```
 
-`regions` is the ordered list of brokered AWS regions the coordinator considers.
+Ordinary brokered AWS leases try the requested `aws.region` first, followed by
+the coordinator's preferred region and the configured capacity regions, with
+duplicates removed. Private AWS workspaces and pinned Mac leases retain their
+single-region routing. Promotions from another region do not override the request.
+
+`regions` is the ordered list of additional brokered AWS regions the coordinator
+considers.
 Single-region setups use `aws.region` and leave `capacity.regions` empty;
 multi-region setups list every region the broker may launch into. Regions are
 tried in order: when every candidate type in a region is rejected for a
 retryable reason, Crabbox advances to the next region.
+
+Automatic brokered AWS images are selected for each candidate region. If that
+region has no matching promoted image, Crabbox resolves its normal stock image
+for the requested OS and architecture. If AWS definitively reports an automatic
+promotion missing (`InvalidAMIID.NotFound`), Crabbox retries once with stock and
+records the image failure in the provisioning attempts. Explicit AMIs,
+snapshots, and required image capabilities do not silently switch to stock.
+An empty stock-image lookup permits the next configured region; changing the
+capacity market cannot fix a missing image.
 
 Brokered Azure uses `CRABBOX_AZURE_REGIONS` on the coordinator for its Azure-specific
 region list, so AWS and Azure do not accidentally share incompatible region
@@ -225,9 +272,51 @@ brokered runs — the `provisioningAttempts` you can inspect with `crabbox histo
 
 Related docs:
 
-- [Providers](providers.md)
+- [Provider Reference](../providers/README.md)
 - [AWS](../providers/aws.md)
 - [Hetzner](../providers/hetzner.md)
 - [Cost and usage](cost-usage.md)
 - [Orchestrator](../orchestrator.md)
 - [Operations](../operations.md)
+
+## Optional AWS resource minimums
+
+For a new Linux AWS lease, add `--min-vcpus` and/or `--min-memory-mib` to
+`warmup` or a one-shot `run`. These filter the existing class candidates;
+they do not change their order or turn the preferred type into a minimum.
+For example, a workload needing four vCPUs and 15 GiB can request:
+
+```sh
+crabbox warmup --provider aws --class standard --min-vcpus 4 --min-memory-mib 15360
+```
+
+The matching configuration keys are `capacity.minVCPUs` and
+`capacity.minMemoryMiB`. Values are whole numbers
+from 0 to 2147483647. Zero or omission disables that dimension; command flags
+can override configured values. MiB means 1,048,576 bytes.
+
+Crabbox checks the candidates against EC2 `DescribeInstanceTypes` metadata.
+Candidates below a requested minimum, or with unknown metadata for a requested
+dimension, cannot launch. Metadata lookup failure is reported as an inability
+to verify capacity. An exact `--type` must satisfy the minimum too and retains
+its exact-type behavior. Market and region fallback, quotas and lease lifetimes
+remain unchanged. Without minimums, existing requests retain their current
+candidate lists and advisory metadata behavior.
+
+Both the direct AWS CLI and a supporting coordinator enforce these minimums.
+A constrained request uses a distinct coordinator creation route, so an older
+coordinator fails instead of silently ignoring the fields. Fixed `--lease-id`
+creation binds the minimums to its original request; changing them on replay
+conflicts with that request. Updating the client alone does not add coordinator
+support.
+
+Minimums initially apply to AWS Linux creation on amd64 and arm64. Existing
+lease `--id` reuse, ready pools, checkpoint creation, jobs and prewarm do not
+accept nonzero minimums; unsupported combinations fail before allocation.
+Use creation-time flags when warming a lease for subsequent ordinary `run --id`
+commands. Those commands still require the caller's normal runtime checks.
+
+EC2 metadata describes nominal hardware. Workloads must also check effective
+process CPU and memory limits before expensive preparation or execution, and
+select a concurrency mode that fits both. These options do not guarantee runtime
+headroom, execution duration or a particular worker count.

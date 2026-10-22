@@ -4,6 +4,7 @@ import (
 	"flag"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
@@ -15,17 +16,24 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return []string{"namespace-compute"} }
+var (
+	_ core.ProviderClassProfileProvider = Provider{}
+	_ core.ProviderClassSpecProvider    = Provider{}
+)
+
+var classProfiles = buildClassProfiles()
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      providerName,
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"namespace-compute"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationCLI),
+		Name:             providerName,
+		Family:           providerName,
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionMapped,
 	}
 }
 
@@ -113,14 +121,6 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return &backend{spec: p.Spec(), cfg: cfg, rt: rt}, nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	return backend.(core.DoctorBackend), nil
-}
-
 func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.ServerTypeExplicit && cfg.ServerType != "" {
 		return cfg.ServerType
@@ -128,9 +128,54 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.NamespaceInstance.MachineType != "" {
 		return cfg.NamespaceInstance.MachineType
 	}
+	if candidates, matched := core.ProviderClassCandidatesForProfiles(classProfiles, cfg); matched {
+		return candidates[0]
+	}
+	if core.IsCanonicalProviderClass(cfg.Class) {
+		return ""
+	}
 	return machineTypeForClass(cfg.Class)
 }
 
-func (Provider) ServerTypeForClass(class string) string {
-	return machineTypeForClass(class)
+func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
+	machineType := strings.TrimSpace(cfg.NamespaceInstance.MachineType)
+	return machineType, machineType != ""
+}
+
+func (Provider) ClassProfiles() []core.ProviderClassProfile {
+	return classProfiles
+}
+
+func (Provider) ClassSpecs() []core.ClassSpec {
+	return core.ProviderClassSpecsFromProfiles(classProfiles)
+}
+
+func buildClassProfiles() []core.ProviderClassProfile {
+	types := []string{"1x2", "2x4", "4x8", "8x16", "16x32", "32x64"}
+	classes := core.CanonicalProviderClasses()
+	profiles := make([]core.ProviderClassProfile, 0, len(classes))
+	for index, class := range classes {
+		vcpus, memoryGB := machineShape(types[index])
+		profiles = append(profiles, core.ProviderClassProfileFromMachines(
+			class, core.TargetLinux, "", core.ProviderClassArchitectureAMD64,
+			[]core.ProviderClassMachine{{
+				Type: types[index], Architecture: core.ProviderClassArchitectureAMD64,
+				VCPU: &vcpus, Memory: &core.ProviderMemory{Value: float64(memoryGB), Unit: core.ProviderMemoryUnitGB},
+			}},
+		))
+	}
+	return profiles
+}
+
+func machineShape(machineType string) (int, int) {
+	cpuValue, memoryValue, ok := strings.Cut(strings.ToLower(strings.TrimSpace(machineType)), "x")
+	if !ok || cpuValue == "" || memoryValue == "" || strings.Contains(memoryValue, "x") {
+		return 0, 0
+	}
+	vcpus, cpuErr := strconv.Atoi(cpuValue)
+	memoryGB, memoryErr := strconv.Atoi(memoryValue)
+	if cpuErr != nil || memoryErr != nil || vcpus <= 0 || memoryGB <= 0 {
+		return 0, 0
+	}
+	return vcpus, memoryGB
 }

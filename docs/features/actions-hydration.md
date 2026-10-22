@@ -27,6 +27,21 @@ There are two hydration paths:
 Both paths converge on the same readiness marker, so later `crabbox run`
 commands attach to the hydrated workspace identically.
 
+Before adopting a marker, `run`, `cache warm`, and editor handoffs verify that
+`WORKSPACE` is the exact Git root and its actual `origin` matches the invoking
+repository or the explicitly configured `actions.repo`. Custom workspace paths
+are supported. Missing, unreadable, or mismatched identity fails before sync,
+marker replacement, environment sourcing, or command execution.
+
+For `actions hydrate --github-runner --repo owner/name`, Crabbox records the
+verified target origin and marker identity in the existing local lease claim.
+Later commands from that same checkout can attach without repeating `--repo`.
+Replacement hydration, reclaim, or a changed lease resource clears that consent.
+An older cross-repository marker without this binding is left untouched: rerun
+the explicit GitHub-runner hydration command with `--repo`, or configure the
+intended `actions.repo`. `--reclaim` alone does not authorize a foreign workspace.
+Automatic local hydration still must produce the invoking repository.
+
 ## Supported targets
 
 | Path | Targets |
@@ -56,6 +71,20 @@ You can also hydrate explicitly: `crabbox actions hydrate --id <id>` syncs the
 current checkout and then runs the hydrate workflow. Automatic hydration during
 `crabbox run` reuses the run's own sync rather than syncing twice.
 
+When `--full-resync` starts from an existing readiness marker, Crabbox
+invalidates that marker before resetting the workspace. Runs with a command must
+be able to hydrate the canonical lease workspace locally after sync; unsupported
+targets, `--no-hydrate`, and noncanonical adopted workspaces fail before reset.
+Use `--sync-only` when the intent is to replace the synced tree without
+rehydrating or running a command. Reused leases keep this sequence inside the
+workspace lifecycle owner.
+
+Local hydration captures workflow and composite-action sources, resolves the
+remote workspace, and renders its setup script before invalidating markers or
+sync fingerprints. Invalid or unsupported selected steps therefore fail before
+those mutations; source edits during workspace resolution do not change the
+prepared setup.
+
 ## Local hydration details
 
 For local hydration Crabbox picks the workflow job to run in this order:
@@ -81,7 +110,16 @@ Supported `uses:` steps:
   `persist-credentials`, `set-safe-directory`, and disabled `submodules`/`lfs`
   are accepted, anything else needs `--github-runner`);
 - `actions/setup-node@*`, `actions/setup-go@*`, `actions/setup-python@*` —
-  honoring `*-version` / `*-version-file`;
+  honoring `*-version` / `*-version-file`; setup-node also accepts `cache: pnpm`
+  but explicitly skips cache restore/save (local hydration runs uncached);
+- `pnpm/action-setup@*` — requires an explicit exact `version` (`major.minor.patch`,
+  including simple expressions). Installs that pnpm version into the managed
+  tool cache using npm, without lifecycle scripts. If Node or npm is absent,
+  bootstraps Node 24 so this step can precede setup-node; a later setup-node
+  still selects the requested project runtime. The selected pnpm stays on PATH
+  for hydration and subsequent commands. Version inference/ranges, custom
+  destinations, standalone mode, dependency installation, and caching inputs
+  are not supported; use a separate `run: pnpm install` step;
 - `actions/cache/restore@*` — reports a cache miss;
 - `actions/cache/save@*` — skipped;
 - repo-local composite actions (`./...`).

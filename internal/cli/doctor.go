@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,7 +31,46 @@ type doctorJSONCheck struct {
 func (a App) doctor(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("doctor", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpAll())
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), `Usage:
+  crabbox doctor [flags]
+
+Check local tools and configured broker/provider readiness without creating,
+mutating, or deleting provider resources.
+
+Modes:
+  crabbox doctor                              check configured readiness
+  crabbox doctor --provider aws               check a selected provider strictly
+  crabbox doctor --id blue-box                inspect a lease and probe remote tools
+  crabbox doctor --profile live-qa --id blue-box  check an enabled profile's remote prerequisites
+  crabbox doctor --from-run run_abcdef123456   diagnose a recorded run (requires coordinator)
+  crabbox doctor --pond my-pond               verify an existing pond's Tailscale policy
+  crabbox doctor --all --prepare-check        check the test-runner provider matrix
+  crabbox doctor --json                       print structured check results
+
+Doctor flags:
+  --provider <name>             provider to validate (defaults to configured selection)
+  --profile <name>              profile for remote prerequisite checks
+  --id <lease-id-or-slug>       resolve a lease and run remote SSH/tool checks
+  --from-run <run-id>           load recorded provider, target, lease, and phase context
+  --pond <name>                 verify Tailscale policy setup for this pond
+  --all                         check the test-runner matrix, not every provider
+  --providers <list>            comma-separated providers for --all
+  --prepare-check               include preparation readiness checks with --all
+  --doctor-probe-ssh            opt in to static SSH reachability checks
+  --json                        print JSON
+  --target linux|macos|windows  select the target OS
+  --windows-mode normal|wsl2    select the Windows execution mode
+
+With no selected provider, doctor checks local readiness and skips provider
+credentials with a warning. Configured broker checks may still access the network.
+Profile prerequisite checks require doctor.enabled and do not support native Windows.
+
+All flags:
+`)
+		fs.PrintDefaults()
+	}
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpAll())
 	profile := fs.String("profile", defaults.Profile, "configured profile for remote prerequisite checks")
 	id := fs.String("id", "", "remote lease id to inspect")
 	fromRun := fs.String("from-run", "", "recorded run id to use for provider, target, lease, and phase context")
@@ -49,11 +89,12 @@ func (a App) doctor(ctx context.Context, args []string) error {
 		return a.doctorAll(ctx, doctorAllOptions{Providers: splitCommaList(*providersFlag), JSON: *jsonOut, PrepareCheck: *prepareCheck})
 	}
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
 	cfg.Profile = strings.TrimSpace(*profile)
+	recordConfigInput(&cfg, configInputGeneric, configInputFlag, flagWasSet(fs, "profile"))
 	if err := applySelectedProfileConfig(&cfg); err != nil {
 		return err
 	}
@@ -63,11 +104,17 @@ func (a App) doctor(ctx context.Context, args []string) error {
 			return err
 		}
 		cfg.Pond = pondName
+		recordConfigInput(&cfg, configInputGeneric, configInputFlag, true)
 	}
 	resolvedDoctorID := strings.TrimSpace(*id)
 	ok := true
 	var checks []doctorJSONCheck
 	record := func(status, check, message string, details map[string]string) {
+		secrets := configuredDiagnosticSecrets(cfg)
+		status = RedactDiagnosticSecrets(status, secrets...)
+		check = RedactDiagnosticSecrets(check, secrets...)
+		message = RedactDiagnosticSecrets(message, secrets...)
+		details = redactDiagnosticDetails(details, secrets)
 		if *jsonOut {
 			item := doctorJSONCheck{Status: status, Check: check, Message: message, Details: details}
 			if details != nil {
@@ -121,12 +168,16 @@ func (a App) doctor(ctx context.Context, args []string) error {
 			record(status, "pond", message, details)
 		}
 		if *jsonOut {
-			if err := json.NewEncoder(a.Stdout).Encode(doctorJSONOutput{OK: ok, Provider: cfg.Provider, Checks: checks}); err != nil {
+			provider := cfg.Provider
+			if !providerSelectionIsActionable(cfg) {
+				provider = ""
+			}
+			if err := json.NewEncoder(a.Stdout).Encode(doctorJSONOutput{OK: ok, Provider: provider, Checks: checks}); err != nil {
 				return err
 			}
 		}
 		if !ok {
-			return exit(1, "doctor found problems")
+			return Exit(1, "doctor found problems")
 		}
 		return nil
 	}
@@ -135,7 +186,7 @@ func (a App) doctor(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		if run.Provider != "" {
+		if run.Provider != "" && !flagWasSet(fs, "provider") {
 			*provider = run.Provider
 		}
 		if resolvedDoctorID == "" && run.LeaseID != "" {
@@ -171,10 +222,13 @@ func (a App) doctor(ctx context.Context, args []string) error {
 	if err := prepareProviderSelection(&cfg, *provider); err != nil {
 		return err
 	}
+	if flagWasSet(fs, "provider") {
+		cfg.providerSelectionSource = providerSelectionFlag
+	}
 	if err := applyTargetFlagOverrides(&cfg, fs, targetFlags); err != nil {
 		return err
 	}
-	if err := autoRouteExternalLease(&cfg, fs, resolvedDoctorID); err != nil {
+	if err := autoRouteLeaseProviderForIdentifier(&cfg, fs, resolvedDoctorID); err != nil {
 		return err
 	}
 	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
@@ -183,19 +237,37 @@ func (a App) doctor(ctx context.Context, args []string) error {
 	if err := finalizeProviderSelection(&cfg); err != nil {
 		return err
 	}
+	providerSelected := providerSelectionIsActionable(cfg)
 	var providerDef Provider
-	if resolvedDoctorID == "" {
-		providerDef, err = validateProviderTargetSupport(cfg)
-		if err != nil {
-			return err
-		}
-	} else {
-		providerDef, err = ProviderFor(cfg.Provider)
-		if err != nil {
-			return err
+	if providerSelected {
+		if resolvedDoctorID == "" {
+			providerDef, err = validateProviderTargetSupport(cfg)
+			if err != nil {
+				return err
+			}
+		} else {
+			providerDef, err = ProviderFor(cfg.Provider)
+			if err != nil {
+				return err
+			}
 		}
 	}
-	for _, tool := range doctorLocalTools(providerDef.Spec()) {
+	providerSpec := ProviderSpec{}
+	if providerSelected {
+		providerSpec = providerDef.Spec()
+		record("ok", "provider-selection", fmt.Sprintf("provider=%s source=%s selected=true", cfg.Provider, cfg.providerSelectionSource), map[string]string{
+			"provider": cfg.Provider,
+			"source":   string(cfg.providerSelectionSource),
+			"selected": "true",
+		})
+	} else {
+		record("ok", "provider-selection", fmt.Sprintf("no provider selected source=%s selected=false", cfg.providerSelectionSource), map[string]string{
+			"provider": "",
+			"source":   string(cfg.providerSelectionSource),
+			"selected": "false",
+		})
+	}
+	for _, tool := range doctorLocalTools(providerSpec) {
 		path, err := exec.LookPath(tool)
 		if err != nil {
 			record("missing", tool, "", map[string]string{"tool": tool})
@@ -217,7 +289,7 @@ func (a App) doctor(ctx context.Context, args []string) error {
 			remote := "printf 'git='; git --version; printf 'rsync='; rsync --version | head -1; printf 'curl='; curl --version | head -1; printf 'jq='; jq --version"
 			if cfg.Profiles[cfg.Profile].Doctor.Enabled {
 				if isWindowsNativeTarget(target) {
-					return exit(2, "profile doctor is not supported for native Windows targets")
+					return Exit(2, "profile doctor is not supported for native Windows targets")
 				}
 				remote = remoteProfileDoctorCommand(cfg.Profile, cfg.Profiles[cfg.Profile].Doctor, profileDoctorWorkdirForLease(cfg, leaseID))
 			}
@@ -231,9 +303,13 @@ func (a App) doctor(ctx context.Context, args []string) error {
 					record("failed", "remote", fmt.Sprintf("%s\n%s", resolvedDoctorID, strings.TrimSpace(out)), map[string]string{"id": resolvedDoctorID})
 				}
 				if *jsonOut {
-					_ = json.NewEncoder(a.Stdout).Encode(doctorJSONOutput{OK: false, Provider: cfg.Provider, Checks: checks})
+					provider := cfg.Provider
+					if !providerSelected {
+						provider = ""
+					}
+					_ = json.NewEncoder(a.Stdout).Encode(doctorJSONOutput{OK: false, Provider: provider, Checks: checks})
 				}
-				return exit(7, "remote doctor failed for %s: %v", resolvedDoctorID, err)
+				return Exit(7, "remote doctor failed for %s: %v", resolvedDoctorID, err)
 			}
 			record("ok", "remote", fmt.Sprintf("%s\n%s", resolvedDoctorID, out), map[string]string{"id": resolvedDoctorID})
 		}
@@ -241,11 +317,15 @@ func (a App) doctor(ctx context.Context, args []string) error {
 	if os.Getenv("CRABBOX_SERVER_TYPE") == "" {
 		applyServerTypeFlagOverrides(&cfg, fs, "")
 	}
-	if largeDefaultServerType(cfg) {
+	if providerSelected && largeDefaultServerType(cfg) {
 		record("warning", "capacity", fmt.Sprintf("provider=%s class=%s type=%s large_default=true hint=set class/type in .crabbox.yaml for routine tests", cfg.Provider, cfg.Class, cfg.ServerType), map[string]string{"provider": cfg.Provider, "class": cfg.Class, "type": cfg.ServerType, "large_default": "true"})
 	}
 	useCoordinator := false
-	if shouldUseCoordinator(cfg, providerDef.Spec()) {
+	useCoordinatorForDoctor := cfg.BrokerMode != BrokerModeRegistered && strings.TrimSpace(cfg.Coordinator) != ""
+	if providerSelected {
+		useCoordinatorForDoctor = ShouldUseCoordinator(cfg, providerDef.Spec())
+	}
+	if useCoordinatorForDoctor {
 		if coord, coordinatorConfigured, err := newTargetCoordinatorClient(cfg); err != nil {
 			record("failed", "coord", err.Error(), nil)
 			ok = false
@@ -255,7 +335,8 @@ func (a App) doctor(ctx context.Context, args []string) error {
 				record("failed", "coord", err.Error(), nil)
 				ok = false
 			} else {
-				record("ok", "coord", fmt.Sprintf("%s access=%s", cfg.Coordinator, accessAuthState(cfg.Access)), map[string]string{"url": cfg.Coordinator, "access": accessAuthState(cfg.Access)})
+				coordinatorURL := redactedConfigURL(cfg.Coordinator)
+				record("ok", "coord", fmt.Sprintf("%s access=%s", coordinatorURL, accessAuthState(cfg.Access)), map[string]string{"url": coordinatorURL, "access": accessAuthState(cfg.Access)})
 				brokerOK := true
 				if whoami, err := coord.Whoami(ctx); err != nil {
 					class := doctorErrorClass(err)
@@ -263,17 +344,33 @@ func (a App) doctor(ctx context.Context, args []string) error {
 						class = "broker_auth"
 					}
 					hint := doctorErrorHint("broker", class)
-					record("failed", "broker", fmt.Sprintf("class=%s hint=%s %v", class, hint, err), map[string]string{"class": class, "hint": hint, "error": err.Error()})
+					message := fmt.Sprintf("class=%s hint=%s %v", class, hint, err)
+					details := map[string]string{"class": class, "hint": hint, "error": err.Error()}
+					if class == "broker_auth" {
+						if tokenInfo, ok := brokerTokenInfo(cfg.CoordToken, time.Now()); ok {
+							details["token_expires"] = tokenInfo.expiresAt
+							details["token_state"] = tokenInfo.state
+							if tokenInfo.state == "expired" {
+								message = fmt.Sprintf("class=%s hint=%s token_state=expired token_expires=%s %v", class, hint, tokenInfo.expiresAt, err)
+							}
+						}
+					}
+					record("failed", "broker", message, details)
 					ok = false
 					brokerOK = false
 				} else {
-					details := map[string]string{"auth": whoami.Auth, "owner": whoami.Owner, "org": whoami.Org, "default_type": cfg.ServerType}
+					details := map[string]string{"auth": whoami.Auth, "owner": whoami.Owner, "org": whoami.Org}
+					defaultType := ""
+					if providerSelected {
+						defaultType = cfg.ServerType
+						details["default_type"] = defaultType
+					}
 					if whoami.TokenExpiresAt != "" {
 						details["token_expires"] = whoami.TokenExpiresAt
 					}
-					record("ok", "broker", doctorBrokerOKMessage(whoami, cfg.ServerType), details)
+					record("ok", "broker", doctorBrokerOKMessage(whoami, defaultType), details)
 				}
-				if brokerOK && coordinatorProviderReadinessSupported(cfg.Provider) {
+				if brokerOK && providerSelected && coordinatorProviderReadinessSupported(cfg.Provider) {
 					readiness, err := coord.ProviderReadiness(ctx, cfg)
 					if err == nil {
 						if readiness.Configured {
@@ -296,7 +393,7 @@ func (a App) doctor(ctx context.Context, args []string) error {
 						ok = false
 					}
 				}
-				if cfg.CoordAdminToken != "" {
+				if providerSelected && cfg.CoordAdminToken != "" {
 					adminCfg := cfg
 					adminCfg.CoordToken = cfg.CoordAdminToken
 					adminCfg.CoordTokenCommand = nil
@@ -323,7 +420,7 @@ func (a App) doctor(ctx context.Context, args []string) error {
 		if _, err := os.Stat(cfg.SSHKey); err != nil {
 			record("missing", "ssh-key", cfg.SSHKey, map[string]string{"path": cfg.SSHKey})
 			ok = false
-		} else if _, err := publicKeyFor(cfg.SSHKey); err != nil {
+		} else if _, err := PublicKeyFor(cfg.SSHKey); err != nil {
 			record("missing", "ssh-key", cfg.SSHKey+".pub", map[string]string{"path": cfg.SSHKey + ".pub"})
 			ok = false
 		} else {
@@ -332,67 +429,66 @@ func (a App) doctor(ctx context.Context, args []string) error {
 	} else {
 		record("ok", "ssh-key", "per-lease", map[string]string{"mode": "per-lease"})
 	}
+	if !providerSelected {
+		record("warning", "provider", fmt.Sprintf("no provider selected source=%s selected=false readiness=skipped hint=select_provider_with_flag_env_or_config", cfg.providerSelectionSource), map[string]string{
+			"provider":  "",
+			"source":    string(cfg.providerSelectionSource),
+			"selected":  "false",
+			"readiness": "skipped",
+			"hint":      "select_provider_with_flag_env_or_config",
+		})
+		return finish()
+	}
 
 	if useCoordinator {
 		return finish()
 	}
 
-	doctorProvider, doctorSupported := providerDef.(DoctorProvider)
-	if doctorSupported {
-		if err := validateProviderConfig(cfg); err != nil {
-			class := doctorErrorClass(err)
-			hint := doctorErrorHint(providerDef.Name(), class)
-			record("failed", "provider", fmt.Sprintf("provider=%s class=%s hint=%s %v", providerDef.Name(), class, hint, err), map[string]string{"provider": providerDef.Name(), "class": class, "hint": hint, "error": err.Error()})
-			ok = false
-			return finish()
-		}
-		doctor, err := doctorProvider.ConfigureDoctor(cfg, runtimeForApp(a))
+	if err := validateProviderConfig(cfg); err != nil {
+		class := doctorErrorClass(err)
+		hint := doctorErrorHint(providerDef.Spec().Name, class)
+		record("failed", "provider", fmt.Sprintf("provider=%s class=%s hint=%s %v", providerDef.Spec().Name, class, hint, err), map[string]string{"provider": providerDef.Spec().Name, "class": class, "hint": hint, "error": err.Error()})
+		ok = false
+		return finish()
+	}
+	doctor, err := ConfigureProviderDoctor(providerDef, cfg, runtimeForApp(a))
+	if err != nil {
+		class := doctorErrorClass(err)
+		hint := doctorErrorHint(providerDef.Spec().Name, class)
+		record("failed", "provider", fmt.Sprintf("provider=%s class=%s hint=%s %v", providerDef.Spec().Name, class, hint, err), map[string]string{"provider": providerDef.Spec().Name, "class": class, "hint": hint, "error": err.Error()})
+		ok = false
+	} else if doctor == nil {
+		record("skip", "provider", fmt.Sprintf("provider=%s direct_doctor=unsupported", providerDef.Spec().Name), map[string]string{"provider": providerDef.Spec().Name, "direct_doctor": "unsupported"})
+	} else {
+		doctorCtx, cancel := context.WithTimeout(ctx, doctorProviderTimeout)
+		result, err := doctor.Doctor(doctorCtx, DoctorRequest{ProbeSSH: *probeSSH})
+		cancel()
 		if err != nil {
 			class := doctorErrorClass(err)
-			hint := doctorErrorHint(providerDef.Name(), class)
-			record("failed", "provider", fmt.Sprintf("provider=%s class=%s hint=%s %v", providerDef.Name(), class, hint, err), map[string]string{"provider": providerDef.Name(), "class": class, "hint": hint, "error": err.Error()})
+			hint := doctorErrorHint(doctor.Spec().Name, class)
+			record("failed", "provider", fmt.Sprintf("provider=%s class=%s hint=%s %v", doctor.Spec().Name, class, hint, err), map[string]string{"provider": doctor.Spec().Name, "class": class, "hint": hint, "error": err.Error(), "timeout": doctorProviderTimeout.String()})
 			ok = false
 		} else {
-			doctorCtx, cancel := context.WithTimeout(ctx, doctorProviderTimeout)
-			result, err := doctor.Doctor(doctorCtx, DoctorRequest{ProbeSSH: *probeSSH})
-			cancel()
-			if err != nil {
-				class := doctorErrorClass(err)
-				hint := doctorErrorHint(doctor.Spec().Name, class)
-				record("failed", "provider", fmt.Sprintf("provider=%s class=%s hint=%s %v", doctor.Spec().Name, class, hint, err), map[string]string{"provider": doctor.Spec().Name, "class": class, "hint": hint, "error": err.Error(), "timeout": doctorProviderTimeout.String()})
-				ok = false
+			if len(result.Checks) > 0 {
+				for _, check := range result.Checks {
+					recordProviderDoctorCheck(result.Provider, check)
+				}
 			} else {
-				if len(result.Checks) > 0 {
-					for _, check := range result.Checks {
-						recordProviderDoctorCheck(result.Provider, check)
-					}
-				} else {
-					status := strings.TrimSpace(result.Status)
-					if status == "" {
-						status = "ok"
-					}
-					message := fmt.Sprintf("provider=%s timeout=%s %s", result.Provider, doctorProviderTimeout, result.Message)
-					details := parseDoctorDetails(result.Message)
-					details["provider"] = result.Provider
-					details["timeout"] = doctorProviderTimeout.String()
-					record(status, "provider", message, details)
-					if doctorStatusFails(status) {
-						ok = false
-					}
+				status := strings.TrimSpace(result.Status)
+				if status == "" {
+					status = "ok"
+				}
+				message := fmt.Sprintf("provider=%s timeout=%s %s", result.Provider, doctorProviderTimeout, result.Message)
+				details := parseDoctorDetails(result.Message)
+				details["provider"] = result.Provider
+				details["timeout"] = doctorProviderTimeout.String()
+				record(status, "provider", message, details)
+				if doctorStatusFails(status) {
+					ok = false
 				}
 			}
 		}
-		return finish()
 	}
-
-	if providerDef.Spec().Kind == ProviderKindDelegatedRun {
-		if !doctorSupported {
-			record("skip", "provider", fmt.Sprintf("provider=%s direct_doctor=unsupported", providerDef.Name()), map[string]string{"provider": providerDef.Name(), "direct_doctor": "unsupported"})
-		}
-		return finish()
-	}
-
-	record("skip", "provider", fmt.Sprintf("provider=%s direct_doctor=unsupported", providerDef.Name()), map[string]string{"provider": providerDef.Name(), "direct_doctor": "unsupported"})
 	return finish()
 }
 
@@ -402,7 +498,7 @@ func applyDoctorFromRunContext(ctx context.Context, cfg *Config, runID string) (
 		return CoordinatorRun{}, nil, err
 	}
 	if !ok {
-		return CoordinatorRun{}, nil, exit(2, "doctor --from-run requires a configured coordinator")
+		return CoordinatorRun{}, nil, Exit(2, "doctor --from-run requires a configured coordinator")
 	}
 	run, err := coord.Run(ctx, runID)
 	if err != nil {
@@ -410,7 +506,7 @@ func applyDoctorFromRunContext(ctx context.Context, cfg *Config, runID string) (
 	}
 	var missing []string
 	if strings.TrimSpace(run.Provider) != "" {
-		cfg.Provider = strings.TrimSpace(run.Provider)
+		setProviderSelection(cfg, strings.TrimSpace(run.Provider), providerSelectionRecordedRun)
 		prepareProviderDefaults(cfg)
 	} else {
 		missing = append(missing, "provider")
@@ -539,6 +635,20 @@ func doctorProviderMessage(provider, message string) string {
 	return strings.Join(fields, " ")
 }
 
+// DoctorChecksStatus returns failed, warning, or ok without modifying checks or their details.
+func DoctorChecksStatus(checks []DoctorCheck) string {
+	status := "ok"
+	for _, check := range checks {
+		if doctorStatusFails(check.Status) {
+			return "failed"
+		}
+		if strings.TrimSpace(strings.ToLower(check.Status)) == "warning" {
+			status = "warning"
+		}
+	}
+	return status
+}
+
 func doctorStatusFails(status string) bool {
 	switch strings.TrimSpace(strings.ToLower(status)) {
 	case "failed", "missing":
@@ -553,12 +663,49 @@ func doctorBrokerOKMessage(whoami CoordinatorWhoami, serverType string) string {
 		"auth=" + whoami.Auth,
 		"owner=" + whoami.Owner,
 		"org=" + whoami.Org,
-		"default_type=" + serverType,
+	}
+	if strings.TrimSpace(serverType) != "" {
+		parts = append(parts, "default_type="+serverType)
 	}
 	if whoami.TokenExpiresAt != "" {
 		parts = append(parts, "token_expires="+whoami.TokenExpiresAt)
 	}
 	return strings.Join(parts, " ")
+}
+
+type localBrokerTokenInfo struct {
+	expiresAt string
+	state     string
+}
+
+func brokerTokenInfo(token string, now time.Time) (localBrokerTokenInfo, bool) {
+	if !strings.HasPrefix(token, "cbxu_") {
+		return localBrokerTokenInfo{}, false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(token, "cbxu_"), ".", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return localBrokerTokenInfo{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return localBrokerTokenInfo{}, false
+	}
+	var decoded struct {
+		Type string `json:"typ"`
+		Exp  int64  `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return localBrokerTokenInfo{}, false
+	}
+	if decoded.Type != "crabbox-user" || decoded.Exp <= 0 {
+		return localBrokerTokenInfo{}, false
+	}
+	expiresAt := time.Unix(decoded.Exp, 0).UTC()
+	state := "present"
+	if !now.Before(expiresAt) {
+		state = "expired"
+	}
+	return localBrokerTokenInfo{expiresAt: expiresAt.Format(time.RFC3339), state: state}, true
 }
 
 func doctorErrorClass(err error) string {
@@ -572,6 +719,9 @@ func doctorErrorClass(err error) string {
 	switch {
 	case strings.Contains(message, "timed out") || strings.Contains(message, "timeout") || strings.Contains(message, "deadline"):
 		return "timeout"
+	case strings.Contains(message, "dial unix ") && strings.Contains(message, "no such file"):
+		// A missing daemon socket is an endpoint failure, not a missing CLI.
+		return "network"
 	case strings.Contains(message, "executable file not found") || strings.Contains(message, "not found in $path") || strings.Contains(message, "no such file"):
 		return "tool"
 	case strings.Contains(message, "missing") || strings.Contains(message, "required") || strings.Contains(message, "not configured") || strings.Contains(message, "empty config"):

@@ -1,0 +1,227 @@
+# bench
+
+`crabbox bench` records and reports local benchmark timing observations. It is a
+local evidence workflow, not a provider leaderboard.
+
+Benchmark rows are append-only JSONL records. They wrap the existing
+`TimingReport` payload with local comparison context such as command
+fingerprint, command display text, provider family/kind, repo fingerprint, and
+cold/warm state when known. Crabbox only writes this ledger when explicitly
+requested.
+
+Default store:
+
+```text
+<CrabboxStateDir()>/timings.jsonl
+```
+
+`CrabboxStateDir()` uses `$XDG_STATE_HOME/crabbox` when set; otherwise it uses
+the user config directory's `crabbox/state` directory.
+
+## Record from a run
+
+Use `run --timing-record` to append the final timing report from a real run:
+
+```sh
+crabbox run --timing-record=default -- pnpm test
+crabbox run --timing-record ./bench/timings.jsonl --provider aws -- pnpm test
+```
+
+Plain `crabbox run` remains non-recording by default.
+
+## Run and record a benchmark
+
+`bench run` runs the same command for each selected provider and repeat, then
+records observations in the benchmark store:
+
+```sh
+crabbox bench run --providers aws,hetzner --repeats 3 -- pnpm test
+crabbox bench run --provider aws --cold -- go test ./...
+```
+
+The command uses the same execution path as `crabbox run`, so provider setup,
+sync, command streaming, timing, and normal cleanup behavior stay centralized.
+If any provider or repeat fails, Crabbox continues the remaining attempts and
+exits non-zero after printing the number of recorded observations. Use
+`--store <path>` to write a specific JSONL store; the default is the local state
+store.
+
+## Record an existing timing JSON payload
+
+`bench record` ingests one saved `TimingReport` JSON object from a file or
+stdin:
+
+```sh
+crabbox bench record --timing-json timing.json --command "pnpm test" --cold
+```
+
+`--command` or command args after `--` set the command display text and command
+fingerprint used for grouping:
+
+```sh
+crabbox bench record --timing-json timing.json -- pnpm test
+```
+
+## Report local observations
+
+`bench report` reads the local store and groups observations by record source,
+provider, provider family/kind, machine type, command fingerprint, and
+cold/warm bucket. Records without a source use the `unknown` source bucket.
+
+```sh
+crabbox bench report
+crabbox bench report --since 7d --providers aws,hetzner
+crabbox bench report --command-fingerprint sha256:... --json
+```
+
+`--since` accepts Go durations such as `24h` and whole days such as `7d`.
+Values beyond Go's duration range (more than 106751 whole days) are rejected
+instead of changing the report cutoff through integer overflow.
+
+Human output includes successful sample count (`n`), median total duration, p95
+total duration when enough samples exist, median sync and command duration,
+failure count, and an evidence marker. When records contain runner telemetry,
+the report also includes median and p95 runner totals plus deterministic runner
+and sync phase summaries. Duplicate phase names within one observation are
+summed before that observation contributes one sample. Runner phases with the
+same name remain separate when one is opaque and the other is not.
+
+Only successful observations contribute duration and phase distributions.
+Failed observations contribute to `failureCount` only. P95 values require at
+least three samples for that specific metric or phase. Sync skip counts are
+counted once per successful observation. Legacy records without runner or phase
+fields omit those summaries.
+
+`bench report` marks groups as `insufficient_successful_samples` until the
+group has at least `--min-samples` successful observations. The default is `2`.
+`runnerTotalN` reports how many successful observations contained runner total
+telemetry.
+
+JSON output uses the same grouped data:
+
+```json
+{
+  "schemaVersion": 1,
+  "storePath": ".../timings.jsonl",
+  "filters": {
+    "since": "7d",
+    "providers": ["aws"],
+    "minSamples": 2
+  },
+  "groups": [
+    {
+      "source": "bench-run",
+      "provider": "aws",
+      "providerFamily": "aws",
+      "providerKind": "ssh-lease",
+      "machineType": "c7a.large",
+      "commandFingerprint": "sha256:...",
+      "n": 2,
+      "runnerTotalN": 2,
+      "medianTotalMs": 64000,
+      "medianRunnerTotalMs": 67000,
+      "medianSyncMs": 12000,
+      "medianCommandMs": 45000,
+      "runnerPhases": [
+        {
+          "name": "provider.acquire",
+          "n": 2,
+          "medianMs": 8500
+        }
+      ],
+      "syncPhases": [
+        {
+          "name": "rsync",
+          "n": 2,
+          "medianMs": 9200
+        }
+      ],
+      "failureCount": 0,
+      "insufficientEvidence": false,
+      "evidence": "sufficient_local_samples"
+    }
+  ]
+}
+```
+
+## Check runner timing policy
+
+`bench check` applies one policy to every group selected by the existing store,
+provider, command fingerprint, and recency filters:
+
+```sh
+crabbox bench check --since 24h --providers aws,hetzner \
+  --max-p95-runner-total 5s
+crabbox bench check --command-fingerprint sha256:... \
+  --min-samples 5 --max-failures 1 --max-p95-runner-total 8s --json
+```
+
+Every matched group must have at least `--min-samples` successful observations,
+no more than `--max-failures`, enough runner total observations to calculate a
+p95, and a p95 runner total at or below the required duration. Runner total
+evidence must contain at least three samples even when `--min-samples` is lower.
+The defaults are three successful samples and zero failures.
+
+The command exits `0` only when every matched group passes. It exits `1` for no
+matches or any policy failure, including missing runner telemetry, and exits `2`
+for invalid flags, durations, or stores. With `--json`, schema version 1 output
+is written before a policy exit of `1`. Check JSON is deterministic and excludes
+the store path, raw timing records, command text, command fingerprints, and
+lease or run IDs.
+
+Treat `bench check --json` as local, private evidence. It can still identify
+the selected provider and machine type, so it is not a publication format.
+Public workflows must project the result through a separate exact-key
+allowlist instead of uploading or copying this JSON directly.
+
+## Privacy and interpretation
+
+Timing records can include repo paths, workdirs, command display text, labels,
+artifact paths, and lease metadata because they preserve the existing
+`TimingReport` payload. Treat the store as local private state. Delete it when
+you no longer want the observations.
+
+Reports say what happened locally for matching workloads. They do not claim that
+one provider is fastest globally, do not publish measurements, and do not infer
+cost unless a future record includes a defensible cost basis.
+
+## Flags
+
+```text
+bench run:
+--store default|path        JSONL store destination (default: default)
+--provider <name>           run one provider
+--providers a,b             run comma-separated providers
+--repeats <n>               repeat count per provider (default: 1)
+--cold                      mark observations as cold runs
+--warm                      mark observations as warm/reused runs
+
+bench record:
+--store default|path        JSONL store destination (default: default)
+--timing-json path|-        TimingReport JSON input, or stdin with -
+--source <label>            record source label
+--command <text>            command display text for grouping
+--cold                      mark observation as a cold run
+--warm                      mark observation as a warm/reused run
+--repeat-index <n>          one-based repeat index when known
+
+bench report:
+--store default|path        JSONL store to read (default: default)
+--provider <name>           include one provider
+--providers a,b             include comma-separated providers
+--command-fingerprint <id>  include one command fingerprint
+--since <duration>          include records since 7d, 24h, etc.
+--min-samples <n>           successful samples required for sufficient evidence
+--json                      print machine-readable report JSON
+
+bench check:
+--store default|path        JSONL store to read (default: default)
+--provider <name>           include one provider
+--providers a,b             include comma-separated providers
+--command-fingerprint <id>  include one command fingerprint
+--since <duration>          include records since 7d, 24h, etc.
+--min-samples <n>           successful samples required per group (default: 3)
+--max-failures <n>          failed observations allowed per group (default: 0)
+--max-p95-runner-total <d>  required positive p95 runner total limit
+--json                      print deterministic machine-readable check JSON
+```

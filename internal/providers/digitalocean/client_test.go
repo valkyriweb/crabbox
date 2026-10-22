@@ -8,12 +8,51 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+func newDigitalOceanTestClient(t *testing.T, server *httptest.Server, token string) *digitalOceanClient {
+	t.Helper()
+	t.Setenv("DIGITALOCEAN_TOKEN", token)
+	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.baseURL = server.URL
+	return client
+}
+
+func TestDigitalOceanAcquisitionReadinessHTTP(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/droplets/42" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = io.WriteString(w, `{"droplet":{"id":42,"status":"new","networks":{"v4":[]}}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"droplet":{"id":42,"status":"off","networks":{"v4":[{"ip_address":"203.0.113.42","type":"public"}]}}}`)
+	}))
+	defer server.Close()
+	client := newDigitalOceanTestClient(t, server, "fixture-token")
+	got, err := new(digitalOceanLeaseBackend).waitForDropletIP(context.Background(), client, 42, time.Minute)
+	if err != nil || got.ID != 42 || publicIPv4(got) != "203.0.113.42" || calls.Load() != 2 {
+		t.Fatalf("droplet=%#v err=%v requests=%d", got, err, calls.Load())
+	}
+	t.Log("production HTTP client: two observations, pending to public IP while off")
+}
 
 func TestDigitalOceanClientCreateDropletRequestShape(t *testing.T) {
 	var requests []struct {
@@ -85,12 +124,7 @@ func TestDigitalOceanClientCreateDropletRequestShape(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "secret-token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "secret-token")
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	cfg.TargetOS = core.TargetLinux
@@ -131,12 +165,7 @@ func TestDigitalOceanClientAccountIDPrefersTeamContext(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	accountID, err := client.AccountID(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -197,18 +226,13 @@ func TestDigitalOceanClientCreateDropletRollsBackKeyOnSemanticTagCollision(t *te
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	cfg.TargetOS = core.TargetLinux
 	cfg.ServerType = "s-1vcpu-1gb"
 
-	_, err = client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
+	_, err := client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
 	if err == nil || !strings.Contains(err.Error(), `conflicts with existing account tag "Crabbox:Slug:Blue"`) {
 		t.Fatalf("CreateDroplet err=%v", err)
 	}
@@ -256,12 +280,7 @@ func TestDigitalOceanClientCreateDropletRetriesWithCanonicalTags(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	cfg.TargetOS = core.TargetLinux
@@ -308,13 +327,8 @@ func TestDigitalOceanClientReplaceDropletTagsDetachesObsoleteCrabboxTags(t *test
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
-	err = client.ReplaceDropletTags(
+	client := newDigitalOceanTestClient(t, server, "token")
+	err := client.ReplaceDropletTags(
 		context.Background(),
 		42,
 		[]string{tagCrabbox, "crabbox:lease:cbx_abcdef123456", "crabbox:state:running", "crabbox:last_touched_at:100", "other"},
@@ -369,12 +383,7 @@ func TestDigitalOceanClientReplaceDropletTagsUsesCanonicalTagName(t *testing.T) 
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	if err := client.ReplaceDropletTags(
 		context.Background(),
 		42,
@@ -408,12 +417,7 @@ func TestDigitalOceanClientEnsureTagRejectsUnconfirmedConflict(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	if _, err := client.EnsureTag(context.Background(), "crabbox:state:ready", map[string]string{}); err == nil {
 		t.Fatal("EnsureTag unexpectedly suppressed unconfirmed 422")
 	}
@@ -430,12 +434,7 @@ func TestDigitalOceanClientEnsureTagRejectsSemanticCanonicalCollision(t *testing
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	if _, err := client.EnsureTag(context.Background(), "crabbox:slug:blue", map[string]string{}); err == nil {
 		t.Fatal("EnsureTag accepted semantic canonical collision")
 	}
@@ -458,13 +457,8 @@ func TestDigitalOceanClientReplaceDropletTagsSkipsUnchangedSet(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
-	tags := []string{tagCrabbox, "crabbox:lease:cbx_1", "crabbox:state:ready"}
+	client := newDigitalOceanTestClient(t, server, "token")
+	tags := []string{tagCrabbox, "crabbox:lease:cbx_111111111111", "crabbox:state:ready"}
 	if err := client.ReplaceDropletTags(context.Background(), 42, tags, append([]string(nil), tags...)); err != nil {
 		t.Fatal(err)
 	}
@@ -500,17 +494,12 @@ func TestDigitalOceanClientCreateDropletRollsBackNewSSHKeyOnCreateFailure(t *tes
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	cfg.TargetOS = core.TargetLinux
 	cfg.ServerType = "s-1vcpu-1gb"
-	_, err = client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
+	_, err := client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
 	if err == nil {
 		t.Fatal("CreateDroplet succeeded")
 	}
@@ -520,53 +509,50 @@ func TestDigitalOceanClientCreateDropletRollsBackNewSSHKeyOnCreateFailure(t *tes
 }
 
 func TestDigitalOceanClientCreateDropletPreservesKeyOnAmbiguousFailure(t *testing.T) {
-	var deleteKey bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/account/keys":
-			_, _ = w.Write([]byte(`{"ssh_keys":[],"links":{"pages":{}}}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/account/keys":
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"ssh_key":{"id":123,"name":"crabbox-cbx-abcdef123456","fingerprint":"fp","public_key":"ssh-ed25519 test"}}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/droplets":
-			http.Error(w, "temporary failure", http.StatusInternalServerError)
-		case r.Method == http.MethodGet && r.URL.Path == "/tags":
-			writeDigitalOceanTagList(t, w)
-		case r.Method == http.MethodGet && r.URL.Path == "/droplets":
-			_, _ = w.Write([]byte(`{"droplets":[],"links":{"pages":{}}}`))
-		case r.Method == http.MethodDelete && r.URL.Path == "/account/keys/123":
-			deleteKey = true
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+	synctest.Test(t, func(t *testing.T) {
+		var deleteKey bool
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/account/keys":
+				_, _ = w.Write([]byte(`{"ssh_keys":[],"links":{"pages":{}}}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/account/keys":
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"ssh_key":{"id":123,"name":"crabbox-cbx-abcdef123456","fingerprint":"fp","public_key":"ssh-ed25519 test"}}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/droplets":
+				http.Error(w, "temporary failure", http.StatusInternalServerError)
+			case r.Method == http.MethodGet && r.URL.Path == "/tags":
+				writeDigitalOceanTagList(t, w)
+			case r.Method == http.MethodGet && r.URL.Path == "/droplets":
+				_, _ = w.Write([]byte(`{"droplets":[],"links":{"pages":{}}}`))
+			case r.Method == http.MethodDelete && r.URL.Path == "/account/keys/123":
+				deleteKey = true
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+			}
+		}))
+		defer server.Close()
+
+		client := newDigitalOceanTestClient(t, server, "token")
+		client.reconcileTimeout = 20 * time.Millisecond
+		client.reconcileInterval = time.Millisecond
+		cfg := core.BaseConfig()
+		cfg.Provider = providerName
+		cfg.TargetOS = core.TargetLinux
+		cfg.ServerType = "s-1vcpu-1gb"
+
+		_, err := client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
+		var ambiguous *ambiguousDropletCreateError
+		if !errors.As(err, &ambiguous) {
+			t.Fatalf("CreateDroplet err=%v, want ambiguousDropletCreateError", err)
 		}
-	}))
-	defer server.Close()
-
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
-	client.reconcileTimeout = 20 * time.Millisecond
-	client.reconcileInterval = time.Millisecond
-	cfg := core.BaseConfig()
-	cfg.Provider = providerName
-	cfg.TargetOS = core.TargetLinux
-	cfg.ServerType = "s-1vcpu-1gb"
-
-	_, err = client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
-	var ambiguous *ambiguousDropletCreateError
-	if !errors.As(err, &ambiguous) {
-		t.Fatalf("CreateDroplet err=%v, want ambiguousDropletCreateError", err)
-	}
-	if !ambiguous.keyOwnershipKnown || !ambiguous.keyCreated || ambiguous.keyID != 123 {
-		t.Fatalf("ambiguous key identity=%#v", ambiguous)
-	}
-	if deleteKey {
-		t.Fatal("ambiguous create deleted its SSH key")
-	}
+		if !ambiguous.keyOwnershipKnown || !ambiguous.keyCreated || ambiguous.keyID != 123 {
+			t.Fatalf("ambiguous key identity=%#v", ambiguous)
+		}
+		if deleteKey {
+			t.Fatal("ambiguous create deleted its SSH key")
+		}
+	})
 }
 
 func TestDigitalOceanClientCreateDropletStopsReconciliationOnLeaseTagCollision(t *testing.T) {
@@ -595,18 +581,13 @@ func TestDigitalOceanClientCreateDropletStopsReconciliationOnLeaseTagCollision(t
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	cfg.TargetOS = core.TargetLinux
 	cfg.ServerType = "s-1vcpu-1gb"
 
-	_, err = client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
+	_, err := client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "blue", false, time.Now())
 	var ambiguous *ambiguousDropletCreateError
 	if !errors.As(err, &ambiguous) || !strings.Contains(err.Error(), "conflicts with existing account tag") {
 		t.Fatalf("CreateDroplet err=%v", err)
@@ -637,14 +618,9 @@ func TestDigitalOceanClientRollbackCreatedSSHKeyUsesFreshContext(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 
-	err = client.rollbackCreatedSSHKey(sshKey{ID: 123, Name: "crabbox-cbx-abcdef123456"}, context.Canceled)
+	err := client.rollbackCreatedSSHKey(sshKey{ID: 123, Name: "crabbox-cbx-abcdef123456"}, context.Canceled)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("rollback err=%v", err)
 	}
@@ -666,14 +642,9 @@ func TestDigitalOceanClientRollbackCreatedSSHKeyReportsRetryableOwnership(t *tes
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	cause := errors.New("droplet create failed")
-	err = client.rollbackCreatedSSHKey(sshKey{ID: 123, Name: "crabbox-cbx-abcdef123456"}, cause)
+	err := client.rollbackCreatedSSHKey(sshKey{ID: 123, Name: "crabbox-cbx-abcdef123456"}, cause)
 	var cleanup *sshKeyCleanupError
 	if !errors.As(err, &cleanup) || !errors.Is(err, cause) || cleanup.keyID != 123 {
 		t.Fatalf("rollback err=%v, want sshKeyCleanupError wrapping cause", err)
@@ -734,12 +705,7 @@ func TestDigitalOceanClientCreateDropletReconcilesLostResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 
 	item, err := client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", leaseID, slug, false, time.Now())
 	if err != nil {
@@ -802,12 +768,7 @@ func TestDigitalOceanClientCreateDropletReconcilesEmptySuccessBody(t *testing.T)
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 
 	item, err := client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", leaseID, slug, false, time.Now())
 	if err != nil {
@@ -822,51 +783,48 @@ func TestDigitalOceanClientCreateDropletReconcilesEmptySuccessBody(t *testing.T)
 }
 
 func TestDigitalOceanClientCreateDropletPreservesKeyWhenEmptySuccessCannotReconcile(t *testing.T) {
-	var deleteKey bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/account/keys":
-			_, _ = w.Write([]byte(`{"ssh_keys":[],"links":{"pages":{}}}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/account/keys":
-			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"ssh_key":{"id":123,"name":"crabbox-cbx-abcdef123456","fingerprint":"fp","public_key":"ssh-ed25519 test"}}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/droplets":
-			w.WriteHeader(http.StatusAccepted)
-			_, _ = w.Write([]byte(`{}`))
-		case r.Method == http.MethodGet && r.URL.Path == "/tags":
-			writeDigitalOceanTagList(t, w)
-		case r.Method == http.MethodGet && r.URL.Path == "/droplets":
-			_, _ = w.Write([]byte(`{"droplets":[],"links":{"pages":{}}}`))
-		case r.Method == http.MethodDelete && r.URL.Path == "/account/keys/123":
-			deleteKey = true
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+	synctest.Test(t, func(t *testing.T) {
+		var deleteKey bool
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/account/keys":
+				_, _ = w.Write([]byte(`{"ssh_keys":[],"links":{"pages":{}}}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/account/keys":
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"ssh_key":{"id":123,"name":"crabbox-cbx-abcdef123456","fingerprint":"fp","public_key":"ssh-ed25519 test"}}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/droplets":
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/tags":
+				writeDigitalOceanTagList(t, w)
+			case r.Method == http.MethodGet && r.URL.Path == "/droplets":
+				_, _ = w.Write([]byte(`{"droplets":[],"links":{"pages":{}}}`))
+			case r.Method == http.MethodDelete && r.URL.Path == "/account/keys/123":
+				deleteKey = true
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+			}
+		}))
+		defer server.Close()
+
+		client := newDigitalOceanTestClient(t, server, "token")
+		client.reconcileTimeout = 20 * time.Millisecond
+		client.reconcileInterval = time.Millisecond
+		cfg := core.BaseConfig()
+		cfg.Provider = providerName
+		cfg.TargetOS = core.TargetLinux
+		cfg.ServerType = "s-1vcpu-1gb"
+
+		_, err := client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "empty-response", false, time.Now())
+		var ambiguous *ambiguousDropletCreateError
+		if !errors.As(err, &ambiguous) {
+			t.Fatalf("CreateDroplet err=%v, want ambiguousDropletCreateError", err)
 		}
-	}))
-	defer server.Close()
-
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
-	client.reconcileTimeout = 20 * time.Millisecond
-	client.reconcileInterval = time.Millisecond
-	cfg := core.BaseConfig()
-	cfg.Provider = providerName
-	cfg.TargetOS = core.TargetLinux
-	cfg.ServerType = "s-1vcpu-1gb"
-
-	_, err = client.CreateDroplet(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "empty-response", false, time.Now())
-	var ambiguous *ambiguousDropletCreateError
-	if !errors.As(err, &ambiguous) {
-		t.Fatalf("CreateDroplet err=%v, want ambiguousDropletCreateError", err)
-	}
-	if deleteKey {
-		t.Fatal("indeterminate create deleted its SSH key")
-	}
+		if deleteKey {
+			t.Fatal("indeterminate create deleted its SSH key")
+		}
+	})
 }
 
 func TestDigitalOceanClientCreateDropletReconcilesTruncatedSuccessBody(t *testing.T) {
@@ -948,6 +906,338 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestDigitalOceanDropletReconciliationZeroThenOne(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		leaseID := "cbx_abcdef123456"
+		name := core.LeaseProviderName(leaseID, "blue")
+		cfg := core.BaseConfig()
+		cfg.Provider = providerName
+		standardCalls := 0
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("type") == "gpus" {
+				_, _ = w.Write([]byte(`{"droplets":[],"links":{"pages":{}}}`))
+				return
+			}
+			standardCalls++
+			items := []droplet(nil)
+			if standardCalls == 2 {
+				items = []droplet{{ID: 42, Name: name, Tags: leaseTags(cfg, leaseID, "blue", "provisioning", false, time.Now())}}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"droplets": items, "links": map[string]any{"pages": map[string]any{}}})
+		}))
+		defer server.Close()
+		client := &digitalOceanClient{token: "token", client: server.Client(), baseURL: server.URL, reconcileTimeout: time.Second, reconcileInterval: time.Nanosecond}
+
+		item, err := client.reconcileDropletCreate("crabbox:lease:"+leaseID, true, leaseID, name)
+		if err != nil || item.ID != 42 || standardCalls != 2 {
+			t.Fatalf("droplet=%#v err=%v standardCalls=%d", item, err, standardCalls)
+		}
+
+	})
+}
+
+func TestDigitalOceanDropletReconciliationMultipleMatchesFailsImmediately(t *testing.T) {
+	leaseID := "cbx_abcdef123456"
+	name := core.LeaseProviderName(leaseID, "blue")
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	standardCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		items := []droplet(nil)
+		if r.URL.Query().Get("type") != "gpus" {
+			standardCalls++
+			tags := leaseTags(cfg, leaseID, "blue", "provisioning", false, time.Now())
+			items = []droplet{{ID: 42, Name: name, Tags: tags}, {ID: 43, Name: name, Tags: tags}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"droplets": items, "links": map[string]any{"pages": map[string]any{}}})
+	}))
+	defer server.Close()
+	client := &digitalOceanClient{token: "token", client: server.Client(), baseURL: server.URL, reconcileTimeout: time.Second, reconcileInterval: time.Hour}
+
+	_, err := client.reconcileDropletCreate("crabbox:lease:"+leaseID, true, leaseID, name)
+	if err == nil || !strings.Contains(err.Error(), "found multiple droplets") || standardCalls != 1 {
+		t.Fatalf("err=%v standardCalls=%d", err, standardCalls)
+	}
+}
+
+func TestDigitalOceanDropletReconciliationRetainsLastListError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := &digitalOceanClient{
+			token: "token",
+			client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("list unavailable marker")),
+				}, nil
+			})},
+			baseURL:           "https://api.digitalocean.test",
+			reconcileTimeout:  20 * time.Millisecond,
+			reconcileInterval: time.Millisecond,
+		}
+
+		_, err := client.reconcileDropletCreate("crabbox:lease:cbx_abcdef123456", true, "cbx_abcdef123456", "crabbox-blue")
+		if err == nil || !strings.Contains(err.Error(), "list unavailable marker") || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
+func TestDigitalOceanSSHKeyReconciliationZeroThenOne(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		listCalls := 0
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			listCalls++
+			keys := []sshKey(nil)
+			if listCalls == 2 {
+				keys = []sshKey{{ID: 7, Name: "crabbox-key", PublicKey: "ssh-ed25519 expected"}}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ssh_keys": keys, "links": map[string]any{"pages": map[string]any{}}})
+		}))
+		defer server.Close()
+		client := &digitalOceanClient{token: "token", client: server.Client(), baseURL: server.URL, reconcileTimeout: time.Second, reconcileInterval: time.Nanosecond}
+
+		key, err := client.reconcileSSHKey("crabbox-key", "ssh-ed25519 expected")
+		if err != nil || key.ID != 7 || listCalls != 2 {
+			t.Fatalf("key=%#v err=%v listCalls=%d", key, err, listCalls)
+		}
+
+	})
+}
+
+func TestDigitalOceanSSHKeyReconciliationMultipleMatchesFailsImmediately(t *testing.T) {
+	listCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		listCalls++
+		keys := []sshKey{
+			{ID: 7, Name: "crabbox-key", PublicKey: "ssh-ed25519 expected"},
+			{ID: 8, Name: "crabbox-key", PublicKey: "ssh-ed25519 expected"},
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ssh_keys": keys, "links": map[string]any{"pages": map[string]any{}}})
+	}))
+	defer server.Close()
+	client := &digitalOceanClient{token: "token", client: server.Client(), baseURL: server.URL, reconcileTimeout: time.Second, reconcileInterval: time.Hour}
+
+	_, err := client.reconcileSSHKey("crabbox-key", "ssh-ed25519 expected")
+	if err == nil || !strings.Contains(err.Error(), "multiple entries matching") || listCalls != 1 {
+		t.Fatalf("err=%v listCalls=%d", err, listCalls)
+	}
+}
+
+func TestDigitalOceanClientRedactsReflectedToken(t *testing.T) {
+	const token = "sibling-secret-token"
+	for _, tt := range []struct {
+		name        string
+		body        string
+		wantContext string
+	}{
+		{
+			name:        "ordinary reflection",
+			body:        `{"message":"credential ` + token + ` rejected","request":"safe-digitalocean-context"}`,
+			wantContext: "safe-digitalocean-context",
+		},
+		{
+			name: "credential crosses diagnostic cutoff",
+			body: strings.Repeat("x", 390) + token + " trailing provider detail",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &digitalOceanClient{
+				token:   token,
+				baseURL: "https://api.digitalocean.test",
+				client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if got := req.Header.Get("Authorization"); got != "Bearer "+token {
+						t.Fatalf("authorization=%q", got)
+					}
+					return &http.Response{
+						StatusCode: http.StatusUnauthorized,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(tt.body)),
+						Request:    req,
+					}, nil
+				})},
+			}
+
+			err := client.do(context.Background(), http.MethodGet, "/account", nil, nil)
+			var apiErr *digitalOceanAPIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err=%v, want *digitalOceanAPIError", err)
+			}
+			if apiErr.Status != http.StatusUnauthorized {
+				t.Fatalf("status=%d, want %d", apiErr.Status, http.StatusUnauthorized)
+			}
+			for _, value := range []string{apiErr.Body, err.Error()} {
+				for _, leaked := range []string{token, token[:10]} {
+					if strings.Contains(value, leaked) {
+						t.Fatalf("token fragment %q leaked in %q", leaked, value)
+					}
+				}
+				if !strings.Contains(value, "[redacted]") {
+					t.Fatalf("reflected token was not redacted in %q", value)
+				}
+				if tt.wantContext != "" && !strings.Contains(value, tt.wantContext) {
+					t.Fatalf("redacted error lost useful context: %q", value)
+				}
+			}
+		})
+	}
+}
+
+func TestDigitalOceanAPIErrorDiagnosticRedaction(t *testing.T) {
+	const token = "fixture-digitalocean-secret"
+	readErr := errors.New("read interrupted with " + token)
+	c := &digitalOceanClient{token: token, baseURL: "https://example.test", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Request: req, Body: io.NopCloser(&errorAfterReader{data: []byte("partial response"), err: readErr})}, nil
+	})}}
+	err := c.do(t.Context(), http.MethodGet, "/account", nil, nil)
+	var apiErr *digitalOceanAPIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+		t.Fatalf("typed status changed: %v", err)
+	}
+	if strings.Contains(apiErr.Body, token) || !strings.Contains(apiErr.Body, "[redacted]") || !strings.Contains(apiErr.Body, "partial response; response body read failed:") {
+		t.Fatalf("unsafe or incomplete API diagnostic: %q", apiErr.Body)
+	}
+	if errors.Is(err, readErr) {
+		t.Fatal("read failure overrode API error classification")
+	}
+}
+
+func TestDigitalOceanClientRedactsSemanticDropletName(t *testing.T) {
+	const token = "digitalocean-droplet-secret"
+	const leaseID = "cbx_abcdef123456"
+	const publicKey = "ssh-ed25519 test"
+	keyName := providerKeyForLease(leaseID)
+	client := &digitalOceanClient{
+		token:             token,
+		baseURL:           "https://api.digitalocean.test",
+		reconcileTimeout:  time.Millisecond,
+		reconcileInterval: time.Millisecond,
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if got := req.Header.Get("Authorization"); got != "Bearer "+token {
+				t.Fatalf("authorization=%q", got)
+			}
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/account/keys":
+				body, _ := json.Marshal(map[string]any{
+					"ssh_keys": []map[string]any{{"id": 123, "name": keyName, "public_key": publicKey}},
+					"links":    map[string]any{"pages": map[string]any{}},
+				})
+				return digitalOceanTestResponse(req, http.StatusOK, string(body)), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/droplets":
+				body := `{"droplet":{"id":456,"name":"safe-droplet-context-` + token + `"}}`
+				return digitalOceanTestResponse(req, http.StatusAccepted, body), nil
+			case req.Method == http.MethodGet && req.URL.Path == "/tags":
+				return nil, errors.New("synthetic reconciliation failure")
+			default:
+				t.Fatalf("unexpected request %s %s", req.Method, req.URL.RequestURI())
+				return nil, nil
+			}
+		})},
+	}
+	cfg := core.BaseConfig()
+	cfg.Provider = providerName
+	cfg.TargetOS = core.TargetLinux
+	cfg.ServerType = "s-1vcpu-1gb"
+
+	_, err := client.CreateDroplet(context.Background(), cfg, publicKey, leaseID, "blue", false, time.Now())
+	assertDigitalOceanSemanticDiagnostic(t, err, token, "safe-droplet-context")
+}
+
+func TestDigitalOceanClientRedactsSemanticSSHKeyName(t *testing.T) {
+	const token = "digitalocean-key-secret"
+	keyListCalls := 0
+	client := &digitalOceanClient{
+		token:             token,
+		baseURL:           "https://api.digitalocean.test",
+		reconcileTimeout:  time.Millisecond,
+		reconcileInterval: time.Millisecond,
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/account/keys":
+				keyListCalls++
+				if keyListCalls == 1 {
+					return digitalOceanTestResponse(req, http.StatusOK, `{"ssh_keys":[],"links":{"pages":{}}}`), nil
+				}
+				return nil, errors.New("synthetic reconciliation failure")
+			case req.Method == http.MethodPost && req.URL.Path == "/account/keys":
+				body := `{"ssh_key":{"id":0,"name":"safe-key-context-` + token + `","public_key":"wrong"}}`
+				return digitalOceanTestResponse(req, http.StatusCreated, body), nil
+			default:
+				t.Fatalf("unexpected request %s %s", req.Method, req.URL.RequestURI())
+				return nil, nil
+			}
+		})},
+	}
+
+	_, _, err := client.EnsureSSHKey(context.Background(), "expected-key", "ssh-ed25519 expected")
+	assertDigitalOceanSemanticDiagnostic(t, err, token, "safe-key-context")
+}
+
+func TestDigitalOceanClientRedactsSemanticTagNames(t *testing.T) {
+	const token = "digitalocean-tag-secret"
+	const requested = "crabbox:slug:blue"
+	for _, tt := range []struct {
+		name string
+		http func(*http.Request) (*http.Response, error)
+		safe string
+	}{
+		{
+			name: "existing tag",
+			safe: "safe-existing-tag-context",
+			http: func(req *http.Request) (*http.Response, error) {
+				body := `{"tag":{"name":"safe-existing-tag-context-` + token + `"}}`
+				return digitalOceanTestResponse(req, http.StatusOK, body), nil
+			},
+		},
+		{
+			name: "created tag",
+			safe: "safe-created-tag-context",
+			http: func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return digitalOceanTestResponse(req, http.StatusNotFound, `{"id":"not_found"}`), nil
+				}
+				body := `{"tag":{"name":"safe-created-tag-context-` + token + `"}}`
+				return digitalOceanTestResponse(req, http.StatusCreated, body), nil
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &digitalOceanClient{
+				token:   token,
+				baseURL: "https://api.digitalocean.test",
+				client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.URL.Path != "/tags/"+requested && req.URL.Path != "/tags" {
+						t.Fatalf("unexpected request %s %s", req.Method, req.URL.RequestURI())
+					}
+					return tt.http(req)
+				})},
+			}
+
+			_, err := client.EnsureTag(context.Background(), requested, map[string]string{})
+			assertDigitalOceanSemanticDiagnostic(t, err, token, tt.safe)
+		})
+	}
+}
+
+func digitalOceanTestResponse(req *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+}
+
+func assertDigitalOceanSemanticDiagnostic(t *testing.T, err error, token, safeContext string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("semantic mismatch was accepted")
+	}
+	if strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "[redacted]") || !strings.Contains(err.Error(), safeContext) {
+		t.Fatalf("semantic diagnostic=%q", err)
+	}
 }
 
 type errorAfterReader struct {
@@ -1048,12 +1338,7 @@ func TestDigitalOceanClientEnsureSSHKeyReconcilesEmptySuccessBody(t *testing.T) 
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	key, created, err := client.EnsureSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 test")
 	if err != nil {
 		t.Fatal(err)
@@ -1075,13 +1360,8 @@ func TestDigitalOceanClientEnsureSSHKeyRejectsMismatchedPublicKey(t *testing.T) 
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
-	_, _, err = client.EnsureSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 expected")
+	client := newDigitalOceanTestClient(t, server, "token")
+	_, _, err := client.EnsureSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 expected")
 	if err == nil || !strings.Contains(err.Error(), "exists with different public key") {
 		t.Fatalf("EnsureSSHKey err=%v", err)
 	}
@@ -1103,12 +1383,7 @@ func TestDigitalOceanClientEnsureSSHKeySelectsMatchingDuplicateName(t *testing.T
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 
 	key, created, err := client.EnsureSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 expected")
 	if err != nil {
@@ -1131,45 +1406,79 @@ func TestDigitalOceanClientFindSSHKeyRejectsDuplicatePublicKeyMatches(t *testing
 	}))
 	defer server.Close()
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 
-	_, _, err = client.FindSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 expected")
+	_, _, err := client.FindSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 expected")
 	if err == nil || !strings.Contains(err.Error(), "multiple entries matching") {
 		t.Fatalf("FindSSHKey err=%v", err)
 	}
 }
 
-func TestDigitalOceanClientEnsureSSHKeyPreservesAmbiguousCreate(t *testing.T) {
+func TestDigitalOceanClientFindSSHKeyByImmutableID(t *testing.T) {
+	for _, test := range []struct {
+		name, body string
+		status     int
+		found      bool
+	}{
+		{name: "found", status: http.StatusOK, body: `{"ssh_key":{"id":123,"name":"crabbox-key","public_key":"ssh-ed25519 exact"}}`, found: true},
+		{name: "absent", status: http.StatusNotFound, body: `{"id":"not_found"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/account/keys/123" {
+					t.Fatalf("request=%s %s", r.Method, r.URL.RequestURI())
+				}
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			client := &digitalOceanClient{token: "token", client: server.Client(), baseURL: server.URL}
+			key, found, err := client.FindSSHKeyByID(context.Background(), 123)
+			if err != nil || found != test.found || (found && key.ID != 123) {
+				t.Fatalf("key=%#v found=%v err=%v", key, found, err)
+			}
+		})
+	}
+}
+
+func TestDigitalOceanClientFindSSHKeyByPublicKeyIgnoresName(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.RequestURI(), "/account/keys"):
-			_, _ = w.Write([]byte(`{"ssh_keys":[],"links":{"pages":{}}}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/account/keys":
-			http.Error(w, "temporary failure", http.StatusInternalServerError)
-		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+		if r.Method != http.MethodGet || r.URL.Path != "/account/keys" {
+			t.Fatalf("request=%s %s", r.Method, r.URL.RequestURI())
 		}
+		_, _ = w.Write([]byte(`{"ssh_keys":[{"id":123,"name":"renamed","public_key":"ssh-ed25519 exact"}],"links":{"pages":{}}}`))
 	}))
 	defer server.Close()
+	client := &digitalOceanClient{token: "token", client: server.Client(), baseURL: server.URL}
+	key, found, err := client.FindSSHKeyByPublicKey(context.Background(), "ssh-ed25519 exact")
+	if err != nil || !found || key.ID != 123 {
+		t.Fatalf("key=%#v found=%v err=%v", key, found, err)
+	}
+}
 
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
-	client.reconcileTimeout = 20 * time.Millisecond
-	client.reconcileInterval = time.Millisecond
-	_, _, err = client.EnsureSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 test")
-	var ambiguous *ambiguousSSHKeyCreateError
-	if !errors.As(err, &ambiguous) {
-		t.Fatalf("EnsureSSHKey err=%v, want ambiguousSSHKeyCreateError", err)
-	}
+func TestDigitalOceanClientEnsureSSHKeyPreservesAmbiguousCreate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.RequestURI(), "/account/keys"):
+				_, _ = w.Write([]byte(`{"ssh_keys":[],"links":{"pages":{}}}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/account/keys":
+				http.Error(w, "temporary failure", http.StatusInternalServerError)
+			default:
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+			}
+		}))
+		defer server.Close()
+
+		client := newDigitalOceanTestClient(t, server, "token")
+		client.reconcileTimeout = 20 * time.Millisecond
+		client.reconcileInterval = time.Millisecond
+		_, _, err := client.EnsureSSHKey(context.Background(), "crabbox-cbx-abcdef123456", "ssh-ed25519 test")
+		var ambiguous *ambiguousSSHKeyCreateError
+		if !errors.As(err, &ambiguous) {
+			t.Fatalf("EnsureSSHKey err=%v, want ambiguousSSHKeyCreateError", err)
+		}
+	})
 }
 
 func TestNewDigitalOceanClientRequiresToken(t *testing.T) {
@@ -1191,23 +1500,18 @@ func TestListCrabboxDropletsFiltersAndPaginates(t *testing.T) {
 			t.Fatalf("tag_name=%q", r.URL.Query().Get("tag_name"))
 		}
 		if r.URL.Query().Get("type") == "gpus" {
-			_, _ = w.Write([]byte(`{"droplets":[{"id":4,"name":"gpu-owned","tags":["crabbox","crabbox:provider:digitalocean","crabbox:lease:cbx_4","crabbox:slug:gpu","crabbox:target:linux"]}],"links":{"pages":{}}}`))
+			_, _ = w.Write([]byte(`{"droplets":[{"id":4,"name":"gpu-owned","tags":["crabbox","crabbox:provider:digitalocean","crabbox:lease:cbx_444444444444","crabbox:slug:gpu","crabbox:target:linux"]}],"links":{"pages":{}}}`))
 			return
 		}
 		standardPage++
 		if standardPage == 1 {
-			_, _ = w.Write([]byte(`{"droplets":[{"id":1,"name":"owned","tags":["Crabbox","Crabbox:Provider:DigitalOcean","Crabbox:Lease:cbx_1","Crabbox:Slug:one","Crabbox:Target:Linux"]},{"id":2,"name":"foreign","tags":["Crabbox"]}],"links":{"pages":{"next":"yes"}}}`))
+			_, _ = w.Write([]byte(`{"droplets":[{"id":1,"name":"owned","tags":["Crabbox","Crabbox:Provider:DigitalOcean","Crabbox:Lease:cbx_111111111111","Crabbox:Slug:one","Crabbox:Target:Linux"]},{"id":2,"name":"foreign","tags":["Crabbox"]}],"links":{"pages":{"next":"yes"}}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"droplets":[{"id":3,"name":"owned2","tags":["crabbox","crabbox:provider:digitalocean","crabbox:lease:cbx_2","crabbox:slug:two","crabbox:target:linux"]}],"links":{"pages":{}}}`))
+		_, _ = w.Write([]byte(`{"droplets":[{"id":3,"name":"owned2","tags":["crabbox","crabbox:provider:digitalocean","crabbox:lease:cbx_222222222222","crabbox:slug:two","crabbox:target:linux"]}],"links":{"pages":{}}}`))
 	}))
 	defer server.Close()
-	t.Setenv("DIGITALOCEAN_TOKEN", "token")
-	client, err := newDigitalOceanClient(core.Runtime{HTTP: server.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.baseURL = server.URL
+	client := newDigitalOceanTestClient(t, server, "token")
 	droplets, err := client.ListCrabboxDroplets(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1215,4 +1519,170 @@ func TestListCrabboxDropletsFiltersAndPaginates(t *testing.T) {
 	if len(droplets) != 3 || droplets[0].ID != 1 || droplets[1].ID != 3 || droplets[2].ID != 4 {
 		t.Fatalf("droplets=%v", droplets)
 	}
+}
+
+type envelopeRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f envelopeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type envelopeMarshaler func() ([]byte, error)
+
+func (f envelopeMarshaler) MarshalJSON() ([]byte, error) { return f() }
+
+func TestDigitalOceanClientRequestEnvelope(t *testing.T) {
+	type contextKey struct{}
+	ctx := context.WithValue(context.Background(), contextKey{}, "envelope-context")
+	var pointer *struct{ Value string }
+	var slice []string
+	for _, tc := range []struct {
+		name    string
+		body    any
+		want    string
+		nilBody bool
+	}{
+		{"nil interface", nil, "", true},
+		{"typed nil pointer", pointer, "null\n", false},
+		{"typed nil slice", slice, "null\n", false},
+		{"JSON bytes and HTML escaping", map[string]string{"message": "<&>"}, "{\"message\":\"\\u003c\\u0026\\u003e\"}\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			transport := envelopeRoundTripper(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Context() != ctx || req.Context().Value(contextKey{}) != "envelope-context" {
+					t.Fatal("request lost caller context")
+				}
+				if req.Method != http.MethodPost || req.URL.String() != "https://api.example.test/v1/records?limit=2" {
+					t.Fatalf("request=%s %s", req.Method, req.URL)
+				}
+				if req.Header.Get("Authorization") != "Bearer synthetic-envelope-token" || req.Header.Get("Accept") != "application/json" {
+					t.Fatalf("headers=%v", req.Header)
+				}
+				contentType := "application/json"
+
+				if req.Header.Get("Content-Type") != contentType {
+					t.Fatalf("Content-Type=%q want %q", req.Header.Get("Content-Type"), contentType)
+				}
+				if (req.Body == nil) != tc.nilBody {
+					t.Fatalf("nil body=%v want %v", req.Body == nil, tc.nilBody)
+				}
+				if req.ContentLength != int64(len(tc.want)) {
+					t.Fatalf("ContentLength=%d want %d", req.ContentLength, len(tc.want))
+				}
+				if req.Body != nil {
+					data, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(data) != tc.want {
+						t.Fatalf("body=%q want %q", data, tc.want)
+					}
+				}
+				if tc.nilBody {
+					if req.GetBody != nil {
+						t.Fatal("nil input gained GetBody")
+					}
+				} else {
+					if req.GetBody == nil {
+						t.Fatal("encoded body lost GetBody")
+					}
+					replay, err := req.GetBody()
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer replay.Close()
+					data, err := io.ReadAll(replay)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(data) != tc.want {
+						t.Fatalf("replay=%q want %q", data, tc.want)
+					}
+				}
+				return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			})
+			client := &digitalOceanClient{token: "synthetic-envelope-token", baseURL: "https://api.example.test/v1", client: &http.Client{Transport: transport}}
+			if err := client.do(ctx, http.MethodPost, "/records?limit=2", tc.body, nil); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 {
+				t.Fatalf("transport calls=%d", calls)
+			}
+		})
+	}
+	t.Run("encoding fails before request construction and transport", func(t *testing.T) {
+		sentinel := errors.New("synthetic encoder failure")
+		calls := 0
+		client := &digitalOceanClient{baseURL: ":invalid", client: &http.Client{Transport: envelopeRoundTripper(func(*http.Request) (*http.Response, error) { calls++; return nil, errors.New("unexpected transport") })}}
+		body := envelopeMarshaler(func() ([]byte, error) { return nil, sentinel })
+		err := client.do(nil, "invalid method", "/records", body, nil)
+		var marshalerError *json.MarshalerError
+		if !errors.As(err, &marshalerError) || !errors.Is(err, sentinel) {
+			t.Fatalf("error=%T %v want original encoding cause", err, err)
+		}
+		if calls != 0 {
+			t.Fatalf("transport calls=%d", calls)
+		}
+	})
+}
+
+func TestAcquireRollbackHTTPStopsBeforeKeyOnDropletDeleteFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name                                 string
+		dropletStatus, keyStatus, wantStatus int
+		wantPaths                            []string
+	}{
+		{name: "droplet failure", dropletStatus: 500, keyStatus: 204, wantStatus: 500, wantPaths: []string{"/droplets/42"}},
+		{name: "droplet absent", dropletStatus: 404, keyStatus: 204, wantPaths: []string{"/droplets/42", "/account/keys/700"}},
+		{name: "deleted", dropletStatus: 204, keyStatus: 204, wantPaths: []string{"/droplets/42", "/account/keys/700"}},
+		{name: "key failure", dropletStatus: 204, keyStatus: 403, wantStatus: 403, wantPaths: []string{"/droplets/42", "/account/keys/700"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var paths []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodDelete {
+					t.Errorf("method=%s", r.Method)
+				}
+				paths = append(paths, r.URL.Path)
+				switch r.URL.Path {
+				case "/droplets/42":
+					w.WriteHeader(tc.dropletStatus)
+				case "/account/keys/700":
+					w.WriteHeader(tc.keyStatus)
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+					w.WriteHeader(500)
+				}
+			}))
+			defer server.Close()
+			client := newDigitalOceanTestClient(t, server, "fixture-token")
+			err := rollbackDigitalOceanAcquire(client, 42, 700)
+			var apiErr *digitalOceanAPIError
+			if tc.wantStatus == 0 && err != nil || tc.wantStatus != 0 && (!errors.As(err, &apiErr) || apiErr.Status != tc.wantStatus) || !reflect.DeepEqual(paths, tc.wantPaths) {
+				t.Fatalf("err=%v paths=%v wantStatus=%d wantPaths=%v", err, paths, tc.wantStatus, tc.wantPaths)
+			}
+		})
+	}
+}
+
+func TestDigitalOceanReadinessDeadlineCancelsNativeHTTPClient(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		received := make(chan struct{})
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(received)
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+		client := newDigitalOceanTestClient(t, server, "fixture-token")
+		_, err := new(digitalOceanLeaseBackend).waitForDropletIP(t.Context(), client, 42, 100*time.Millisecond)
+		select {
+		case <-received:
+		default:
+			t.Fatal("request did not reach native HTTP handler")
+		}
+		var exit core.ExitError
+		if !errors.Is(err, context.DeadlineExceeded) || !core.AsExitError(err, &exit) || exit.Code != 5 || err.Error() != "timed out waiting for DigitalOcean Droplet IP" {
+			t.Fatalf("err=%v exit=%#v", err, exit)
+		}
+	})
 }

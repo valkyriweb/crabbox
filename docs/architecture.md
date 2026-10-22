@@ -27,12 +27,15 @@ Crabbox has three parts:
   `worker/node`).
 - **Runners** — managed cloud machines, self-hosted VMs, BYO SSH hosts, or
   delegated sandboxes that actually run commands. See the
-  [provider reference](features/providers.md).
+  [provider reference](providers/README.md).
 
-The coordinator manages leases. The CLI executes work. Runners do not call back
-to the coordinator for ordinary command execution; lease bridges (WebVNC,
-code-server, egress) are the only on-demand paths that route runner traffic
-through it.
+For normal CLI leases, the coordinator manages leases and the CLI executes
+work. Runners do not call back to the coordinator for ordinary command
+execution; lease bridges (WebVNC, code-server, egress) are the only on-demand
+paths that route runner traffic through it. The dedicated
+[private AWS workspace service](features/aws-private-workspaces.md) is a
+separate route-scoped API deployment that bootstraps an SSM-only workspace from
+the coordinator and exposes no SSH path.
 
 ```text
 developer machine
@@ -48,21 +51,22 @@ coordinator ----------------------------------------------->  (provision)
 
 ## Execution Modes
 
-The CLI picks one of four modes per provider in `loadBackend`
-(`internal/cli/provider_backend.go`):
+Provider backends (`internal/cli/provider_backend.go`) support these execution
+and control modes:
 
 - **Brokered (coordinator) mode** — chosen when the provider declares
   `Coordinator: supported` _and_ a broker URL is configured
   (`CRABBOX_COORDINATOR` or `config set-broker`). The provider's SSH backend is
   wrapped in a `coordinatorLeaseBackend`: lease lifecycle goes through the
   coordinator over HTTPS, but the CLI still drives SSH, rsync, and command execution
-  **directly** to the runner. The brokered set is exactly the four managed cloud
-  providers: `aws`, `azure`, `gcp`, `hetzner`.
+  **directly** to the runner. The brokered set is the five managed cloud
+  providers (`aws`, `azure`, `daytona`, `gcp`, `hetzner`) plus owner-donated
+  container capacity (`serve`). Serve requires the coordinator.
 - **Direct SSH mode** — the provider returns an SSH lease backend but no broker
   is configured. The CLI provisions and connects against the cloud or host API
-  itself; no coordinator is involved. The four brokerable providers fall back to this
+  itself; no coordinator is involved. The five brokerable providers fall back to this
   when no broker URL is set, and every other SSH-lease provider (`ssh`,
-  `parallels`, `proxmox`, `daytona`, `runpod`, and so on) always runs here.
+  `parallels`, `proxmox`, `runpod`, and so on) always runs here.
 - **Registered direct mode** — `broker.mode: registered` keeps the same direct
   SSH provider lifecycle but registers lease metadata and heartbeats with the
   coordinator. It can list and share portal bridges, but cannot directly call
@@ -73,6 +77,9 @@ The CLI picks one of four modes per provider in `loadBackend`
   `e2b`, `modal`, `cloudflare`, `azure-dynamic-sessions`). The provider owns
   sync and execution end to end; the CLI calls `Warmup`/`Run` and never performs
   its own rsync. Delegated providers reject local-sync flags.
+- **Service control** — providers such as Railway, FastAPI Cloud, and Unikraft
+  Cloud expose their declared service lifecycle or inspection operations. They
+  do not supply arbitrary Crabbox shell execution or checkout sync.
 
 Provider kinds, coordinator modes, and feature sets are declared in each
 adapter's `Spec()`; the type definitions live in
@@ -92,8 +99,10 @@ adapter's `Spec()`; the type definitions live in
    and enforces cost/spend caps.
 5. `FleetCoordinator` provisions the machine through the provider adapter (with
    region/market fallback) and persists the lease record through its runtime.
-6. The broker returns the lease ID, slug, host, SSH user/port, work root, and
-   expiry.
+6. On publication of an active lease, the coordinator starts its idle clock and
+   computes expiry from that idle deadline and the hard TTL measured from admission.
+   Provisioning records use only the TTL deadline. The broker returns the lease ID,
+   slug, host, SSH user/port, work root, and expiry.
 7. The CLI waits for the `crabbox-ready` bootstrap marker.
 8. The CLI seeds the remote Git tree when possible, compares sync fingerprints,
    and rsyncs changed files (see [Sync](#sync-and-hydration)).
@@ -115,9 +124,16 @@ adapter's `Spec()`; the type definitions live in
 (`FLEET.idFromName("default")`); `worker/node/server.ts` forwards them to the
 Node runtime:
 
+Serve relay admission uses the normal authenticated Fleet routes. After a
+single-use admission, the Worker upgrades the connection in a dedicated
+`ServeRelayDurableObject` addressed by session ID. Node uses the same session
+engine outside its lifecycle queue. Neither implementation sends SSH data
+frames through Fleet or stores them in the coordinator database.
+
 - `GET /v1/health` returns liveness; `GET /` redirects to `/portal`.
-- `/v1/auth/*`, `/portal/login`, `/portal/logout`, and WebSocket upgrades for
-  the live bridges go to `FleetCoordinator`.
+- `/v1/auth/*`, `/portal/login`, and WebSocket upgrades for the live bridges go
+  to `FleetCoordinator` without the normal portal-session authentication;
+  `/portal/logout` remains authenticated and same-origin gated.
 - `/v1/internal/*` is 404 externally; runtime schedulers invoke maintenance
   internally.
 - Everything else passes through `authenticateRequest` and is forwarded with
@@ -126,10 +142,14 @@ Node runtime:
 Auth (`worker/src/auth.ts`) requires a Bearer token, matched in order:
 `CRABBOX_ADMIN_TOKEN` (admin), `CRABBOX_SHARED_TOKEN` (non-admin shared), then a
 signed user token (prefix `cbxu_`, HMAC-SHA256, 180-day default expiry) minted
-after GitHub OAuth login verifies allowed org membership. An optional Cloudflare
+after GitHub OAuth login verifies allowed org membership. The signed token keeps
+the OAuth credential encrypted under the session secret so request authentication
+can periodically revalidate the immutable GitHub account ID and current org/team
+membership. An optional Cloudflare
 Access JWT (`cf-access-jwt-assertion`) can supply the owner identity. The
 coordinator injects `x-crabbox-auth`, `-admin`, `-owner`, `-org`, and `-github-login`
-headers. The portal converts a `crabbox_session` cookie into a Bearer token.
+headers. The portal converts one unique `__Host-crabbox_session` host-only
+cookie into a Bearer token and rejects duplicate session cookies.
 
 ## Fleet Coordinator And Runtime Adapters
 
@@ -140,18 +160,31 @@ One logical `FleetCoordinator` (`worker/src/fleet.ts`) owns:
   sharing, TTL/idle timeout, cost estimates, state
   (`active|released|expired|failed`), telemetry history, cleanup metadata, and
   optional Tailscale/pond/exposed-port fields.
-- **Cost and spend caps** (`worker/src/usage.ts`) — `enforceCostLimits` checks
+- **Brokered native checkpoints** — provider-neutral
+  `worker/src/checkpoints.ts` owns versioned `checkpoint:*` records, sorted
+  `checkpoint-due:*` deadlines, exact `checkpoint-resource:*` reverse claims,
+  hashed use claims, promotion pins, and ordered audit events. Storage
+  transactions fence create/use/delete generations; provider-specific AWS,
+  Azure, and GCP identity verification and deletion remain adapter-owned.
+  Manual retention is the default and local checkpoint records are caches,
+  never ownership authority.
+- **Cost and spend caps** (`worker/src/usage.ts`) — `enforceCostLimitUsage` checks
   active-lease counts and monthly reserved-USD budgets (global / per-owner /
   per-org) from `CRABBOX_MAX_*` env. Over-limit requests get HTTP 429
   `cost_limit_exceeded`. Cost = hourly rate × TTL, where the rate comes from a
   `CRABBOX_COST_RATES_JSON` override, then a provider live price, then built-in
   defaults.
+  Shared predicates in `worker/src/lease-state.ts` keep accounting, host
+  reservations, and lifecycle handling aligned: active/provisioning rows remain
+  live until a terminal transition, even after a heartbeat deadline, and
+  registered inventory stays outside managed usage.
 - **Usage accounting** — `usageSummary` aggregates leases per
   owner/org/provider/server type for the month; served at `GET /v1/usage`.
 - **Cleanup and expiry** — runtime alarms/jobs and reconciliation run maintenance:
   `expireLeases` deletes the cloud server for active leases past `expiresAt`
-  (retrying after a 5-minute backoff on failure), then an optional AWS orphan
-  sweep, then `scheduleAlarm` arms the next alarm at the soonest pending expiry.
+  (retrying after a 5-minute backoff on failure), then optional AWS and Azure
+  orphan sweeps, then `scheduleAlarm` arms the next alarm at the soonest pending
+  expiry.
 - **Runs, run events, run logs, and telemetry** — see
   [What Flows on a Run](#what-flows-on-a-run).
 - **Live bridges** — WebSocket relays for WebVNC (agent ↔ viewer), the
@@ -159,11 +192,30 @@ One logical `FleetCoordinator` (`worker/src/fleet.ts`) owns:
   run-event subscriptions and lease heartbeats. Cloudflare can hibernate
   sockets; Node keeps them in process and clients reconnect after restarts.
 - **Provider operations** — per-provider adapters (`aws.ts`, `azure.ts`,
-  `gcp.ts`, `hetzner.ts`) handle provision/release/images/identity/capacity. The
-  core stays provider-neutral through hooks such as `prepareLeaseCreate`,
+  `daytona.ts`, `gcp.ts`, `hetzner.ts`) handle provision/release and their
+  supported image, identity, and capacity hooks. The core stays provider-neutral
+  through hooks such as `prepareLeaseCreate`,
   `createServerWithFallback`, `finalizeLeaseCreate`, and `hourlyPriceUSD`.
 
+Azure and GCP share an instance-scoped expiring-token cache. Concurrent requests
+on one client join the same refresh; failures clear the pending refresh so a
+later request can retry. Token acquisition, refresh margins, expiry calculation,
+and metadata-server trust/retry rules remain adapter-owned. Caches are neither
+global nor persisted, and do not fall back to expired credentials.
+
+Binary hex/base64 encoding and SHA-256 formatting live in `worker/src/encoding.ts`,
+independent of authentication. Text digests use UTF-8; binary digests preserve
+the supplied view and byte offsets. Token formats, validation, signing, and
+encryption key derivation remain with the protocols that own them.
+
 Runtime-specific persistence and scheduling stay behind `CoordinatorRuntime`:
+
+Fleet, host-reservation, and checkpoint scans share the ordered, bounded
+`coordinatorStorageEntries` iterator in `worker/src/storage-scan.ts`. It fetches
+the next page only after the current page is consumed. Callers retain their
+page sizes, cache policy, transaction scope, and early-exit conditions;
+checkpoint claim expiry still applies each transition sequentially. Destructive
+first-page draining and maintenance with persisted cursors remain separate.
 
 | Runtime    | Durable state               | Scheduling                                     | WebSockets                               |
 | ---------- | --------------------------- | ---------------------------------------------- | ---------------------------------------- |
@@ -175,6 +227,32 @@ serialization and live bridge ownership are process-local. PostgreSQL and
 pg-boss are durable, but horizontal replicas need distributed locking and
 bridge routing first.
 
+Maintenance selects bridge cleanup from live bridge owners and existing persisted
+egress records, so ended leases with no bridge state require no repeated deletes,
+including after coordinator restarts. Failed deletes retain their cleanup evidence.
+Ready-pool maintenance reads only the leases referenced by its entries, and
+interrupted-provisioning checks read journals only for recovery candidates.
+Each maintenance pass collects candidate lease IDs once, then rereads their
+current records at the owning phase. Final alarm selection still scans current
+state so work admitted during provider I/O keeps its wakeup.
+
+Alarm selection follows the maintenance owner's eligibility: elapsed prewarm
+failure history does not remain a retry deadline, and durable provisioning owns
+the wake for its leases. At the end of maintenance only, the same earliest overdue
+source and record on consecutive passes receives a one-second backoff, doubling
+to a 60-second cap. Deadlines within 10 milliseconds count as due. Classification
+uses the underlying deadline even when a minimum delay clamps the scheduled wake
+forward; pending run pruning is due work. All overdue
+candidates share that backoff floor, capped by the earliest genuinely future
+deadline so backoff never postpones another candidate's future wake. The streak
+clears when no overdue candidates remain; a different earliest overdue record
+starts a new streak. Run and checkpoint audit pruning
+include their advancing cursors in the identity. While the earliest item remains
+overdue, arms admitted during a pass bypass its backoff but preserve the existing
+streak without escalating or resetting it. This in-memory guard resets on
+eviction. Request-path
+alarms and the independently merged provisioning due index remain immediate.
+
 ## Coordinator HTTP API
 
 Lease lifecycle:
@@ -183,10 +261,27 @@ Lease lifecycle:
 GET  /v1/leases
 GET  /v1/leases/{id-or-slug}
 POST /v1/leases
+POST /v1/leases/resource-constrained
+PUT  /v1/leases/{canonical-id}/resource-constrained
+POST /v1/leases/from-checkpoint
+PUT  /v1/leases/{canonical-id}/from-checkpoint
+POST /v1/leases/{requested-id}/cancel-create
 POST /v1/leases/{id-or-slug}/heartbeat
 POST /v1/leases/{id-or-slug}/release
 POST /v1/leases/{id-or-slug}/tailscale
 GET|PUT|DELETE /v1/leases/{id-or-slug}/share
+```
+
+Owner-scoped brokered native checkpoints:
+
+```text
+POST   /v1/checkpoints
+GET    /v1/checkpoints
+GET    /v1/checkpoints/{id}
+GET    /v1/checkpoints/{id}/events
+PATCH  /v1/checkpoints/{id}/retention
+POST   /v1/checkpoints/{id}/use
+DELETE /v1/checkpoints/{id}
 ```
 
 Runs and observability:
@@ -194,9 +289,11 @@ Runs and observability:
 ```text
 GET  /v1/runs
 POST /v1/runs
+PUT  /v1/runs/{run-id}
 GET  /v1/runs/{run-id}
 GET  /v1/runs/{run-id}/logs
 POST /v1/runs/{run-id}/events
+PUT  /v1/runs/{run-id}/events
 POST /v1/runs/{run-id}/telemetry
 POST /v1/runs/{run-id}/finish
 ```
@@ -220,16 +317,21 @@ GET  /v1/providers/{provider}/readiness
 GET  /v1/runners
 POST /v1/runners/sync
 POST /v1/images
-POST /v1/images/{id}/promote | fast-snapshot-restore
+POST /v1/images/{id}/promote
+GET  /v1/images/{id}/fast-snapshot-restore
 POST /v1/artifacts/uploads
 GET  /v1/admin/leases
-POST /v1/admin/lease-audit
+GET  /v1/admin/lease-audit
 POST /v1/admin/leases/{id-or-slug}/release | delete
 GET  /v1/admin/hosts
+GET  /v1/admin/aws-orphan-sweep
 POST /v1/admin/aws-orphan-sweep
+GET  /v1/admin/azure-orphan-sweep
+POST /v1/admin/azure-orphan-sweep
 ```
 
-`GET /v1/pool` and `/v1/admin/*` require the admin token. User tokens scope
+`GET /v1/pool` and `/v1/admin/*` require admin authorization, from the admin token
+or an existing immutable-owner GitHub admin grant. Non-admin user tokens scope
 list, lookup, heartbeat, release, run mutation, and usage to the token's
 owner/org. Run reads also permit every recorded backing lease owner so
 shared-lease and replacement activity remains auditable without granting those
@@ -238,14 +340,64 @@ owners event, telemetry, or finish writes. The CLI client wraps these in
 when a user request 404s or 401s, an admin-token fallback re-resolves and
 retries as admin.
 
+Lease list clients can negotiate `pagination=keyset-v1&projection=summary` on
+`GET /v1/leases` or `GET /v1/admin/leases`. Each response scans at most `limit`
+stored rows (default and maximum 100), applies visibility and filters, and returns
+`pagination: "keyset-v1"` plus an optional opaque `nextCursor`. Pass that value as
+`cursor` with the same filters until it is absent, even when `leases` is empty.
+Pages use storage-key order, not creation-time order, and do not represent a
+snapshot. Summaries omit creation events, telemetry history, and provisioning
+attempts before redaction/serialization; detail endpoints retain those fields.
+
+The cursor encrypts the last scanned key because that row may be invisible to the
+caller. It grants no access: every page reapplies authorization. It uses the
+existing session secret, otherwise the admin/shared/proxy secret; rotating that
+secret invalidates outstanding cursors and callers must restart their listing.
+No schema migration or new credential is required. A runtime without any of
+these configured secrets returns the legacy response without the pagination
+marker. Without negotiation, `/v1` preserves its full newest-first records,
+default 100 and maximum 500 results. Summary projection is independently opt-in.
+
+List and identity reads bypass the lifecycle queue. Slug resolution streams
+history and retains at most two matches to detect ambiguity. Durable admission
+streams cost accounting inside its storage transaction, retaining only live/access
+records instead of the full lease history. These scans still do work proportional
+to retained history; paging bounds each list request rather than introducing a
+new persisted index or deleting diagnostic evidence.
+
+Maintenance discovers workspace, bridge, and lease candidates without holding
+the lifecycle mutex. These paged discovery reads also opt out of Cloudflare's
+storage input gate, allowing incoming lease reads and mutations to proceed
+while a history page is pending. Discovery grants no authority: workspace
+quarantine rereads each candidate under the mutex, and lease recovery and cleanup
+retain their existing state and ownership fences. Full alarm reconciliation
+remains serialized with deadline changes so a concurrent heartbeat or release
+cannot lose its wakeup.
+
+Existing-image promotion and deletion retain the lifecycle queue across provider
+validation and catalog publication, with a shared 120-second provider deadline.
+AWS and Azure requests default to 60 seconds, including response bodies; AWS
+credential resolution, signing, retries, and backoff share that request budget.
+Provider timeouts return HTTP 503 with `retry-after` and
+`error: "provider_request_timeout"`; a mutation may have reached the provider, so
+callers must retry against the retained ownership and publication state.
+
+Mac host deletion reads its ownership claim under the mutex, verifies provider
+identity and host tags outside it, then rereads the claim before the bounded,
+serialized release. A changed claim returns 409. Tailscale preflight reads only
+environment configuration and bypasses the lifecycle queue; its OAuth and auth-key
+requests each have a 15-second deadline and retain the existing preflight statuses.
+
 ## What Flows on a Run
 
 `crabbox run` (`internal/cli/run.go`). In brokered mode a run recorder mirrors
 progress to the broker so the portal and `history`/`logs`/`events`/`results`
 commands can read it back:
 
-- `POST /v1/runs` creates a `RunRecord` in state `running`.
-- `POST /v1/runs/{id}/events` streams phase-tagged events: `run.started`,
+- `PUT /v1/runs/{id}` atomically admits a caller-known run and its first event,
+  or returns the retained record for the same caller and original request.
+  Legacy `POST /v1/runs` creates a coordinator-issued `RunRecord` in state `running`.
+- `PUT /v1/runs/{id}/events` (legacy clients use `POST`) streams phase-tagged events: `run.started`,
   `leasing.started`, `bootstrap.waiting`, `sync.started`/`finished`,
   `actions.hydrate.*`, `command.started`, stdout/stderr chunks,
   `command.finished`, `lease.released`.
@@ -254,6 +406,41 @@ commands can read it back:
   (chunked at 64 KiB, capped at 8 MiB), and parsed [results](features/test-results.md).
   The coordinator computes `durationMs`, sets state `succeeded`/`failed`, and records
   classification (`blockedStage`, `retryLikely`).
+
+The Cloudflare runtime consumes one lifecycle upload at a time and retains that
+body only through its serialized state transition. Waiting uploads remain streams;
+a stalled lifecycle operation cannot accumulate whole run logs from every caller.
+Bodyless reads and direct lease create, heartbeat, and release routes bypass this
+upload queue, and reading an upload never holds the lifecycle mutex.
+
+Event polling and control subscriptions seek directly to the requested sequence
+and read at most the requested page without filling the storage cache. Legacy
+lease attribution scans events in bounded pages, retaining lease identities only.
+Neither path loads an entire run's event payload into memory. An event append whose
+upload or Durable Object dispatch throws returns HTTP 503
+`run_event_append_unavailable`; the Worker does not replay it because a reset can
+follow a committed event. Existing application error responses are preserved.
+
+Other Durable Object dispatch failures return JSON with `Cache-Control: no-store`:
+overload returns HTTP 503 `coordinator_overloaded` with `retryable: true` and
+`Retry-After: 5`; runtime resets and known availability failures return HTTP 503
+`coordinator_unavailable` with `retryable: true` and `Retry-After: 2`. Unknown or
+application exceptions return HTTP 500 `coordinator_internal_error` without a
+retry hint. Responses never expose the underlying exception text.
+
+CLI reads retry HTTP 429/502/503/504 and raw Cloudflare HTTP 500 bodies
+`error code: 1101`/`error code: 1102`, keeping their five-attempt, one-minute budget.
+Idempotent run admission retries transient failures up to four attempts within
+30 seconds, with a 10-second limit per attempt and the same body and captured
+authentication. Both use exponential backoff with jitter and honor `Retry-After`
+up to eight seconds; admission stops if the next delay would exceed its remaining
+budget. Lease-create recovery and run-event replay contracts remain unchanged.
+
+Coordinator API requests negotiate HTTP/2 over TLS when the server supports it,
+so independent requests can share a connection. HTTP/1 coordinators and the
+HTTP/1 WebSocket upgrade remain supported; both use the coordinator's same-origin
+redirect guard. An ended control owner closes and
+joins its local connection without waiting for a peer close handshake.
 
 The command itself, file sync, and I/O streaming all happen **directly
 CLI → runner over SSH** and never traverse the broker.
@@ -352,3 +539,20 @@ retry. Therefore:
 | Coordinator entry / auth   | `worker/src/coordinator-entry.ts`, `worker/src/index.ts`, `worker/node/server.ts`, `worker/src/auth.ts` |
 | Fleet state / endpoints    | `worker/src/fleet.ts`, `types.ts`, `config.ts`, `usage.ts`                                              |
 | Runtime adapters           | `worker/src/coordinator-runtime.ts`, `worker/node/node-runtime.ts`, `worker/node/postgres-storage.ts`   |
+
+## Donated container capacity
+
+The `serve` SSH-lease provider uses owner-scoped machines registered by the
+outbound `crabbox serve` agent. `worker/src/serve.ts` runs in both coordinator
+runtimes and owns placement, per-machine reservations, agent reports, and lost
+machine detection. Normal lease records retain the existing provisioning,
+active, released, expired, and failed states. Release is pending until an agent
+heartbeat confirms container absence; capacity stays reserved until then.
+
+The agent shares container creation and SSH bootstrap with local-container,
+but uses explicit address binding, CPU shares, resource limits, named cache
+volumes, an in-container deadline watchdog, and automatic container removal.
+Serve can reuse prepared bootstrap images; every lease gets fresh SSH host keys.
+Heartbeats are spaced from the previous response.
+Clients transfer files and execute commands directly over SSH. See
+[Serve](providers/serve.md) for the trust boundary and network requirements.

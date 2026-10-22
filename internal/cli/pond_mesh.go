@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +47,10 @@ const pondMeshLocalPortStart = 51820
 // large ponds simultaneously without exhausting it.
 const pondMeshLocalPortEnd = 52819
 
+// pondMeshCancelWaitDelay bounds the exec.CommandContext fallback when a
+// platform teardown API reports an error before the SSH root has exited.
+const pondMeshCancelWaitDelay = 5 * time.Second
+
 // pondMeshHostsRoot is the per-user state directory under HOME where
 // `pond connect` writes the rendered hosts and env files. The structure
 // mirrors the existing ~/.crabbox layout other commands already use.
@@ -63,79 +68,112 @@ const pondMeshEnvFileName = "env"
 // `pond disconnect <name>` can clean up this pond without broad process scans.
 const pondMeshDaemonFileName = "daemon.json"
 
-// pondMeshRunner abstracts os/exec.CommandContext so the connect orchestration
-// is testable without spawning real ssh processes. The production runner
-// returns a real *exec.Cmd; tests inject a recorder that captures arguments.
 type pondMeshRunner interface {
-	Command(ctx context.Context, name string, args ...string) pondMeshHandle
+	Command(ctx context.Context, target SSHTarget, name string, args ...string) pondMeshHandle
 }
 
-// pondMeshHandle is the minimal surface area the connect loop needs from a
-// spawned process: start it, wait for it to exit, and tear it down on context
-// cancellation. The real implementation wraps *exec.Cmd; tests substitute a
-// stub that records the invocation and exits when signaled.
 type pondMeshHandle interface {
 	Start() error
 	Wait() error
-	Process() processSignaler
-	PID() int
-	String() string
+	// Cancellation provenance belongs to each process; the shared context cannot
+	// distinguish our teardown from a sibling's genuine failure.
+	WasTerminatedByOurCancel() bool
 }
 
-// processSignaler is the subset of *os.Process that the connect loop touches
-// when the operator presses Ctrl-C and the orchestrator tears down each
-// underlying ssh process in turn.
-type processSignaler interface {
-	Signal(os.Signal) error
-	Kill() error
-}
-
-// pondMeshExecRunner is the production pondMeshRunner. It wraps
-// exec.CommandContext directly so behaviour under ctx cancellation matches
-// every other Crabbox SSH invocation.
 type pondMeshExecRunner struct{}
 
-func (pondMeshExecRunner) Command(ctx context.Context, name string, args ...string) pondMeshHandle {
-	return &pondMeshExecHandle{cmd: exec.CommandContext(ctx, name, args...)}
+func (pondMeshExecRunner) Command(ctx context.Context, target SSHTarget, name string, args ...string) pondMeshHandle {
+	return pondMeshExecCommand(ctx, target, name, args...)
 }
 
-// pondMeshDaemonRunner creates SSH tunnel processes that survive the parent
-// CLI exit. It uses plain exec.Command (not CommandContext) so context
-// cancellation does not kill the tunnels, and sets Setpgid so the kernel
-// orphan-adopts them when crabbox exits. Used only by the --export path
-// so eval $(crabbox pond connect --export) works.
-type pondMeshDaemonRunner struct{}
+func pondMeshExecCommand(ctx context.Context, target SSHTarget, name string, args ...string) *pondMeshExecHandle {
+	cmd := exec.CommandContext(ctx, name, args...)
+	applyTargetChildEnvironment(cmd, target)
+	cmd.WaitDelay = pondMeshCancelWaitDelay
+	h := &pondMeshExecHandle{cmd: cmd}
+	h.prepare = func() error { return prepareSSHConnection(ctx, target) }
+	// Kill the owned process tree so ProxyCommand descendants cannot outlive SSH.
+	// A catchable signal could produce a nonzero exit indistinguishable from a
+	// genuine failure; platform hard-kill provenance keeps that distinction.
+	h.cmd.Cancel = h.cancelAndKill
+	return h
+}
 
-func (pondMeshDaemonRunner) Command(_ context.Context, name string, args ...string) pondMeshHandle {
+// Exported tunnels outlive the caller, so they have no CommandContext watchdog.
+func pondMeshDaemonCommand(target SSHTarget, name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)
+	if cmd.Err == nil && target.PrepareConnection != nil {
+		cmd.Err = prepareSSHConnection(context.Background(), target)
+	}
+	applyTargetChildEnvironment(cmd, target)
 	configureDaemonCommand(cmd)
-	return &pondMeshExecHandle{cmd: cmd}
+	return cmd
 }
 
 type pondMeshExecHandle struct {
-	cmd *exec.Cmd
+	cmd      *exec.Cmd
+	prepare  func() error
+	platform pondMeshPlatformState
+	// Set before delivering the kill so a concurrent Wait observes provenance.
+	cancelled atomic.Bool
+	// cancelFailed makes cleanup/inventory failures observable instead of
+	// suppressing them as an ordinary operator cancellation.
+	cancelFailed atomic.Bool
+	cancelErrMu  sync.Mutex
+	cancelErr    error
 }
 
-func (h *pondMeshExecHandle) Start() error   { return h.cmd.Start() }
-func (h *pondMeshExecHandle) Wait() error    { return h.cmd.Wait() }
-func (h *pondMeshExecHandle) String() string { return h.cmd.String() }
-func (h *pondMeshExecHandle) PID() int {
-	if h.cmd.Process == nil {
-		return 0
+func (h *pondMeshExecHandle) prepareStart() error {
+	if h.cmd.Err != nil {
+		return h.cmd.Err
 	}
-	return h.cmd.Process.Pid
+	if h.prepare != nil {
+		return h.prepare()
+	}
+	return nil
 }
-func (h *pondMeshExecHandle) Process() processSignaler {
+
+func (h *pondMeshExecHandle) cancelAndKill() error {
+	h.cancelled.Store(true)
 	if h.cmd.Process == nil {
 		return nil
 	}
-	return h.cmd.Process
+	if err := terminatePondMeshForwardProcess(h); err != nil {
+		if errors.Is(err, os.ErrProcessDone) {
+			return os.ErrProcessDone
+		}
+		h.cancelFailed.Store(true)
+		h.cancelErrMu.Lock()
+		h.cancelErr = err
+		h.cancelErrMu.Unlock()
+		return err
+	}
+	return nil
 }
 
-// pondMeshDefaultRunner is overridden in tests via the package-level pointer
-// so the production pondMeshExecRunner never appears in unit tests. Reads are
-// guarded by the tests running serially per package.
-var pondMeshDefaultRunner pondMeshRunner = pondMeshExecRunner{}
+func (h *pondMeshExecHandle) joinCancellationError(err error) error {
+	h.cancelErrMu.Lock()
+	defer h.cancelErrMu.Unlock()
+	if h.cancelErr == nil || errors.Is(err, h.cancelErr) {
+		return err
+	}
+	return errors.Join(err, h.cancelErr)
+}
+
+func (h *pondMeshExecHandle) WasTerminatedByOurCancel() bool {
+	if !h.cancelled.Load() {
+		// We never touched this process, so any Wait error is a genuine
+		// failure regardless of whether the shared context was cancelled by a
+		// sibling member or the caller.
+		return false
+	}
+	if h.cancelFailed.Load() {
+		// Cleanup itself failed. Surface that error instead of disguising a
+		// possible surviving process tree as clean cancellation.
+		return false
+	}
+	return killAttributableToCancel(h.cmd.ProcessState)
+}
 
 // requestedExposedPorts validates and normalizes the values from a repeated
 // `--expose` flag. Each entry must be a positive TCP port; comma-separated
@@ -147,16 +185,16 @@ func requestedExposedPorts(values []string) ([]string, error) {
 	out := []int{}
 	for _, raw := range values {
 		if strings.TrimSpace(raw) == "" {
-			return nil, exit(2, "--expose value must not be empty")
+			return nil, Exit(2, "--expose value must not be empty")
 		}
 		parts := splitCommaList(raw)
 		if len(parts) == 0 {
-			return nil, exit(2, "--expose value must not be empty")
+			return nil, Exit(2, "--expose value must not be empty")
 		}
 		for _, part := range parts {
 			port, err := strconv.Atoi(strings.TrimSpace(part))
 			if err != nil || port <= 0 || port > pondMaxExposedPort {
-				return nil, exit(2, "--expose %q must be a TCP port in 1..%d", part, pondMaxExposedPort)
+				return nil, Exit(2, "--expose %q must be a TCP port in 1..%d", part, pondMaxExposedPort)
 			}
 			if seen[port] {
 				continue
@@ -166,7 +204,7 @@ func requestedExposedPorts(values []string) ([]string, error) {
 		}
 	}
 	if len(out) > pondMaxExposedPortsPerLease {
-		return nil, exit(2, "--expose accepts at most %d distinct ports per lease", pondMaxExposedPortsPerLease)
+		return nil, Exit(2, "--expose accepts at most %d distinct ports per lease", pondMaxExposedPortsPerLease)
 	}
 	sort.Ints(out)
 	rendered := make([]string, len(out))
@@ -291,18 +329,18 @@ func (a App) pondConnect(ctx context.Context, args []string) error {
 	jsonOut := fs.Bool("json", false, "print the forward table as JSON and exit")
 	exportOnly := fs.Bool("export", false, "print shell exports for the rendered hosts and exit")
 	providerFlags := registerProviderFlags(fs, defaults)
-	if err := parseFlags(fs, args); err != nil {
+	if err := parseInterspersedFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return exit(2, "usage: crabbox pond connect <name>")
+		return Exit(2, "usage: crabbox pond connect <name>")
 	}
 	pond, err := requestedPondName(fs.Arg(0))
 	if err != nil {
 		return err
 	}
 	if pond == "" {
-		return exit(2, "usage: crabbox pond connect <name>")
+		return Exit(2, "usage: crabbox pond connect <name>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -325,7 +363,7 @@ func (a App) pondConnect(ctx context.Context, args []string) error {
 		fmt.Fprintf(a.Stderr, "pond %q has no SSH-mesh-capable members\n", pond)
 		return nil
 	}
-	opts := pondConnectOptions{Stdout: a.Stdout, Stderr: a.Stderr, HomeDir: os.Getenv("HOME"), Runner: pondMeshDefaultRunner}
+	opts := pondConnectOptions{Stdout: a.Stdout, Stderr: a.Stderr, HomeDir: os.Getenv("HOME")}
 	summary, err := preparePondMeshSummary(pond, members, opts)
 	if err != nil {
 		return err
@@ -339,52 +377,14 @@ func (a App) pondConnect(ctx context.Context, args []string) error {
 	}
 	if *exportOnly {
 		if !pondMeshDaemonSupported(runtime.GOOS) {
-			return exit(2, "pond connect --export is not supported on Windows operator hosts yet; run without --export or from macOS/Linux")
+			return Exit(2, "pond connect --export is not supported on Windows operator hosts yet; run without --export or from macOS/Linux")
 		}
 		// Start daemons before emitting exports so shell evals never see
 		// assignments for tunnels that failed to start.
 		if _, err := stopPondMeshDaemonState(opts.HomeDir, pond); err != nil {
 			return err
 		}
-		daemonRunner := pondMeshDaemonRunner{}
-		peerTarget := pondSSHTargetsByLease(members)
-		var started []pondMeshHandle
-		for _, fwd := range summary.Forwards {
-			target, ok := peerTarget[fwd.LeaseID]
-			if !ok {
-				stopDaemonHandles(started)
-				return exit(7, "no SSH target resolved for pond peer %q", fwd.Peer)
-			}
-			args := pondMeshSSHArgsForForward(target, fwd)
-			handle := daemonRunner.Command(context.Background(), "ssh", args...)
-			if err := handle.Start(); err != nil {
-				stopDaemonHandles(started)
-				return fmt.Errorf("start ssh -L %d:%d for %s: %w", fwd.LocalPort, fwd.RemotePort, fwd.Peer, err)
-			}
-			started = append(started, handle)
-			fmt.Fprintf(opts.Stderr, "  -L 127.0.0.1:%d -> %s:%d\n", fwd.LocalPort, fwd.Peer, fwd.RemotePort)
-		}
-		// Give tunnels a brief window to complete authentication and forward
-		// setup, then verify none exited immediately (wrong key, host unreachable, ...).
-		waitCh := make(chan error, len(started))
-		for i, h := range started {
-			go func(i int, h pondMeshHandle) {
-				err := h.Wait()
-				label := fmt.Sprintf("%s:%d", summary.Forwards[i].Peer, summary.Forwards[i].RemotePort)
-				select {
-				case waitCh <- fmt.Errorf("ssh -L for %s exited immediately: %w", label, err):
-				default:
-				}
-			}(i, h)
-		}
-		select {
-		case err := <-waitCh:
-			stopDaemonHandles(started)
-			return err
-		case <-time.After(200 * time.Millisecond):
-		}
-		if err := writePondMeshDaemonState(opts.HomeDir, pond, summary, started); err != nil {
-			stopDaemonHandles(started)
+		if err := startPondMeshDaemons(ctx, opts, pond, members, summary); err != nil {
 			return err
 		}
 		for _, line := range summary.Exports {
@@ -403,18 +403,19 @@ func (a App) pondConnect(ctx context.Context, args []string) error {
 
 func (a App) pondDisconnect(_ context.Context, args []string) error {
 	fs := newFlagSet("pond disconnect", a.Stderr)
-	if err := parseFlags(fs, args); err != nil {
+	fs.Usage = func() { fmt.Fprintln(a.Stderr, "Usage:\n  crabbox pond disconnect <name>") }
+	if err := parseInterspersedFlags(fs, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
-		return exit(2, "usage: crabbox pond disconnect <name>")
+	if fs.NArg() != 1 {
+		return Exit(2, "usage: crabbox pond disconnect <name>")
 	}
 	pond, err := requestedPondName(fs.Arg(0))
 	if err != nil {
 		return err
 	}
 	if pond == "" {
-		return exit(2, "usage: crabbox pond disconnect <name>")
+		return Exit(2, "usage: crabbox pond disconnect <name>")
 	}
 	stopped, err := stopPondMeshDaemonState(os.Getenv("HOME"), pond)
 	if err != nil {
@@ -439,7 +440,7 @@ func (a App) pondDisconnect(_ context.Context, args []string) error {
 // provider — the caller passes this through from `--provider X` for users
 // who want an explicit single-provider filter.
 func collectPondMembersAcrossProviders(ctx context.Context, rt Runtime, cfg Config, pond, providerFilter string) ([]pondMember, []string, error) {
-	claims, err := listLeaseClaims()
+	claims, err := ListLeaseClaimsContext(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -450,7 +451,7 @@ func collectPondMembersAcrossProviders(ctx context.Context, rt Runtime, cfg Conf
 	byProvider := make(map[string][]leaseClaim)
 	order := make([]string, 0, 4)
 	for _, claim := range matches {
-		key := strings.TrimSpace(claim.Provider)
+		key := canonicalClaimProvider(claim.Provider)
 		if _, seen := byProvider[key]; !seen {
 			order = append(order, key)
 		}
@@ -466,7 +467,7 @@ func collectPondMembersAcrossProviders(ctx context.Context, rt Runtime, cfg Conf
 			continue
 		}
 		providerCfg := cfg
-		providerCfg.Provider = p
+		setProviderSelection(&providerCfg, p, providerSelectionLeaseContext)
 		backend, berr := loadBackend(providerCfg, rt)
 		if berr != nil {
 			return nil, nil, fmt.Errorf("load backend for provider %s: %w", p, berr)
@@ -479,7 +480,7 @@ func collectPondMembersAcrossProviders(ctx context.Context, rt Runtime, cfg Conf
 			ineligible = append(ineligible, p)
 			continue
 		}
-		servers, serr := sshBackend.List(ctx, ListRequest{Options: LeaseOptions{Pond: normalizePondName(pond)}})
+		servers, serr := sshBackend.List(ctx, ListRequest{Options: LeaseOptions{Pond: NormalizePondName(pond)}})
 		if serr != nil {
 			return nil, nil, fmt.Errorf("list %s leases: %w", p, serr)
 		}
@@ -505,7 +506,7 @@ func collectPondMembers(ctx context.Context, backend SSHLeaseBackend, cfg Config
 	out := make([]pondMember, 0, len(servers))
 	for _, server := range servers {
 		resolveID := pondResolveIDForServer(server)
-		name := strings.TrimSpace(serverSlug(server))
+		name := strings.TrimSpace(ServerSlug(server))
 		if name == "" {
 			name = resolveID
 		}
@@ -514,7 +515,7 @@ func collectPondMembers(ctx context.Context, backend SSHLeaseBackend, cfg Config
 			out = append(out, pondMember{Name: name, Ports: ports, Lease: resolveID})
 			continue
 		}
-		expectedClaim, expectedClaimed, err := resolveLeaseClaim(resolveID)
+		expectedClaim, expectedClaimed, err := ResolveLeaseClaim(resolveID)
 		if err != nil {
 			return nil, fmt.Errorf("resolve %s claim: %w", server.Name, err)
 		}
@@ -523,8 +524,8 @@ func collectPondMembers(ctx context.Context, backend SSHLeaseBackend, cfg Config
 			return nil, fmt.Errorf("resolve %s: %w", server.Name, err)
 		}
 		if expectedClaimed && expectedClaim.LeaseID == lease.LeaseID {
-			if _, err := updateLeaseClaimEndpointIfUnchanged(lease.LeaseID, expectedClaim, lease.Server, lease.SSH); err != nil {
-				current, claimed, resolveErr := resolveLeaseClaim(lease.LeaseID)
+			if _, err := UpdateLeaseClaimEndpointIfUnchanged(lease.LeaseID, expectedClaim, lease.Server, lease.SSH); err != nil {
+				current, claimed, resolveErr := ResolveLeaseClaim(lease.LeaseID)
 				if resolveErr != nil {
 					return nil, fmt.Errorf("refresh %s claim endpoint: %w", server.Name, resolveErr)
 				}
@@ -585,11 +586,11 @@ func disambiguatePondMemberNames(members []pondMember) []pondMember {
 }
 
 func duplicatePondMemberName(member pondMember) string {
-	base := normalizePondName(member.Name)
+	base := NormalizePondName(member.Name)
 	if base == "" {
 		base = "peer"
 	}
-	suffix := normalizePondName(member.Provider)
+	suffix := NormalizePondName(member.Provider)
 	if suffix == "" {
 		suffix = shortLeaseID(member.Lease)
 	}
@@ -608,7 +609,7 @@ func duplicatePondMemberNameWithLease(member pondMember) string {
 }
 
 func shortLeaseID(leaseID string) string {
-	leaseID = normalizePondName(leaseID)
+	leaseID = NormalizePondName(leaseID)
 	leaseID = strings.TrimPrefix(leaseID, "cbx-")
 	leaseID = strings.TrimPrefix(leaseID, "isb-")
 	if len(leaseID) > 6 {
@@ -677,7 +678,7 @@ func allocateLocalForwardPort(used map[int]bool) (int, error) {
 		_ = listener.Close()
 		return port, nil
 	}
-	return 0, exit(7, "no free loopback ports between %d and %d for SSH-mesh forwards", pondMeshLocalPortStart, pondMeshLocalPortEnd)
+	return 0, Exit(7, "no free loopback ports between %d and %d for SSH-mesh forwards", pondMeshLocalPortStart, pondMeshLocalPortEnd)
 }
 
 // pondMeshHostsAndEnvPaths returns the absolute paths to the per-pond state
@@ -693,7 +694,7 @@ func pondMeshHostsAndEnvPaths(home, pond string) (string, string, error) {
 
 func pondMeshStateDir(home, pond string) (string, error) {
 	if home == "" {
-		return "", exit(2, "HOME is unset; cannot write pond SSH-mesh state files")
+		return "", Exit(2, "HOME is unset; cannot write pond SSH-mesh state files")
 	}
 	return filepath.Join(home, pondMeshHostsRoot, pond), nil
 }
@@ -787,22 +788,7 @@ func writePondMeshStateFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
 }
 
-// stopDaemonHandles kills every daemon process that was started before a
-// partial failure. Used by the --export path to avoid orphaned tunnels when
-// a later forward fails to start.
-func stopDaemonHandles(handles []pondMeshHandle) {
-	for _, h := range handles {
-		if proc := h.Process(); proc != nil {
-			if osProc, ok := proc.(*os.Process); ok {
-				_ = stopDaemonProcess(osProc, h.PID())
-			} else {
-				_ = proc.Kill()
-			}
-		}
-	}
-}
-
-func writePondMeshDaemonState(home, pond string, summary pondMeshSummary, handles []pondMeshHandle) error {
+func writePondMeshDaemonState(home, pond string, summary pondMeshSummary, groups []pondMeshForwardGroup, handles []*exec.Cmd) error {
 	path, err := pondMeshDaemonStatePath(home, pond, true)
 	if err != nil {
 		return err
@@ -810,11 +796,11 @@ func writePondMeshDaemonState(home, pond string, summary pondMeshSummary, handle
 	pids := make([]int, 0, len(handles))
 	processes := make([]pondMeshDaemonProcess, 0, len(handles))
 	for i, handle := range handles {
-		if pid := handle.PID(); pid > 0 {
+		if pid := handle.Process.Pid; pid > 0 {
 			pids = append(pids, pid)
 			process := pondMeshDaemonProcess{PID: pid, Command: handle.String()}
-			if i < len(summary.Forwards) {
-				process.Forward = summary.Forwards[i]
+			if i < len(groups) && len(groups[i].Forwards) > 0 {
+				process.Forward = groups[i].Forwards[0]
 			}
 			processes = append(processes, process)
 		}
@@ -847,11 +833,11 @@ func stopPondMeshDaemonState(home, pond string) (int, error) {
 		return 0, err
 	}
 	if !pondMeshDaemonSupported(runtime.GOOS) {
-		return 0, exit(2, "pond disconnect is not supported on Windows operator hosts because exported SSH-mesh daemons are disabled")
+		return 0, Exit(2, "pond disconnect is not supported on Windows operator hosts because exported SSH-mesh daemons are disabled")
 	}
 	var state pondMeshDaemonState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return 0, exit(2, "parse pond daemon state %s: %v", path, err)
+		return 0, Exit(2, "parse pond daemon state %s: %v", path, err)
 	}
 	stopped := 0
 	for _, entry := range pondMeshDaemonProcesses(state) {
@@ -892,7 +878,7 @@ func pondMeshDaemonProcesses(state pondMeshDaemonState) []pondMeshDaemonProcess 
 }
 
 func pondMeshDaemonProcessCommand(pid int) (string, bool) {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	out, err := systemInspectionCommand("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
 	if err != nil {
 		return "", false
 	}
@@ -940,93 +926,197 @@ func pondResolveIDForServer(server Server) string {
 	if server.ID != 0 {
 		return strconv.FormatInt(server.ID, 10)
 	}
-	return serverSlug(server)
+	return ServerSlug(server)
 }
 
-// pondMeshSSHArgsForForward builds the `ssh -L ...` argument vector for one
-// forward. It re-uses the same SSH options as the rest of the CLI.
-func pondMeshSSHArgsForForward(target SSHTarget, fwd pondMeshForward) []string {
+type pondMeshForwardGroup struct {
+	Target   SSHTarget
+	Forwards []pondMeshForward
+}
+
+func pondMeshForwardGroups(members []pondMember, forwards []pondMeshForward) ([]pondMeshForwardGroup, error) {
+	peerTarget := pondSSHTargetsByLease(members)
+	groupIndex := make(map[string]int, len(peerTarget))
+	groups := make([]pondMeshForwardGroup, 0, len(peerTarget))
+	for _, fwd := range forwards {
+		target, ok := peerTarget[fwd.LeaseID]
+		if !ok {
+			return nil, Exit(7, "no SSH target resolved for pond peer %q", fwd.Peer)
+		}
+		index, ok := groupIndex[fwd.LeaseID]
+		if !ok {
+			index = len(groups)
+			groupIndex[fwd.LeaseID] = index
+			groups = append(groups, pondMeshForwardGroup{Target: target})
+		}
+		groups[index].Forwards = append(groups[index].Forwards, fwd)
+	}
+	return groups, nil
+}
+
+func pondMeshForwardGroupLabel(forwards []pondMeshForward) string {
+	if len(forwards) == 0 {
+		return "unknown peer"
+	}
+	ports := make([]string, 0, len(forwards))
+	for _, fwd := range forwards {
+		ports = append(ports, strconv.Itoa(fwd.RemotePort))
+	}
+	return fmt.Sprintf("%s:%s", forwards[0].Peer, strings.Join(ports, ","))
+}
+
+// pondMeshSSHArgsForForwards builds one owned `ssh` argument vector containing
+// every `-L` for a member. One connection per member avoids both multiplexed
+// background masters and concurrent per-port handshakes.
+func pondMeshSSHArgsForForwards(target SSHTarget, forwards []pondMeshForward) []string {
+	// A pond member tunnel must remain the process owned by its exec.Cmd. Reusing a
+	// persistent master lets the short-lived mux client exit while the master
+	// retains the listener, so cancellation cannot reap or classify the tunnel.
+	target.NoControlMaster = true
 	args := append([]string{}, sshBaseArgs(target)...)
-	forward := fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", fwd.LocalPort, fwd.RemotePort)
 	args = append(args,
+		"-o", "ControlPath=none",
+		"-o", "ControlPersist=no",
 		"-N",
 		"-o", "ExitOnForwardFailure=yes",
-		"-L", forward,
-		target.User+"@"+target.Host,
 	)
+	for _, fwd := range forwards {
+		forward := fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", fwd.LocalPort, fwd.RemotePort)
+		args = append(args, "-L", forward)
+	}
+	args = append(args, target.User+"@"+target.Host)
 	return args
 }
 
-// runPondMeshForwards spawns one ssh -L per forward in the summary, waits for
-// ctx cancellation or any process exit, and tears the rest down. The
-// orchestration is deliberately simple: ControlMaster + ControlPersist (from
-// sshBaseArgs) reuses a single underlying TCP connection per peer so the
-// fan-out is cheap.
+func pondMeshForwardInvocation(ctx context.Context, group pondMeshForwardGroup) ([]string, *sshTransportSession, error) {
+	if !group.Target.AuthSecret && group.Target.SSHConfigFile == "" {
+		return pondMeshSSHArgsForForwards(group.Target, group.Forwards), nil, nil
+	}
+	session, err := newSSHTransportSession(ctx, group.Target, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	args := append(session.commandPrefixWithOptions("10", "3"), "-o", "ForkAfterAuthentication=no", "-N")
+	for _, fwd := range group.Forwards {
+		args = append(args, "-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", fwd.LocalPort, fwd.RemotePort))
+	}
+	return append(args, session.host()), session, nil
+}
+
+func closePondMeshForwardSession(handle pondMeshHandle, session *sshTransportSession) error {
+	if session == nil {
+		return nil
+	}
+	if h, ok := handle.(*pondMeshExecHandle); ok {
+		// Wait has already finished the platform owner. Do not remove configs
+		// when that owner could not prove descendant teardown.
+		if err := h.finishPondMeshPlatform(); err != nil {
+			return err
+		}
+	}
+	return session.Close()
+}
+
+// runPondMeshForwards spawns one SSH process per member, with all that member's
+// -L specifications, then waits for ctx cancellation or any process exit and
+// tears the rest down. Each member owns one non-multiplexed SSH process so
+// cancellation owns its complete lifetime and process tree.
 func runPondMeshForwards(ctx context.Context, opts pondConnectOptions, members []pondMember, summary pondMeshSummary) error {
+	terminationCtx, stopTerminationSignals := pondMeshTerminationContext(ctx)
+	defer stopTerminationSignals()
 	runner := opts.Runner
 	if runner == nil {
-		runner = pondMeshDefaultRunner
+		runner = pondMeshExecRunner{}
 	}
-	peerTarget := pondSSHTargetsByLease(members)
-	type runningForward struct {
-		fwd    pondMeshForward
-		handle pondMeshHandle
+	groups, err := pondMeshForwardGroups(members, summary.Forwards)
+	if err != nil {
+		return err
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	type runningForwardGroup struct {
+		group   pondMeshForwardGroup
+		handle  pondMeshHandle
+		session *sshTransportSession
+	}
+	ctx, cancel := context.WithCancel(terminationCtx)
 	defer cancel()
-	running := []runningForward{}
-	for _, fwd := range summary.Forwards {
-		target, ok := peerTarget[fwd.LeaseID]
-		if !ok {
-			cancel()
-			return exit(7, "no SSH target resolved for pond peer %q", fwd.Peer)
+	running := []runningForwardGroup{}
+	reapStarted := func() error {
+		var wg sync.WaitGroup
+		waitErrs := make([]error, len(running))
+		terminatedByCancel := make([]bool, len(running))
+		closeErrs := make([]error, len(running))
+		for i, rf := range running {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				waitErrs[i] = rf.handle.Wait()
+				terminatedByCancel[i] = rf.handle.WasTerminatedByOurCancel()
+				closeErrs[i] = closePondMeshForwardSession(rf.handle, rf.session)
+			}()
 		}
-		args := pondMeshSSHArgsForForward(target, fwd)
-		handle := runner.Command(ctx, "ssh", args...)
+		wg.Wait()
+		for i, rf := range running {
+			if waitErrs[i] == nil && !terminatedByCancel[i] {
+				return errors.Join(fmt.Errorf("ssh forwards for %s exited unexpectedly", pondMeshForwardGroupLabel(rf.group.Forwards)), errors.Join(closeErrs...))
+			}
+			if waitErrs[i] != nil && !terminatedByCancel[i] {
+				return errors.Join(waitErrs[i], errors.Join(closeErrs...))
+			}
+		}
+		return errors.Join(closeErrs...)
+	}
+	for _, group := range groups {
+		args, session, err := pondMeshForwardInvocation(ctx, group)
+		if err != nil {
+			cancel()
+			return errors.Join(err, reapStarted())
+		}
+		handle := runner.Command(ctx, group.Target, directSSHExecutable(), args...)
 		if err := handle.Start(); err != nil {
+			closeErr := session.Close()
+			parentErr := terminationCtx.Err()
 			cancel()
-			return fmt.Errorf("start ssh -L %d:%d for %s: %w", fwd.LocalPort, fwd.RemotePort, fwd.Peer, err)
+			if reapErr := reapStarted(); reapErr != nil {
+				return errors.Join(reapErr, closeErr)
+			}
+			if parentErr != nil && errors.Is(err, parentErr) {
+				return closeErr
+			}
+			return errors.Join(fmt.Errorf("start ssh forwards for %s: %w", pondMeshForwardGroupLabel(group.Forwards), err), closeErr)
 		}
-		running = append(running, runningForward{fwd: fwd, handle: handle})
-		fmt.Fprintf(opts.Stderr, "  -L 127.0.0.1:%d -> %s:%d\n", fwd.LocalPort, fwd.Peer, fwd.RemotePort)
+		running = append(running, runningForwardGroup{group: group, handle: handle, session: session})
+		for _, fwd := range group.Forwards {
+			fmt.Fprintf(opts.Stderr, "  -L 127.0.0.1:%d -> %s:%d\n", fwd.LocalPort, fwd.Peer, fwd.RemotePort)
+		}
 	}
 	var wg sync.WaitGroup
 	var firstErr error
 	var firstErrOnce sync.Once
+	var closeErrMu sync.Mutex
+	var closeErr error
 	for _, rf := range running {
 		wg.Add(1)
-		go func(rf runningForward) {
+		go func(rf runningForwardGroup) {
 			defer wg.Done()
 			err := rf.handle.Wait()
-			if err != nil && !errors.Is(err, context.Canceled) {
+			if err := closePondMeshForwardSession(rf.handle, rf.session); err != nil {
+				closeErrMu.Lock()
+				closeErr = errors.Join(closeErr, err)
+				closeErrMu.Unlock()
+			}
+			terminatedByCancel := rf.handle.WasTerminatedByOurCancel()
+			if err == nil && !terminatedByCancel {
+				firstErrOnce.Do(func() {
+					firstErr = fmt.Errorf("ssh forwards for %s exited unexpectedly", pondMeshForwardGroupLabel(rf.group.Forwards))
+				})
+			} else if err != nil && !terminatedByCancel {
 				firstErrOnce.Do(func() { firstErr = err })
 			}
 			cancel()
 		}(rf)
 	}
 	<-ctx.Done()
-	for _, rf := range running {
-		if proc := rf.handle.Process(); proc != nil {
-			_ = proc.Signal(os.Interrupt)
-		}
-	}
+	// Keep ownership until every process and its transport session have settled.
 	wg.Wait()
-	return firstErr
-}
-
-// pondMeshDoctorCounts inspects a slice of servers (already filtered by
-// pond) and returns the per-plane summary doctor surfaces. The function is
-// intentionally pure: no network, no SSH, no provider calls. doctor invokes
-// it from doctorPondMeshSummary so the test suite exercises every branch
-// without spawning subprocesses.
-func pondMeshDoctorCounts(servers []Server) (memberCount, exposedCount, totalPorts int) {
-	for _, server := range servers {
-		memberCount++
-		ports := parseExposedPortsLabel(server.Labels[pondExposedPortsLabelKey])
-		if len(ports) > 0 {
-			exposedCount++
-			totalPorts += len(ports)
-		}
-	}
-	return memberCount, exposedCount, totalPorts
+	return errors.Join(firstErr, closeErr)
 }

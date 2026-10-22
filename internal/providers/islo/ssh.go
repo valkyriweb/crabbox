@@ -7,6 +7,7 @@ import (
 
 	gosdk "github.com/islo-labs/go-sdk"
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const isloSSHDomain = "islo"
@@ -18,42 +19,52 @@ func (b *isloBackend) Resolve(ctx context.Context, req core.ResolveRequest) (cor
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	leaseID, name, _, err := resolveIsloLeaseID(req.ID, req.Repo.Root, req.Reclaim)
+	leaseID, name, _, err := b.resolveLeaseIDForRepo(ctx, client, req.ID, req.Repo.Root, req.Reclaim)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	sandbox, err := b.resolveSSHReadySandbox(ctx, client, name, req)
+	if !req.StatusOnly {
+		if _, err := requireIsloLeaseClaim(leaseID, "SSH reuse"); err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
+	sandbox, err := b.resolveRunningSandbox(ctx, client, name, req)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
 	server := isloSandboxToServer(sandbox)
 	applyIsloSSHLabels(&server, leaseID, b.cfg)
 	target := b.sshTargetForSandbox(name)
+	if err := core.UseLeaseKnownHosts(&target, leaseID); err != nil {
+		return core.LeaseTarget{}, err
+	}
 	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 }
 
-func (b *isloBackend) Touch(_ context.Context, req core.TouchRequest) (Server, error) {
+func (b *isloBackend) Touch(_ context.Context, req core.TouchRequest) (core.Server, error) {
 	server := req.Lease.Server
 	if server.Labels == nil {
 		server.Labels = map[string]string{}
 	}
-	server.Labels["state"] = blank(req.State, blank(server.Labels["state"], server.Status))
+	server.Labels["state"] = core.Blank(req.State, core.Blank(server.Labels["state"], server.Status))
 	return server, nil
 }
 
-func (b *isloBackend) resolveSSHReadySandbox(ctx context.Context, client isloAPI, name string, req core.ResolveRequest) (*gosdk.SandboxResponse, error) {
+// Readiness is shared by explicit SSH resolution and admitted delegated reuse;
+// callers decide admission and retention before requesting a billable resume.
+func (b *isloBackend) resolveRunningSandbox(ctx context.Context, client isloAPI, name string, req core.ResolveRequest) (*gosdk.SandboxResponse, error) {
 	sandbox, err := client.GetSandbox(ctx, name)
 	if err != nil {
 		return nil, isloError("get sandbox", err)
 	}
 	if sandbox == nil {
-		return nil, exit(4, "islo sandbox %s not found", name)
+		return nil, core.Exit(4, "islo sandbox %s not found", name)
 	}
 	if req.StatusOnly || isloStatusReady(sandbox.GetStatus()) {
 		return sandbox, nil
 	}
 	if isloStatusTerminal(sandbox.GetStatus()) {
-		return nil, exit(5, "islo sandbox %s entered terminal state=%s", name, sandbox.GetStatus())
+		return nil, core.Exit(5, "islo sandbox %s entered terminal state=%s", name, sandbox.GetStatus())
 	}
 	if strings.EqualFold(strings.TrimSpace(sandbox.GetStatus()), "paused") {
 		sandbox, err = resumeIsloSandbox(ctx, client, name)
@@ -70,28 +81,52 @@ func waitForIsloSandboxRunning(ctx context.Context, client isloAPI, name string,
 	defer deadline.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-deadline.C:
-			return nil, exit(5, "timed out waiting for islo sandbox %s to become running", name)
-		case <-ticker.C:
-			sandbox, err := client.GetSandbox(ctx, name)
-			if err != nil {
-				return nil, isloError("get sandbox", err)
-			}
-			if sandbox == nil {
-				return nil, exit(4, "islo sandbox %s not found", name)
-			}
-			if isloStatusReady(sandbox.GetStatus()) {
-				return sandbox, nil
-			}
-			if isloStatusTerminal(sandbox.GetStatus()) {
-				return nil, exit(5, "islo sandbox %s entered terminal state=%s", name, sandbox.GetStatus())
-			}
-		}
+	type observation struct {
+		sandbox *gosdk.SandboxResponse
+		active  bool
 	}
+	initial := true
+	result, err := shared.Poll(context.WithoutCancel(ctx), 0, time.Second,
+		func(context.Context, time.Duration) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline.C:
+				return core.Exit(5, "timed out waiting for islo sandbox %s to become running", name)
+			case <-ticker.C:
+				return nil
+			}
+		},
+		func(context.Context) (observation, error) {
+			if initial {
+				initial = false
+				return observation{}, nil
+			}
+			sandbox, err := client.GetSandbox(ctx, name)
+			return observation{sandbox: sandbox, active: true}, err
+		},
+		func(_ context.Context, current observation, fetchErr error) (bool, error) {
+			if !current.active {
+				return false, nil
+			}
+			if fetchErr != nil {
+				return false, isloError("get sandbox", fetchErr)
+			}
+			if current.sandbox == nil {
+				return false, core.Exit(4, "islo sandbox %s not found", name)
+			}
+			if isloStatusReady(current.sandbox.GetStatus()) {
+				return true, nil
+			}
+			if isloStatusTerminal(current.sandbox.GetStatus()) {
+				return false, core.Exit(5, "islo sandbox %s entered terminal state=%s", name, current.sandbox.GetStatus())
+			}
+			return false, nil
+		}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return result.Value.sandbox, nil
 }
 
 func (b *isloBackend) sshTargetForSandbox(name string) core.SSHTarget {
@@ -108,14 +143,13 @@ func (b *isloBackend) sshTargetForSandbox(name string) core.SSHTarget {
 		key = b.cfg.SSHKey
 	}
 	return core.SSHTarget{
-		User:                   user,
-		Host:                   isloSSHHost(name),
-		Key:                    key,
-		Port:                   port,
-		FallbackPorts:          []string{},
-		TargetOS:               targetLinux,
-		SSHConfigProxy:         true,
-		DisableHostKeyChecking: true,
+		User:           user,
+		Host:           isloSSHHost(name),
+		Key:            key,
+		Port:           port,
+		FallbackPorts:  []string{},
+		TargetOS:       targetLinux,
+		SSHConfigProxy: true,
 	}
 }
 
@@ -123,7 +157,7 @@ func isloSSHHost(name string) string {
 	return strings.TrimSpace(name) + "." + isloSSHDomain
 }
 
-func applyIsloSSHLabels(server *Server, leaseID string, cfg Config) {
+func applyIsloSSHLabels(server *core.Server, leaseID string, cfg core.Config) {
 	if server.Labels == nil {
 		server.Labels = map[string]string{}
 	}

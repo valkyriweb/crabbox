@@ -4,6 +4,8 @@ package cli
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -21,7 +23,32 @@ func ensurePrivateRunOutputDir(path string) error {
 		return err
 	}
 	defer unix.Close(fd)
-	return unix.Fchmod(fd, privateRunOutputDirMode)
+	return securePrivateRunOutputDirFD(fd)
+}
+
+func securePrivateRunOutputDirFD(fd int) error {
+	if err := setPrivateFDPermissions(uintptr(fd), privateRunOutputDirMode); err != nil {
+		return err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if os.FileMode(stat.Mode).Perm() != privateRunOutputDirMode {
+		return fmt.Errorf("private output directory mode is %#o, want %#o", os.FileMode(stat.Mode).Perm(), privateRunOutputDirMode)
+	}
+	return nil
+}
+
+func createPrivateRunOutputDir(path string) error {
+	if err := os.MkdirAll(path, privateRunOutputDirMode); err != nil {
+		return privateRunOutputWriteError{err}
+	}
+	return nil
+}
+
+func privateRunOutputPermissionError(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EROFS)
 }
 
 func openPrivateRunOutputFile(path string) (*os.File, error) {
@@ -61,14 +88,18 @@ func writePrivateRunOutputFile(path string, data []byte) error {
 	return nil
 }
 
+func replacePrivateRunOutputTemp(tempPath, path string) error {
+	return os.Rename(tempPath, path)
+}
+
 func createPrivateRunOutputTemp(path string) (*os.File, string, error) {
 	dir := filepath.Dir(path)
 	file, err := os.CreateTemp(dir, "."+filepath.Base(path)+".crabbox-*")
 	if err != nil {
-		return nil, "", err
+		return nil, "", privateRunOutputWriteError{err}
 	}
 	tempPath := file.Name()
-	if err := file.Chmod(privateRunOutputFileMode); err != nil {
+	if err := securePrivateFile(file); err != nil {
 		_ = file.Close()
 		_ = os.Remove(tempPath)
 		return nil, "", err
@@ -76,14 +107,55 @@ func createPrivateRunOutputTemp(path string) (*os.File, string, error) {
 	return file, tempPath, nil
 }
 
+func securePrivateFile(file *os.File) error {
+	if file == nil {
+		return fmt.Errorf("private output file handle is unavailable")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("private output must be a regular file")
+	}
+	if err := setPrivateFDPermissions(file.Fd(), privateRunOutputFileMode); err != nil {
+		return err
+	}
+	info, err = file.Stat()
+	if err != nil {
+		return err
+	}
+	if got := info.Mode().Perm(); got != privateRunOutputFileMode {
+		return fmt.Errorf("private output mode is %#o, want %#o", got, privateRunOutputFileMode)
+	}
+	return nil
+}
+
+func openExistingPrivateRunOutputFile(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open private output file handle")
+	}
+	if err := securePrivateFile(file); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
 func checkPrivateRunOutputReplaceable(label, path string) error {
 	dirInfo, err := os.Stat(filepath.Dir(path))
 	if err != nil {
-		return exit(2, "%s: %v", label, err)
+		return Exit(2, "%s: %v", label, err)
 	}
 	fileInfo, err := os.Lstat(path)
 	if err != nil {
-		return exit(2, "%s: %v", label, err)
+		return Exit(2, "%s: %v", label, err)
 	}
 	dirStat, dirOK := dirInfo.Sys().(*syscall.Stat_t)
 	fileStat, fileOK := fileInfo.Sys().(*syscall.Stat_t)
@@ -91,7 +163,7 @@ func checkPrivateRunOutputReplaceable(label, path string) error {
 		return nil
 	}
 	if !stickyRunOutputReplaceAllowed(uint32(os.Geteuid()), fileStat.Uid, dirStat.Uid, dirInfo.Mode()&os.ModeSticky != 0) {
-		return exit(2, "%s: cannot replace %s in sticky directory owned by another user", label, path)
+		return Exit(2, "%s: cannot replace %s in sticky directory owned by another user", label, path)
 	}
 	return nil
 }

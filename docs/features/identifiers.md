@@ -25,12 +25,201 @@ characters. `newLeaseID` mints one from 6 random bytes, and the regex
 `^cbx_[a-f0-9]{12}$` (`isCanonicalLeaseID`) decides whether a value is a
 canonical ID; anything that fails the pattern is treated as a slug.
 
-The CLI mints a provisional lease ID before calling the broker. The broker may
-return a different final ID (when the Worker dedupes a retried request, for
-example). When that happens, the CLI moves the local SSH key directory from the
-provisional ID to the final ID with `MoveStoredTestboxKey` (an atomic
-`os.Rename` of the per-lease directory) and re-keys the claim and other
-references accordingly.
+The CLI normally mints a provisional lease ID before calling the broker. A
+broker may return a different final ID, in which case the CLI moves the local
+SSH key directory from the provisional ID to the final ID with
+`MoveStoredTestboxKey` and re-keys the claim and other references accordingly.
+For each ordinary coordinator `POST` create, the CLI also mints a fresh opaque
+create-attempt token. The coordinator reserves the provisional ID in a private
+`pending` attempt record after synchronous request validation and before
+provider preparation. Cancellation uses the exact ID and token on the
+dedicated `cancel-create` route, so a cancel that arrives before the create
+still wins durably. An unbound canceled record tombstones only that exact
+owner/org/token operation: a fresh token may replace it after the coordinator
+rechecks that no exact lease or workspace reservation exists. Fixed-ID,
+registration, and workspace allocation also ignore unbound canceled records.
+Pending attempts and attempts bound to a canonical lease remain global ID
+reservations.
+
+New ordinary lease records bind to the token. Retained AWS Mac reactivation
+also binds the private attempt to the canonical lease, cloud ID, and a fresh
+generation. Only same-token create replay and create cancellation consume that
+mapping; status, heartbeat, sharing, runs, and normal release lookups remain
+canonical-only. Same-token concurrent creates replay the already bound
+provisioning or active canonical lease. Cancellation writes its tombstone and
+the canonical lease's release/cleanup claim together before provider deletion.
+Provisional IDs are permanently unavailable to ordinary, fixed-ID, registration,
+and workspace allocators once pending or bound to a canonical lease. Superseded
+unbound cancellations remain exact-operation tombstones, so the old token still
+returns `create_canceled` without affecting the replacement lifecycle. The
+private token and generation never appear in public lease records. Fixed-ID
+`PUT` creates do not use this protocol: their exact ID and intent hash continue
+to own replay, and caller cancellation never releases them.
+
+After caller cancellation, the CLI gives cancel-create recovery 30 seconds,
+retrying transient errors at the existing five-second interval. If that window
+expires, one final cancel-create request has its own 30-second budget.
+
+Automation may instead supply the canonical ID with `warmup --lease-id` on
+supported backends. Check `fixed-lease-id` in `crabbox providers --json` and the
+provider's recovery contract. These include direct AWS, Azure, DigitalOcean,
+Daytona, Incus, Linode, Machine0, local-container, Parallels, Proxmox, RunPod,
+Scaleway, Tenki, Boat, delegated Agent Sandbox, and managed coordinator leases.
+Scaleway implements fixed IDs but currently omits the offline catalog feature.
+That ID is an
+immutable create identity: an identical semantic replay returns the same
+live lease, while intent drift returns `lease_id_conflict`.
+Managed coordinator replay of the same terminal intent returns
+`fixed_lease_terminal`, except definite provisioning failures with no possible
+machine, which preserve `422 provisioning_failed` and the original diagnostics.
+External providers also accept requested IDs when their
+protocol explicitly advertises
+idempotent lease identity support. The coordinator durably stores a versioned
+normalized request hash. Direct AWS durably stores the intent and current
+resolved EC2 attempt in the normal lease claim before `RunInstances`, then uses
+a deterministic regional/zonal client token. No path uses the slug to decide
+replay ownership.
+
+Direct [RunPod](../providers/runpod.md), [Scaleway](../providers/scaleway.md), and
+[Linode](../providers/linode.md) bind replay and cleanup to the original provider
+scope and recorded resource identities. Preserve the local claims and key
+material through recovery; successful stop retains a terminal receipt so the
+same ID cannot create another machine. The catalog capability is a preflight
+signal, not permission to adopt a resource by name or ID alone.
+
+Tenki records its exact session and recovery attempt before reuse. See
+[Tenki fixed lease IDs](../providers/tenki.md#fixed-lease-ids-for-orchestration)
+for attestation, retained recovery state, and terminal receipt behavior.
+
+Boat records a keyed creation intent before submission and permits one recovery
+submission within the native 24-hour window, further limited by the intent TTL.
+Keep the original account and local state: its endpoint and organization scope
+cannot distinguish two personal account keys. See
+[Boat fixed lease IDs](../providers/ascii-box.md#fixed-lease-ids).
+
+Agent Sandbox binds each fixed attempt to its Kubernetes resource identities and
+retains terminal receipts through adapter cleanup. See
+[Agent Sandbox fixed lease IDs](../providers/agent-sandbox.md#fixed-lease-ids)
+for scope checks and foreground deletion requirements.
+
+The shared fixed-lease transaction engine records a versioned journal alongside
+the existing normalized intent, native attempt, and terminal receipt fields.
+The direct providers listed above use declarative admission and record formats with
+core-owned attempt encoding, binding publication, and terminal retention.
+Existing records remain readable; upgrading a record preserves its fingerprint and native ownership
+evidence. Uncertain submission and deletion retain custody, and a released ID
+cannot be allocated again. Native adapters validate their provider-specific scope,
+resource identity, and deletion completion. Only provider-certified definite
+failures permit a new attempt; Boat's one same-key recovery submission follows
+its bounded policy described above. Missing inventory alone never authorizes a
+new allocation. Providers that acknowledge
+termination without an intermediate cleanup marker retain their acquired record
+unmodified until acknowledgement. Existing native absence-recovery rules remain
+unchanged.
+
+External providers retain their delegated protocol: controller acknowledgement
+precedes readiness, and rejection rolls back the exact resource even with
+`Keep=true`. Their legacy records lack the original intent fingerprint and are
+not converted into built-in fixed-lease transactions.
+
+Direct Machine0 binds the intent to its deterministic VM name before creation;
+the durable attempt binds the first visible match to its Machine0 resource ID,
+and every later adoption requires that exact recorded ID. Its fixed claims use
+the downgrade-safe `machine0-fixed-v1` marker alongside AWS's `aws-fixed-v1`
+marker.
+
+Direct Daytona binds the API endpoint and observed native organization, then
+persists its exact create attempt before submission and the first observed
+sandbox UUID before readiness or deletion. Its `daytona-fixed-v1` claim marker
+prevents older clients from treating it as an ordinary lease. Submitted cleanup
+records an exact deletion acknowledgment, then reconciles a scope-attested UUID
+404 against complete failure-inclusive database inventory. Durable cleanup entry
+blocks reuse; unknown UUIDs and an unqualified 404 retain custody. The ordinary
+search index and mutable label filters do not establish absence. For successfully
+acquired children removed by native TTL or external deletion, `inspect`, `status`,
+and `stop` can publish the same terminal tombstone after verifying the current
+organization and complete failure-inclusive database absence. See
+[Daytona fixed operation IDs](../providers/daytona.md#fixed-operation-ids)
+for organization discovery and recovery limits.
+
+Direct local-container binds the intent to its runtime and daemon scope,
+normalized container configuration, and deterministic container name before
+creation. Replay adopts only the exact recorded container when its lease, name,
+runtime identity, and intent fingerprint still match; an unresolved attempt or
+missing acquired container fails closed instead of starting another container.
+Its fixed claims use the downgrade-safe `local-container-fixed-v1` marker, so
+older clients cannot mistake them for ordinary local-container claims.
+
+Direct Parallels binds the intent to an attested host connection identity, the
+immutable source VM UUID, the normalized clone identity, and the host-unique
+`crabbox-<lease-id>-<slug>` VM name, all persisted before `prlctl clone`. That
+name is the idempotency key: `prlctl` refuses a duplicate name on a host, so a
+concurrent create of the same lease is rejected by Parallels even after a lost
+reply. The host scope is a digest of the Parallels service's own server and
+hardware identifiers and the host account UID, so a fleet entry that keeps its
+display name while reaching another machine or account is refused. An inventory
+read through another account cannot prove the original VM absent. The same
+machine/account answering at a new address still owns and can
+still stop its leases; only attested values enter the scope, and hashing keeps
+host identifiers out of claims, labels, and errors. The
+source name is resolved to its immutable UUID before fingerprinting and before
+clone submission, so replacing a template under the same name is drift rather
+than a different fork.
+
+A Parallels VM name is host-unique but reusable, so replay requires
+provider-side creation evidence as well. `prlctl clone` reports no UUID, so
+Crabbox clones into a per-lease directory named with a secret nonce, recorded
+before the clone and passed as `--dst`: a bundle there can only have come from
+that attempt. The VM found in it supplies the UUID, and adoption, guest
+preparation and deletion all require the observed VM to carry that UUID and
+still live in that directory. A lost clone reply is therefore recoverable —
+replay finds its own VM in the attempt directory instead of cloning a second
+one — while a VM the attempt did not create is never adopted, credentialed or
+deleted, whatever name it holds. Release resolves a fixed lease from its durable
+claim alone, reading no guest and building no SSH target before the host and
+incarnation are re-attested. Clone submission, including a prepared retry on the
+pinned host, holds that host's `maxVMs` reservation across the count and the
+clone, while replay and release of an existing VM stay possible at capacity. A fixed Parallels
+lease never re-runs fleet selection; an unreadable inventory keeps custody
+instead of proving absence, a renamed acquired VM is found by its bound UUID
+rather than reported absent, and a vanished acquired VM fails closed rather than
+cloning another. `crabbox stop` reaches the durable release path through
+fixed-claim-aware resolution, so missing-resource finalization and idempotent
+terminal stop work through the CLI and not only through direct backend calls.
+Parallels fixed claims use the downgrade-safe `parallels-fixed-v1` marker
+alongside AWS's `aws-fixed-v1`, Machine0's `machine0-fixed-v1`, Daytona's
+`daytona-fixed-v1`, and local-container's `local-container-fixed-v1`; current
+clients map it back to runtime Parallels, while released clients cannot mistake
+it for an ordinary Parallels lease and delete its VM or prune its tombstone.
+
+Direct Proxmox selects a free VMID through the cluster allocator, then durably
+binds that exact VMID, the normalized intent, source node, and cluster scope
+before submitting the template clone with an explicit `newid`. Replay inspects
+that VMID and requires matching lease labels, intent fingerprint, provider
+scope, and native `vmgenid`; it never derives a VMID from the lease ID or adopts
+by slug. Missing or ambiguous post-submit state retains the attempt and cannot
+issue another clone. Its fixed claims use the downgrade-safe
+`proxmox-fixed-v1` marker.
+
+After the direct AWS launch attempt is durable, Crabbox never submits that
+attempt again. An ambiguous replay with no visible tagged instance fails closed;
+a later replay can adopt the one instance after inventory converges only when
+its non-secret attempt-attestation tags and provider-reported launch identity
+match the persisted attempt exactly. Fixed AWS
+claims use the downgrade-safe local discriminator `aws-fixed-v1`; current
+clients map it to runtime AWS, while older clients skip/refuse it.
+
+Fixed IDs are single-use operation identities. Direct AWS, Daytona, Machine0,
+local-container, and Parallels keep a compact terminal claim tombstone after
+successful destroy release or exact missing-resource cleanup. Tombstones
+contain only the ID, slug, provider scope, versioned intent hash, timestamps,
+and terminal state; automatic provider cleanup never prunes them.
+Proxmox also keeps terminal tombstones, retaining the selected VMID and,
+when observed, its native generation identity so release reconciliation
+remains exact. Automatic provider cleanup never prunes these tombstones.
+There is no time-based reuse window. Explicitly deleting local Crabbox claim
+state forfeits this replay protection, so automation must instead mint a new
+operation ID.
 
 Provider resources reference the lease ID through a Crabbox label (the label key
 is literally `lease`):
@@ -53,11 +242,12 @@ amber-crab
 silver-shrimp
 ```
 
-By default a slug is generated from a stable hash of the lease ID
-(`newLeaseSlug`), so the same lease always gets the same generated slug. The
-vocabulary is deliberately small (14 adjectives x 8 nouns = 112 base
-combinations) to match Crabbox's small-fleet model. Lease-creating commands can
-request a custom slug with `--slug <name>`:
+The base slug is generated from a stable hash of the lease ID (`newLeaseSlug`).
+CLI allocation for a new lease adds an eight-hex (32-bit) ID fingerprint immediately,
+such as `blue-lobster-1f3a9c2b`, without scanning local claims. Provider/coordinator
+collision checks remain authoritative. Fixed-ID replay retains its existing
+deterministic naming contract. The base vocabulary has 14 adjectives and 8 nouns.
+Lease-creating commands can request a custom slug with `--slug <name>`:
 
 ```sh
 crabbox warmup --slug update-flow-smoke
@@ -67,25 +257,27 @@ crabbox checkpoint fork chk_abc123def456 --slug update-flow-smoke
 
 `--slug` is creation-time metadata, not a rename. It is honored only when
 Crabbox is creating a new lease; existing leases keep their assigned slug.
+It is never an operation or idempotency key.
 
-Slugs are normalized everywhere they are accepted. `normalizeLeaseSlug`
+Slugs are normalized everywhere they are accepted. `NormalizeLeaseSlug`
 lowercases, keeps only `[a-z0-9]`, collapses every other run of characters into
 a single `-`, and trims leading and trailing dashes — so `Blue_Lobster` and
 `BLUE-LOBSTER` both resolve to `blue-lobster`. A requested slug must contain at
 least one letter or digit and is capped at 41 characters after normalization, so
 collision suffixes and provider names stay portable.
 
-When a requested or generated slug collides with an existing active lease (a
-matching server label or a matching local claim), `slugWithCollisionSuffix`
-appends a 4-hex suffix derived from a per-attempt seed:
+When a slug collides with a provider server label, or a requested slug matches a
+local claim, `slugWithCollisionSuffix` appends a four-hex suffix derived from a
+per-attempt seed. Requested slugs retain strict local claim collision checks;
+generated slugs skip that local scan:
 
 ```text
 blue-lobster-1f3a
 ```
 
-Allocation tries up to 20 suffixed candidates before settling. Collisions are
-rare in normal use — a single user's active leases seldom approach the 112 base
-slugs.
+Allocation tries up to 20 candidates and one final ID-derived fallback, then
+fails if that fallback is occupied. Generated slugs spread the small base
+vocabulary across the ID-derived suffixes.
 
 ## Provider Name
 
@@ -103,22 +295,29 @@ lease ID with `_` rewritten to `-`).
 
 ## Run ID
 
-Each `crabbox run` against a coordinator also gets a durable run handle:
+Each `crabbox run` gets a run ID:
 
 ```text
-run_abcdef123456
+run_abcdef1234567890abcdef1234567890
 ```
 
-Like lease IDs, run IDs are the `run_` prefix plus 12 lowercase hex characters
-(`newRunID` in the coordinator, from 6 random bytes). The coordinator mints the run
-record before the lease is acquired, so events can be appended for leasing
-failures, sync failures, and command output even when the run never reaches
-command-start. A run ID is stable across a single invocation; retrying the same
-command produces a new run.
+Current clients mint the `run_` prefix plus 32 lowercase hex characters from
+16 random bytes before admission. The same ID identifies coordinator history
+and execution metadata. Legacy coordinator-issued IDs use 12 lowercase hex
+characters and remain valid history handles. A run ID is stable across a single
+invocation; a new invocation of the same command always produces a new ID.
 
-`crabbox history`, `crabbox events`, `crabbox attach`, `crabbox logs`, and
-`crabbox results` all accept run IDs. Slugs do not resolve to runs — only to
-leases.
+The caller-known admission route binds the ID to the initiating actor and
+original create request. Repeating that admission while its record is retained
+returns the existing record, without restarting it or adding an event. It does
+not replay remote execution, grant authority from an ID alone, or permit an
+invocation to adopt another actor's record.
+
+Admitted IDs are durable handles accepted by `crabbox history`,
+`crabbox events`, `crabbox attach`, `crabbox logs`, and `crabbox results`.
+Coordinator-free runs use their locally minted IDs in command environments,
+timing, proof, and failure artifacts without creating coordinator history.
+Slugs do not resolve to runs — only to leases.
 
 ## Local Claims
 
@@ -159,6 +358,18 @@ A conflicting claim (same lease, different `repoRoot`) refuses commands by
 default with a `use --reclaim` error; `--reclaim` overrides the check and
 rewrites the claim atomically.
 
+Metadata discovery reads atomically published claim snapshots without waiting
+for lease operation locks. Active claims remain visible to listing, identifier
+resolution, and slug collision checks, so a busy lease does not block discovery
+or execution of an independent lease. A snapshot is not mutation authority:
+guarded actions and cleanup still lock the target claim and recheck its exact
+contents and revision before acting. Using an exact ID does not bypass that
+lease's own operation lock, repo ownership, or provider scope checks.
+
+Slug-based local claim resolution rejects multiple matching claims within the
+selected provider/scope before stop or release. Use the exact lease ID to
+disambiguate; an exact claim ID keeps precedence over aliases.
+
 Static SSH leases (`provider: ssh`) record extra endpoint fields in the claim —
 `staticHost`, `staticUser`, `staticPort`, `staticWorkRoot`, `targetOS`, and
 `windowsMode` — so the resolver knows the lease bypasses the coordinator and can
@@ -180,7 +391,18 @@ Keys are `ed25519` by default; AWS and Azure Windows leases use a 4096-bit RSA
 key instead (`ensureTestboxKeyForConfig`). The provisional-to-final lease ID
 move renames the whole directory so the private key, public key, and any
 `known_hosts` entries migrate together. The provider key name registered with
-the cloud account is `crabbox-cbx-abcdef123456` (`providerKeyForLease`).
+the cloud account is `crabbox-cbx-abcdef123456` (`providerKeyForLease`). Ordinary
+coordinator callers cannot override this lease-bound name; custom provider key
+names require admin authentication and are retained when a lease is released.
+Canonical `crabbox-cbx-*` names remain reserved for their encoded lease ID even
+for admin callers.
+AWS reuses an existing lease-bound key only when both its public key material
+and provider ownership metadata match the canonical lease ID. Hetzner applies
+the same check to an exact-name match. Because Hetzner makes public-key material
+account-unique, a differently named identity match is recorded as the lease's
+actual shared provider key without cleanup ownership and is retained. Cleanup
+requires that persisted ownership decision, re-reads provider ownership
+metadata, and leaves legacy, unowned, shared, or custom keys intact.
 
 ## Resolving An Identifier
 
@@ -193,18 +415,29 @@ the cloud account is `crabbox-cbx-abcdef123456` (`providerKeyForLease`).
 
 Resolution order:
 
-1. Read the local claim store. `resolveLeaseClaim` first tries the literal
-   identifier as a claim filename, then scans `claims/*.json` for any claim
-   whose `leaseID` or normalized `slug` matches.
-2. If a matching claim exists, use its `leaseID` as the canonical handle.
-3. If no claim is found and a coordinator is configured, ask the coordinator to
+1. Read the local claim store. A literal claim filename has precedence. When
+   `--provider` is omitted, its recorded provider is selected before backend
+   configuration; legacy claims without a provider keep the configured default.
+2. For a slug without an explicit provider, require all provider-bearing local
+   claims to agree on one canonical provider. Multiple scopes within that
+   provider remain available to its normal resolver; claims from different
+   providers fail with guidance to use a canonical lease ID or pass
+   `--provider`. An explicit provider remains authoritative.
+3. Use the matching claim's `leaseID` as the canonical handle.
+4. If no claim is found and a coordinator is configured, ask the coordinator to
    resolve the identifier (slug or canonical ID).
-4. For static SSH and direct-provider modes, fall back to the provider's
+5. For static SSH and direct-provider modes, fall back to the provider's
    `Resolve` implementation on `SSHLeaseBackend`.
 
-The first source that returns a hit wins. This is why `--id blue-lobster` works
-from any directory once a warmup ran in some other repo — the local claim
-translates the slug to a lease ID before the broker is ever involved.
+This is why `--id blue-lobster` can select both the canonical lease and its
+provider before provider credentials or configuration are validated. Exact IDs
+remain deterministic even when another claim uses the same text as a slug.
+Canonical IDs never fall back to a normalized local slug: if
+`cbx_abcdef123456` has no matching claim, a different lease named
+`cbx-abcdef123456` is not selected through that slug, nor is its provider. Exact
+native provider-ID matching remains available where supported. The normal
+provider-specific missing-claim or inventory-recovery behavior still applies.
+Use the hyphenated slug explicitly to select that other lease.
 
 ## Identifier Lifetime
 
@@ -213,12 +446,13 @@ provisional lease ID  newLeaseID() before the broker call
 final lease ID        broker may return a different ID; key dir + claim re-keyed to it
 slug                  computed on first lease creation, stable for that lease
 provider name         derived from final lease ID + slug
-run ID                minted per crabbox run when a coordinator is configured
+run ID                minted per invocation by the CLI; legacy coordinators mint POST-created IDs
 ```
 
-Slugs are not reserved after a lease ends. The next lease that happens to hash
-to the same base slug will reuse it; the small vocabulary makes that possible
-but uncommon in practice.
+Slugs are not permanent identities. The wordlist pair can recur, while new
+generated names include the ID fingerprint and allocation checks for active
+collisions. Automation should retain the canonical lease ID, especially for
+fixed-ID replay and cleanup.
 
 Related docs:
 

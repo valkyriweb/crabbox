@@ -3,14 +3,16 @@ import { BlockList, isIP } from "node:net";
 import type { Writable } from "node:stream";
 import { finished } from "node:stream/promises";
 
+import type { AsyncMutex } from "../src/async-mutex";
 import { coordinatorRequestQueue, type CoordinatorRequestQueue } from "../src/coordinator-runtime";
 import { runtimeAdapterRelayBodyLimit } from "../src/runtime-adapter-relay";
+import type { AsyncOperationTracker } from "./async-operation-tracker";
 
 export const unauthenticatedRequestBodyBytes = 1024 * 1024;
 export const authenticatedRequestBodyBytes = 16 * 1024 * 1024;
 export const runFinishRequestBodyBytes = 64 * 1024 * 1024;
 
-const noop = () => {};
+const untrustedForwardingWarningIntervalMs = 60_000;
 
 export class RequestBodyTooLargeError extends Error {}
 
@@ -35,49 +37,6 @@ export function nodeRequestAbortSignal(
       response.off("close", abortResponse);
     },
   };
-}
-
-export class AsyncMutex {
-  private tail: Promise<void> = Promise.resolve();
-
-  async run<T>(callback: () => Promise<T>): Promise<T> {
-    const previous = this.tail;
-    let release = noop;
-    this.tail = new Promise<void>((resolvePromise) => {
-      release = resolvePromise;
-    });
-    await previous;
-    try {
-      return await callback();
-    } finally {
-      release();
-    }
-  }
-
-  async drain(): Promise<void> {
-    await this.tail;
-  }
-}
-
-export class AsyncOperationTracker {
-  private readonly active = new Set<Promise<unknown>>();
-
-  async run<T>(callback: () => Promise<T>): Promise<T> {
-    const operation = callback();
-    this.active.add(operation);
-    try {
-      return await operation;
-    } finally {
-      this.active.delete(operation);
-    }
-  }
-
-  async drain(): Promise<void> {
-    const active = [...this.active];
-    if (active.length === 0) return;
-    await Promise.allSettled(active);
-    return this.drain();
-  }
 }
 
 export type FleetRequestQueue = CoordinatorRequestQueue;
@@ -126,29 +85,52 @@ export function isTrustedProxySource(
   const family = isIP(normalizedAddress);
   if (family === 0 || !configuredCIDRs?.trim()) return false;
 
-  const blockList = new BlockList();
   try {
-    for (const rawEntry of configuredCIDRs.split(",")) {
-      const entry = rawEntry.trim();
-      if (!entry) continue;
-      const separator = entry.lastIndexOf("/");
-      const subnet = normalizeIPAddress(separator === -1 ? entry : entry.slice(0, separator));
-      const subnetFamily = isIP(subnet);
-      if (subnetFamily === 0) return false;
-      const type = subnetFamily === 4 ? "ipv4" : "ipv6";
-      if (separator === -1) {
-        blockList.addAddress(subnet, type);
-        continue;
-      }
-      const prefix = Number(entry.slice(separator + 1));
-      const maxPrefix = subnetFamily === 4 ? 32 : 128;
-      if (!Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) return false;
-      blockList.addSubnet(subnet, prefix, type);
-    }
+    const blockList = trustedProxyBlockList(configuredCIDRs);
+    return blockList.check(normalizedAddress, family === 4 ? "ipv4" : "ipv6");
   } catch {
     return false;
   }
-  return blockList.check(normalizedAddress, family === 4 ? "ipv4" : "ipv6");
+}
+
+export function validateTrustedProxyCIDRs(configuredCIDRs: string | undefined): void {
+  if (!configuredCIDRs?.trim()) return;
+  trustedProxyBlockList(configuredCIDRs);
+}
+
+export interface UntrustedForwardingDiagnosticOptions {
+  now?: () => number;
+  warningIntervalMs?: number;
+  warn?: (message: string) => void;
+}
+
+export function createUntrustedForwardingDiagnostic(
+  options: UntrustedForwardingDiagnosticOptions = {},
+): (
+  peerAddress: string | undefined,
+  forwardedFor: string | undefined,
+  trustedProxy: boolean,
+) => boolean {
+  const now = options.now ?? Date.now;
+  const warningIntervalMs = options.warningIntervalMs ?? untrustedForwardingWarningIntervalMs;
+  const warn = options.warn ?? console.warn;
+  let nextWarningAt = Number.NEGATIVE_INFINITY;
+
+  return (peerAddress, forwardedFor, trustedProxy) => {
+    const peer = normalizeIPAddress(peerAddress);
+    if (trustedProxy || !forwardedFor?.trim() || isIP(peer) === 0) return false;
+    const currentTime = now();
+    if (currentTime < nextWarningAt) return false;
+    nextWarningAt = currentTime + warningIntervalMs;
+    try {
+      warn(
+        `crabbox coordinator received X-Forwarded-For from untrusted peer ${peer}; reverse proxy trust may be misconfigured; configure CRABBOX_TRUSTED_PROXY_CIDRS`,
+      );
+    } catch {
+      // Diagnostics must never affect request handling.
+    }
+    return true;
+  };
 }
 
 export function requestSourceIP(
@@ -177,6 +159,38 @@ function normalizeIPAddress(address: string | undefined): string {
   return mappedIPv4?.[1] ?? value;
 }
 
+function trustedProxyBlockList(configuredCIDRs: string): BlockList {
+  const blockList = new BlockList();
+  for (const rawEntry of configuredCIDRs.split(",")) {
+    const entry = rawEntry.trim();
+    try {
+      if (!entry) throw new Error("empty entry");
+      const separator = entry.lastIndexOf("/");
+      const subnet = normalizeIPAddress(separator === -1 ? entry : entry.slice(0, separator));
+      const subnetFamily = isIP(subnet);
+      if (subnetFamily === 0) throw new Error("invalid address");
+      const type = subnetFamily === 4 ? "ipv4" : "ipv6";
+      if (separator === -1) {
+        blockList.addAddress(subnet, type);
+        continue;
+      }
+      const rawPrefix = entry.slice(separator + 1);
+      if (!/^\d+$/u.test(rawPrefix)) throw new Error("invalid prefix");
+      const prefix = Number(rawPrefix);
+      const maxPrefix = subnetFamily === 4 ? 32 : 128;
+      if (!Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
+        throw new Error("invalid prefix");
+      }
+      blockList.addSubnet(subnet, prefix, type);
+    } catch {
+      throw new Error(
+        `CRABBOX_TRUSTED_PROXY_CIDRS contains invalid entry ${JSON.stringify(entry || "<empty>")}`,
+      );
+    }
+  }
+  return blockList;
+}
+
 export async function readNodeRequestBody(
   request: IncomingMessage,
   limit: number,
@@ -203,6 +217,20 @@ export async function writeNodeResponseBody(stream: Writable, body: Buffer): Pro
   const completion = finished(stream, { cleanup: true, readable: false });
   stream.end(body);
   await completion;
+}
+
+export function nodeResponseHeaders(headers: Headers): Array<[string, string | string[]]> {
+  const result: Array<[string, string | string[]]> = [];
+  for (const [name, value] of headers) {
+    if (name.toLowerCase() !== "set-cookie") {
+      result.push([name, value]);
+    }
+  }
+  const setCookies = headers.getSetCookie();
+  if (setCookies.length > 0) {
+    result.push(["set-cookie", setCookies]);
+  }
+  return result;
 }
 
 export function fleetRequestQueue(request: Request): FleetRequestQueue {

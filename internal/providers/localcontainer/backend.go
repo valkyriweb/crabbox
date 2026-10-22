@@ -2,8 +2,8 @@ package localcontainer
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -17,29 +17,60 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const (
-	providerName        = "local-container"
-	sshPort             = "2222"
-	workRootMarkerName  = ".crabbox-local-container-work-root"
-	dockerSocketInGuest = "/var/run/docker.sock"
-	rollbackTimeout     = 10 * time.Second
+	providerName          = "local-container"
+	sshPort               = "2222"
+	workRootMarkerName    = ".crabbox-local-container-work-root"
+	dockerSocketInGuest   = "/var/run/docker.sock"
+	rollbackTimeout       = 10 * time.Second
+	cgroupEvidenceLimit   = 4 << 10
+	pendingClaimState     = "provisioning"
+	pendingRecoveryKind   = "ssh-readiness-pending"
+	pendingRecoveryReason = "post-create failure; exact claim retained"
+	readinessPollInterval = 250 * time.Millisecond
+
+	readinessInspectionTimeout = 30 * time.Second
 )
 
-type backend struct {
-	spec core.ProviderSpec
-	cfg  core.Config
-	rt   core.Runtime
+var cgroupOOMCounterPaths = []string{
+	"/sys/fs/cgroup/memory.events",
+	"/sys/fs/cgroup/memory/memory.oom_control",
 }
+
+var errContainerIdentityMismatch = errors.New("local-container exact container identity changed")
+
+type backend struct {
+	spec                   core.ProviderSpec
+	cfg                    core.Config
+	rt                     core.Runtime
+	waitForSSHReady        func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error
+	captureRuntimeScope    func(context.Context, core.Config) (checkpointScope, error)
+	validateRuntimeScope   func(context.Context, checkpointScope) error
+	confirmContainerAbsent func(context.Context, string) (bool, error)
+	removeAll              func(string) error
+	beforeCleanupMutation  func(string)
+	afterClaimCleanup      func(string)
+}
+
+var _ core.ExclusiveOneShotAcquireBackend = (*backend)(nil)
+var _ core.IdempotentLeaseIDBackend = (*backend)(nil)
+var _ core.ReleaseLeaseClaimRetentionVerifier = (*backend)(nil)
+var _ core.StatusTouchClaimAuthorizer = (*backend)(nil)
 
 type inspectContainer struct {
 	ID              string            `json:"Id"`
+	Image           string            `json:"Image"`
 	Name            string            `json:"Name"`
 	Created         string            `json:"Created"`
 	Config          inspectConfig     `json:"Config"`
 	State           inspectState      `json:"State"`
 	NetworkSettings inspectNetworking `json:"NetworkSettings"`
+	// Optional settings must not make identity or OOM-state inspection fail.
+	HostConfig json.RawMessage `json:"HostConfig"`
+	Mounts     json.RawMessage `json:"Mounts"`
 }
 
 type inspectConfig struct {
@@ -48,8 +79,9 @@ type inspectConfig struct {
 }
 
 type inspectState struct {
-	Status  string `json:"Status"`
-	Running bool   `json:"Running"`
+	Status    string `json:"Status"`
+	Running   bool   `json:"Running"`
+	OOMKilled bool   `json:"OOMKilled"`
 }
 
 type inspectNetworking struct {
@@ -61,22 +93,150 @@ type inspectPort struct {
 	HostPort string `json:"HostPort"`
 }
 
+type terminalContainerError struct {
+	err   error
+	state string
+}
+
+func (e *terminalContainerError) Error() string { return e.err.Error() }
+
+func (e *terminalContainerError) Unwrap() error { return e.err }
+
 func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	applyDefaults(&cfg)
-	return &backend{spec: spec, cfg: cfg, rt: rt}
+	b := &backend{spec: spec, cfg: cfg, rt: rt, waitForSSHReady: core.WaitForSSHReady, removeAll: os.RemoveAll}
+	b.captureRuntimeScope = func(ctx context.Context, cfg core.Config) (checkpointScope, error) {
+		if isPodmanRuntime(cfg.LocalContainer.Runtime) {
+			return podmanScopeForConfig(ctx, cfg)
+		}
+		return checkpointScopeForServer(ctx, cfg, core.Server{Labels: cfg.LocalContainer.CheckpointMetadata})
+	}
+	b.validateRuntimeScope = validateCheckpointScope
+	b.confirmContainerAbsent = b.exactContainerAbsent
+	return b
 }
 
 func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
+func (b *backend) AcquireIsExclusiveOneShot() bool { return true }
+
+func (b *backend) SupportsRequestedLeaseID() bool { return true }
+
+func (b *backend) SupportsRequestedCheckpointID() bool { return true }
+
+func (b *backend) BeginRunFailureEvidence(ctx context.Context, req core.RunFailureEvidenceRequest) (core.RunFailureEvidenceCollector, error) {
+	containerID := strings.TrimSpace(req.Lease.Server.CloudID)
+	if containerID == "" {
+		return nil, core.Exit(2, "local-container failed-run evidence requires a container id")
+	}
+	runtime := b.memoryRuntime()
+	baseline, err := readOOMKillCount(ctx, runtime.run, containerID)
+	if err != nil {
+		return nil, err
+	}
+	baselineContainer, err := inspectRuntimeContainer(ctx, runtime.run, containerID)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context) (core.RunFailureEvidence, error) {
+		current, err := readOOMKillCount(ctx, runtime.run, containerID)
+		if err == nil && current > baseline {
+			return runtime.memoryFailureEvidence(ctx, containerID, baselineContainer), nil
+		}
+		if err == nil {
+			return core.RunFailureEvidence{}, nil
+		}
+		container, inspectErr := inspectRuntimeContainer(ctx, runtime.run, containerID)
+		if inspectErr == nil && !baselineContainer.State.OOMKilled && container.State.OOMKilled {
+			return runtime.memoryFailureEvidence(ctx, containerID, baselineContainer), nil
+		}
+		if inspectErr != nil {
+			return core.RunFailureEvidence{}, fmt.Errorf("%v; inspect container OOM state: %w", err, inspectErr)
+		}
+		return core.RunFailureEvidence{}, err
+	}, nil
+}
+
+func (b *backend) readOOMKillCount(ctx context.Context, containerID string) (uint64, error) {
+	return readOOMKillCount(ctx, b.memoryRuntime().run, containerID)
+}
+
+func readOOMKillCount(ctx context.Context, run containerObservationCommand, containerID string) (uint64, error) {
+	var failures []string
+	for _, cgroupPath := range cgroupOOMCounterPaths {
+		result, err := run(ctx, []string{"exec", containerID, "cat", cgroupPath})
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", cgroupPath, err))
+			continue
+		}
+		count, err := parseOOMKillCount(result.Stdout)
+		if err == nil {
+			return count, nil
+		}
+		failures = append(failures, fmt.Sprintf("%s: %v", cgroupPath, err))
+	}
+	return 0, core.Exit(2, "read local-container OOM counter: %s", strings.Join(failures, "; "))
+}
+
+func parseOOMKillCount(text string) (uint64, error) {
+	if len(text) > cgroupEvidenceLimit {
+		return 0, fmt.Errorf("cgroup counter output exceeds %d bytes", cgroupEvidenceLimit)
+	}
+	fields := strings.Fields(text)
+	for i := 0; i+1 < len(fields); i += 2 {
+		if fields[i] != "oom_kill" {
+			continue
+		}
+		count, err := strconv.ParseUint(fields[i+1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse oom_kill counter: %w", err)
+		}
+		return count, nil
+	}
+	return 0, fmt.Errorf("oom_kill counter is missing")
+}
+
 func (b *backend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID string) error {
-	core.UseStoredTestboxKey(&target.SSH, leaseID)
-	return nil
+	return core.UseStoredTestboxKey(&target.SSH, leaseID)
 }
 
 func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	cfg := b.configForRun()
-	if err := validateCheckpointFork(ctx, cfg); err != nil {
+	architecture, err := b.assertRequestedArchitecture(ctx, cfg)
+	if err != nil {
 		return core.LeaseTarget{}, err
+	}
+	if architecture != "" {
+		cfg.Architecture = architecture
+	}
+	metadata := cfg.LocalContainer.CheckpointMetadata
+	if strings.TrimSpace(req.RequestedLeaseID) != "" && len(metadata) != 0 &&
+		strings.TrimSpace(metadata[checkpointMetadataForkID]) == "" &&
+		strings.TrimSpace(metadata[checkpointMetadataForkName]) == "" {
+		if err := b.validateRuntimeScope(ctx, checkpointScopeFromMetadata(metadata, cfg.LocalContainer.Runtime)); err != nil {
+			return core.LeaseTarget{}, err
+		}
+	} else if err := validateCheckpointFork(ctx, cfg); err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if !hasCompleteCapturedRuntimeScope(cfg.LocalContainer.CheckpointMetadata) {
+		scope, err := b.captureRuntimeScope(ctx, cfg)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		completedScope := checkpointScopeMetadata(scope)
+		if !hasCompleteCapturedRuntimeScope(completedScope) {
+			return core.LeaseTarget{}, core.Exit(2, "local-container runtime identity is incomplete; refusing to create an unscoped lease")
+		}
+		metadata := shared.CloneLabels(cfg.LocalContainer.CheckpointMetadata)
+		for _, key := range checkpointScopeMetadataKeys {
+			metadata[key] = completedScope[key]
+		}
+		cfg.LocalContainer.CheckpointMetadata = shared.CloneLabels(metadata)
+		b.cfg.LocalContainer.CheckpointMetadata = shared.CloneLabels(metadata)
+	}
+	if strings.TrimSpace(req.RequestedLeaseID) != "" {
+		return b.acquireFixed(ctx, req, cfg)
 	}
 	leaseID := core.NewLeaseID()
 	containers, err := b.listContainers(ctx)
@@ -91,6 +251,10 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
+	claimScope := b.claimScope(ctx)
+	if strings.TrimSpace(claimScope) == "" {
+		return core.LeaseTarget{}, core.Exit(2, "local-container runtime scope is unavailable; refusing to create an unscoped lease")
+	}
 	keyPath, publicKey, err := core.EnsureTestboxKeyForConfig(cfg, leaseID)
 	if err != nil {
 		return core.LeaseTarget{}, err
@@ -104,48 +268,469 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	cfg.SSHKey = keyPath
 	name := core.LeaseProviderName(leaseID, slug)
 	fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s runtime=%s image=%s keep=%v\n", providerName, leaseID, slug, cfg.LocalContainer.Runtime, cfg.LocalContainer.Image, req.Keep)
-	containerID, bootstrapDir, err := b.createContainer(ctx, cfg, name, leaseID, slug, publicKey, req.Keep)
+	containerID, bootstrapDir, createErr := b.createContainer(ctx, cfg, name, leaseID, slug, publicKey, req.Keep)
+	if containerID == "" {
+		return core.LeaseTarget{}, createErr
+	}
+	lease := createdPendingLease(cfg, containerID, leaseID, slug, bootstrapDir, req.Keep)
+	pendingClaim, err := b.publishCreatedPendingClaim(leaseID, slug, claimScope, req, cfg, lease)
 	if err != nil {
-		if req.Keep && containerID != "" {
-			cleanupKey = false
-		}
-		return core.LeaseTarget{}, err
-	}
-	if req.Keep {
 		cleanupKey = false
+		rollbackErr := b.rollbackUnclaimedContainer(containerID, leaseID, bootstrapDir, &lease.Server)
+		if rollbackErr != nil {
+			if retryClaim, retryErr := b.publishCreatedPendingClaim(leaseID, slug, claimScope, req, cfg, lease); retryErr == nil {
+				pendingClaim = retryClaim
+				b.printPendingRecovery(leaseID, slug, pendingClaim, errors.Join(err, rollbackErr))
+				return core.LeaseTarget{}, errors.Join(err, rollbackErr)
+			}
+		}
+		return core.LeaseTarget{}, errors.Join(err, rollbackErr)
 	}
-	cleanupContainer := func() {
+	cleanupKey = false
+	if createErr != nil {
 		if req.Keep {
-			return
+			b.printPendingRecovery(leaseID, slug, pendingClaim, createErr)
+			return core.LeaseTarget{}, createErr
 		}
-		if err := b.removeContainer(context.Background(), containerID); err != nil {
-			return
+		rollbackErr := b.rollbackPendingLease(pendingClaim, lease, bootstrapDir)
+		if rollbackErr != nil {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, rollbackErr)
 		}
-		if bootstrapDir != "" && trustedBootstrapDir(bootstrapDir) {
-			_ = os.RemoveAll(bootstrapDir)
-		}
+		return core.LeaseTarget{}, errors.Join(createErr, rollbackErr)
 	}
 	container, err := b.inspectContainer(ctx, containerID)
 	if err != nil {
-		cleanupContainer()
-		return core.LeaseTarget{}, err
+		if req.Keep {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+			return core.LeaseTarget{}, err
+		}
+		rollbackErr := b.rollbackPendingLease(pendingClaim, lease, bootstrapDir)
+		if rollbackErr != nil {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, rollbackErr)
+		}
+		return core.LeaseTarget{}, errors.Join(err, rollbackErr)
 	}
-	lease, err := b.prepareLease(ctx, cfg, container, leaseID, slug, true)
+	if err := validateObservedContainer(container, containerID, leaseID); err != nil {
+		retained, reconcileErr := b.reconcileReadinessFailure(req.Keep, pendingClaim, lease, bootstrapDir, err)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+	}
+	lease, err = b.pendingLease(cfg, container, leaseID, slug)
 	if err != nil {
-		cleanupContainer()
-		return core.LeaseTarget{}, err
+		retained, reconcileErr := b.reconcileReadinessFailure(req.Keep, pendingClaim, lease, bootstrapDir, err)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
 	}
-	if err := core.ClaimLeaseForRepoProviderScopePondCacheVolumes(leaseID, slug, providerName, b.claimScope(ctx), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, core.CacheVolumeStickyDiskSpecs(cfg.Cache.Volumes)); err != nil {
-		cleanupContainer()
-		return core.LeaseTarget{}, err
+	lease.Server.ImageEvidence, err = b.observeImageEvidence(ctx, cfg, container, pendingClaim)
+	if err != nil {
+		retained, reconcileErr := b.reconcileReadinessFailure(req.Keep, pendingClaim, lease, bootstrapDir, err)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
 	}
-	if err := core.UpdateLeaseClaimEndpoint(leaseID, lease.Server, lease.SSH); err != nil {
-		cleanupContainer()
-		return core.LeaseTarget{}, err
+	markPendingLease(&lease.Server)
+	updatedPendingClaim, err := core.UpdateLeaseClaimEndpointIfUnchanged(leaseID, pendingClaim, lease.Server, lease.SSH)
+	if err != nil {
+		retained, reconcileErr := b.reconcileChangedClaim(lease, bootstrapDir)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
 	}
-	cleanupKey = false
+	pendingClaim = updatedPendingClaim
+	lease, err = b.waitForContainerEndpoint(ctx, cfg, containerID, leaseID, slug)
+	if err != nil {
+		retained, reconcileErr := b.reconcileReadinessFailure(req.Keep, pendingClaim, lease, bootstrapDir, err)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+	}
+	markPendingLease(&lease.Server)
+	lease.Server.ImageEvidence = core.CloneImageEvidence(pendingClaim.ImageEvidence)
+	updatedPendingClaim, err = core.UpdateLeaseClaimEndpointIfUnchanged(leaseID, pendingClaim, lease.Server, lease.SSH)
+	if err != nil {
+		retained, reconcileErr := b.reconcileChangedClaim(lease, bootstrapDir)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+			return core.LeaseTarget{}, err
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+	}
+	pendingClaim = updatedPendingClaim
+	if err := b.waitForExactContainerSSHReady(ctx, &lease, core.BootstrapWaitTimeout(cfg)); err != nil {
+		retained, reconcileErr := b.reconcileReadinessFailure(req.Keep, pendingClaim, lease, bootstrapDir, err)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+	}
+	lease.Server.Status = "ready"
+	lease.Server.Labels = shared.CloneLabels(lease.Server.Labels)
+	lease.Server.Labels["state"] = "ready"
+	delete(lease.Server.Labels, "recovery")
+	readyClaim, err := core.UpdateLeaseClaimEndpointIfUnchanged(leaseID, pendingClaim, lease.Server, lease.SSH)
+	if err != nil {
+		retained, reconcileErr := b.reconcileChangedClaim(lease, bootstrapDir)
+		if retained {
+			b.printPendingRecovery(leaseID, slug, pendingClaim, err)
+			return core.LeaseTarget{}, err
+		}
+		return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+	}
+	core.SetServerLeaseClaimSnapshot(&lease.Server, readyClaim, true)
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s container=%s state=ready\n", leaseID, shortID(container.ID))
 	return lease, nil
+}
+
+func createdPendingLease(cfg core.Config, containerID, leaseID, slug, bootstrapDir string, keep bool) core.LeaseTarget {
+	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, time.Now().UTC())
+	if core.IsArchitectureExplicit(cfg) {
+		labels["architecture"] = cfg.Architecture
+	}
+	labels["state"] = pendingClaimState
+	labels["recovery"] = pendingRecoveryKind
+	labels["ssh_key_owned"] = "true"
+	labels["bootstrap_owned"] = "true"
+	labels["bootstrap_dir"] = bootstrapDir
+	labels["runtime"] = cfg.LocalContainer.Runtime
+	labels["image"] = localContainerDisplayImage(cfg)
+	labels["ssh_user"] = cfg.LocalContainer.User
+	labels["ssh_port"] = sshPort
+	labels["docker_socket"] = boolEnv(cfg.LocalContainer.DockerSocket)
+	containerWorkRoot := cfg.LocalContainer.WorkRoot
+	if cfg.LocalContainer.DockerSocket {
+		hostWorkRoot, resolvedWorkRoot := dockerSocketWorkRoots(cfg)
+		labels["host_work_root"] = hostWorkRoot
+		containerWorkRoot = resolvedWorkRoot
+	}
+	labels["work_root"] = containerWorkRoot
+	for _, key := range checkpointScopeMetadataKeys {
+		if value := strings.TrimSpace(cfg.LocalContainer.CheckpointMetadata[key]); value != "" {
+			labels[key] = value
+		}
+	}
+	if contextName := strings.TrimSpace(cfg.LocalContainer.CheckpointMetadata[checkpointMetadataContext]); contextName != "" {
+		labels["runtime_context"] = contextName
+	}
+	server := core.Server{
+		CloudID:  containerID,
+		Provider: providerName,
+		Name:     core.LeaseProviderName(leaseID, slug),
+		Status:   pendingClaimState,
+		Labels:   labels,
+	}
+	server.ServerType.Name = localContainerDisplayImage(cfg)
+	target := core.SSHTargetFromConfig(cfg, "")
+	target.Port = ""
+	target.ReadyCheck = localContainerReadyCheck(cfg)
+	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}
+}
+
+func (b *backend) publishCreatedPendingClaim(leaseID, slug, claimScope string, req core.AcquireRequest, cfg core.Config, lease core.LeaseTarget) (core.LeaseClaim, error) {
+	claim, err := core.ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurable(
+		leaseID,
+		slug,
+		cfg,
+		claimScope,
+		lease.Server,
+		lease.SSH,
+		req.Repo.Root,
+		cfg.IdleTimeout,
+		req.Reclaim,
+		core.LeaseClaim{},
+		false,
+	)
+	if err == nil && claim.LeaseID != leaseID {
+		err = core.Exit(2, "local-container pending claim was not persisted for lease=%s", leaseID)
+	}
+	return claim, err
+}
+
+func (b *backend) pendingLease(cfg core.Config, container inspectContainer, leaseID, slug string) (core.LeaseTarget, error) {
+	server := b.serverFromContainer(container, cfg)
+	if user := strings.TrimSpace(server.Labels["ssh_user"]); user != "" {
+		cfg.LocalContainer.User = user
+		cfg.SSHUser = user
+	}
+	if root := strings.TrimSpace(server.Labels["work_root"]); root != "" {
+		cfg.LocalContainer.WorkRoot = root
+		cfg.WorkRoot = root
+	}
+	host, port, _ := containerSSHHostPort(container)
+	if keyPath, err := core.OptionalStoredTestboxKeyPath(leaseID); err == nil {
+		if _, statErr := os.Stat(keyPath); statErr == nil {
+			cfg.SSHKey = keyPath
+		}
+	} else if !os.IsNotExist(err) {
+		return core.LeaseTarget{Server: server, LeaseID: leaseID}, err
+	}
+	target := core.SSHTargetFromConfig(cfg, host)
+	target.Port = port
+	target.ReadyCheck = localContainerReadyCheck(cfg)
+	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+}
+
+func (b *backend) waitForContainerEndpoint(ctx context.Context, cfg core.Config, containerID, leaseID, slug string) (core.LeaseTarget, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var lastErr error
+	var observedContainerErr error
+	result, err := shared.Poll(waitCtx, 0, 100*time.Millisecond, shared.SleepContext,
+		func(observeCtx context.Context) (core.LeaseTarget, error) {
+			container, err := b.inspectContainer(observeCtx, containerID)
+			if err != nil {
+				return core.LeaseTarget{}, err
+			}
+			if err := validateObservedContainer(container, containerID, leaseID); err != nil {
+				observedContainerErr = err
+				return core.LeaseTarget{}, err
+			}
+			return b.prepareLease(observeCtx, cfg, container, leaseID, slug, false)
+		},
+		func(_ context.Context, _ core.LeaseTarget, fetchErr error) (bool, error) {
+			if fetchErr == nil {
+				return true, nil
+			}
+			if observedContainerErr != nil {
+				return false, fetchErr
+			}
+			lastErr = fetchErr
+			return false, nil
+		}, nil)
+	if err != nil {
+		if context.Cause(ctx) == nil && waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
+			if lastErr == nil {
+				lastErr = err
+			}
+			err = shared.PollTerminationError(waitCtx, err, core.Exit(5, "timed out waiting for SSH port on local-container %s: %v", shortID(containerID), lastErr))
+		}
+		return core.LeaseTarget{LeaseID: leaseID, Server: core.Server{CloudID: containerID}}, err
+	}
+	return result.Value, nil
+}
+
+func (b *backend) waitForExactContainerSSHReady(ctx context.Context, lease *core.LeaseTarget, timeout time.Duration) error {
+	inspectExact := func(observeCtx context.Context) error {
+		// Keep inspections bounded without replacing the SSH waiter's own timeout diagnostics.
+		observeCtx, cancel := context.WithTimeout(observeCtx, readinessInspectionTimeout)
+		defer cancel()
+		container, err := b.inspectContainer(observeCtx, lease.Server.CloudID)
+		if err != nil {
+			return err
+		}
+		return validateObservedContainer(container, lease.Server.CloudID, lease.LeaseID)
+	}
+	if err := inspectExact(ctx); err != nil {
+		return err
+	}
+
+	waitCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- b.waitForSSHReady(waitCtx, &lease.SSH, b.rt.Stderr, "local container ssh", timeout)
+	}()
+	ticker := time.NewTicker(readinessPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-waitDone:
+			if err != nil {
+				if observedErr := inspectExact(ctx); observedErr != nil {
+					var terminalErr *terminalContainerError
+					if errors.As(observedErr, &terminalErr) || errors.Is(observedErr, errContainerIdentityMismatch) {
+						return observedErr
+					}
+				}
+				return err
+			}
+			return inspectExact(ctx)
+		case <-ticker.C:
+			if err := inspectExact(ctx); err != nil {
+				cancel(err)
+				<-waitDone
+				return err
+			}
+		case <-ctx.Done():
+			cancel(context.Cause(ctx))
+			<-waitDone
+			return context.Cause(ctx)
+		}
+	}
+}
+
+func validateObservedContainer(container inspectContainer, containerID, leaseID string) error {
+	if strings.TrimSpace(container.ID) != strings.TrimSpace(containerID) {
+		return fmt.Errorf("%w: %w", errContainerIdentityMismatch,
+			core.Exit(2, "local-container lease %s is bound to container %s; refusing readiness for container %s", leaseID, shortID(containerID), shortID(container.ID)))
+	}
+	if state := terminalContainerState(container.State.Status); state != "" {
+		return &terminalContainerError{
+			err:   core.Exit(5, "local-container lease %s container %s reached terminal runtime state %s before SSH readiness", leaseID, shortID(containerID), state),
+			state: state,
+		}
+	}
+	return nil
+}
+
+func terminalContainerState(state string) string {
+	switch state = strings.ToLower(strings.TrimSpace(state)); state {
+	case "dead", "exited", "stopped":
+		return state
+	default:
+		return ""
+	}
+}
+
+func markPendingLease(server *core.Server) {
+	if server.Labels == nil {
+		server.Labels = map[string]string{}
+	} else {
+		server.Labels = shared.CloneLabels(server.Labels)
+	}
+	server.Status = pendingClaimState
+	server.Labels["state"] = pendingClaimState
+	server.Labels["recovery"] = pendingRecoveryKind
+	server.Labels["ssh_key_owned"] = "true"
+	server.Labels["bootstrap_owned"] = "true"
+}
+
+func (b *backend) rollbackUnclaimedContainer(containerID, leaseID, bootstrapDir string, server *core.Server) error {
+	lease := core.LeaseTarget{LeaseID: leaseID, Server: core.Server{CloudID: containerID}}
+	if server != nil {
+		lease.Server = *server
+		lease.Server.CloudID = containerID
+	}
+	retained, err := b.reconcileChangedClaim(lease, bootstrapDir)
+	if retained {
+		return errors.Join(err, core.Exit(2, "lease %s claim changed to own container %s; refusing stale rollback", leaseID, shortID(containerID)))
+	}
+	return err
+}
+
+func (b *backend) reconcileChangedClaim(lease core.LeaseTarget, bootstrapDir string) (bool, error) {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+	defer cancel()
+	retained := false
+	err := core.WithDurableLeaseClaimLock(lease.LeaseID, func(claim *core.LeaseClaim, exists bool, _ func() error) error {
+		if exists && strings.TrimSpace(claim.CloudID) == strings.TrimSpace(lease.Server.CloudID) {
+			retained = true
+			return nil
+		}
+		if err := b.removeContainer(rollbackCtx, lease.Server.CloudID); err != nil {
+			return fmt.Errorf("rollback unclaimed local-container resource %s: %w", shortID(lease.Server.CloudID), err)
+		}
+		var cleanupErrs []error
+		if hostRoot := hostLeaseWorkRoot(lease); hostRoot != "" {
+			winningHostRoot := ""
+			if exists {
+				winningHostRoot = hostLeaseWorkRoot(core.LeaseTarget{LeaseID: claim.LeaseID, Server: core.Server{Labels: claim.Labels}})
+			}
+			if hostRoot != winningHostRoot {
+				if err := b.removeAll(hostRoot); err != nil {
+					cleanupErrs = append(cleanupErrs, fmt.Errorf("remove local-container host work root %s: %w", hostRoot, err))
+				}
+			}
+		}
+		if bootstrapDir != "" {
+			winningBootstrapDir := ""
+			if exists {
+				winningBootstrapDir = strings.TrimSpace(claim.Labels["bootstrap_dir"])
+			}
+			if bootstrapDir != winningBootstrapDir {
+				if err := b.removeBootstrapDir(bootstrapDir); err != nil {
+					cleanupErrs = append(cleanupErrs, err)
+				}
+			}
+		}
+		if !exists && len(cleanupErrs) == 0 {
+			core.RemoveStoredTestboxKey(lease.LeaseID)
+		}
+		return errors.Join(cleanupErrs...)
+	})
+	return retained, err
+}
+
+func (b *backend) reconcileReadinessFailure(keep bool, expected core.LeaseClaim, lease core.LeaseTarget, bootstrapDir string, failure error) (bool, error) {
+	return core.ReconcileFixedReadiness(core.FixedReadinessRecovery{Expected: expected, Keep: keep, IdentityConflict: errors.Is(failure, errContainerIdentityMismatch),
+		Prepare: func() {
+			lease.Server = mergeLocalContainerClaim(lease.Server, expected)
+			if lease.Server.CloudID == "" {
+				lease.Server.CloudID = expected.CloudID
+			}
+		},
+		RollbackExact: func() error { return b.rollbackPendingLease(expected, lease, bootstrapDir) },
+		Reconcile:     func() (bool, error) { return b.reconcileChangedClaim(lease, bootstrapDir) },
+	})
+}
+
+func (b *backend) rollbackPendingLease(expected core.LeaseClaim, lease core.LeaseTarget, bootstrapDir string) error {
+	lease.Server = mergeLocalContainerClaim(lease.Server, expected)
+	if lease.Server.CloudID == "" {
+		lease.Server.CloudID = expected.CloudID
+	}
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+	defer cancel()
+	err := fixedLocalContainerLeaseKind.FinalizeAfterCleanup(expected, func() error {
+		if err := core.AuthorizeCheckpointRelease(expected, ""); err != nil {
+			return err
+		}
+		if err := b.removeContainer(rollbackCtx, lease.Server.CloudID); err != nil {
+			return err
+		}
+		labels := shared.CloneLabels(lease.Server.Labels)
+		labels["bootstrap_dir"] = bootstrapDir
+		return b.cleanupContainerSidecars(lease.LeaseID, labels, true)
+	})
+	if b.afterClaimCleanup != nil {
+		b.afterClaimCleanup(lease.LeaseID)
+	}
+	return err
+}
+
+func (b *backend) printPendingRecovery(leaseID, slug string, claim core.LeaseClaim, reason error) {
+	runtimeName := shared.FirstNonBlank(claim.Labels[checkpointMetadataRuntime], claim.Labels["runtime"], b.cfg.LocalContainer.Runtime, "docker")
+	envPrefix := []string{"CRABBOX_LOCAL_CONTAINER_RUNTIME=" + core.ShellQuote(runtimeName)}
+	scope := checkpointScopeFromMetadata(checkpointScopeMetadataFromLabels(claim.Labels), runtimeName)
+	if isDockerRuntime(runtimeName) && scope.Context != "" {
+		envPrefix = append(envPrefix, "DOCKER_CONTEXT="+core.ShellQuote(scope.Context))
+	}
+	if isPodmanRuntime(runtimeName) && scope.Context != "" && scope.Context != "default" && scope.Host == "" {
+		envPrefix = append(envPrefix, "CONTAINER_CONNECTION="+core.ShellQuote(scope.Context))
+	}
+	routeEnv := strings.Join(envPrefix, " ")
+	idArg := core.ShellQuote(leaseID)
+	runtimeState := ""
+	var terminalErr *terminalContainerError
+	if errors.As(reason, &terminalErr) {
+		runtimeState = " runtime_state=" + terminalErr.state
+	}
+	fmt.Fprintf(b.rt.Stderr, "retained provider=%s lease=%s slug=%s state=%s%s reason=%q\n", providerName, leaseID, blank(slug, "-"), pendingClaimState, runtimeState, pendingRecoveryReason)
+	fmt.Fprintf(b.rt.Stderr, "inspect: %s crabbox inspect --provider %s --id %s --json\n", routeEnv, providerName, idArg)
+	if terminalErr != nil && localContainerRestartIsActionable(scope, terminalErr.state) {
+		fmt.Fprintf(b.rt.Stderr, "restart: %s %s start %s\n", routeEnv, core.ShellQuote(runtimeName), core.ShellQuote(claim.CloudID))
+	}
+	if terminalErr == nil || terminalErr.state != "dead" {
+		fmt.Fprintf(b.rt.Stderr, "reclaim: %s crabbox run --provider %s --id %s --reclaim --keep --sync-only\n", routeEnv, providerName, idArg)
+	}
+	fmt.Fprintf(b.rt.Stderr, "cleanup: %s crabbox stop --provider %s --id %s\n", routeEnv, providerName, idArg)
+}
+
+func localContainerRestartIsActionable(scope checkpointScope, state string) bool {
+	if state == "dead" || scope.Host != "" {
+		return false
+	}
+	if scope.Config == "" {
+		return true
+	}
+	homeDir, err := os.UserHomeDir()
+	return err == nil && filepath.Clean(scope.Config) == filepath.Join(homeDir, ".docker")
 }
 
 func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
@@ -160,17 +745,185 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 		}
 		return core.LeaseTarget{}, err
 	}
-	cfg := b.configForRun()
-	if req.ReleaseOnly {
-		return core.LeaseTarget{Server: b.serverFromContainer(container, cfg), LeaseID: leaseID}, nil
+	if leaseID != "" {
+		if claim, ok, exact, claimErr := core.ResolveLeaseClaimForProviderWithExact(leaseID, providerName); claimErr != nil {
+			return core.LeaseTarget{}, claimErr
+		} else if ok && exact {
+			if _, scopeErr := b.applyCheckpointScopeLabels(ctx, claim.Labels); scopeErr != nil {
+				return core.LeaseTarget{}, scopeErr
+			}
+		}
 	}
-	lease, err := b.prepareLease(ctx, cfg, container, leaseID, slug, false)
+	cfg := b.configForRun()
+	readOnlyStatus := req.StatusOnly && !req.ReleaseOnly
+	if strings.TrimSpace(leaseID) == "" && (!readOnlyStatus || req.Reclaim) {
+		return core.LeaseTarget{}, localContainerOwnershipError(leaseID, container.ID)
+	}
+	owned, conflict, err := b.localContainerClaimStatus(ctx, leaseID, container.ID)
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	if req.Repo.Root != "" {
-		if err := core.ClaimLeaseForRepoProviderScopePond(leaseID, slug, providerName, b.claimScope(ctx), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
+	if (conflict && (!readOnlyStatus || req.Reclaim)) || (!owned && !readOnlyStatus && (req.ReleaseOnly || !req.Reclaim)) {
+		return core.LeaseTarget{}, localContainerOwnershipError(leaseID, container.ID)
+	}
+	if req.ReleaseOnly {
+		claim, err := b.requireExactLocalContainerClaim(ctx, leaseID, container.ID)
+		if err != nil {
 			return core.LeaseTarget{}, err
+		}
+		server := mergeLocalContainerClaim(b.serverFromContainer(container, cfg), claim)
+		core.SetServerLeaseClaimSnapshot(&server, claim, true)
+		return core.LeaseTarget{Server: server, LeaseID: leaseID}, nil
+	}
+	if !readOnlyStatus || req.Prepare || req.ReadyProbe {
+		if err := validateLocalContainerInspectedMounts(container); err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
+	var exactClaim core.LeaseClaim
+	if owned {
+		claim, ok, exact, claimErr := core.ResolveLeaseClaimForProviderWithExact(leaseID, providerName)
+		if claimErr != nil {
+			return core.LeaseTarget{}, claimErr
+		}
+		legacyReclaim := req.Reclaim && !hasCompleteCapturedRuntimeScope(claim.Labels) && strings.TrimSpace(claim.ProviderScope) == strings.TrimSpace(b.claimScope(ctx))
+		if !ok || !exact || claim.CloudID != container.ID || (!b.claimMatchesCurrentScope(ctx, claim) && !legacyReclaim) {
+			return core.LeaseTarget{}, localContainerOwnershipError(leaseID, container.ID)
+		}
+		exactClaim = claim
+	}
+	var lease core.LeaseTarget
+	if isPendingLocalContainerClaim(exactClaim) {
+		lease, err = b.pendingLease(cfg, container, leaseID, slug)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+		if req.Prepare {
+			keep := strings.EqualFold(exactClaim.Labels["keep"], "true")
+			bootstrapDir := strings.TrimSpace(exactClaim.Labels["bootstrap_dir"])
+			imageEvidence, observationErr := b.observeImageEvidence(ctx, cfg, container, exactClaim)
+			if observationErr != nil {
+				retained, reconcileErr := b.reconcileReadinessFailure(keep, exactClaim, lease, bootstrapDir, observationErr)
+				if retained {
+					b.printPendingRecovery(leaseID, slug, exactClaim, observationErr)
+				}
+				return core.LeaseTarget{}, errors.Join(observationErr, reconcileErr)
+			}
+			lease, err = b.waitForContainerEndpoint(ctx, cfg, container.ID, leaseID, slug)
+			if err != nil {
+				retained, reconcileErr := b.reconcileReadinessFailure(keep, exactClaim, lease, bootstrapDir, err)
+				if retained {
+					b.printPendingRecovery(leaseID, slug, exactClaim, err)
+				}
+				return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+			}
+			markPendingLease(&lease.Server)
+			lease.Server.ImageEvidence = imageEvidence
+			updatedClaim, updateErr := core.UpdateLeaseClaimEndpointIfUnchanged(leaseID, exactClaim, lease.Server, lease.SSH)
+			err = updateErr
+			if err != nil {
+				retained, reconcileErr := b.reconcileChangedClaim(lease, bootstrapDir)
+				if retained {
+					b.printPendingRecovery(leaseID, slug, exactClaim, err)
+				}
+				return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+			}
+			exactClaim = updatedClaim
+			if err := b.waitForExactContainerSSHReady(ctx, &lease, core.BootstrapWaitTimeout(cfg)); err != nil {
+				retained, reconcileErr := b.reconcileReadinessFailure(keep, exactClaim, lease, bootstrapDir, err)
+				if retained {
+					b.printPendingRecovery(leaseID, slug, exactClaim, err)
+				}
+				return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+			}
+			lease.Server.Status = "ready"
+			lease.Server.Labels = shared.CloneLabels(lease.Server.Labels)
+			lease.Server.Labels["state"] = "ready"
+			delete(lease.Server.Labels, "recovery")
+			updatedClaim, updateErr = core.UpdateLeaseClaimEndpointIfUnchanged(leaseID, exactClaim, lease.Server, lease.SSH)
+			err = updateErr
+			if err != nil {
+				retained, reconcileErr := b.reconcileChangedClaim(lease, bootstrapDir)
+				if retained {
+					b.printPendingRecovery(leaseID, slug, exactClaim, err)
+				}
+				return core.LeaseTarget{}, errors.Join(err, reconcileErr)
+			}
+			exactClaim = updatedClaim
+		}
+	} else if terminalContainerState(container.State.Status) != "" && req.StatusOnly {
+		lease, err = b.pendingLease(cfg, container, leaseID, slug)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+	} else {
+		lease, err = b.prepareLease(ctx, cfg, container, leaseID, slug, false)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
+	if owned {
+		lease.Server = mergeLocalContainerClaim(lease.Server, exactClaim)
+		core.SetServerLeaseClaimSnapshot(&lease.Server, exactClaim, true)
+	}
+	if isPendingLocalContainerClaim(exactClaim) {
+		// Until acquisition publishes its first snapshot, status must not expose
+		// a transient observation that can disagree with the completed run.
+		if exactClaim.ImageEvidence != nil && exactClaim.ImageEvidence.RuntimeImageID == container.Image {
+			lease.Server.ImageEvidence = core.CloneImageEvidence(exactClaim.ImageEvidence)
+		}
+	} else {
+		lease.Server.ImageEvidence, err = b.observeImageEvidence(ctx, cfg, container, exactClaim)
+		if err != nil {
+			return core.LeaseTarget{}, err
+		}
+	}
+	if req.Reclaim && (!owned || !hasCompleteCapturedRuntimeScope(exactClaim.Labels)) {
+		scope, scopeErr := b.captureRuntimeScope(ctx, cfg)
+		if scopeErr != nil {
+			return core.LeaseTarget{}, scopeErr
+		}
+		if strings.TrimSpace(scope.DaemonID) == "" {
+			return core.LeaseTarget{}, core.Exit(2, "local-container runtime identity is unavailable; refusing reclaim")
+		}
+		metadata := checkpointScopeMetadata(scope)
+		cfg.LocalContainer.CheckpointMetadata = metadata
+		b.cfg.LocalContainer.CheckpointMetadata = metadata
+		if lease.Server.Labels == nil {
+			lease.Server.Labels = map[string]string{}
+		}
+		for key, value := range metadata {
+			if strings.TrimSpace(value) != "" {
+				lease.Server.Labels[key] = value
+			}
+		}
+	}
+	if req.Repo.Root != "" && (!readOnlyStatus || req.Reclaim) {
+		var claimErr error
+		if expected, exists, set := core.ServerLeaseClaimSnapshot(lease.Server); set {
+			var updated core.LeaseClaim
+			updated, claimErr = core.ClaimLeaseTargetForRepoConfigScopeIfUnchanged(leaseID, slug, cfg, b.claimScope(ctx), lease.Server, lease.SSH, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, expected, exists)
+			if claimErr == nil {
+				core.SetServerLeaseClaimSnapshot(&lease.Server, updated, true)
+			}
+		} else {
+			claimErr = core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, providerName, b.claimScope(ctx), cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, lease.Server, lease.SSH)
+		}
+		if claimErr != nil {
+			return core.LeaseTarget{}, claimErr
+		}
+	}
+	lease.Server.Labels = publicLocalContainerClaimLabels(lease.Server.Labels)
+	if req.IncludeDiagnostics && req.IsReadOnlyStatus() && !req.ReadyProbe {
+		// All ownership/claim merges are complete. Enrich only the returned copy.
+		lease.Server.Labels = shared.CloneLabels(lease.Server.Labels)
+		for key := range lease.Server.Labels {
+			if strings.HasPrefix(key, memoryDiagnosticPrefix) {
+				delete(lease.Server.Labels, key)
+			}
+		}
+		for key, value := range b.memoryRuntime().memoryDetails(ctx, container.ID, container, "current") {
+			lease.Server.Labels[memoryDiagnosticPrefix+key] = value
 		}
 	}
 	return lease, nil
@@ -182,9 +935,44 @@ func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseVie
 	if err != nil {
 		return nil, err
 	}
-	servers := make([]core.LeaseView, 0, len(containers))
+	claims, err := core.ListLeaseClaims()
+	if err != nil {
+		return nil, err
+	}
+	claimScope := b.claimScope(ctx)
+	claimsByLease := make(map[string]core.LeaseClaim, len(claims))
+	for _, claim := range claims {
+		if isLocalContainerClaimProvider(claim.Provider) && claim.ProviderScope == claimScope {
+			claimsByLease[claim.LeaseID] = claim
+		}
+	}
+	servers := make([]core.LeaseView, 0, len(containers)+len(claimsByLease))
+	seenClaims := make(map[string]struct{}, len(containers))
 	for _, container := range containers {
-		servers = append(servers, b.serverFromContainer(container, cfg))
+		server := b.serverFromContainer(container, cfg)
+		leaseID := strings.TrimSpace(server.Labels["lease"])
+		if claim, ok := claimsByLease[leaseID]; ok && claim.CloudID == container.ID {
+			server = mergeLocalContainerClaim(server, claim)
+			seenClaims[leaseID] = struct{}{}
+		}
+		servers = append(servers, server)
+	}
+	for leaseID, claim := range claimsByLease {
+		if _, ok := seenClaims[leaseID]; ok || !isPendingLocalContainerClaim(claim) {
+			continue
+		}
+		labels := publicLocalContainerClaimLabels(claim.Labels)
+		labels["missing_container"] = "1"
+		server := core.Server{
+			CloudID:  claim.CloudID,
+			Provider: providerName,
+			Name:     core.LeaseProviderName(claim.LeaseID, claim.Slug),
+			Status:   "missing",
+			Labels:   labels,
+		}
+		server.PublicNet.IPv4.IP = claim.SSHHost
+		server.ServerType.Name = labels["server_type"]
+		servers = append(servers, server)
 	}
 	return servers, nil
 }
@@ -205,13 +993,28 @@ func (b *backend) Doctor(ctx context.Context, req core.DoctorRequest) (core.Doct
 }
 
 func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	_, err := b.ReleaseLeaseWithOutcome(ctx, req)
+	return err
+}
+
+func (b *backend) ReleaseLeaseWithOutcome(ctx context.Context, req core.ReleaseLeaseRequest) (core.ReleaseLeaseOutcome, error) {
+	var outcome core.ReleaseLeaseOutcome
+	err := b.releaseLease(ctx, req, &outcome)
+	return outcome, err
+}
+
+func (b *backend) releaseLease(ctx context.Context, req core.ReleaseLeaseRequest, outcome *core.ReleaseLeaseOutcome) error {
 	lease := req.Lease
-	appliedScope, err := b.applyCheckpointScopeLabels(ctx, lease.Server.Labels)
+	scopeLabels := lease.Server.Labels
+	if snapshot, exists, set := core.ServerLeaseClaimSnapshot(lease.Server); set && exists {
+		scopeLabels = snapshot.Labels
+	}
+	appliedScope, err := b.applyCheckpointScopeLabels(ctx, scopeLabels)
 	if err != nil {
 		return err
 	}
 	if !appliedScope {
-		identifier := firstNonBlank(lease.LeaseID, lease.Server.Labels["lease"])
+		identifier := shared.FirstNonBlank(lease.LeaseID, lease.Server.Labels["lease"])
 		if claim, ok, err := core.ResolveLeaseClaimForProvider(identifier, providerName); err != nil {
 			return err
 		} else if ok {
@@ -222,8 +1025,8 @@ func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest
 	}
 	id := strings.TrimSpace(req.Lease.Server.CloudID)
 	if id == "" {
-		if b.releaseMissingClaim(lease) {
-			return nil
+		if handled, err := b.releaseMissingClaim(ctx, lease, req.CheckpointID, outcome); handled || err != nil {
+			return err
 		}
 		container, leaseID, _, err := b.resolveContainer(ctx, req.Lease.LeaseID)
 		if err != nil {
@@ -238,39 +1041,165 @@ func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest
 	if id == "" {
 		return core.Exit(2, "provider=%s release requires a container id", providerName)
 	}
-	hostLeaseRoot := hostLeaseWorkRoot(lease)
-	bootstrapDir := strings.TrimSpace(lease.Server.Labels["bootstrap_dir"])
-	if err := b.removeContainer(ctx, id); err != nil {
-		return err
-	}
-	var cleanupErr error
-	if hostLeaseRoot != "" {
-		cleanupErr = os.RemoveAll(hostLeaseRoot)
-	}
-	if bootstrapDir != "" && trustedBootstrapDir(bootstrapDir) {
-		if err := os.RemoveAll(bootstrapDir); err != nil && cleanupErr == nil {
-			cleanupErr = err
+	claim, claimExists, snapshotSet := core.ServerLeaseClaimSnapshot(lease.Server)
+	if snapshotSet {
+		if !claimExists {
+			return localContainerOwnershipError(lease.LeaseID, id)
+		}
+		if err := b.validateExactLocalContainerClaim(ctx, claim, lease.LeaseID, id); err != nil {
+			return err
+		}
+	} else {
+		claim, err = b.requireExactLocalContainerClaim(ctx, lease.LeaseID, id)
+		if err != nil {
+			return err
 		}
 	}
-	core.RemoveLeaseClaim(lease.LeaseID)
-	core.RemoveStoredTestboxKey(lease.LeaseID)
-	if cleanupErr != nil {
-		return core.Exit(2, "remove local-container host work root %s: %v", hostLeaseRoot, cleanupErr)
+	lease.Server = mergeLocalContainerClaim(lease.Server, claim)
+	if err := core.AuthorizeCheckpointRelease(claim, req.CheckpointID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(lease.Server.Labels["fixed_intent_sha256"]) != "" && !fixedLocalContainerLeaseKind.IsFixedClaim(claim) {
+		return core.Exit(4, "lease_id_conflict: refusing to release fixed local-container lease %s without its durable create intent", lease.LeaseID)
+	}
+	deleteExact := func() error {
+		if err := core.AuthorizeCheckpointRelease(claim, req.CheckpointID); err != nil {
+			return err
+		}
+		if err := b.removeContainer(ctx, id); err != nil {
+			return err
+		}
+		outcome.Terminal = true
+		return b.cleanupContainerSidecars(lease.LeaseID, lease.Server.Labels, true)
+	}
+	if fixedLocalContainerLeaseKind.IsFixedClaim(claim) {
+		err = core.DeleteFixedResource(ctx, fixedLocalContainerLeaseKind, claim, core.FixedLeaseOperations[string]{
+			ObserveExact: func(ctx context.Context, tx *core.FixedTransaction, _ core.FixedObserveMode) (core.FixedObservation[string], error) {
+				if err := b.validateExactLocalContainerClaim(ctx, *tx.Claim, lease.LeaseID, id); err != nil {
+					return core.FixedObservation[string]{}, err
+				}
+				return core.FixedObservation[string]{Candidates: []string{id}}, nil
+			},
+			DeleteExact: func(context.Context, *core.FixedTransaction, string) error { return deleteExact() },
+		})
+	} else {
+		err = fixedLocalContainerLeaseKind.FinalizeAfterCleanup(claim, deleteExact)
+	}
+	if b.afterClaimCleanup != nil {
+		b.afterClaimCleanup(lease.LeaseID)
+	}
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func (b *backend) releaseMissingClaim(lease core.LeaseTarget) bool {
-	leaseID := strings.TrimSpace(firstNonBlank(lease.LeaseID, lease.Server.Labels["lease"]))
+func (b *backend) localContainerClaimStatus(ctx context.Context, leaseID, containerID string) (owned, conflict bool, err error) {
+	leaseID = strings.TrimSpace(leaseID)
+	claim, ok, exact, err := core.ResolveLeaseClaimForProviderWithExact(leaseID, providerName)
+	if err != nil {
+		return false, false, err
+	}
+	if !ok || !exact || claim.LeaseID != leaseID {
+		return false, false, nil
+	}
+	claimScope := strings.TrimSpace(claim.ProviderScope)
+	currentScope := strings.TrimSpace(b.claimScope(ctx))
+	claimCloudID := strings.TrimSpace(claim.CloudID)
+	if claimScope != "" && claimScope != currentScope {
+		return false, true, nil
+	}
+	if claimCloudID != "" && claimCloudID != strings.TrimSpace(containerID) {
+		return false, true, nil
+	}
+	if claimScope == "" || currentScope == "" || claimCloudID == "" {
+		return false, false, nil
+	}
+	return true, false, nil
+}
+
+func localContainerOwnershipError(leaseID, containerID string) error {
+	return core.Exit(4, "local-container lease %q has no exact local claim bound to container %q in the current runtime scope; adopt it with an explicit --reclaim reuse before stop", strings.TrimSpace(leaseID), strings.TrimSpace(containerID))
+}
+
+func (b *backend) requireExactLocalContainerClaim(ctx context.Context, leaseID, containerID string) (core.LeaseClaim, error) {
+	claim, ok, exact, err := core.ResolveLeaseClaimForProviderWithExact(leaseID, providerName)
+	if err != nil {
+		return core.LeaseClaim{}, err
+	}
+	if !ok || !exact {
+		return core.LeaseClaim{}, localContainerOwnershipError(leaseID, containerID)
+	}
+	if err := b.validateExactLocalContainerClaim(ctx, claim, leaseID, containerID); err != nil {
+		return core.LeaseClaim{}, err
+	}
+	return claim, nil
+}
+
+func (b *backend) validateExactLocalContainerClaim(ctx context.Context, claim core.LeaseClaim, leaseID, containerID string) error {
+	claimScope := strings.TrimSpace(claim.ProviderScope)
+	currentScope := strings.TrimSpace(b.claimScope(ctx))
+	if claim.LeaseID != strings.TrimSpace(leaseID) || !isLocalContainerClaimProvider(claim.Provider) ||
+		claim.CloudID == "" || claim.CloudID != strings.TrimSpace(containerID) ||
+		claimScope == "" || currentScope == "" || claimScope != currentScope {
+		return localContainerOwnershipError(leaseID, containerID)
+	}
+	if err := b.validateClaimRuntimeScope(ctx, claim); err != nil {
+		return localContainerOwnershipError(leaseID, containerID)
+	}
+	return nil
+}
+
+func (b *backend) AuthorizeStatusTouchClaim(ctx context.Context, lease core.LeaseTarget, claim core.LeaseClaim) error {
+	leaseID := strings.TrimSpace(lease.LeaseID)
+	containerID := strings.TrimSpace(lease.Server.CloudID)
+	if lease.Server.Provider != providerName || claim.LeaseID != leaseID || !isLocalContainerClaimProvider(claim.Provider) ||
+		claim.CloudID == "" || claim.CloudID != containerID {
+		return localContainerOwnershipError(lease.LeaseID, lease.Server.CloudID)
+	}
+	applied, err := b.applyCheckpointScopeLabels(ctx, claim.Labels)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return localContainerOwnershipError(lease.LeaseID, lease.Server.CloudID)
+	}
+	return b.validateExactLocalContainerClaim(ctx, claim, lease.LeaseID, lease.Server.CloudID)
+}
+
+func (b *backend) releaseMissingClaim(ctx context.Context, lease core.LeaseTarget, checkpointID string, outcome *core.ReleaseLeaseOutcome) (bool, error) {
+	leaseID := strings.TrimSpace(shared.FirstNonBlank(lease.LeaseID, lease.Server.Labels["lease"]))
 	if leaseID == "" || strings.TrimSpace(lease.Server.CloudID) != "" {
-		return false
+		return false, nil
 	}
 	if lease.Server.Labels["missing_container"] != "1" {
-		return false
+		return false, nil
 	}
-	core.RemoveLeaseClaim(leaseID)
-	core.RemoveStoredTestboxKey(leaseID)
-	return true
+	claim, claimExists, snapshotSet := core.ServerLeaseClaimSnapshot(lease.Server)
+	if !snapshotSet || !claimExists || claim.LeaseID != leaseID || !isLocalContainerClaimProvider(claim.Provider) || !b.claimMatchesCurrentScope(ctx, claim) {
+		return true, localContainerOwnershipError(leaseID, claim.CloudID)
+	}
+	err := fixedLocalContainerLeaseKind.FinalizeAfterCleanup(claim, func() error {
+		if err := core.AuthorizeCheckpointRelease(claim, checkpointID); err != nil {
+			return err
+		}
+		absent, err := b.confirmContainerAbsent(ctx, claim.CloudID)
+		if err != nil {
+			return err
+		}
+		if !absent {
+			return core.Exit(4, "local-container %s still exists; refusing to remove its claim", shortID(claim.CloudID))
+		}
+		outcome.Terminal = true
+		return b.cleanupContainerSidecars(leaseID, claim.Labels, true)
+	})
+	if b.afterClaimCleanup != nil {
+		b.afterClaimCleanup(leaseID)
+	}
+	if err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (b *backend) resolveMissingClaimForRelease(ctx context.Context, identifier string) (core.LeaseTarget, bool, error) {
@@ -291,11 +1220,11 @@ func (b *backend) resolveMissingClaimForRelease(ctx context.Context, identifier 
 		"missing_container": "1",
 	}
 	for key, value := range claim.Labels {
-		if strings.TrimSpace(value) != "" {
+		if strings.TrimSpace(value) != "" && !privateLocalContainerScopeLabel(key) {
 			labels[key] = value
 		}
 	}
-	return core.LeaseTarget{
+	lease := core.LeaseTarget{
 		LeaseID: claim.LeaseID,
 		Server: core.Server{
 			Provider: providerName,
@@ -303,7 +1232,9 @@ func (b *backend) resolveMissingClaimForRelease(ctx context.Context, identifier 
 			Status:   "missing",
 			Labels:   labels,
 		},
-	}, true, nil
+	}
+	core.SetServerLeaseClaimSnapshot(&lease.Server, claim, true)
+	return lease, true, nil
 }
 
 func localContainerClaimByIDOrSlug(identifier string) (core.LeaseClaim, bool, error) {
@@ -315,7 +1246,7 @@ func localContainerClaimByIDOrSlug(identifier string) (core.LeaseClaim, bool, er
 	if err != nil {
 		return core.LeaseClaim{}, false, err
 	}
-	if exactClaim.LeaseID == identifier && exactClaim.Provider == providerName {
+	if exactClaim.LeaseID == identifier && isLocalContainerClaimProvider(exactClaim.Provider) {
 		return exactClaim, true, nil
 	}
 	normalized := core.NormalizeLeaseSlug(identifier)
@@ -328,7 +1259,8 @@ func localContainerClaimByIDOrSlug(identifier string) (core.LeaseClaim, bool, er
 	}
 	var matches []core.LeaseClaim
 	for _, claim := range claims {
-		if claim.Provider == providerName && core.NormalizeLeaseSlug(claim.Slug) == normalized {
+		if isLocalContainerClaimProvider(claim.Provider) && !isReleasedFixedLocalContainerClaim(claim) &&
+			core.NormalizeLeaseSlug(claim.Slug) == normalized {
 			matches = append(matches, claim)
 		}
 	}
@@ -346,7 +1278,47 @@ func (b *backend) claimMatchesCurrentScope(ctx context.Context, claim core.Lease
 	if claimScope == "" {
 		return true
 	}
-	return claimScope == strings.TrimSpace(b.claimScope(ctx))
+	if claimScope != strings.TrimSpace(b.claimScope(ctx)) {
+		return false
+	}
+	return b.validateClaimRuntimeScope(ctx, claim) == nil
+}
+
+func (b *backend) validateClaimRuntimeScope(ctx context.Context, claim core.LeaseClaim) error {
+	metadata := checkpointScopeMetadataFromLabels(claim.Labels)
+	if !hasCompleteCapturedRuntimeScope(claim.Labels) {
+		return core.Exit(4, "local-container claim lacks captured runtime identity")
+	}
+	expected := checkpointScopeFromMetadata(metadata, claim.Labels["runtime"])
+	currentMetadata := b.cfg.LocalContainer.CheckpointMetadata
+	if len(currentMetadata) == 0 {
+		return core.Exit(4, "local-container captured runtime scope is not hydrated")
+	}
+	current := checkpointScopeFromMetadata(currentMetadata, b.cfg.LocalContainer.Runtime)
+	if !sameCheckpointScope(expected, current) {
+		return core.Exit(4, "local-container captured runtime scope changed")
+	}
+	if err := b.validateRuntimeScope(ctx, expected); err != nil {
+		return core.Exit(4, "local-container captured runtime identity changed")
+	}
+	return nil
+}
+
+func hasCompleteCapturedRuntimeScope(labels map[string]string) bool {
+	metadata := checkpointScopeMetadataFromLabels(labels)
+	return strings.TrimSpace(metadata[checkpointMetadataRuntime]) != "" &&
+		strings.TrimSpace(metadata[checkpointMetadataEndpoint]) != "" &&
+		strings.TrimSpace(metadata[checkpointMetadataDaemonID]) != "" &&
+		(strings.TrimSpace(metadata[checkpointMetadataContext]) != "" || strings.TrimSpace(metadata[checkpointMetadataHost]) != "")
+}
+
+func sameCheckpointScope(a, b checkpointScope) bool {
+	return strings.TrimSpace(a.Runtime) == strings.TrimSpace(b.Runtime) &&
+		strings.TrimSpace(a.Host) == strings.TrimSpace(b.Host) &&
+		strings.TrimSpace(a.Context) == strings.TrimSpace(b.Context) &&
+		strings.TrimSpace(a.Config) == strings.TrimSpace(b.Config) &&
+		strings.TrimSpace(a.Endpoint) == strings.TrimSpace(b.Endpoint) &&
+		strings.TrimSpace(a.DaemonID) == strings.TrimSpace(b.DaemonID)
 }
 
 func isExitCode(err error, code int) bool {
@@ -354,7 +1326,20 @@ func isExitCode(err error, code int) bool {
 	return core.AsExitError(err, &exit) && exit.Code == code
 }
 
+type cleanupMutationOutcome struct {
+	changed          bool
+	scopeUnavailable bool
+}
+
 func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
+	// Snapshot orphan-candidate claims before listing containers so a claim
+	// registered by a concurrent Acquire cannot be compared against an older
+	// container view and misclassified as a "missing container" orphan. Only
+	// claims that predate our container view can be genuine orphans.
+	orphanCandidates, err := core.ListLeaseClaims()
+	if err != nil {
+		return err
+	}
 	containers, err := b.listContainers(ctx)
 	if err != nil {
 		return err
@@ -366,7 +1351,7 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	claimScope := b.claimScope(ctx)
 	claimsByLease := map[string]core.LeaseClaim{}
 	for _, claim := range claims {
-		if claim.Provider == providerName {
+		if isLocalContainerClaimProvider(claim.Provider) {
 			claimsByLease[claim.LeaseID] = claim
 		}
 	}
@@ -385,53 +1370,129 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 			fmt.Fprintf(b.rt.Stderr, "skip container id=%s name=%s reason=%s\n", server.DisplayID(), server.Name, reason)
 			continue
 		}
-		if req.DryRun {
-			fmt.Fprintf(b.rt.Stdout, "would remove container id=%s name=%s lease=%s reason=%s\n", server.DisplayID(), server.Name, blank(leaseID, "-"), reason)
-			continue
+		if leaseID != "" && b.beforeCleanupMutation != nil {
+			b.beforeCleanupMutation(leaseID)
 		}
-		fmt.Fprintf(b.rt.Stdout, "remove container id=%s name=%s lease=%s reason=%s\n", server.DisplayID(), server.Name, blank(leaseID, "-"), reason)
-		if err := b.removeContainer(ctx, container.ID); err != nil {
-			return err
-		}
-		var cleanupErr error
-		hostLeaseRoot := hostLeaseWorkRootFromLabels(leaseID, server.Labels)
-		if hostLeaseRoot != "" {
-			cleanupErr = os.RemoveAll(hostLeaseRoot)
-		}
-		bootstrapDir := strings.TrimSpace(server.Labels["bootstrap_dir"])
-		if bootstrapDir != "" && trustedBootstrapDir(bootstrapDir) {
-			if err := os.RemoveAll(bootstrapDir); err != nil && cleanupErr == nil {
-				cleanupErr = err
+		if hasClaim {
+			outcome, cleanupErr := b.cleanupClaimedContainer(ctx, claim, container.ID, req.DryRun)
+			if outcome.changed {
+				fmt.Fprintf(b.rt.Stderr, "skip container id=%s name=%s reason=changed-during-cleanup err=%v\n", server.DisplayID(), server.Name, cleanupErr)
+				continue
+			}
+			if outcome.scopeUnavailable {
+				fmt.Fprintf(b.rt.Stderr, "skip container id=%s name=%s reason=captured-scope-unavailable err=%v\n", server.DisplayID(), server.Name, cleanupErr)
+				continue
+			}
+			if cleanupErr != nil {
+				return cleanupErr
+			}
+		} else if leaseID != "" {
+			claimAppeared, cleanupErr := b.cleanupClaimlessContainer(ctx, leaseID, container.ID, server.Labels, req.DryRun)
+			if claimAppeared {
+				fmt.Fprintf(b.rt.Stderr, "skip container id=%s name=%s reason=changed-during-cleanup\n", server.DisplayID(), server.Name)
+				continue
+			}
+			if cleanupErr != nil {
+				return cleanupErr
+			}
+		} else if !req.DryRun {
+			if err := b.removeContainer(ctx, container.ID); err != nil {
+				return err
+			}
+			if err := b.cleanupContainerSidecars("", server.Labels, false); err != nil {
+				return err
 			}
 		}
-		if leaseID != "" {
-			core.RemoveLeaseClaim(leaseID)
-			core.RemoveStoredTestboxKey(leaseID)
+		verb := "remove"
+		if req.DryRun {
+			verb = "would remove"
+		} else {
+			removed++
 		}
-		if cleanupErr != nil {
-			return core.Exit(2, "remove local-container host work root %s: %v", hostLeaseRoot, cleanupErr)
-		}
-		removed++
+		fmt.Fprintf(b.rt.Stdout, "%s container id=%s name=%s lease=%s reason=%s\n", verb, server.DisplayID(), server.Name, blank(leaseID, "-"), reason)
 	}
 	claimsRemoved := 0
-	for leaseID, claim := range claimsByLease {
-		if leaseID == "" {
+	for _, claim := range orphanCandidates {
+		if !isLocalContainerClaimProvider(claim.Provider) || claim.LeaseID == "" {
 			continue
 		}
-		if _, ok := liveLeases[leaseID]; ok {
+		if fixedLocalContainerLeaseKind.IsFixedClaim(claim) {
+			continue
+		}
+		if _, ok := liveLeases[claim.LeaseID]; ok {
 			continue
 		}
 		if !localContainerClaimMatchesScope(claim, claimScope, now) {
 			continue
 		}
-		reason := "missing container"
-		if req.DryRun {
-			fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s slug=%s reason=%s\n", leaseID, blank(claim.Slug, "-"), reason)
+		if isPendingLocalContainerClaim(claim) && strings.EqualFold(claim.Labels["keep"], "true") {
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=pending-readiness-recovery\n", claim.LeaseID, blank(claim.Slug, "-"))
 			continue
 		}
-		fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s slug=%s reason=%s\n", leaseID, blank(claim.Slug, "-"), reason)
-		core.RemoveLeaseClaim(leaseID)
-		core.RemoveStoredTestboxKey(leaseID)
+		missing, scopeErr := b.claimMissingInCapturedScope(ctx, claim)
+		if scopeErr != nil {
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=captured-scope-unavailable err=%v\n", claim.LeaseID, blank(claim.Slug, "-"), scopeErr)
+			continue
+		}
+		if !missing {
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=container-present-in-captured-scope\n", claim.LeaseID, blank(claim.Slug, "-"))
+			continue
+		}
+		reason := "missing container"
+		if isPendingLocalContainerClaim(claim) {
+			reason = "missing non-keep pending container"
+			if b.beforeCleanupMutation != nil {
+				b.beforeCleanupMutation(claim.LeaseID)
+			}
+			outcome, removeErr := b.cleanupMissingPendingClaim(ctx, claim, req.DryRun)
+			if outcome.changed {
+				fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=changed-during-cleanup err=%v\n", claim.LeaseID, blank(claim.Slug, "-"), removeErr)
+				continue
+			}
+			if removeErr != nil {
+				return removeErr
+			}
+			if req.DryRun {
+				fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, blank(claim.Slug, "-"), reason)
+				continue
+			}
+			fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, blank(claim.Slug, "-"), reason)
+			claimsRemoved++
+			continue
+		}
+		if req.DryRun {
+			if err := core.WithLeaseClaimUnchanged(claim.LeaseID, claim, func() error { return core.AuthorizeCheckpointRelease(claim, "") }); err != nil {
+				fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=changed-during-cleanup err=%v\n", claim.LeaseID, blank(claim.Slug, "-"), err)
+				continue
+			}
+			fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, blank(claim.Slug, "-"), reason)
+			continue
+		}
+		// Remove the orphan claim only if it is unchanged since our pre-container
+		// snapshot; a concurrent Acquire/Touch that (re)bound this lease makes it no
+		// longer an orphan, so the guard declines and the live lease survives.
+		if dir := strings.TrimSpace(claim.Labels["bootstrap_dir"]); dir != "" {
+			if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+				fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=bootstrap-cleanup-pending path=%s; retry stop with the original cache settings\n", claim.LeaseID, blank(claim.Slug, "-"), dir)
+				continue
+			}
+		}
+		if err := core.RemoveLeaseClaimIfUnchangedAfter(claim.LeaseID, claim, func() error { return core.AuthorizeCheckpointRelease(claim, "") }); err != nil {
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s slug=%s reason=changed-during-cleanup err=%v\n", claim.LeaseID, blank(claim.Slug, "-"), err)
+			continue
+		}
+		// Retain the stored testbox key rather than deleting it in the sweep. A
+		// concurrent Acquire/reclaim prepares or reuses this lease's key (via
+		// EnsureTestboxKeyForConfig) BEFORE it publishes the replacement claim, so the
+		// claim can still match our pre-container snapshot at the instant the key
+		// already belongs to a live reacquisition. Deleting it here would leave that
+		// live container unreachable over SSH. Mirrors the merged tart fix
+		// (https://github.com/openclaw/crabbox/pull/1124), which retains per-lease
+		// state for this reason; the apple-container sibling
+		// (https://github.com/openclaw/crabbox/pull/1146) applies the same key
+		// retention. A genuinely dead lease's key is a harmless small residue in the
+		// state dir.
+		fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s slug=%s reason=%s\n", claim.LeaseID, blank(claim.Slug, "-"), reason)
 		claimsRemoved++
 	}
 	if !req.DryRun {
@@ -440,21 +1501,198 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	return nil
 }
 
-func (b *backend) Touch(_ context.Context, req core.TouchRequest) (core.Server, error) {
-	server := req.Lease.Server
-	if server.Labels == nil {
-		server.Labels = map[string]string{}
+func (b *backend) claimMissingInCapturedScope(ctx context.Context, claim core.LeaseClaim) (bool, error) {
+	originalCfg := b.cfg
+	defer func() { b.cfg = originalCfg }()
+	if _, err := b.applyCheckpointScopeLabels(ctx, claim.Labels); err != nil {
+		return false, err
 	}
-	original := server.Labels
-	server.Labels = core.TouchDirectLeaseLabels(original, b.configForRun(), req.State, time.Now().UTC())
-	preservedKeys := []string{"bootstrap_dir", "container_id", "docker_socket", "host_work_root", "image", "runtime", "runtime_context", "ssh_port", "ssh_user", "work_root"}
-	preservedKeys = append(preservedKeys, checkpointScopeMetadataKeys...)
-	for _, key := range preservedKeys {
-		if value := strings.TrimSpace(original[key]); value != "" {
-			server.Labels[key] = value
+	if err := b.validateClaimRuntimeScope(ctx, claim); err != nil {
+		return false, err
+	}
+	_, _, _, err := b.findContainerForClaim(ctx, claim)
+	if err == nil {
+		return false, nil
+	}
+	if isExitCode(err, 4) {
+		return true, nil
+	}
+	return false, err
+}
+
+func (b *backend) cleanupClaimedContainer(ctx context.Context, claim core.LeaseClaim, containerID string, dryRun bool) (cleanupMutationOutcome, error) {
+	if err := core.AuthorizeCheckpointRelease(claim, ""); err != nil {
+		return cleanupMutationOutcome{}, err
+	}
+	originalCfg := b.cfg
+	defer func() { b.cfg = originalCfg }()
+	actionEntered := false
+	mutationEntered := false
+	action := func() error {
+		actionEntered = true
+		if err := core.AuthorizeCheckpointRelease(claim, ""); err != nil {
+			return err
+		}
+		if err := b.validateCleanupClaim(ctx, claim, claim.LeaseID, containerID); err != nil {
+			return err
+		}
+		if dryRun {
+			return nil
+		}
+		mutationEntered = true
+		if err := b.removeContainer(ctx, containerID); err != nil {
+			return err
+		}
+		return b.cleanupContainerSidecars(claim.LeaseID, claim.Labels, true)
+	}
+	var err error
+	if dryRun {
+		err = core.WithLeaseClaimUnchanged(claim.LeaseID, claim, action)
+	} else {
+		err = fixedLocalContainerLeaseKind.FinalizeAfterCleanup(claim, action)
+	}
+	if err == nil {
+		return cleanupMutationOutcome{}, nil
+	}
+	if !actionEntered {
+		return cleanupMutationOutcome{changed: true}, err
+	}
+	if !mutationEntered {
+		return cleanupMutationOutcome{scopeUnavailable: true}, err
+	}
+	return cleanupMutationOutcome{}, err
+}
+
+func (b *backend) cleanupClaimlessContainer(ctx context.Context, leaseID, containerID string, labels map[string]string, dryRun bool) (bool, error) {
+	claimAppeared := false
+	err := core.WithDurableLeaseClaimLock(leaseID, func(_ *core.LeaseClaim, exists bool, _ func() error) error {
+		if exists {
+			claimAppeared = true
+			return nil
+		}
+		if err := core.AuthorizeCheckpointRelease(core.LeaseClaim{LeaseID: leaseID}, ""); err != nil {
+			return err
+		}
+		if dryRun {
+			return nil
+		}
+		if err := b.removeContainer(ctx, containerID); err != nil {
+			return err
+		}
+		return b.cleanupContainerSidecars(leaseID, labels, true)
+	})
+	return claimAppeared, err
+}
+
+func (b *backend) cleanupMissingPendingClaim(ctx context.Context, claim core.LeaseClaim, dryRun bool) (cleanupMutationOutcome, error) {
+	if err := core.AuthorizeCheckpointRelease(claim, ""); err != nil {
+		return cleanupMutationOutcome{}, err
+	}
+	originalCfg := b.cfg
+	defer func() { b.cfg = originalCfg }()
+	actionEntered := false
+	action := func() error {
+		actionEntered = true
+		if err := core.AuthorizeCheckpointRelease(claim, ""); err != nil {
+			return err
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, rollbackTimeout)
+		defer cancel()
+		if err := b.validateCleanupClaim(checkCtx, claim, claim.LeaseID, claim.CloudID); err != nil {
+			return err
+		}
+		absent, err := b.confirmContainerAbsent(checkCtx, claim.CloudID)
+		if err != nil {
+			return err
+		}
+		if !absent {
+			return core.Exit(4, "local-container %s reappeared; refusing to remove its pending claim", shortID(claim.CloudID))
+		}
+		if dryRun {
+			return nil
+		}
+		return b.cleanupContainerSidecars(claim.LeaseID, claim.Labels, true)
+	}
+	var err error
+	if dryRun {
+		err = core.WithLeaseClaimUnchanged(claim.LeaseID, claim, action)
+	} else {
+		err = fixedLocalContainerLeaseKind.FinalizeAfterCleanup(claim, action)
+	}
+	if err != nil && !actionEntered {
+		return cleanupMutationOutcome{changed: true}, err
+	}
+	return cleanupMutationOutcome{}, err
+}
+
+func (b *backend) validateCleanupClaim(ctx context.Context, claim core.LeaseClaim, leaseID, containerID string) error {
+	if claim.LeaseID != strings.TrimSpace(leaseID) || !isLocalContainerClaimProvider(claim.Provider) ||
+		strings.TrimSpace(claim.CloudID) == "" || strings.TrimSpace(claim.CloudID) != strings.TrimSpace(containerID) ||
+		!hasCompleteCapturedRuntimeScope(claim.Labels) {
+		return localContainerOwnershipError(leaseID, containerID)
+	}
+	applied, err := b.applyCheckpointScopeLabels(ctx, claim.Labels)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return core.Exit(4, "local-container claim lacks captured runtime identity")
+	}
+	return b.validateExactLocalContainerClaim(ctx, claim, leaseID, containerID)
+}
+
+func (b *backend) cleanupContainerSidecars(leaseID string, labels map[string]string, removeKey bool) error {
+	var cleanupErrs []error
+	if hostRoot := hostLeaseWorkRootFromLabels(leaseID, labels); hostRoot != "" {
+		if err := b.removeAll(hostRoot); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove local-container host work root %s: %w", hostRoot, err))
 		}
 	}
+	if err := b.removeBootstrapDir(strings.TrimSpace(labels["bootstrap_dir"])); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+	}
+	if len(cleanupErrs) != 0 {
+		return errors.Join(cleanupErrs...)
+	}
+	if removeKey && leaseID != "" {
+		core.RemoveStoredTestboxKey(leaseID)
+	}
+	return nil
+}
+
+func (b *backend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	updated, err := shared.CommitClaimTouch(ctx, req, shared.ClaimTouchPolicy{
+		Provider: "local-container", Authorize: b.AuthorizeStatusTouchClaim,
+		Prepare: func(expected core.LeaseClaim) (map[string]string, time.Time) {
+			now := time.Now().UTC()
+			if b.rt.Clock != nil {
+				now = b.rt.Clock.Now().UTC()
+			}
+			cfg := b.configForRun()
+			if expected.IdleTimeoutSeconds > 0 {
+				cfg.IdleTimeout = time.Duration(expected.IdleTimeoutSeconds) * time.Second
+			}
+			return localContainerTouchLabels(expected, cfg, req.State, now, req.IdleTimeoutOverride), now
+		},
+	})
+	if err != nil {
+		return core.Server{}, err
+	}
+	server := mergeLocalContainerClaim(req.Lease.Server, updated)
+	core.SetServerLeaseClaimSnapshot(&server, updated, true)
 	return server, nil
+}
+
+func localContainerTouchLabels(claim core.LeaseClaim, cfg core.Config, state string, now time.Time, idleTimeoutOverride *time.Duration) map[string]string {
+	labels := core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(claim.Labels, cfg, state, now, idleTimeoutOverride)
+	// Expiry uses parsed lifecycle values, while the claim retains its original
+	// creation anchor and TTL representation across heartbeat updates.
+	for _, key := range []string{"created_at", "ttl_secs"} {
+		if value, ok := claim.Labels[key]; ok {
+			labels[key] = value
+		}
+	}
+	return labels
 }
 
 func (b *backend) ValidateCheckpointForkWorkdir(ctx context.Context, lease core.LeaseTarget, workdir string) error {
@@ -480,7 +1718,7 @@ func (b *backend) ValidateCheckpointForkWorkdir(ctx context.Context, lease core.
 	}
 	result, err := b.docker(ctx, args, nil, nil)
 	if err != nil {
-		return commandError("validate local-container checkpoint fork workdir", result, err)
+		return shared.LocalCommandError("validate local-container checkpoint fork workdir", result, err)
 	}
 	return nil
 }
@@ -527,12 +1765,12 @@ func applyDefaults(cfg *core.Config) {
 		cfg.LocalContainer.Runtime = "docker"
 	}
 	if cfg.LocalContainer.Image == "" {
-		cfg.LocalContainer.Image = "debian:bookworm"
+		cfg.LocalContainer.Image = core.BaseConfig().LocalContainer.Image
 	}
 	if cfg.LocalContainer.User == "" {
 		cfg.LocalContainer.User = "crabbox"
 	}
-	if cfg.LocalContainer.DockerSocket && isDefaultWorkRoot(cfg.LocalContainer.WorkRoot) && isDefaultWorkRoot(cfg.WorkRoot) {
+	if cfg.LocalContainer.DockerSocket && !localContainerWorkRootExplicit(*cfg) && isDefaultWorkRoot(cfg.LocalContainer.WorkRoot) && isDefaultWorkRoot(cfg.WorkRoot) {
 		if runtime.GOOS == "windows" {
 			cfg.LocalContainer.WorkRoot = "/work/crabbox"
 		} else {
@@ -563,10 +1801,31 @@ func localContainerDisplayImage(cfg core.Config) string {
 }
 
 func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey string, keep bool) (string, string, error) {
+	return b.createContainerWithFixedIntent(ctx, cfg, name, leaseID, slug, publicKey, "", keep)
+}
+
+func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey, fixedFingerprint string, keep bool) (string, string, error) {
+	return b.createContainerWithOptions(ctx, cfg, name, leaseID, slug, publicKey, fixedFingerprint, keep, nil)
+}
+
+func (b *backend) createContainerWithOptions(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey, fixedFingerprint string, keep bool, served *ServedContainerOptions) (string, string, error) {
+	if digest, known := core.DefaultContainerImageDigest(cfg.LocalContainer.Image); known && digest == "" {
+		return "", "", core.Exit(2, "compiled container image is missing its reviewed digest")
+	}
 	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, time.Now().UTC())
+	// Checkpoint images may carry an older allocation's fixed-ID authority.
+	// Always override it, including for ordinary allocations with no intent.
+	labels["fixed_intent_sha256"] = fixedFingerprint
+	if core.IsArchitectureExplicit(cfg) {
+		labels["architecture"] = cfg.Architecture
+	}
+	labels["state"] = pendingClaimState
+	labels["recovery"] = pendingRecoveryKind
+	labels["ssh_key_owned"] = "true"
+	labels["bootstrap_owned"] = "true"
 	labels["runtime"] = cfg.LocalContainer.Runtime
 	labels["image"] = localContainerDisplayImage(cfg)
-	for _, key := range checkpointScopeMetadataKeys {
+	for _, key := range []string{checkpointMetadataRuntime, checkpointMetadataContext, checkpointMetadataDaemonID} {
 		if value := strings.TrimSpace(cfg.LocalContainer.CheckpointMetadata[key]); value != "" {
 			labels[key] = value
 		}
@@ -581,6 +1840,9 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 	hostWorkRoot := ""
 	if cfg.LocalContainer.DockerSocket {
 		hostWorkRoot, containerWorkRoot = dockerSocketWorkRoots(cfg)
+		if err := validateLocalContainerHostMount("local-container host work-root mount", hostWorkRoot); err != nil {
+			return "", "", err
+		}
 		labels["host_work_root"] = hostWorkRoot
 	}
 	hostLeaseWorkRoot := ""
@@ -602,7 +1864,6 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 	args := []string{
 		"run", "-d",
 		"--name", name,
-		"--hostname", name,
 		"--user", "root",
 		"--network", cfg.LocalContainer.Network,
 		"-p", "127.0.0.1::" + sshPort,
@@ -618,8 +1879,18 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 	for i, volume := range cfg.Cache.Volumes {
 		args = append(args, "-e", fmt.Sprintf("CRABBOX_CACHE_VOLUME_PATH_%d=%s", i, strings.TrimSpace(volume.Path)))
 	}
+	// Runtimes sharing a host UTS namespace can reject an explicit hostname.
+	if !cfg.LocalContainer.NoHostname {
+		args = append(args, "--hostname", name)
+	}
 	for i, destination := range hostVolumeDestinations {
 		args = append(args, "-e", fmt.Sprintf("CRABBOX_HOST_VOLUME_PATH_%d=%s", i, destination))
+	}
+	if served != nil {
+		for key, value := range served.Labels {
+			labels[key] = value
+		}
+		args = append(args, "--rm", "--cpu-shares", "2", "-e", "CRABBOX_MANAGED_HOME=1")
 	}
 	for key, value := range labels {
 		args = append(args, "--label", key+"="+value)
@@ -657,6 +1928,9 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 		if err != nil {
 			return "", "", err
 		}
+		if err := validateLocalContainerHostMount("local-container Docker socket mount", socketPath); err != nil {
+			return "", "", err
+		}
 		args = append(args, "-v", socketPath+":"+dockerSocketInGuest)
 		if isPodmanRuntime(cfg.LocalContainer.Runtime) {
 			args = append(args, "--security-opt", "label=disable")
@@ -668,9 +1942,29 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 	for _, vol := range cfg.LocalContainer.Volumes {
 		args = append(args, "-v", vol)
 	}
-	bootstrapDir, err := os.MkdirTemp("", "crabbox-bootstrap-*")
+	if served != nil {
+		script := servedWatchdog + "\n" + bootstrapScript
+		runtimeImage := cfg.LocalContainer.Image
+		if served.runtimeImage != "" {
+			runtimeImage = served.runtimeImage
+		}
+		args = append(args, "-e", "CRABBOX_SERVE_DEADLINE="+strconv.FormatInt(served.Deadline, 10), runtimeImage, "/bin/sh", "-c", script)
+		result, err := b.docker(ctx, args, nil, b.rt.Stderr)
+		if err != nil {
+			return "", "", shared.LocalCommandError("served container run (loopback SSH binding)", result, err)
+		}
+		return strings.TrimSpace(result.Stdout), "", nil
+	}
+	bootstrapRoot := localContainerBootstrapRoot()
+	if err := os.MkdirAll(bootstrapRoot, 0o700); err != nil {
+		return "", "", core.Exit(2, "create local-container bootstrap root %s: %v", bootstrapRoot, err)
+	}
+	bootstrapDir, err := os.MkdirTemp(bootstrapRoot, "crabbox-bootstrap-*")
 	if err != nil {
 		return "", "", core.Exit(2, "create bootstrap script directory: %v", err)
+	}
+	if err := validateLocalContainerHostMount("local-container bootstrap mount", bootstrapDir); err != nil {
+		return "", "", errors.Join(err, os.Remove(bootstrapDir))
 	}
 	bootstrapPath := filepath.Join(bootstrapDir, "bootstrap.sh")
 	if err := os.WriteFile(bootstrapPath, []byte(bootstrapScript), 0o644); err != nil {
@@ -685,22 +1979,16 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
 		defer cancel()
 		containerID, owned, inspectErr := b.ownedContainerID(cleanupCtx, leaseID, bootstrapDir)
-		if owned && keep {
-			cleanupHostLeaseWorkRoot = false
-			return containerID, bootstrapDir, commandError("container run", result, err)
-		}
 		if owned {
-			if removeErr := b.removeContainer(cleanupCtx, containerID); removeErr == nil {
-				os.RemoveAll(bootstrapDir)
-			} else {
-				cleanupHostLeaseWorkRoot = false
-			}
-		} else if inspectErr == nil {
+			cleanupHostLeaseWorkRoot = false
+			return containerID, bootstrapDir, shared.LocalCommandError("container run", result, err)
+		}
+		if inspectErr == nil {
 			os.RemoveAll(bootstrapDir)
 		} else {
 			cleanupHostLeaseWorkRoot = false
 		}
-		return "", "", commandError("container run", result, err)
+		return "", "", shared.LocalCommandError("container run", result, err)
 	}
 	id := strings.TrimSpace(result.Stdout)
 	if id == "" {
@@ -745,37 +2033,9 @@ func localContainerCacheVolumeMounts(volumes []core.CacheVolumeConfig) ([]string
 		if !strings.HasPrefix(path, "/") {
 			return nil, core.Exit(2, "cache volume path %q must be absolute", path)
 		}
-		mounts = append(mounts, localContainerCacheVolumeName(key)+":"+path)
+		mounts = append(mounts, shared.CacheVolumeName(key)+":"+path)
 	}
 	return mounts, nil
-}
-
-func localContainerCacheVolumeName(key string) string {
-	key = strings.TrimSpace(key)
-	sum := sha256.Sum256([]byte(key))
-	var safe strings.Builder
-	for _, r := range key {
-		switch {
-		case r >= 'a' && r <= 'z':
-			safe.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			safe.WriteRune(r + ('a' - 'A'))
-		case r >= '0' && r <= '9':
-			safe.WriteRune(r)
-		case r == '.' || r == '_' || r == '-':
-			safe.WriteRune(r)
-		default:
-			safe.WriteByte('-')
-		}
-		if safe.Len() >= 80 {
-			break
-		}
-	}
-	name := strings.Trim(safe.String(), ".-_")
-	if name == "" {
-		name = "volume"
-	}
-	return fmt.Sprintf("crabbox-cache-%s-%x", name, sum[:6])
 }
 
 func (b *backend) dockerSocketMountPath(ctx context.Context) (string, error) {
@@ -817,10 +2077,18 @@ func dockerSocketMountPathFromHostForGOOS(host, goos string) (string, error) {
 }
 
 func dockerSocketWorkRoots(cfg core.Config) (string, string) {
-	return dockerSocketWorkRootsForGOOS(cfg.LocalContainer.WorkRoot, runtime.GOOS)
+	return dockerSocketWorkRootsForGOOSExplicit(cfg.LocalContainer.WorkRoot, runtime.GOOS, localContainerWorkRootExplicit(cfg))
 }
 
 func dockerSocketWorkRootsForGOOS(workRoot, goos string) (string, string) {
+	return dockerSocketWorkRootsForGOOSExplicit(workRoot, goos, false)
+}
+
+func localContainerWorkRootExplicit(cfg core.Config) bool {
+	return core.IsWorkRootExplicit(&cfg) || core.LocalContainerWorkRootExplicit(cfg)
+}
+
+func dockerSocketWorkRootsForGOOSExplicit(workRoot, goos string, explicit bool) (string, string) {
 	workRoot = strings.TrimSpace(workRoot)
 	if workRoot == "" {
 		workRoot = "/work/crabbox"
@@ -830,6 +2098,12 @@ func dockerSocketWorkRootsForGOOS(workRoot, goos string) (string, string) {
 			return workRoot, "/work/crabbox"
 		}
 		return defaultDockerSocketWorkRoot(), workRoot
+	}
+	// Default Docker-socket work roots are host cache paths. Keep that host
+	// storage location, but mount it somewhere the unprivileged SSH user can
+	// traverse inside the container.
+	if !explicit && filepath.Clean(workRoot) == filepath.Clean(defaultDockerSocketWorkRoot()) {
+		return workRoot, "/work/crabbox"
 	}
 	return workRoot, workRoot
 }
@@ -903,11 +2177,13 @@ func (b *backend) prepareLease(ctx context.Context, cfg core.Config, container i
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	keyPath, err := core.TestboxKeyPath(leaseID)
+	keyPath, err := core.OptionalStoredTestboxKeyPath(leaseID)
 	if err == nil {
 		if _, statErr := os.Stat(keyPath); statErr == nil {
 			cfg.SSHKey = keyPath
 		}
+	} else if !os.IsNotExist(err) {
+		return core.LeaseTarget{}, err
 	}
 	target := core.SSHTargetFromConfig(cfg, host)
 	target.Port = port
@@ -923,9 +2199,12 @@ func (b *backend) prepareLease(ctx context.Context, cfg core.Config, container i
 }
 
 func (b *backend) listContainers(ctx context.Context) ([]inspectContainer, error) {
-	result, err := b.docker(ctx, []string{"ps", "-a", "--filter", "label=crabbox=true", "--filter", "label=provider=" + providerName, "--format", "{{.ID}}"}, nil, nil)
+	return b.listContainersForProvider(ctx, providerName)
+}
+func (b *backend) listContainersForProvider(ctx context.Context, provider string) ([]inspectContainer, error) {
+	result, err := b.docker(ctx, []string{"ps", "-a", "--filter", "label=crabbox=true", "--filter", "label=provider=" + provider, "--format", "{{.ID}}"}, nil, nil)
 	if err != nil {
-		return nil, commandError("container list", result, err)
+		return nil, shared.LocalCommandError("container list", result, err)
 	}
 	ids := strings.Fields(result.Stdout)
 	containers := make([]inspectContainer, 0, len(ids))
@@ -940,9 +2219,13 @@ func (b *backend) listContainers(ctx context.Context) ([]inspectContainer, error
 }
 
 func (b *backend) inspectContainer(ctx context.Context, id string) (inspectContainer, error) {
-	result, err := b.docker(ctx, []string{"inspect", id}, nil, nil)
+	return inspectRuntimeContainer(ctx, b.memoryRuntime().run, id)
+}
+
+func inspectRuntimeContainer(ctx context.Context, run containerObservationCommand, id string) (inspectContainer, error) {
+	result, err := run(ctx, []string{"inspect", id})
 	if err != nil {
-		return inspectContainer{}, commandError("container inspect", result, err)
+		return inspectContainer{}, shared.LocalCommandError("container inspect", result, err)
 	}
 	var containers []inspectContainer
 	if err := json.Unmarshal([]byte(result.Stdout), &containers); err != nil {
@@ -954,6 +2237,65 @@ func (b *backend) inspectContainer(ctx context.Context, id string) (inspectConta
 	return containers[0], nil
 }
 
+func (b *backend) exactContainerAbsent(ctx context.Context, id string) (bool, error) {
+	result, err := b.docker(ctx, []string{"inspect", "--type", "container", id}, nil, nil)
+	if err == nil {
+		return false, nil
+	}
+	detail := strings.ToLower(strings.TrimSpace(shared.FirstNonBlank(result.Stderr, result.Stdout)))
+	if localContainerRouteFailure(detail) {
+		return false, shared.LocalCommandError("confirm local-container absence", result, err)
+	}
+	containerID := strings.ToLower(strings.TrimSpace(id))
+	// Accept Podman's quoted-ID spelling only as the complete diagnostic.
+	if containerID != "" && detail == "error: no such container \""+containerID+"\"" {
+		return true, nil
+	}
+	for _, marker := range []string{
+		"no such object: " + containerID,
+		"no such container: " + containerID,
+		"container " + containerID + " not found",
+		"container " + containerID + " does not exist",
+		"no container with name or id \"" + containerID + "\" found",
+		"no container with id or name \"" + containerID + "\" found",
+		"no such object: '" + containerID + "'",
+		"no such container: '" + containerID + "'",
+	} {
+		if containerID != "" && strings.Contains(detail, marker) {
+			return true, nil
+		}
+	}
+	return false, shared.LocalCommandError("confirm local-container absence", result, err)
+}
+
+func localContainerRouteFailure(detail string) bool {
+	for _, marker := range []string{
+		"cannot connect to the docker daemon",
+		"cannot connect to podman",
+		"connection refused",
+		"error during connect",
+		"failed to connect",
+		"daemon not found",
+		"daemon does not exist",
+		"daemon unavailable",
+	} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	for _, route := range []string{"context", "connection", "endpoint", "socket", "transport"} {
+		if !strings.Contains(detail, route) {
+			continue
+		}
+		for _, failure := range []string{"not found", "does not exist", "unavailable", "cannot connect", "refused"} {
+			if strings.Contains(detail, failure) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (b *backend) resolveContainer(ctx context.Context, identifier string) (inspectContainer, string, string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
@@ -963,8 +2305,11 @@ func (b *backend) resolveContainer(ctx context.Context, identifier string) (insp
 	if err != nil {
 		return inspectContainer{}, "", "", err
 	}
-	if exactClaim.LeaseID == identifier && exactClaim.Provider == providerName {
+	if exactClaim.LeaseID == identifier && isLocalContainerClaimProvider(exactClaim.Provider) {
 		if _, err := b.applyCheckpointScopeLabels(ctx, exactClaim.Labels); err != nil {
+			return inspectContainer{}, "", "", err
+		}
+		if err := b.assertResolveRequestedArchitecture(ctx); err != nil {
 			return inspectContainer{}, "", "", err
 		}
 		return b.findContainerForClaim(ctx, exactClaim)
@@ -977,7 +2322,7 @@ func (b *backend) resolveContainer(ctx context.Context, identifier string) (insp
 	slugClaims := make([]core.LeaseClaim, 0, 1)
 	for i := range claims {
 		claim := claims[i]
-		if claim.Provider != providerName {
+		if !isLocalContainerClaimProvider(claim.Provider) || isReleasedFixedLocalContainerClaim(claim) {
 			continue
 		}
 		if normalized != "" && core.NormalizeLeaseSlug(claim.Slug) == normalized {
@@ -986,6 +2331,14 @@ func (b *backend) resolveContainer(ctx context.Context, identifier string) (insp
 	}
 	if len(slugClaims) > 1 {
 		return inspectContainer{}, "", "", core.Exit(2, "local-container slug %s is ambiguous across %d lease claims; use a lease id", identifier, len(slugClaims))
+	}
+	if len(slugClaims) == 1 && core.IsArchitectureExplicit(b.cfg) {
+		if _, err := b.applyCheckpointScopeLabels(ctx, slugClaims[0].Labels); err != nil {
+			return inspectContainer{}, "", "", err
+		}
+	}
+	if err := b.assertResolveRequestedArchitecture(ctx); err != nil {
+		return inspectContainer{}, "", "", err
 	}
 	containers, listErr := b.listContainers(ctx)
 	for _, container := range containers {
@@ -1021,13 +2374,28 @@ func (b *backend) resolveContainer(ctx context.Context, identifier string) (insp
 	return inspectContainer{}, "", "", core.Exit(4, "local-container lease not found: %s", identifier)
 }
 
+func (b *backend) assertResolveRequestedArchitecture(ctx context.Context) error {
+	cfg := b.configForRun()
+	architecture, err := b.assertRequestedArchitecture(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if architecture != "" {
+		b.cfg.Architecture = architecture
+	}
+	return nil
+}
+
 func (b *backend) applyCheckpointScopeLabels(ctx context.Context, labels map[string]string) (bool, error) {
+	if !hasCompleteCapturedRuntimeScope(labels) {
+		return false, nil
+	}
 	metadata := checkpointScopeMetadataFromLabels(labels)
 	if len(metadata) == 0 {
 		return false, nil
 	}
 	scope := checkpointScopeFromMetadata(metadata, b.cfg.LocalContainer.Runtime)
-	if err := validateCheckpointScope(ctx, scope); err != nil {
+	if err := b.validateRuntimeScope(ctx, scope); err != nil {
 		return false, err
 	}
 	b.cfg.LocalContainer.CheckpointMetadata = metadata
@@ -1043,44 +2411,75 @@ func (b *backend) findContainerForClaim(ctx context.Context, claim core.LeaseCla
 	if err != nil {
 		return inspectContainer{}, "", "", err
 	}
+	if boundID := strings.TrimSpace(claim.CloudID); boundID != "" {
+		for _, container := range containers {
+			if strings.TrimSpace(container.ID) == boundID {
+				labels := container.Config.Labels
+				return container, shared.FirstNonBlank(claim.LeaseID, labels["lease"]), shared.FirstNonBlank(claim.Slug, labels["slug"]), nil
+			}
+		}
+		return inspectContainer{}, "", "", core.Exit(4, "local-container lease not found: %s", shared.FirstNonBlank(claim.Slug, claim.LeaseID))
+	}
+	var matched *inspectContainer
 	for _, container := range containers {
 		labels := container.Config.Labels
 		if labels["lease"] == claim.LeaseID {
-			return container, labels["lease"], labels["slug"], nil
+			if matched != nil {
+				return inspectContainer{}, "", "", core.Exit(2, "local-container lease %s matches multiple containers; reclaim by exact container id", claim.LeaseID)
+			}
+			candidate := container
+			matched = &candidate
 		}
 	}
-	return inspectContainer{}, "", "", core.Exit(4, "local-container lease not found: %s", firstNonBlank(claim.Slug, claim.LeaseID))
+	if matched != nil {
+		labels := matched.Config.Labels
+		return *matched, labels["lease"], labels["slug"], nil
+	}
+	return inspectContainer{}, "", "", core.Exit(4, "local-container lease not found: %s", shared.FirstNonBlank(claim.Slug, claim.LeaseID))
 }
 
 func (b *backend) removeContainer(ctx context.Context, id string) error {
 	result, err := b.docker(ctx, []string{"rm", "-f", id}, nil, b.rt.Stderr)
 	if err != nil {
-		return commandError("container remove", result, err)
+		return shared.LocalCommandError("container remove", result, err)
 	}
 	return nil
 }
 
 func (b *backend) ownedContainerID(ctx context.Context, leaseID, bootstrapDir string) (string, bool, error) {
-	result, err := b.docker(ctx, []string{"ps", "-aq", "--filter", "label=lease=" + leaseID}, nil, nil)
+	result, err := b.docker(ctx, []string{
+		"ps", "-aq", "--no-trunc",
+		"--filter", "label=provider=" + providerName,
+		"--filter", "label=lease=" + leaseID,
+		"--filter", "label=bootstrap_dir=" + bootstrapDir,
+	}, nil, nil)
 	if err != nil {
 		return "", false, err
 	}
-	for _, id := range strings.Fields(result.Stdout) {
-		container, err := b.inspectContainer(ctx, id)
-		if err != nil {
-			return "", false, err
-		}
-		labels := container.Config.Labels
-		if labels["lease"] != leaseID || labels["bootstrap_dir"] != bootstrapDir {
-			continue
-		}
-		containerID := strings.TrimSpace(container.ID)
-		if containerID == "" {
-			containerID = id
-		}
-		return containerID, true, nil
+	ids := strings.Fields(result.Stdout)
+	if len(ids) > 1 {
+		return "", false, core.Exit(2, "local-container lease %s matches multiple exact bootstrap identities", leaseID)
 	}
-	return "", false, nil
+	if len(ids) == 0 {
+		return "", false, nil
+	}
+	id := strings.TrimSpace(ids[0])
+	if !isFullContainerID(id) {
+		return "", false, core.Exit(2, "local-container runtime returned a truncated or invalid container id")
+	}
+	return id, true, nil
+}
+
+func isFullContainerID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *backend) runtimeInfo(ctx context.Context) (string, string) {
@@ -1100,7 +2499,10 @@ func (b *backend) runtimeContext(ctx context.Context, runtimeName string) string
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(contextName.Stdout)
+	if name := strings.TrimSpace(contextName.Stdout); name != "" {
+		return name
+	}
+	return "default"
 }
 
 func (b *backend) claimScope(ctx context.Context) string {
@@ -1165,47 +2567,81 @@ func localContainerClaimMatchesScope(claim core.LeaseClaim, currentScope string,
 	if currentScope != "" && claimScope == currentScope {
 		return true
 	}
-	return claimScope == "" && localContainerClaimExpired(claim, now)
-}
-
-func localContainerClaimExpired(claim core.LeaseClaim, now time.Time) bool {
-	lastUsed, err := time.Parse(time.RFC3339, strings.TrimSpace(claim.LastUsedAt))
-	if err != nil || lastUsed.IsZero() {
+	if claimScope != "" {
 		return false
 	}
-	idle := time.Duration(claim.IdleTimeoutSeconds) * time.Second
-	if idle <= 0 {
-		return false
-	}
-	return now.After(lastUsed.Add(idle).Add(12 * time.Hour))
+	claim.LastUsedAt = strings.TrimSpace(claim.LastUsedAt)
+	expired, _ := shared.ClaimIdleExpiredAfterGrace(claim, now, 12*time.Hour)
+	return expired
 }
 
 func (b *backend) docker(ctx context.Context, args []string, stdout, stderr io.Writer) (core.LocalCommandResult, error) {
-	cfg := b.configForRun()
+	return b.containerRuntime(ctx, b.configForRun(), args, stdout, stderr)
+}
+
+func (b *backend) containerRuntime(ctx context.Context, cfg core.Config, args []string, stdout, stderr io.Writer) (core.LocalCommandResult, error) {
+	req := containerRuntimeRequest(cfg, args)
+	req.Stdout, req.Stderr = stdout, stderr
+	return b.rt.Exec.Run(ctx, req)
+}
+
+func containerRuntimeRequest(cfg core.Config, args []string) core.LocalCommandRequest {
 	var env []string
 	if metadata := cfg.LocalContainer.CheckpointMetadata; len(metadata) != 0 {
 		scope := checkpointScopeFromMetadata(metadata, cfg.LocalContainer.Runtime)
-		if scope.Context != "" {
+		if isDockerRuntime(scope.Runtime) && scope.Context != "" && scope.Context != "default" {
 			args = append([]string{"--context", scope.Context}, args...)
+		} else if isPodmanRuntime(scope.Runtime) && scope.Context != "" && scope.Context != "default" && scope.Host == "" {
+			args = append([]string{"--connection", scope.Context}, args...)
 		}
 		env = checkpointEnvForScope(scope)
 	}
-	return b.rt.Exec.Run(ctx, core.LocalCommandRequest{
-		Name:   cfg.LocalContainer.Runtime,
-		Args:   args,
-		Env:    env,
-		Stdout: stdout,
-		Stderr: stderr,
-	})
+	return core.LocalCommandRequest{
+		Name: cfg.LocalContainer.Runtime,
+		Args: args,
+		Env:  env,
+	}
+}
+
+func (b *backend) assertRequestedArchitecture(ctx context.Context, cfg core.Config) (string, error) {
+	if !core.IsArchitectureExplicit(cfg) {
+		return "", nil
+	}
+	requested, err := core.NormalizeArchitecture(cfg.Architecture)
+	if err != nil {
+		return "", err
+	}
+	format := "{{.Architecture}}"
+	runtimeLabel := "Docker"
+	if isPodmanRuntime(cfg.LocalContainer.Runtime) {
+		format = "{{.Host.Arch}}"
+		runtimeLabel = "Podman"
+	}
+	result, runErr := b.containerRuntime(ctx, cfg, []string{"info", "--format", format}, nil, nil)
+	if runErr != nil {
+		return "", core.Exit(2, "local-container architecture assertion failed: requested=%s available=unknown: query %s daemon architecture: %v", requested, runtimeLabel, shared.LocalCommandError("container runtime info", result, runErr))
+	}
+	raw := strings.TrimSpace(result.Stdout)
+	available, normalizeErr := core.NormalizeArchitecture(raw)
+	if raw == "" || normalizeErr != nil {
+		return "", core.Exit(2, "local-container architecture assertion failed: requested=%s available=%q: %s daemon returned an unrecognized architecture", requested, raw, runtimeLabel)
+	}
+	if requested != available {
+		return "", core.Exit(2, "local-container architecture mismatch: requested=%s available=%s", requested, available)
+	}
+	return available, nil
 }
 
 func (b *backend) serverFromContainer(container inspectContainer, cfg core.Config) core.Server {
 	labels := map[string]string{}
 	for key, value := range container.Config.Labels {
-		if strings.TrimSpace(value) == "" {
+		if strings.TrimSpace(value) == "" || privateLocalContainerScopeLabel(key) {
 			continue
 		}
 		labels[key] = value
+	}
+	if core.IsArchitectureExplicit(cfg) {
+		labels["architecture"] = cfg.Architecture
 	}
 	labels["container_id"] = shortID(container.ID)
 	if labels["provider"] == "" {
@@ -1214,7 +2650,9 @@ func (b *backend) serverFromContainer(container inspectContainer, cfg core.Confi
 	if labels["server_type"] == "" {
 		labels["server_type"] = container.Config.Image
 	}
-	if labels["state"] == "" {
+	if terminalState := terminalContainerState(container.State.Status); terminalState != "" {
+		labels["state"] = terminalState
+	} else if labels["state"] == "" {
 		labels["state"] = container.State.Status
 	}
 	host, port, _ := containerSSHHostPort(container)
@@ -1232,8 +2670,64 @@ func (b *backend) serverFromContainer(container inspectContainer, cfg core.Confi
 		server.Status = "ready"
 	}
 	server.PublicNet.IPv4.IP = host
-	server.ServerType.Name = firstNonBlank(labels["server_type"], cfg.LocalContainer.Image)
+	server.ServerType.Name = shared.FirstNonBlank(labels["server_type"], cfg.LocalContainer.Image)
 	return server
+}
+
+func mergeLocalContainerClaim(server core.Server, claim core.LeaseClaim) core.Server {
+	terminalState := terminalContainerState(server.Status)
+	labels := publicLocalContainerClaimLabels(server.Labels)
+	for key, value := range claim.Labels {
+		if strings.TrimSpace(value) != "" && !privateLocalContainerScopeLabel(key) {
+			labels[key] = value
+		}
+	}
+	if _, ok := claim.Labels["recovery"]; !ok {
+		delete(labels, "recovery")
+	}
+	if terminalState != "" {
+		labels["state"] = terminalState
+	}
+	server.Labels = labels
+	state := strings.TrimSpace(labels["state"])
+	observedRunning := strings.EqualFold(server.Status, "running") || strings.EqualFold(server.Status, "ready")
+	if state != "" && observedRunning {
+		server.Status = state
+	}
+	if server.CloudID == "" {
+		server.CloudID = claim.CloudID
+	}
+	if server.PublicNet.IPv4.IP == "" {
+		server.PublicNet.IPv4.IP = claim.SSHHost
+	}
+	return server
+}
+
+func publicLocalContainerClaimLabels(labels map[string]string) map[string]string {
+	out := shared.CloneLabels(labels)
+	for key := range out {
+		if privateLocalContainerScopeLabel(key) {
+			delete(out, key)
+		}
+	}
+	return out
+}
+
+func privateLocalContainerScopeLabel(key string) bool {
+	switch key {
+	case checkpointMetadataHost, checkpointMetadataEndpoint, checkpointMetadataConfig:
+		return true
+	default:
+		return false
+	}
+}
+
+func isPendingLocalContainerClaim(claim core.LeaseClaim) bool {
+	return isLocalContainerClaimProvider(claim.Provider) &&
+		strings.EqualFold(strings.TrimSpace(claim.Labels["state"]), pendingClaimState) &&
+		strings.TrimSpace(claim.Labels["recovery"]) == pendingRecoveryKind &&
+		strings.TrimSpace(claim.CloudID) != "" &&
+		strings.TrimSpace(claim.ProviderScope) != ""
 }
 
 func containerSSHHostPort(container inspectContainer) (string, string, error) {
@@ -1246,21 +2740,6 @@ func containerSSHHostPort(container inspectContainer) (string, string, error) {
 		host = "127.0.0.1"
 	}
 	return host, strings.TrimSpace(ports[0].HostPort), nil
-}
-
-func commandError(action string, result core.LocalCommandResult, err error) error {
-	code := result.ExitCode
-	if code == 0 {
-		code = 1
-	}
-	detail := strings.TrimSpace(result.Stderr)
-	if detail == "" {
-		detail = strings.TrimSpace(result.Stdout)
-	}
-	if detail != "" {
-		return core.Exit(code, "%s failed: %v: %s", action, err, detail)
-	}
-	return core.Exit(code, "%s failed: %v", action, err)
 }
 
 func isPodmanRuntime(runtimeName string) bool {
@@ -1281,24 +2760,15 @@ func blank(value, fallback string) string {
 	return value
 }
 
-func firstNonBlank(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
-
 func hostLeaseWorkRoot(lease core.LeaseTarget) string {
-	return hostLeaseWorkRootFromLabels(firstNonBlank(lease.LeaseID, lease.Server.Labels["lease"]), lease.Server.Labels)
+	return hostLeaseWorkRootFromLabels(shared.FirstNonBlank(lease.LeaseID, lease.Server.Labels["lease"]), lease.Server.Labels)
 }
 
 func hostLeaseWorkRootFromLabels(leaseID string, labels map[string]string) string {
 	if labels["docker_socket"] != "1" {
 		return ""
 	}
-	root := strings.TrimSpace(firstNonBlank(labels["host_work_root"], labels["work_root"]))
+	root := strings.TrimSpace(shared.FirstNonBlank(labels["host_work_root"], labels["work_root"]))
 	leaseID = strings.TrimSpace(leaseID)
 	if root == "" || leaseID == "" || !filepath.IsAbs(root) {
 		return ""
@@ -1331,6 +2801,22 @@ func safeLocalContainerLeaseID(leaseID string) bool {
 	return true
 }
 
+func (b *backend) removeBootstrapDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if !trustedBootstrapDir(dir) {
+		if _, err := os.Lstat(dir); os.IsNotExist(err) {
+			return nil
+		}
+		return core.Exit(2, "local-container bootstrap directory %s is outside the current cache/temp roots; restore the original cache settings or remove the verified residue explicitly, then retry stop", dir)
+	}
+	if err := b.removeAll(dir); err != nil {
+		return fmt.Errorf("remove local-container bootstrap directory %s: %w", dir, err)
+	}
+	return nil
+}
+
 func trustedBootstrapDir(dir string) bool {
 	dir = filepath.Clean(dir)
 	if !filepath.IsAbs(dir) {
@@ -1341,7 +2827,15 @@ func trustedBootstrapDir(dir string) bool {
 		return false
 	}
 	parent := filepath.Dir(dir)
-	return parent == filepath.Clean(os.TempDir())
+	return parent == filepath.Clean(localContainerBootstrapRoot()) || parent == filepath.Clean(os.TempDir())
+}
+
+func localContainerBootstrapRoot() string {
+	if cache, err := os.UserCacheDir(); err == nil && strings.TrimSpace(cache) != "" {
+		// Default user caches are normally VM-shared; custom caches must be mounted.
+		return filepath.Join(cache, "crabbox", "local-container-bootstrap")
+	}
+	return os.TempDir()
 }
 
 func trustedLocalContainerWorkRoot(root string) bool {
@@ -1364,19 +2858,7 @@ func shouldCleanupLocalContainer(server core.Server, claim core.LeaseClaim, hasC
 		return true, "container state=" + blank(server.Status, "unknown")
 	}
 	if hasClaim {
-		lastUsed, err := time.Parse(time.RFC3339, claim.LastUsedAt)
-		if err != nil || lastUsed.IsZero() {
-			return false, "claim active"
-		}
-		idle := time.Duration(claim.IdleTimeoutSeconds) * time.Second
-		if idle <= 0 {
-			return false, "claim active"
-		}
-		expires := lastUsed.Add(idle)
-		if now.After(expires.Add(12 * time.Hour)) {
-			return true, "claim expired"
-		}
-		return false, "claim active"
+		return shared.ClaimIdleExpiredAfterGrace(claim, now, 12*time.Hour)
 	}
 	if expires, ok := localContainerLabelTime(labels["expires_at"]); ok {
 		if now.After(expires.Add(12 * time.Hour)) {
@@ -1426,8 +2908,8 @@ func localContainerReadyCheck(cfg core.Config) string {
 			)
 		default:
 			checks = append(checks,
-				"pgrep -f 'Xvfb :99' >/dev/null",
-				"pgrep -f 'x11vnc.*-rfbport 5900' >/dev/null",
+				// Existing leases keep their original desktop server until recreated.
+				"(pgrep -f 'Xtigervnc :99' >/dev/null || (pgrep -f 'Xvfb :99' >/dev/null && pgrep -f 'x11vnc.*-rfbport 5900' >/dev/null))",
 				"ss -ltn | grep -q '127.0.0.1:5900'",
 				"test -s /var/lib/crabbox/vnc.password",
 			)
@@ -1441,7 +2923,15 @@ func localContainerReadyCheck(cfg core.Config) string {
 			"\"$BROWSER\" --version >>/tmp/crabbox-ready.log 2>&1",
 		)
 	}
+	for i, check := range checks {
+		checks[i] = localContainerReadyCheckWithDiagnostics(check)
+	}
 	return strings.Join(checks, " && ")
+}
+
+func localContainerReadyCheckWithDiagnostics(check string) string {
+	message := "local-container ready-check failed: " + check
+	return "{ " + check + "; } || { status=$?; printf '%s\n' " + shellQuote(message) + " >&2; if [ -f /tmp/crabbox-ready.log ]; then printf '%s\n' '--- /tmp/crabbox-ready.log ---' >&2; cat /tmp/crabbox-ready.log >&2; fi; exit \"$status\"; }"
 }
 
 func validateLocalContainerHostVolumes(cfg core.Config, workRoot string) ([]string, error) {
@@ -1479,7 +2969,7 @@ func validateLocalContainerHostVolumes(cfg core.Config, workRoot string) ([]stri
 	}
 	destinations := make([]string, 0, len(cfg.LocalContainer.Volumes))
 	for _, volume := range cfg.LocalContainer.Volumes {
-		destination, err := localContainerVolumeDestination(volume)
+		source, destination, err := localContainerVolumePaths(volume)
 		if err != nil {
 			return nil, err
 		}
@@ -1488,34 +2978,99 @@ func validateLocalContainerHostVolumes(cfg core.Config, workRoot string) ([]stri
 				return nil, core.Exit(2, "local-container volume %q targets %s, which overlaps bootstrap-managed path %s", volume, destination, path.Clean(managedPath))
 			}
 		}
+		if !localContainerNamedVolume(source) {
+			if err := validateLocalContainerHostMount("local-container host volume", source); err != nil {
+				return nil, err
+			}
+		}
 		destinations = append(destinations, destination)
 	}
 	return destinations, nil
 }
 
+func validateLocalContainerHostMount(scope, source string) error {
+	if os.Getenv("XDG_STATE_HOME") == "" {
+		return nil
+	}
+	root, err := filepath.Abs(source)
+	if err != nil {
+		return err
+	}
+	return core.ValidateManagedStateTransferScope(scope, root)
+}
+
+func validateLocalContainerInspectedMounts(container inspectContainer) error {
+	if os.Getenv("XDG_STATE_HOME") == "" {
+		return nil
+	}
+	var mounts []struct {
+		Type   string `json:"Type"`
+		Source string `json:"Source"`
+	}
+	if json.Unmarshal(container.Mounts, &mounts) != nil || mounts == nil {
+		return core.Exit(2, "local-container retained bind mount scope is unavailable for %s", container.ID)
+	}
+	for _, mount := range mounts {
+		if mount.Type == "" {
+			return core.Exit(2, "local-container retained bind mount scope is incomplete for %s", container.ID)
+		}
+		if mount.Type != "bind" {
+			continue
+		}
+		if !filepath.IsAbs(mount.Source) {
+			return core.Exit(2, "local-container retained bind mount source is not an absolute host path for %s", container.ID)
+		}
+		if _, err := os.Lstat(mount.Source); err != nil {
+			return core.Exit(2, "local-container retained bind mount source cannot be qualified on this host for %s: %v", container.ID, err)
+		}
+		if err := validateLocalContainerHostMount("local-container retained bind mount", mount.Source); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func localContainerVolumeDestination(spec string) (string, error) {
+	_, destination, err := localContainerVolumePaths(spec)
+	return destination, err
+}
+
+func localContainerNamedVolume(source string) bool {
+	if source == "" {
+		return false
+	}
+	for i, c := range source {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (i > 0 && strings.ContainsRune("_.-", c)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func localContainerVolumePaths(spec string) (string, string, error) {
 	spec = strings.TrimSpace(spec)
 	original := spec
 	lastColon := strings.LastIndex(spec, ":")
 	if lastColon < 0 {
-		return "", core.Exit(2, "invalid local-container volume %q; expected host:container[:options]", original)
+		return "", "", core.Exit(2, "invalid local-container volume %q; expected host:container[:options]", original)
 	}
 	destination := spec[lastColon+1:]
 	if !strings.HasPrefix(destination, "/") {
 		spec = spec[:lastColon]
 		lastColon = strings.LastIndex(spec, ":")
 		if lastColon < 0 {
-			return "", core.Exit(2, "invalid local-container volume %q; expected host:container[:options]", original)
+			return "", "", core.Exit(2, "invalid local-container volume %q; expected host:container[:options]", original)
 		}
 		destination = spec[lastColon+1:]
 	}
 	if !strings.HasPrefix(destination, "/") {
-		return "", core.Exit(2, "invalid local-container volume destination %q; expected an absolute container path", destination)
+		return "", "", core.Exit(2, "invalid local-container volume destination %q; expected an absolute container path", destination)
 	}
 	if strings.ContainsAny(destination, "\r\n") {
-		return "", core.Exit(2, "invalid local-container volume destination %q; line breaks are not allowed", destination)
+		return "", "", core.Exit(2, "invalid local-container volume destination %q; line breaks are not allowed", destination)
 	}
-	return path.Clean(destination), nil
+	return spec[:lastColon], path.Clean(destination), nil
 }
 
 func containerPathsOverlap(left, right string) bool {
@@ -1545,12 +3100,123 @@ func isDefaultWorkRoot(value string) bool {
 	return value == "" || value == "/work/crabbox"
 }
 
-const bootstrapScript = `
+const localContainerDockerSigningKeyFingerprint = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+
+const localContainerImagePathRestoreBlock = `# crabbox managed image PATH
+if [ -r "$HOME/.config/crabbox/image-path" ]; then
+  PATH="$(/bin/cat "$HOME/.config/crabbox/image-path"; printf '\001')"
+  PATH="${PATH%?}"
+  export PATH
+fi
+# end crabbox managed image PATH
+`
+
+const installVerifiedAPTKeyringScript = `
+install_verified_apt_keyring() {
+  apt_key_url="$1"
+  apt_key_target="$2"
+  apt_key_expected_fingerprint="$3"
+  install -m 0755 -d "$(dirname "$apt_key_target")"
+  apt_key_tmp_dir="$(mktemp -d "${apt_key_target}.tmp.XXXXXX")"
+  apt_key_download="$apt_key_tmp_dir/downloaded.asc"
+  apt_key_home="$apt_key_tmp_dir/gnupg"
+  apt_key_output="$apt_key_tmp_dir/keyring.gpg"
+  install -m 0700 -d "$apt_key_home"
+  if curl -fsSL "$apt_key_url" >"$apt_key_download" &&
+    GNUPGHOME="$apt_key_home" gpg --batch --import "$apt_key_download" >/dev/null 2>&1; then
+    apt_key_actual_fingerprint="$(
+      GNUPGHOME="$apt_key_home" gpg --batch --with-colons --fingerprint "$apt_key_expected_fingerprint" 2>/dev/null |
+        awk -F: '$1 == "fpr" { print $10; exit }' || true
+    )"
+    if [ "$apt_key_actual_fingerprint" = "$apt_key_expected_fingerprint" ] &&
+      GNUPGHOME="$apt_key_home" gpg --batch --export "$apt_key_expected_fingerprint" >"$apt_key_output" &&
+      [ -s "$apt_key_output" ]; then
+      chmod 0644 "$apt_key_output"
+      mv -f "$apt_key_output" "$apt_key_target"
+      rm -rf "$apt_key_tmp_dir"
+      return 0
+    fi
+  fi
+  rm -rf "$apt_key_tmp_dir"
+  return 1
+}
+`
+
+const localContainerBrowserInstallScript = `
+if [ "${CRABBOX_BROWSER:-0}" = "1" ] && command -v apt-get >/dev/null 2>&1; then
+  has_working_browser() {
+    for candidate in google-chrome chromium firefox-esr firefox; do
+      if candidate_path="$(command -v "$candidate" 2>/dev/null)" && "$candidate_path" --version >/dev/null 2>&1; then
+        return 0
+      fi
+    done
+    return 1
+  }
+  browser_install_failed() {
+    echo "local-container $1; use a prebuilt image with a working browser or a supported Debian image" >&2
+    exit 127
+  }
+  if ! has_working_browser; then
+    apt-get update
+    ID=""
+    if [ -r /etc/os-release ]; then . /etc/os-release; fi
+    if [ "$ID" = ubuntu ]; then
+      # Ubuntu's Firefox package is a Snap transition, not a container browser.
+      if ! apt-get install -y --no-install-recommends ca-certificates curl gnupg; then
+        browser_install_failed "Mozilla Firefox signing key tools unavailable"
+      fi
+      if ! install_verified_apt_keyring "https://packages.mozilla.org/apt/repo-signing-key.gpg" /etc/apt/keyrings/crabbox-mozilla.gpg "35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"; then
+        browser_install_failed "Mozilla Firefox signing key verification failed"
+      fi
+      install -m 0755 -d /etc/apt/sources.list.d /etc/apt/preferences.d
+      arch="$(dpkg --print-architecture)"
+      cat > /etc/apt/sources.list.d/crabbox-mozilla.sources <<MOZILLA
+Types: deb
+URIs: https://packages.mozilla.org/apt
+Suites: mozilla
+Components: main
+Architectures: $arch
+Signed-By: /etc/apt/keyrings/crabbox-mozilla.gpg
+MOZILLA
+      cat > /etc/apt/preferences.d/crabbox-mozilla <<'MOZILLA'
+Package: firefox
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+
+Package: firefox
+Pin: release o=Ubuntu
+Pin-Priority: -1
+MOZILLA
+      chmod 0644 /etc/apt/sources.list.d/crabbox-mozilla.sources /etc/apt/preferences.d/crabbox-mozilla
+      if ! apt-get update -o APT::Update::Error-Mode=any ||
+        ! apt-get install -y --no-install-recommends firefox/mozilla ||
+        ! has_working_browser; then
+        browser_install_failed "Mozilla Firefox installation failed"
+      fi
+    else
+      for browser_package in chromium firefox-esr firefox; do
+        if has_working_browser; then break; fi
+        if apt-cache show "$browser_package" >/dev/null 2>&1; then
+          apt-get install -y --no-install-recommends "$browser_package" || true
+        fi
+      done
+    fi
+  fi
+fi
+`
+
+const bootstrapTools = "/usr/sbin/sshd git rsync curl sudo python3"
+const bootstrapPackages = "openssh-server ca-certificates git rsync curl sudo python3"
+
+var bootstrapScript = `
 set -eu
+image_path="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 export DEBIAN_FRONTEND=noninteractive
 user="${CRABBOX_SSH_USER:-crabbox}"
 work_root="${CRABBOX_WORK_ROOT:-/work/crabbox}"
 ssh_port="${CRABBOX_SSH_PORT:-2222}"
+docker_signing_key_fingerprint="` + localContainerDockerSigningKeyFingerprint + `"
+` + installVerifiedAPTKeyringScript + `
 home_dir=""
 if [ -r /etc/passwd ]; then
   while IFS=: read -r account _ _ _ _ account_home _; do
@@ -1623,12 +3289,12 @@ env | sed -n 's/^CRABBOX_HOST_VOLUME_PATH_[0-9][0-9]*=//p' | while IFS= read -r 
   check_host_volume_path "$host_path"
 done
 need_install=0
-	for tool in /usr/sbin/sshd git rsync curl sudo python3; do
+	for tool in ` + bootstrapTools + `; do
 	  command -v "$tool" >/dev/null 2>&1 || need_install=1
 	done
 	if [ "$need_install" = "1" ] && command -v apt-get >/dev/null 2>&1; then
 	  apt-get update
-	  apt-get install -y --no-install-recommends openssh-server ca-certificates git rsync curl sudo python3
+	  apt-get install -y --no-install-recommends ` + bootstrapPackages + `
 	fi
 if [ "${CRABBOX_DESKTOP:-0}" = "1" ] && command -v apt-get >/dev/null 2>&1; then
   apt-get update
@@ -1639,47 +3305,45 @@ if [ "${CRABBOX_DESKTOP:-0}" = "1" ] && command -v apt-get >/dev/null 2>&1; then
       apt-get install -y --no-install-recommends labwc wayvnc foot grim slurp wtype wl-clipboard wlr-randr dbus-user-session xwayland xdg-desktop-portal-wlr fonts-dejavu-core fonts-liberation iproute2 openssl procps netcat-openbsd novnc websockify
     fi
   else
-    apt-get install -y --no-install-recommends xvfb xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-terminal xfconf xfce4-settings x11vnc xauth dbus-x11 x11-xserver-utils xterm scrot ffmpeg xdotool wmctrl xclip xsel fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme procps netcat-openbsd novnc websockify
+    apt-get install -y --no-install-recommends tigervnc-standalone-server tigervnc-tools xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-terminal xfconf xfce4-settings xauth dbus-x11 x11-xserver-utils xterm scrot ffmpeg xdotool wmctrl xclip xsel fonts-dejavu-core fonts-liberation iproute2 openssl arc-theme procps netcat-openbsd novnc websockify
   fi
 fi
-if [ "${CRABBOX_BROWSER:-0}" = "1" ] && command -v apt-get >/dev/null 2>&1; then
-  apt-get update
-  if apt-cache show chromium >/dev/null 2>&1; then
-    apt-get install -y --no-install-recommends chromium || true
-  fi
-  if ! command -v chromium >/dev/null 2>&1 || ! chromium --version >/dev/null 2>&1; then
-    rm -f /usr/local/bin/crabbox-browser
-    if apt-cache show firefox-esr >/dev/null 2>&1; then
-      apt-get install -y --no-install-recommends firefox-esr || true
-    fi
-  fi
-  if ! command -v chromium >/dev/null 2>&1 && ! command -v firefox-esr >/dev/null 2>&1 && apt-cache show firefox >/dev/null 2>&1; then
-    apt-get install -y --no-install-recommends firefox || true
-  fi
-fi
+` + localContainerBrowserInstallScript + `
 if [ "${CRABBOX_DOCKER_SOCKET:-0}" = "1" ] && ! command -v docker >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
   apt-get update
   install_docker_cli=0
-  if [ -r /etc/os-release ]; then
-    . /etc/os-release
-    case "${ID:-}" in
-      debian|ubuntu)
-        install -m 0755 -d /etc/apt/keyrings
-        if curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc; then
-          chmod a+r /etc/apt/keyrings/docker.asc
-          codename="${VERSION_CODENAME:-}"
-          if [ -n "$codename" ]; then
-            arch="$(dpkg --print-architecture)"
-            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' "$arch" "$ID" "$codename" > /etc/apt/sources.list.d/docker.list
-            if apt-get update && apt-get install -y --no-install-recommends docker-ce-cli; then
-              install_docker_cli=1
-            else
-              rm -f /etc/apt/sources.list.d/docker.list
+  if command -v gpg >/dev/null 2>&1 || apt-get install -y --no-install-recommends gnupg; then
+    if [ -r /etc/os-release ]; then
+      . /etc/os-release
+      case "${ID:-}" in
+        debian|ubuntu)
+          install -m 0755 -d /etc/apt/keyrings /etc/apt/sources.list.d
+          if install_verified_apt_keyring "https://download.docker.com/linux/${ID}/gpg" /etc/apt/keyrings/docker.gpg "$docker_signing_key_fingerprint"; then
+            codename="${VERSION_CODENAME:-}"
+            if [ -n "$codename" ]; then
+              arch="$(dpkg --print-architecture)"
+              docker_source_tmp="$(mktemp /etc/apt/sources.list.d/docker.list.tmp.XXXXXX)"
+              if printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/%s %s stable\n' "$arch" "$ID" "$codename" >"$docker_source_tmp" &&
+                chmod 0644 "$docker_source_tmp" &&
+                mv -f "$docker_source_tmp" /etc/apt/sources.list.d/docker.list; then
+                rm -f /etc/apt/keyrings/docker.asc
+                if apt-get update && apt-get install -y --no-install-recommends docker-ce-cli; then
+                  install_docker_cli=1
+                else
+                  rm -f /etc/apt/sources.list.d/docker.list
+                fi
+              else
+                rm -f "$docker_source_tmp"
+              fi
             fi
+          else
+            echo "Docker APT signing key verification failed; falling back to distro Docker CLI" >&2
           fi
-        fi
-        ;;
-    esac
+          ;;
+      esac
+    fi
+  else
+    echo "Docker APT signing key verification unavailable; falling back to distro Docker CLI" >&2
   fi
   if [ "$install_docker_cli" != "1" ]; then
     apt-get install -y --no-install-recommends docker.io
@@ -1713,6 +3377,10 @@ home_dir="$(getent passwd "$user" | cut -d: -f6)"
 if [ -z "$home_dir" ]; then
   home_dir="/home/$user"
 fi
+# Named cache mounts can create the home before useradd runs.
+if [ "${CRABBOX_MANAGED_HOME:-0}" = "1" ]; then
+  chown -R "$user" "$home_dir"
+fi
 if [ "${CRABBOX_DOCKER_SOCKET:-0}" = "1" ] && [ -S /var/run/docker.sock ]; then
   socket_gid="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)"
   if [ -n "$socket_gid" ]; then
@@ -1735,6 +3403,62 @@ if [ "${CRABBOX_DOCKER_SOCKET:-0}" = "1" ]; then
 else
   chown -R "$user" "$home_dir/.ssh" "$work_root"
 fi
+mkdir -p "$home_dir/.config/crabbox"
+printf '%s' "$image_path" > "$home_dir/.config/crabbox/image-path"
+chown "$user" "$home_dir/.config" "$home_dir/.config/crabbox" "$home_dir/.config/crabbox/image-path"
+chmod 0700 "$home_dir/.config/crabbox"
+chmod 0600 "$home_dir/.config/crabbox/image-path"
+image_path_hook=/etc/profile.d/crabbox-image-path.sh
+install -d -m 0755 /etc/profile.d
+image_path_hook_tmp="$(mktemp "${image_path_hook}.tmp.XXXXXX")"
+cat > "$image_path_hook_tmp" <<'CRABBOX_IMAGE_PATH_HOOK'
+` + localContainerImagePathRestoreBlock + `CRABBOX_IMAGE_PATH_HOOK
+chown 0:0 "$image_path_hook_tmp"
+chmod 0644 "$image_path_hook_tmp"
+mv -f "$image_path_hook_tmp" "$image_path_hook"
+login_profile=""
+for candidate in "$home_dir/.bash_profile" "$home_dir/.bash_login" "$home_dir/.profile"; do
+  if [ -e "$candidate" ]; then
+    login_profile="$candidate"
+    break
+  fi
+done
+if [ -z "$login_profile" ]; then
+  login_profile="$home_dir/.bash_profile"
+  : > "$login_profile"
+  chmod 0644 "$login_profile"
+fi
+python3 - "$login_profile" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+data = path.read_bytes()
+block = rb'''` + localContainerImagePathRestoreBlock + `'''
+
+def find_line_sequence(content, sequence, offset=0):
+    position = content.find(sequence, offset)
+    while position >= 0:
+        if position == 0 or content[position - 1:position] == b"\n":
+            return position
+        position = content.find(sequence, position + 1)
+    return -1
+
+while True:
+    block_start = find_line_sequence(data, block)
+    if block_start < 0:
+        break
+    block_end = block_start + len(block)
+    suffix = data[block_end:]
+    remove_from = block_start
+    if not suffix and remove_from > 0 and data[remove_from - 1:remove_from] == b"\n":
+        remove_from -= 1
+    data = data[:remove_from] + suffix
+if data:
+    data += b"\n"
+path.write_bytes(data + block)
+PY
+chown "$user" "$login_profile"
 chown -R "$user" /var/cache/crabbox
 env | sed -n 's/^CRABBOX_CACHE_VOLUME_PATH_[0-9][0-9]*=//p' | while IFS= read -r cache_path; do
   [ -n "$cache_path" ] || continue
@@ -1784,7 +3508,15 @@ export GDK_BACKEND=x11
 export MOZ_ENABLE_WAYLAND=0
 wallpaper_file="$HOME/.config/crabbox/desktop-background-$theme.svg"
 if command -v swaybg >/dev/null 2>&1; then
-  (swaybg -i "$wallpaper_file" -m fill >/tmp/crabbox-swaybg.log 2>&1 || swaybg -c "#0d1117" >/tmp/crabbox-swaybg.log 2>&1) &
+  (
+    if swaybg -i "$wallpaper_file" -m fill; then
+      exit 0
+    else
+      status=$?
+    fi
+    [ "$status" -lt 128 ] || exit "$status"
+    exec swaybg -c "#0d1117"
+  ) </dev/null >/tmp/crabbox-swaybg.log 2>&1 &
 fi
 gnome-panel >/tmp/crabbox-gnome-panel.log 2>&1 &
 gnome-terminal -- bash -l >/tmp/crabbox-gnome-terminal.log 2>&1 &
@@ -1805,198 +3537,7 @@ xkb_layout=us
 WAYVNC
     if [ "$desktop_env" = "gnome" ]; then
     cat >/usr/local/bin/crabbox-configure-desktop-theme <<'THEME'
-#!/bin/sh
-set -eu
-requested_mode="${1:-${CRABBOX_DESKTOP_THEME:-}}"
-user="${CRABBOX_DESKTOP_USER:-crabbox}"
-home_dir="$(getent passwd "$user" | cut -d: -f6)"
-if [ -z "$home_dir" ]; then
-  home_dir="/home/$user"
-fi
-config_dir="$home_dir/.config"
-mode="$requested_mode"
-if [ -z "$mode" ] && [ -f "$config_dir/crabbox/desktop-theme" ]; then
-  mode="$(cat "$config_dir/crabbox/desktop-theme" 2>/dev/null || true)"
-fi
-case "$mode" in
-  light|dark) ;;
-  *) mode=dark ;;
-esac
-if [ "$mode" = "light" ]; then
-  gtk_theme=Adwaita
-  gtk_prefer_dark_ini=0
-  gsettings_scheme=prefer-light
-  terminal_fg="#1f2937"
-  terminal_bg="#f8fafc"
-  labwc_title_bg="#f3f4f6"
-  labwc_title_fg="#111827"
-  labwc_inactive_title_bg="#e5e7eb"
-  labwc_inactive_title_fg="#374151"
-  labwc_border="#cbd5e1"
-  terminal_menu_bg="#f3f4f6"
-  terminal_menu_fg="#111827"
-  terminal_menu_hover_bg="#e5e7eb"
-  wallpaper_bg="#e7eef7"
-  wallpaper_panel="#d6e7f2"
-  wallpaper_accent="#0891b2"
-  wallpaper_grid="#b9c7d7"
-else
-  gtk_theme=Adwaita-dark
-  gtk_prefer_dark_ini=1
-  gsettings_scheme=prefer-dark
-  terminal_fg="#e5e7eb"
-  terminal_bg="#000000"
-  labwc_title_bg="#1f2329"
-  labwc_title_fg="#e5e7eb"
-  labwc_inactive_title_bg="#111827"
-  labwc_inactive_title_fg="#9ca3af"
-  labwc_border="#30363d"
-  terminal_menu_bg="#2b2f36"
-  terminal_menu_fg="#d1d5db"
-  terminal_menu_hover_bg="#374151"
-  wallpaper_bg="#0d1117"
-  wallpaper_panel="#111827"
-  wallpaper_accent="#22d3ee"
-  wallpaper_grid="#1f2937"
-fi
-if [ "$(id -u)" -eq 0 ]; then
-  install -d -m 0700 -o "$user" "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0"
-else
-  mkdir -p "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0" "$config_dir/labwc"
-  chmod 0700 "$config_dir" "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0" "$config_dir/labwc"
-fi
-printf '%s\n' "$mode" > "$config_dir/crabbox/desktop-theme"
-for gtk_dir in "$config_dir/gtk-3.0" "$config_dir/gtk-4.0"; do
-  cat > "$gtk_dir/settings.ini" <<EOF
-[Settings]
-gtk-theme-name=$gtk_theme
-gtk-icon-theme-name=Adwaita
-gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-EOF
-done
-cat > "$home_dir/.gtkrc-2.0" <<EOF
-gtk-theme-name="$gtk_theme"
-gtk-icon-theme-name="Adwaita"
-gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-EOF
-if [ "$(id -u)" -eq 0 ]; then
-  chown -R "$user" "$config_dir/crabbox" "$config_dir/gtk-3.0" "$config_dir/gtk-4.0" "$home_dir/.gtkrc-2.0"
-fi
-if [ -f /var/lib/crabbox/desktop.env ]; then
-  . /var/lib/crabbox/desktop.env
-fi
-display="${DISPLAY:-:0}"
-runtime="${XDG_RUNTIME_DIR:-/tmp/crabbox-runtime-$(id -u "$user")}"
-dbus_address="${DBUS_SESSION_BUS_ADDRESS:-}"
-if [ -z "$dbus_address" ]; then
-  labwc_pid="$(pgrep -u "$user" -n -x labwc 2>/dev/null || true)"
-  if [ -n "$labwc_pid" ] && [ -r "/proc/$labwc_pid/environ" ]; then
-    dbus_address="$(tr '\0' '\n' < "/proc/$labwc_pid/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n1)"
-  fi
-fi
-set_gnome_terminal_theme() {
-  profiles="$(gsettings get org.gnome.Terminal.ProfilesList list 2>/dev/null | tr -d "[],'" || true)"
-  default_profile="$(gsettings get org.gnome.Terminal.ProfilesList default 2>/dev/null | tr -d "'" || true)"
-  if [ -n "$default_profile" ] && ! printf ' %s ' "$profiles" | grep -q " $default_profile "; then
-    profiles="$profiles $default_profile"
-  fi
-  for profile in $profiles; do
-    [ -n "$profile" ] || continue
-    profile_path="/org/gnome/terminal/legacy/profiles:/:$profile/"
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" use-theme-colors false >/dev/null 2>&1 || true
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" foreground-color "$terminal_fg" >/dev/null 2>&1 || true
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" background-color "$terminal_bg" >/dev/null 2>&1 || true
-    gsettings set "org.gnome.Terminal.Legacy.Profile:$profile_path" use-transparent-background false >/dev/null 2>&1 || true
-  done
-}
-set_gtk_chrome_theme() {
-  cat > "$config_dir/gtk-3.0/gtk.css" <<EOF
-menubar, .menubar {
-  background-color: $terminal_menu_bg;
-  color: $terminal_menu_fg;
-}
-menubar menuitem, menubar menuitem label {
-  color: $terminal_menu_fg;
-}
-menubar menuitem:hover {
-  background-color: $terminal_menu_hover_bg;
-  color: $terminal_menu_fg;
-}
-EOF
-}
-set_labwc_theme() {
-  mkdir -p "$config_dir/labwc"
-  cat > "$config_dir/labwc/themerc-override" <<EOF
-window.active.title.bg.color: $labwc_title_bg
-window.active.label.text.color: $labwc_title_fg
-window.inactive.title.bg.color: $labwc_inactive_title_bg
-window.inactive.label.text.color: $labwc_inactive_title_fg
-window.active.border.color: $labwc_border
-window.inactive.border.color: $labwc_border
-window.active.button.unpressed.image.color: $labwc_title_fg
-window.inactive.button.unpressed.image.color: $labwc_inactive_title_fg
-window.active.button.hover.image.color: $labwc_title_fg
-window.inactive.button.hover.image.color: $labwc_inactive_title_fg
-window.active.button.pressed.image.color: $labwc_title_fg
-window.inactive.button.pressed.image.color: $labwc_inactive_title_fg
-EOF
-  if command -v labwc >/dev/null 2>&1; then
-    labwc_pid="$(pgrep -u "$user" -n -x labwc 2>/dev/null || true)"
-    if [ -n "$labwc_pid" ]; then
-      LABWC_PID="$labwc_pid" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" labwc --reconfigure >/dev/null 2>&1 || kill -HUP "$labwc_pid" >/dev/null 2>&1 || true
-    fi
-  fi
-}
-set_desktop_background() {
-  wallpaper_file="$config_dir/crabbox/desktop-background-$mode.svg"
-  cat > "$wallpaper_file" <<EOF
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080">
-  <rect width="1920" height="1080" fill="$wallpaper_bg"/>
-  <path d="M0 720 C360 620 520 760 860 650 C1210 540 1430 660 1920 520 L1920 1080 L0 1080 Z" fill="$wallpaper_panel"/>
-  <g stroke="$wallpaper_grid" stroke-width="1" opacity="0.45">
-    <path d="M0 180 H1920M0 360 H1920M0 540 H1920M0 720 H1920M0 900 H1920"/>
-    <path d="M240 0 V1080M480 0 V1080M720 0 V1080M960 0 V1080M1200 0 V1080M1440 0 V1080M1680 0 V1080"/>
-  </g>
-  <path d="M220 740 C520 520 790 910 1090 670 S1510 520 1710 700" fill="none" stroke="$wallpaper_accent" stroke-width="18" stroke-linecap="round" opacity="0.8"/>
-  <rect x="1320" y="180" width="360" height="170" rx="18" fill="$wallpaper_accent" opacity="0.12"/>
-</svg>
-EOF
-  if command -v swaybg >/dev/null 2>&1; then
-    pkill -u "$user" -x swaybg >/dev/null 2>&1 || true
-    (XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" swaybg -i "$wallpaper_file" -m fill >/tmp/crabbox-swaybg.log 2>&1 || XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" swaybg -c "$wallpaper_bg" >/tmp/crabbox-swaybg.log 2>&1) &
-  fi
-}
-target_uid="$(id -u "$user" 2>/dev/null || printf 0)"
-if [ "$(id -u)" -eq 0 ] && [ "$target_uid" -ne 0 ]; then
-  su "$user" -s /bin/sh -c "CRABBOX_DESKTOP_USER='$user' CRABBOX_DESKTOP_THEME='$mode' DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 /usr/local/bin/crabbox-configure-desktop-theme '$mode'" || true
-  exit 0
-fi
-if command -v gsettings >/dev/null 2>&1; then
-  if [ "$(id -u)" -eq 0 ]; then
-    su "$user" -s /bin/sh -c "DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface color-scheme '$gsettings_scheme' >/dev/null 2>&1 || true"
-    su "$user" -s /bin/sh -c "DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface gtk-theme '$gtk_theme' >/dev/null 2>&1 || true"
-  else
-    DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface color-scheme "$gsettings_scheme" >/dev/null 2>&1 || true
-    DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 gsettings set org.gnome.desktop.interface gtk-theme "$gtk_theme" >/dev/null 2>&1 || true
-    DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 set_gnome_terminal_theme
-  fi
-fi
-set_gtk_chrome_theme
-set_labwc_theme
-set_desktop_background
-if [ "$(id -u)" -eq 0 ] && pgrep -u "$user" -x gnome-panel >/dev/null 2>&1; then
-  pkill -TERM -u "$user" -x gnome-panel >/dev/null 2>&1 || true
-  su "$user" -s /bin/sh -c "DISPLAY='$display' XDG_RUNTIME_DIR='$runtime' DBUS_SESSION_BUS_ADDRESS='$dbus_address' GDK_BACKEND=x11 GTK_THEME='$gtk_theme' nohup gnome-panel >/tmp/crabbox-gnome-panel.log 2>&1 &" >/dev/null 2>&1 || true
-elif [ "$(id -u)" -ne 0 ] && pgrep -x gnome-panel >/dev/null 2>&1; then
-  pkill -TERM -x gnome-panel >/dev/null 2>&1 || true
-  DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 GTK_THEME="$gtk_theme" nohup gnome-panel >/tmp/crabbox-gnome-panel.log 2>&1 &
-fi
-previous_terminal_theme="$(cat "$config_dir/crabbox/gnome-terminal-theme" 2>/dev/null || true)"
-printf '%s\n' "$mode" > "$config_dir/crabbox/gnome-terminal-theme"
-if [ "$(id -u)" -ne 0 ] && [ "$mode" = dark ] && command -v gnome-terminal >/dev/null 2>&1 && { [ "$previous_terminal_theme" != "$mode" ] || ! pgrep -u "$(id -u)" -f '/gnome-terminal-server' >/dev/null 2>&1; }; then
-  (sleep 0.4; DISPLAY="$display" XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="$dbus_address" GDK_BACKEND=x11 GTK_THEME="$gtk_theme" NO_AT_BRIDGE=1 gnome-terminal -- bash -l >/tmp/crabbox-gnome-terminal.log 2>&1 &) >/dev/null 2>&1 &
-fi
-THEME
+` + core.GnomeDesktopThemeScript() + `THEME
     chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme
     fi
     chown -R "$user" "$home_dir/.config"
@@ -2048,319 +3589,44 @@ DESKTOP
     chmod 0755 /usr/local/bin/crabbox-start-desktop
     CRABBOX_SSH_USER="$user" /usr/local/bin/crabbox-start-desktop
   else
-  { head -c 8 /var/lib/crabbox/vnc.password; printf '\n'; head -c 8 /var/lib/crabbox/vnc.password; printf '\n\n'; } | x11vnc -storepasswd /var/lib/crabbox/vnc.pass >/dev/null 2>&1
+  head -c 8 /var/lib/crabbox/vnc.password | tigervncpasswd -f > /var/lib/crabbox/vnc.pass
   chown "$user" /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
   chmod 0600 /var/lib/crabbox/vnc.password /var/lib/crabbox/vnc.pass
   printf 'CRABBOX_DESKTOP_ENV=xfce\nDISPLAY=:99\n' >/var/lib/crabbox/desktop.env
   chown "$user" /var/lib/crabbox/desktop.env
   chmod 0644 /var/lib/crabbox/desktop.env
-  config_dir="$home_dir/.config"
-  mode="${CRABBOX_DESKTOP_THEME:-}"
-  if [ -z "$mode" ] && [ -f "$config_dir/crabbox/desktop-theme" ]; then
-    mode="$(cat "$config_dir/crabbox/desktop-theme" 2>/dev/null || true)"
-  fi
-  case "$mode" in
-    light|dark) ;;
-    *) mode=dark ;;
-  esac
-  if [ "$mode" = "light" ]; then
-    gtk_theme=Adwaita
-    gtk_prefer_dark=false
-    gtk_prefer_dark_ini=0
-    panel_rgba="0.94 0.95 0.97 1"
-    panel_css_bg="#eef2f7"
-    panel_css_fg="#111827"
-    gtk_candidates="Arc Greybird Adwaita"
-    xfwm_candidates="Arc Greybird Daloa Default"
-  else
-    gtk_theme=Adwaita-dark
-    gtk_prefer_dark=true
-    gtk_prefer_dark_ini=1
-    panel_rgba="0.12 0.13 0.15 1"
-    panel_css_bg="#20242b"
-    panel_css_fg="#e5e7eb"
-    gtk_candidates="Arc-Dark Greybird-dark Adwaita-dark Greybird"
-    xfwm_candidates="Arc-Dark Greybird-dark Daloa Default"
-  fi
-  for candidate in $gtk_candidates; do
-    if [ -d "/usr/share/themes/$candidate/gtk-3.0" ]; then
-      gtk_theme="$candidate"
-      break
-    fi
-  done
-  xfwm_theme=Default
-  for candidate in $xfwm_candidates; do
-    if [ -d "/usr/share/themes/$candidate/xfwm4" ]; then
-      xfwm_theme="$candidate"
-      break
-    fi
-  done
-  install -d -m 0700 -o "$user" "$config_dir/xfce4/xfconf/xfce-perchannel-xml" "$config_dir/xfce4/terminal" "$config_dir/gtk-3.0" "$config_dir/crabbox"
-  printf '%s\n' "$mode" > "$config_dir/crabbox/desktop-theme"
-  cat > "$config_dir/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" <<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xsettings" version="1.0">
-  <property name="Net" type="empty">
-    <property name="ThemeName" type="string" value="$gtk_theme"/>
-    <property name="IconThemeName" type="string" value="Adwaita"/>
-  </property>
-  <property name="Gtk" type="empty">
-    <property name="ApplicationPreferDarkTheme" type="bool" value="$gtk_prefer_dark"/>
-  </property>
-</channel>
-XML
-  if [ ! -s "$config_dir/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" ]; then
-    cat > "$config_dir/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<channel name="xfwm4" version="1.0">
-  <property name="general" type="empty">
-    <property name="theme" type="string" value="$xfwm_theme"/>
-    <property name="box_move" type="bool" value="false"/>
-    <property name="box_resize" type="bool" value="false"/>
-    <property name="move_opacity" type="int" value="100"/>
-    <property name="resize_opacity" type="int" value="100"/>
-    <property name="snap_resist" type="bool" value="false"/>
-    <property name="snap_to_border" type="bool" value="false"/>
-    <property name="snap_to_windows" type="bool" value="false"/>
-    <property name="snap_width" type="int" value="0"/>
-    <property name="tile_on_move" type="bool" value="false"/>
-    <property name="use_compositing" type="bool" value="false"/>
-    <property name="wrap_windows" type="bool" value="false"/>
-  </property>
-</channel>
-XML
-  fi
-  if [ "$mode" = "light" ]; then
-    terminal_fg="#1f2937"
-    terminal_bg="#f8fafc"
-    terminal_cursor="#111827"
-  else
-    terminal_fg="#e5e7eb"
-    terminal_bg="#111827"
-    terminal_cursor="#f3f4f6"
-  fi
-  cat > "$config_dir/xfce4/terminal/terminalrc" <<EOF
-[Configuration]
-ColorForeground=$terminal_fg
-ColorBackground=$terminal_bg
-ColorCursor=$terminal_cursor
-MiscBell=FALSE
-EOF
-  cat > "$config_dir/gtk-3.0/settings.ini" <<EOF
-[Settings]
-gtk-theme-name=$gtk_theme
-gtk-icon-theme-name=Adwaita
-gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-EOF
-  cat > "$home_dir/.gtkrc-2.0" <<EOF
-gtk-theme-name="$gtk_theme"
-gtk-icon-theme-name="Adwaita"
-gtk-application-prefer-dark-theme=$gtk_prefer_dark_ini
-EOF
-  css_file="$config_dir/gtk-3.0/gtk.css"
-  css_tmp="$(mktemp)"
-  if [ -f "$css_file" ]; then
-    sed '/^[/][*] crabbox desktop theme start [*][/]$/,/^[/][*] crabbox desktop theme end [*][/]$/d' "$css_file" > "$css_tmp" || true
-  fi
-  cat >> "$css_tmp" <<EOF
-/* crabbox desktop theme start */
-.xfce4-panel { background: $panel_css_bg; background-color: $panel_css_bg; color: $panel_css_fg; }
-.xfce4-panel * { color: $panel_css_fg; text-shadow: none; -gtk-icon-shadow: none; }
-.xfce4-panel button,
-.xfce4-panel button.flat,
-.xfce4-panel button:hover,
-.xfce4-panel button:active,
-.xfce4-panel button:checked,
-.xfce4-panel button:focus,
-.xfce4-panel button:backdrop,
-.xfce4-panel .tasklist button,
-.xfce4-panel .tasklist button:hover,
-.xfce4-panel .tasklist button:active,
-.xfce4-panel .tasklist button:checked,
-.xfce4-panel .tasklist button:checked:hover,
-.xfce4-panel .tasklist button:focus,
-.xfce4-panel .tasklist button:backdrop,
-.xfce4-panel .tasklist .toggle,
-.xfce4-panel .tasklist .toggle:hover,
-.xfce4-panel .tasklist .toggle:checked,
-.xfce4-panel .tasklist .toggle:checked:hover,
-.xfce4-panel .tasklist button:checked,
-.xfce4-panel .tasklist button:active {
-  background: $panel_css_bg;
-  background-image: none;
-  background-color: $panel_css_bg;
-  border-image: none;
-  border-color: $panel_css_fg;
-  box-shadow: none;
-  color: $panel_css_fg;
-  outline-color: transparent;
-  text-shadow: none;
-  -gtk-icon-shadow: none;
-}
-.xfce4-panel .tasklist button label,
-.xfce4-panel .tasklist .toggle label {
-  color: $panel_css_fg;
-  text-shadow: none;
-}
-/* crabbox desktop theme end */
-EOF
-  mv "$css_tmp" "$css_file"
-  chown -R "$user" "$config_dir" "$home_dir/.gtkrc-2.0"
+  install -d -m 0755 /usr/local/lib/crabbox
+  cat >/usr/local/lib/crabbox/xfce-session.sh <<'SESSION_ENV'
+` + core.XfceSessionEnvironmentScript() + `SESSION_ENV
+  chmod 0644 /usr/local/lib/crabbox/xfce-session.sh
+  cat >/usr/local/bin/crabbox-configure-desktop-theme <<'THEME'
+` + core.XfceDesktopThemeScript() + `THEME
+  cat >/usr/local/bin/crabbox-desktop-session <<'SESSION'
+` + core.XfceDesktopSessionScript() + `SESSION
+  mkdir -p /etc/xdg/autostart
+  cat >/etc/xdg/autostart/crabbox-desktop.desktop <<'AUTOSTART'
+[Desktop Entry]
+Type=Application
+Name=Crabbox Desktop
+Exec=/usr/local/bin/crabbox-desktop-session
+OnlyShowIn=XFCE;
+AUTOSTART
+  chmod 0755 /usr/local/bin/crabbox-configure-desktop-theme /usr/local/bin/crabbox-desktop-session
   cat >/usr/local/bin/crabbox-start-desktop <<'DESKTOP'
 #!/bin/sh
 set -eu
 user="${CRABBOX_SSH_USER:-crabbox}"
 runtime="/tmp/crabbox-runtime-$user"
-requested_mode="${1:-${CRABBOX_DESKTOP_THEME:-}}"
-home_dir="$(getent passwd "$user" | cut -d: -f6)"
-if [ -z "$home_dir" ]; then
-  home_dir="/home/$user"
-fi
-config_dir="$home_dir/.config"
-mode="$requested_mode"
-if [ -z "$mode" ] && [ -f "$config_dir/crabbox/desktop-theme" ]; then
-  mode="$(cat "$config_dir/crabbox/desktop-theme" 2>/dev/null || true)"
-fi
-case "$mode" in
-  light|dark) ;;
-  *) mode=dark ;;
-esac
-if [ "$mode" = "light" ]; then
-  gtk_theme=Adwaita
-  gtk_prefer_dark=false
-  gsettings_scheme=prefer-light
-  root_color="#f4f6f8"
-  terminal_fg="#1f2937"
-  terminal_bg="#f8fafc"
-  panel_rgba="0.94 0.95 0.97 1"
-  panel_css_bg="#eef2f7"
-  panel_css_fg="#111827"
-  gtk_candidates="Arc Greybird Adwaita"
-  xfwm_candidates="Arc Greybird Daloa Default"
-else
-  gtk_theme=Adwaita-dark
-  gtk_prefer_dark=true
-  gsettings_scheme=prefer-dark
-  root_color="#20242b"
-  terminal_fg="#e5e7eb"
-  terminal_bg="#111827"
-  panel_rgba="0.12 0.13 0.15 1"
-  panel_css_bg="#20242b"
-  panel_css_fg="#e5e7eb"
-  gtk_candidates="Arc-Dark Greybird-dark Adwaita-dark Greybird"
-  xfwm_candidates="Arc-Dark Greybird-dark Daloa Default"
-fi
-for candidate in $gtk_candidates; do
-  if [ -d "/usr/share/themes/$candidate/gtk-3.0" ]; then
-    gtk_theme="$candidate"
-    break
-  fi
-done
-xfwm_theme=Default
-for candidate in $xfwm_candidates; do
-  if [ -d "/usr/share/themes/$candidate/xfwm4" ]; then
-    xfwm_theme="$candidate"
-    break
-  fi
-done
-install -d -m 0700 -o "$user" "$config_dir/gtk-3.0" "$config_dir/crabbox"
-printf '%s\n' "$mode" > "$config_dir/crabbox/desktop-theme"
-css_file="$config_dir/gtk-3.0/gtk.css"
-css_tmp="$(mktemp)"
-if [ -f "$css_file" ]; then
-  sed '/^[/][*] crabbox desktop theme start [*][/]$/,/^[/][*] crabbox desktop theme end [*][/]$/d' "$css_file" > "$css_tmp" || true
-fi
-cat >> "$css_tmp" <<EOF
-/* crabbox desktop theme start */
-.xfce4-panel { background: $panel_css_bg; background-color: $panel_css_bg; color: $panel_css_fg; }
-.xfce4-panel * { color: $panel_css_fg; text-shadow: none; -gtk-icon-shadow: none; }
-.xfce4-panel button,
-.xfce4-panel button.flat,
-.xfce4-panel button:hover,
-.xfce4-panel button:active,
-.xfce4-panel button:checked,
-.xfce4-panel button:focus,
-.xfce4-panel button:backdrop,
-.xfce4-panel .tasklist button,
-.xfce4-panel .tasklist button:hover,
-.xfce4-panel .tasklist button:active,
-.xfce4-panel .tasklist button:checked,
-.xfce4-panel .tasklist button:checked:hover,
-.xfce4-panel .tasklist button:focus,
-.xfce4-panel .tasklist button:backdrop,
-.xfce4-panel .tasklist .toggle,
-.xfce4-panel .tasklist .toggle:hover,
-.xfce4-panel .tasklist .toggle:checked,
-.xfce4-panel .tasklist .toggle:checked:hover,
-.xfce4-panel .tasklist button:checked,
-.xfce4-panel .tasklist button:active {
-  background: $panel_css_bg;
-  background-image: none;
-  background-color: $panel_css_bg;
-  border-image: none;
-  border-color: $panel_css_fg;
-  box-shadow: none;
-  color: $panel_css_fg;
-  outline-color: transparent;
-  text-shadow: none;
-  -gtk-icon-shadow: none;
-}
-.xfce4-panel .tasklist button label,
-.xfce4-panel .tasklist .toggle label {
-  color: $panel_css_fg;
-  text-shadow: none;
-}
-/* crabbox desktop theme end */
-EOF
-mv "$css_tmp" "$css_file"
-chown -R "$user" "$config_dir/gtk-3.0" "$config_dir/crabbox"
 install -d -m 0700 -o "$user" "$runtime"
-if ! pgrep -u "$user" -f 'Xvfb :99' >/dev/null 2>&1; then
-  su "$user" -s /bin/sh -c "XDG_RUNTIME_DIR='$runtime' Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -ac >/tmp/crabbox-xvfb.log 2>&1 &"
+if ! pgrep -u "$user" -f 'Xtigervnc :99' >/dev/null 2>&1; then
+  su "$user" -s /bin/sh -c "XDG_RUNTIME_DIR='$runtime' Xtigervnc :99 -geometry 1920x1080 -depth 24 -localhost yes -rfbport 5900 -SecurityTypes VncAuth -PasswordFile=/var/lib/crabbox/vnc.pass -AlwaysShared -AcceptSetDesktopSize -nolisten tcp -ac >/tmp/crabbox-xvfb.log 2>&1 &"
 fi
 sleep 1
-if ! pgrep -u "$user" -f 'xfce4-session|startxfce4' >/dev/null 2>&1; then
+if ! pgrep -u "$user" -x xfce4-session >/dev/null 2>&1; then
+  env -u DISPLAY CRABBOX_DESKTOP_USER="$user" /usr/local/bin/crabbox-configure-desktop-theme "${1:-}"
   su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' dbus-launch startxfce4 >/tmp/crabbox-desktop.log 2>&1 &"
-fi
-sleep 2
-if command -v xfconf-query >/dev/null 2>&1; then
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xsettings -p /Net/ThemeName -n -t string -s '$gtk_theme' >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xsettings -p /Net/IconThemeName -n -t string -s Adwaita >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xsettings -p /Gtk/ApplicationPreferDarkTheme -n -t bool -s '$gtk_prefer_dark' >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/theme -n -t string -s '$xfwm_theme' >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/box_move -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/box_resize -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/move_opacity -n -t int -s 100 >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/resize_opacity -n -t int -s 100 >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/snap_resist -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/snap_to_border -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/snap_to_windows -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/snap_width -n -t int -s 0 >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/tile_on_move -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/use_compositing -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfwm4 -p /general/wrap_windows -n -t bool -s false >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfce4-panel -p /panels/dark-mode -n -t bool -s '$gtk_prefer_dark' >/dev/null 2>&1 || true"
-  set -- $panel_rgba
-  for panel_id in panel-1 panel-2; do
-    su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfce4-panel -p /panels/$panel_id/background-style -n -t int -s 1 >/dev/null 2>&1 || true"
-    su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfconf-query -c xfce4-panel -p /panels/$panel_id/background-rgba -n -a -t double -s '$1' -t double -s '$2' -t double -s '$3' -t double -s '$4' >/dev/null 2>&1 || true"
-  done
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' pkill -TERM -x xfce4-panel >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' sh -c 'sleep 0.4; xfce4-panel >/tmp/crabbox-xfce4-panel-$user.log 2>&1 &' >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfwm4 --replace --compositor=off >/tmp/crabbox-xfwm4-replace-'$user'.log 2>&1 &"
-fi
-su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xsetroot -solid '$root_color' >/dev/null 2>&1 || true"
-if command -v gsettings >/dev/null 2>&1; then
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' gsettings set org.gnome.desktop.interface color-scheme '$gsettings_scheme' >/dev/null 2>&1 || true"
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' gsettings set org.gnome.desktop.interface gtk-theme '$gtk_theme' >/dev/null 2>&1 || true"
-fi
-if command -v xfce4-terminal >/dev/null 2>&1 && ! pgrep -u "$user" -f 'xfce4-terminal.*Crabbox Desktop' >/dev/null 2>&1; then
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xfce4-terminal --title='Crabbox Desktop' --geometry=110x32+48+48 >/tmp/crabbox-terminal.log 2>&1 &" || true
-elif command -v xterm >/dev/null 2>&1 && ! pgrep -u "$user" -f 'xterm -title Crabbox Desktop' >/dev/null 2>&1; then
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' xterm -title 'Crabbox Desktop' -geometry 110x32+48+48 -bg '$terminal_bg' -fg '$terminal_fg' >/tmp/crabbox-terminal.log 2>&1 &" || true
-fi
-if ! ss -ltn | grep -q '127.0.0.1:5900'; then
-  su "$user" -s /bin/sh -c "DISPLAY=:99 XDG_RUNTIME_DIR='$runtime' x11vnc -display :99 -localhost -rfbport 5900 -forever -shared -rfbauth /var/lib/crabbox/vnc.pass -wait 16 -defer 8 -nowait_bog -o /tmp/crabbox-x11vnc.log >/tmp/crabbox-x11vnc.stdout.log 2>&1 &"
+else
+  runuser -u "$user" -- env DISPLAY=:99 /usr/local/bin/crabbox-desktop-session "${1:-}"
 fi
 DESKTOP
   chmod 0755 /usr/local/bin/crabbox-start-desktop

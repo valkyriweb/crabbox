@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -26,7 +27,7 @@ func (a App) cacheVolumes(ctx context.Context, args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(cfg.Cache.Volumes)
+		return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(cfg.Cache.Volumes))
 	}
 	if len(cfg.Cache.Volumes) == 0 {
 		fmt.Fprintln(a.Stdout, "no cache volumes configured")
@@ -50,7 +51,7 @@ func (a App) cacheStats(ctx context.Context, args []string) error {
 		*id = fs.Arg(0)
 	}
 	if *id == "" {
-		return exit(2, "usage: crabbox cache stats --id <lease-id-or-slug>")
+		return Exit(2, "usage: crabbox cache stats --id <lease-id-or-slug>")
 	}
 	target, cfg, _, err := a.cacheTarget(ctx, *id, *reclaim)
 	if err != nil {
@@ -66,7 +67,7 @@ func (a App) cacheStats(ctx context.Context, args []string) error {
 	}
 	entries := parseCacheStats(out)
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(entries)
+		return writeCacheStatsJSON(a.Stdout, entries)
 	}
 	for _, entry := range entries {
 		if entry.Note != "" {
@@ -76,6 +77,15 @@ func (a App) cacheStats(ctx context.Context, args []string) error {
 		fmt.Fprintf(a.Stdout, "%-8s %-32s %s\n", entry.Kind, formatBytes(entry.Bytes), entry.Path)
 	}
 	return nil
+}
+
+// writeCacheStatsJSON preserves the public CLI contract that an empty cache
+// inventory is a JSON array, never null.
+func writeCacheStatsJSON(out io.Writer, entries []cacheEntry) error {
+	if entries == nil {
+		entries = []cacheEntry{}
+	}
+	return json.NewEncoder(out).Encode(entries)
 }
 
 func (a App) cachePurge(ctx context.Context, args []string) error {
@@ -91,10 +101,10 @@ func (a App) cachePurge(ctx context.Context, args []string) error {
 		*id = fs.Arg(0)
 	}
 	if *id == "" {
-		return exit(2, "usage: crabbox cache purge --id <lease-id-or-slug> --kind <kind> --force")
+		return Exit(2, "usage: crabbox cache purge --id <lease-id-or-slug> --kind <kind> --force")
 	}
 	if !*force {
-		return exit(2, "cache purge requires --force")
+		return Exit(2, "cache purge requires --force")
 	}
 	target, cfg, leaseID, err := a.cacheTarget(ctx, *id, *reclaim)
 	if err != nil {
@@ -102,10 +112,10 @@ func (a App) cachePurge(ctx context.Context, args []string) error {
 	}
 	enabled := enabledCacheKinds(cfg.Cache)
 	if *kind != "all" && !enabled[*kind] {
-		return exit(2, "cache kind %q is disabled by config", *kind)
+		return Exit(2, "cache kind %q is disabled by config", *kind)
 	}
 	if isWindowsNativeTarget(target) {
-		return exit(2, "cache purge is not supported for target=windows windows.mode=normal")
+		return Exit(2, "cache purge is not supported for target=windows windows.mode=normal")
 	}
 	if err := runSSHQuiet(ctx, target, remoteCachePurge(*kind, enabled)); err != nil {
 		return err
@@ -114,7 +124,7 @@ func (a App) cachePurge(ctx context.Context, args []string) error {
 	return nil
 }
 
-func (a App) cacheWarm(ctx context.Context, args []string) error {
+func (a App) cacheWarm(ctx context.Context, args []string) (err error) {
 	fs := newFlagSet("cache warm", a.Stderr)
 	id := fs.String("id", "", "lease id or slug")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
@@ -126,10 +136,10 @@ func (a App) cacheWarm(ctx context.Context, args []string) error {
 		command = command[1:]
 	}
 	if *id == "" {
-		return exit(2, "cache warm requires --id")
+		return Exit(2, "cache warm requires --id")
 	}
 	if len(command) == 0 {
-		return exit(2, "usage: crabbox cache warm --id <lease-id-or-slug> -- <command...>")
+		return Exit(2, "usage: crabbox cache warm --id <lease-id-or-slug> -- <command...>")
 	}
 	target, cfg, leaseID, err := a.cacheTarget(ctx, *id, *reclaim)
 	if err != nil {
@@ -141,14 +151,25 @@ func (a App) cacheWarm(ctx context.Context, args []string) error {
 	}
 	workdir := remoteJoin(cfg, leaseID, repo.Name)
 	actionsEnvFile := ""
-	if state, err := readActionsHydrationState(ctx, target, leaseID); err == nil && state.Workspace != "" {
+	state, err := readActionsWorkspace(ctx, target, leaseID, cfg, repo)
+	if err != nil {
+		return err
+	}
+	if state.Workspace != "" {
 		workdir = state.Workspace
 		actionsEnvFile = state.EnvFile
 		fmt.Fprintf(a.Stderr, "using GitHub Actions workspace %s\n", workdir)
 	}
-	remote := remoteCacheWarmCommand(workdir, allowedEnv(cfg.EnvAllow), actionsEnvFile, command)
+	remoteEnv := allowedRemoteEnvForTarget(cfg, target)
+	commandEnv, err := stageSSHCommandEnv(ctx, target, workdir, remoteEnv, a.Stderr)
+	if err != nil {
+		return err
+	}
+	defer commandEnv.closeAfter(&err)
+	envFiles := remoteRunEnvFiles(actionsEnvFile, commandEnv.File)
+	remote := remoteCommandWithEnvFiles(workdir, nil, envFiles, command)
 	if isWindowsNativeTarget(target) {
-		remote = windowsRemoteCommandWithEnvFile(workdir, allowedEnv(cfg.EnvAllow), actionsEnvFile, command)
+		remote = windowsRemoteCommandWithEnvFiles(workdir, nil, envFiles, command)
 	}
 	code := runSSHStream(ctx, target, remote, a.Stdout, a.Stderr)
 	if code != 0 {
@@ -162,13 +183,16 @@ func (a App) cacheTarget(ctx context.Context, id string, reclaim bool) (SSHTarge
 	if err != nil {
 		return SSHTarget{}, Config{}, "", err
 	}
+	if err := autoRouteClaimLeaseProviderForIdentifier(&cfg, id); err != nil {
+		return SSHTarget{}, Config{}, "", err
+	}
 	repo, err := findRepo()
 	if err != nil {
 		return SSHTarget{}, Config{}, "", err
 	}
 	server, target, leaseID, err := a.resolveLeaseTargetForRepoWithConfig(ctx, &cfg, id, repo, reclaim)
 	if err == nil {
-		if claimErr := a.claimResolvedLeaseTargetForRepoAndRegister(ctx, leaseID, serverSlug(server), cfg, server, target, repo.Root, reclaim); claimErr != nil {
+		if claimErr := a.claimResolvedLeaseTargetForRepoAndRegister(ctx, leaseID, ServerSlug(server), cfg, &server, target, repo.Root, reclaim); claimErr != nil {
 			return SSHTarget{}, Config{}, "", claimErr
 		}
 		a.touchLeaseTargetBestEffort(ctx, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, "")
@@ -212,10 +236,6 @@ func remoteCacheStats(enabled map[string]bool) string {
 		return "true"
 	}
 	return b.String()
-}
-
-func remoteCacheWarmCommand(workdir string, env map[string]string, envFile string, command []string) string {
-	return remoteCommandWithEnvFile(workdir, env, envFile, command)
 }
 
 func remoteCachePurge(kind string, enabled map[string]bool) string {

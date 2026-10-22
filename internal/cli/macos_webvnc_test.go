@@ -1,20 +1,177 @@
 package cli
 
 import (
+	"context"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
+
+func TestLocalWebVNCHandoffSizingScript(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required to execute the browser handoff")
+	}
+	for _, credentials := range []bool{false, true} {
+		t.Run(fmt.Sprintf("credentials=%t", credentials), func(t *testing.T) {
+			handoff, err := createMacOSWebVNCHandoff("6080", macOSWebVNCSession{Token: "test-token", Protocol: "crabbox.test-token"}, credentials)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(handoff.Path)
+			cmd := exec.Command(node, "--input-type=module", "-e", `
+import assert from "node:assert/strict";
+import fs from "node:fs";
+const html = fs.readFileSync(process.argv[1], "utf8");
+const script = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1]
+  .replace(/const source=[\s\S]*?const\{default:RFB\}=await import\(moduleURL\);/, "const RFB = globalThis.FakeRFB;");
+let client;
+globalThis.FakeRFB = class {
+  resize = false;
+  writes = [];
+  events = {};
+  constructor() { client = this; }
+  addEventListener(name, callback) { this.events[name] = callback; }
+  get resizeSession() { return this.resize; }
+  set resizeSession(value) { this.resize = value; this.writes.push(value); }
+};
+const sizing = {value:"fit", addEventListener(name, callback) { this[name] = callback; }};
+const status = {style:{}};
+globalThis.document = {getElementById(id) { return id === "sizing" ? sizing : status; }};
+globalThis.fetch = async () => ({ok:true, json:async () => ({password:"test-password"})});
+await import("data:text/javascript," + encodeURIComponent(script));
+assert.equal(client.scaleViewport, true);
+client.events.connect();
+assert.equal(client.resizeSession, false);
+assert.deepEqual(client.writes, []);
+sizing.value = "match";
+sizing.change();
+assert.equal(client.resizeSession, true);
+sizing.change();
+assert.deepEqual(client.writes, [true]);
+sizing.value = "fit";
+sizing.change();
+assert.equal(client.resizeSession, false);
+client.events.disconnect({detail:{clean:true}});
+sizing.value = "match";
+sizing.change();
+assert.equal(client.resizeSession, false);
+assert.equal(status.textContent, "disconnected");
+client.events.connect();
+assert.equal(client.resizeSession, true);
+`, handoff.Path)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("emitted handoff script: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestResolveMacOSWebVNCCredentialsFallsBackToManagedPassword(t *testing.T) {
+	target := SSHTarget{TargetOS: targetMacOS, User: "steipete"}
+	var gotCommand string
+	credentials, authMode, err := resolveMacOSWebVNCCredentials(
+		context.Background(),
+		Config{Provider: parallelsProvider},
+		target,
+		func(_ context.Context, gotTarget SSHTarget, command string) (string, error) {
+			if gotTarget.TargetOS != target.TargetOS || gotTarget.User != target.User {
+				t.Fatalf("target = %#v, want %#v", gotTarget, target)
+			}
+			gotCommand = command
+			return "managed-secret\n", nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCommand != "sudo cat '/var/db/crabbox/vnc.password'" {
+		t.Fatalf("password command = %q", gotCommand)
+	}
+	if credentials.Username != "steipete" || credentials.Password != "managed-secret" {
+		t.Fatalf("credentials = %#v", credentials)
+	}
+	if authMode != localWebVNCAuthVNC {
+		t.Fatalf("auth mode = %d, want VNC", authMode)
+	}
+}
+
+func TestDesktopConfigUsesResolvedProviderIdentity(t *testing.T) {
+	cfg := desktopConfigForResolvedLease(
+		Config{Provider: "auto", TargetOS: targetLinux},
+		Server{Provider: parallelsProvider},
+		SSHTarget{TargetOS: targetMacOS},
+	)
+	if cfg.Provider != parallelsProvider || cfg.TargetOS != targetMacOS {
+		t.Fatalf("resolved desktop config=%#v", cfg)
+	}
+	_, authMode, err := resolveMacOSWebVNCCredentials(
+		context.Background(),
+		cfg,
+		SSHTarget{TargetOS: targetMacOS, User: "lease-user"},
+		func(context.Context, SSHTarget, string) (string, error) { return "managed-secret", nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authMode != localWebVNCAuthVNC {
+		t.Fatalf("resolved provider auth mode=%d, want VNC", authMode)
+	}
+}
+
+func TestResolveMacOSWebVNCCredentialsUsesProviderARDAccount(t *testing.T) {
+	target := SSHTarget{TargetOS: targetMacOS, User: "lease-user"}
+	credentials, authMode, err := resolveMacOSWebVNCCredentials(
+		context.Background(),
+		Config{Provider: "direct-webvnc-test"},
+		target,
+		func(context.Context, SSHTarget, string) (string, error) {
+			t.Fatal("managed password fallback should not run")
+			return "", nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credentials.Username != "provider-user" || credentials.Password != " provider-secret " {
+		t.Fatalf("credentials = %#v", credentials)
+	}
+	if authMode != localWebVNCAuthARD {
+		t.Fatalf("auth mode = %d, want ARD", authMode)
+	}
+}
+
+func TestResolveMacOSWebVNCCredentialsUsesARDForManagedAccountPassword(t *testing.T) {
+	credentials, authMode, err := resolveMacOSWebVNCCredentials(
+		context.Background(),
+		Config{Provider: "aws"},
+		SSHTarget{TargetOS: targetMacOS, User: "ec2-user"},
+		func(context.Context, SSHTarget, string) (string, error) {
+			return "account-secret\n", nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credentials.Username != "ec2-user" || credentials.Password != "account-secret" {
+		t.Fatalf("credentials=%#v", credentials)
+	}
+	if authMode != localWebVNCAuthARD {
+		t.Fatalf("auth mode=%d, want ARD", authMode)
+	}
+}
 
 func TestCreateMacOSWebVNCHandoffKeepsTokenOutOfOpenURL(t *testing.T) {
 	session := macOSWebVNCSession{
 		Token:    "deadbeefcafef00d",
 		Protocol: "crabbox.deadbeefcafef00d",
 	}
-	handoff, err := createMacOSWebVNCHandoff("6080", session)
+	handoff, err := createMacOSWebVNCHandoff("6080", session, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,6 +199,36 @@ func TestCreateMacOSWebVNCHandoffKeepsTokenOutOfOpenURL(t *testing.T) {
 	} {
 		if !strings.Contains(string(content), want) {
 			t.Fatalf("handoff missing %q: %s", want, content)
+		}
+	}
+}
+
+func TestCreateMacOSWebVNCHandoffOmitsCredentialsForARD(t *testing.T) {
+	session := macOSWebVNCSession{
+		Token:    "deadbeefcafef00d",
+		Protocol: "crabbox.deadbeefcafef00d",
+	}
+	handoff, err := createMacOSWebVNCHandoff("6080", session, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(handoff.Path)
+	content, err := os.ReadFile(handoff.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"/credentials", `"credentialsURL"`} {
+		if strings.Contains(string(content), forbidden) {
+			t.Fatalf("ARD handoff contains %q: %s", forbidden, content)
+		}
+	}
+	for _, want := range []string{
+		"ws://127.0.0.1:6080/websockify",
+		"deadbeefcafef00d",
+		"crabbox.deadbeefcafef00d",
+	} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("ARD handoff missing %q: %s", want, content)
 		}
 	}
 }

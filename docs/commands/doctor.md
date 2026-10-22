@@ -2,9 +2,19 @@
 
 `crabbox doctor` runs a preflight before you commit to a long workflow. It is
 fast on a healthy machine, non-destructive, and never creates, mutates, or
-deletes provider resources. Run it before your first `crabbox run`, after
-rotating tokens or editing config, and as a sanity check in agent boot
-sequences or CI smoke jobs.
+deletes provider resources. Bare `crabbox doctor` is also the pre-configuration
+local-readiness check: with no selected provider, doctor reports
+`source=compiled_default selected=false`, leaves the top-level JSON provider
+empty, and skips provider credential readiness with a warning. Run it before
+your first `crabbox run`, after rotating tokens or
+editing config, and as a sanity check in agent boot sequences or CI smoke jobs.
+
+Use `--provider <name>` to check a specific provider instead of the configured
+selection. Doctor validates the name and reports `source=flag selected=true`;
+unknown names fail with exit `2`. A valid selection can still exit `1` when
+readiness checks fail, such as missing AWS credentials or running Firecracker
+on a non-Linux host. For static provider metadata, use
+[`crabbox providers describe <name>`](providers.md#providers-describe).
 
 ```sh
 crabbox doctor
@@ -21,6 +31,11 @@ crabbox doctor --all --prepare-check
 crabbox doctor --json
 ```
 
+`crabbox doctor --help` (or `-h`) shows these modes and the primary doctor flags
+before the complete provider flag reference. Help prints to stderr and exits
+successfully even when configuration is invalid; it does not run readiness checks or change
+configuration.
+
 ## What it checks
 
 Doctor walks a sequence of checks, skipping any that do not apply to the
@@ -28,6 +43,7 @@ selected provider, target, or context:
 
 ```text
 config     writable config file exists and has safe permissions (expects 0600)
+provider-selection selected provider and its winning config source
 tools      provider-applicable local tools are present and executable
 remote     optional SSH/tool probe against a resolved lease (--id / --from-run)
 coord      coordinator URL is reachable and healthy (brokered providers)
@@ -50,11 +66,22 @@ A missing tool prints `missing` and fails the run.
 
 Provider readiness validates the selected provider without creating a lease.
 
+Doctor first prints `provider-selection` with the selected state and source:
+`compiled_default`, `user_config`, `repo_config`, `environment`, `flag`,
+`recorded_run`, or `lease_context`. If the only source is `compiled_default`,
+doctor explicitly says `no provider selected`, reports `selected=false`, and
+does not run provider-specific tool or credential readiness. This warning does not hide other
+failures: missing local tools, invalid coordinator authentication, unsafe config
+permissions, and other applicable checks still determine the exit status.
+Selecting the same provider explicitly is strict; for example,
+`crabbox doctor --provider hetzner` still fails when its credentials are absent.
+
 - When a coordinator is configured for a brokered provider (`aws`, `azure`,
-  `gcp`, `hetzner`), doctor asks the broker for secret readiness. It reports
-  missing coordinator secret names such as `AZURE_TENANT_ID` without exposing secret
-  values. For AWS, broker readiness can also include non-mutating EC2 vCPU quota
-  checks; low quotas print advisory `warning` lines and do not fail the run.
+  `daytona`, `gcp`, `hetzner`), doctor asks the broker for secret readiness. It
+  reports missing coordinator secret names such as `AZURE_TENANT_ID` without
+  exposing secret values. For AWS, broker readiness can also include non-mutating
+  EC2 vCPU quota checks; low quotas print advisory `warning` lines and do not fail
+  the run.
 - Without a coordinator, providers that implement a direct doctor run their own
   non-mutating check (cheapest list or readiness API). These print stable fields
   such as `timeout=10s`, `api=list`, and `mutation=false` so scripts can tell
@@ -68,17 +95,53 @@ Provider readiness validates the selected provider without creating a lease.
   inventory plus priced VPS catalog entries, payment methods, templates, and
   data centers, then reports `purchase=explicit release=stop`; it does not
   purchase, start, stop, delete, or cancel a VPS.
+  Firecracker validates the local Linux KVM contract instead of starting a
+  microVM: host OS, openable `/dev/kvm`, the configured Firecracker binary,
+  unset jailer, kernel/rootfs paths, CNI directories, and the named CNI config.
+  Unsupported hosts, configured jailer paths, missing assets, or missing CNI
+  configs fail with provider-specific checks such as `host`, `kvm`, `binary`,
+  `jailer`, `kernel`, `rootfs`, and `network`, all marked `mutation=false`.
 - Delegated providers run their own direct readiness check where available; for
   example Cloudflare Containers validate the configured runner URL and bearer
   token against the runner readiness API. Cloudflare Dynamic Workers validate
   loader readiness, bearer auth, the Dynamic Workers loader binding, default
   egress, and runtime compatibility metadata without creating a Dynamic Worker.
+  Cloudflare Sandbox validates the configured bridge URL, bridge health, and
+  OpenAPI document without creating a sandbox; when no bridge URL is configured
+  it exits clearly with the missing `cloudflareSandbox.url` /
+  `CRABBOX_CLOUDFLARE_SANDBOX_URL` requirement.
+  Blaxel validates the configured API URL, reports whether an API key and
+  workspace are configured, probes the Blaxel API, and lists inventory with
+  `mutation=false`.
+  Nomad validates the configured HTTP API address, optional env-only ACL token
+  source, `agent.self`, and configured region/namespace values with
+  `mutation=false`; ACL-disabled clusters may omit a token, and doctor does not
+  register jobs or execute allocations.
   Vercel Sandbox checks the SDK bridge
   contract, local `sandbox` CLI, read-only `sandbox list --all --limit 1`
   auth/inventory access, project scoping readiness, and local `vsbx_...`
   inventory without creating resources. Blacksmith Testbox reports runtime as
   provider-hydrated because GitHub Actions hydration is owned by Testbox.
+- `provider=coder` runs only non-mutating Coder CLI checks: `coder version`,
+  `coder whoami -o json`, and workspace inventory. Missing login is reported as
+  `auth=missing_login` with `mutation=false`; doctor does not create, start,
+  stop, or delete Coder workspaces.
 - Providers with no direct doctor print `skip provider ... direct_doctor=unsupported`.
+
+For a static Windows WSL2 target, Doctor also reports `wsl2-sftp`. Without
+`--doctor-probe-ssh` the check is skipped with
+`runtime=unchecked transport=sftp_required mutation=false` and a rerun hint.
+With the flag, Doctor verifies shell access, performs an SFTP protocol
+handshake without filesystem operations, and then runs the WSL readiness
+command. A missing subsystem fails with instructions to enable
+`Subsystem sftp internal-sftp`, restart Windows `sshd`, and rerun the probe.
+Only OpenSSH's explicit subsystem-rejection diagnostic is reported as missing
+SFTP; disconnects and malformed protocol responses remain transport failures.
+This prerequisite probe does not qualify staged execution, its DefaultShell
+exit/stream behavior, or repair HOME ACLs. Execution preparation separately binds
+the observed `cmd.exe` or PowerShell shell to its route nonce; unknown shells
+fail closed. Unsafe existing staging permissions require operator quiescence
+before repair.
 
 The provider check is bounded to a 10s timeout. A failure adds a `class`
 (`timeout`, `tool`, `config`, `auth`, `permission`, `network`, or `provider`) and a
@@ -87,6 +150,9 @@ remediation `hint`:
 ```text
 failed  provider provider=gcp class=auth hint=check_gcp_project_credentials_and_compute_instances_list ...
 ```
+
+An absent Unix daemon socket is a `network` failure: check the configured
+endpoint and start the daemon. A missing provider executable is a `tool` failure.
 
 ### SSH key
 
@@ -116,7 +182,9 @@ supported for native Windows targets (exits `2`).
 `crabbox doctor --from-run <run-id>` is for triaging a recorded failure. Doctor
 fetches the run record and applies its provider, target, class, server type,
 lease, and phase before running diagnostics. This requires a configured
-coordinator (exits `2` otherwise). Older run records may omit fields; doctor
+coordinator (exits `2` otherwise). An explicit `--provider` remains the
+higher-precedence provider selection while the other recorded context is
+retained. Older run records may omit fields; doctor
 prints a `warning run` line with `missing=...` and skips checks that cannot be
 tied to the run, such as the remote probe when no lease ID was recorded.
 
@@ -148,6 +216,7 @@ For the full per-check breakdown of how each one decides between `ok`, `skip`,
 
 ```text
 ok      config   ~/.config/crabbox/config.yaml permissions=0600
+ok      provider-selection provider=aws source=repo_config
 ok      git      /usr/bin/git
 ok      ssh      /usr/bin/ssh
 ok      ssh-keygen /usr/bin/ssh-keygen
@@ -162,22 +231,50 @@ Failures swap the leading `ok` for `failed` (or `missing` for absent tools) and
 add a class plus remediation hint. AWS quota warnings are advisory: doctor still
 exits `0` unless another check fails.
 
+AWS quota checks use `ec2:DescribeInstanceTypes` metadata for the exact type's
+default vCPU count, including bare metal. Missing, invalid, or denied metadata
+produces `capacity=unknown` with `default_needed_vcpus=unknown`; recommendations
+include only types with a known positive vCPU count. The baseline AWS provider
+policy includes `ec2:DescribeInstanceTypes` and `servicequotas:GetServiceQuota`.
+Types outside the supported Standard-instance quota bucket report
+`capacity=unknown` with `hint=unsupported_instance_quota`.
+
+When the applied quota covers the requested type, the check reports `ok` with
+`capacity=unknown quota_limit=sufficient usage=unchecked`. This confirms only
+that the VM fits the quota ceiling. Doctor does not measure account-wide usage
+or Capacity Reservations, so it cannot establish remaining regional headroom.
+A launch can still fail with `VcpuLimitExceeded`; check usage for the reported
+region and quota before retrying or requesting a quota increase.
+
+For automation, `ok` still means this advisory check succeeded, not that a
+launch is guaranteed. The former `capacity=ready` / `quota_satisfies_default_class`
+result is now `capacity=unknown` / `check_regional_quota_usage`; the JSON
+`details` include the same `capacity`, `quota_limit`, and `usage` fields.
+
 `--json` prints the same checks as a structured object with `ok`, `provider`,
 and `checks` fields. Each check includes `status`, `check`, `message`, and
-parsed `details` when available.
+parsed `details` when available; the `provider-selection` details include
+`source`.
+
+Both output modes apply the same final diagnostic redaction to coordinator and
+provider messages and details. Configured credentials, authorization headers,
+credential-bearing URL components, common secret JSON fields, and private-key
+blocks render as `[redacted]`; non-secret routing and failure context remains.
+This protection covers Crabbox-generated diagnostics, not arbitrary output from
+the optional remote command probe.
 
 Exit codes:
 
 - `0` — no failures (skips and warnings do not change this).
 - `1` — at least one check failed.
-- `2` — `--from-run` without a coordinator, or profile doctor on a native
-  Windows target.
+- `2` — invalid flags or provider names, `--from-run` without a coordinator,
+  or profile doctor on a native Windows target.
 - `7` — the remote SSH probe failed.
 
 ## Flags
 
 ```text
---provider <name>             provider to validate (defaults to configured provider)
+--provider <name>             provider to validate strictly (defaults to configured selection)
 --profile <name>              configured profile for remote prerequisite checks
 --id <lease-id-or-slug>       resolve a lease and run a remote SSH/tool probe
 --from-run <run-id>           load provider/target/lease/phase context from a recorded run

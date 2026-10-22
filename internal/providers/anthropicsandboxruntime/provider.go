@@ -12,21 +12,20 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string { return []string{"srt"} }
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:   providerName,
-		Family: providerFamily,
-		Kind:   core.ProviderKindDelegatedRun,
+		Aliases:        []string{"srt"},
+		Authentication: core.DirectProviderAuthentication(core.ProviderAuthenticationLocalContext),
+		Name:           providerName,
+		Family:         providerFamily,
+		Kind:           core.ProviderKindDelegatedRun,
 		Targets: []core.TargetSpec{
 			{OS: core.TargetLinux},
 			{OS: core.TargetMacOS},
 		},
-		Features:    core.FeatureSet{},
-		Coordinator: core.CoordinatorNever,
+		Features:         core.FeatureSet{},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -47,16 +46,4 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 		return nil, err
 	}
 	return newBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, exit(2, "anthropic-sandbox-runtime doctor backend unavailable")
-	}
-	return doctor, nil
 }

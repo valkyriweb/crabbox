@@ -1,0 +1,85 @@
+package scaleway
+
+import (
+	"strings"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func regionForConfig(cfg core.Config) string {
+	if value := strings.TrimSpace(cfg.Scaleway.Region); value != "" {
+		return value
+	}
+	return core.ScalewayConfigDefaultRegion
+}
+
+func zoneForConfig(cfg core.Config) string {
+	if value := strings.TrimSpace(cfg.Scaleway.Zone); value != "" {
+		return value
+	}
+	return core.ScalewayConfigDefaultZone
+}
+
+func imageForConfig(cfg core.Config) string {
+	if value := strings.TrimSpace(cfg.Scaleway.Image); value != "" {
+		return value
+	}
+	return core.ScalewayConfigDefaultImage
+}
+
+func serverTypeForConfig(cfg core.Config) string {
+	if cfg.ServerTypeExplicit && strings.TrimSpace(cfg.ServerType) != "" {
+		return strings.TrimSpace(cfg.ServerType)
+	}
+	if value := strings.TrimSpace(cfg.Scaleway.Type); value != "" && scalewayTypeOverridesClass(cfg) {
+		return value
+	}
+	return scalewayServerTypeForClass(cfg.Class)
+}
+
+func scalewayTypeOverridesClass(cfg core.Config) bool {
+	return !core.ClassWasExplicit(cfg) || core.ScalewayTypeWasExplicit(cfg) ||
+		strings.TrimSpace(cfg.Scaleway.Type) != core.ScalewayConfigDefaultType
+}
+
+func validateFoundationConfig(cfg core.Config) error {
+	if strings.TrimSpace(regionForConfig(cfg)) == "" {
+		return core.Exit(2, "scaleway region is required")
+	}
+	if strings.TrimSpace(zoneForConfig(cfg)) == "" {
+		return core.Exit(2, "scaleway zone is required")
+	}
+	if core.OSImageWasExplicit(cfg) && strings.TrimSpace(cfg.Scaleway.Image) == "" {
+		return core.Exit(2, "provider=scaleway does not support os %q; set scaleway.image or CRABBOX_SCALEWAY_IMAGE to an explicit Scaleway image", cfg.OSImage)
+	}
+	if strings.TrimSpace(imageForConfig(cfg)) == "" {
+		return core.Exit(2, "scaleway image is required")
+	}
+	if strings.TrimSpace(serverTypeForConfig(cfg)) == "" {
+		return core.Exit(2, "scaleway type is required")
+	}
+	return nil
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	if cfg.Scaleway.Region == "" {
+		cfg.Scaleway.Region = core.ScalewayConfigDefaultRegion
+	}
+	if cfg.Scaleway.Zone == "" {
+		cfg.Scaleway.Zone = core.ScalewayConfigDefaultZone
+	}
+	if core.OSImageWasExplicit(*cfg) && !core.ScalewayImageWasExplicit(*cfg) {
+		if cfg.OSImage == "ubuntu:24.04" {
+			cfg.Scaleway.Image = "ubuntu_noble"
+		} else {
+			cfg.Scaleway.Image = ""
+		}
+	} else if cfg.Scaleway.Image == "" {
+		cfg.Scaleway.Image = core.ScalewayConfigDefaultImage
+	}
+	if cfg.Scaleway.Type == "" {
+		cfg.Scaleway.Type = core.ScalewayConfigDefaultType
+	}
+	core.ApplyLinuxConnectionDefaults(cfg, "root", "22")
+	return nil
+}

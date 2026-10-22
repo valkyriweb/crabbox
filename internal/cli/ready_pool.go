@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"strconv"
@@ -13,7 +15,9 @@ import (
 func (a App) readyPoolList(ctx context.Context, args []string) error {
 	fs := newFlagSet("pool ready", a.Stderr)
 	jsonOut := fs.Bool("json", false, "print JSON")
-	args, key := extractFirstPositionalArg(args, nil)
+	portableAccess := fs.Bool("access", false, "list portable typed pools")
+	identityFile := fs.String("identity-file", "", "generated typed ready-pool identity JSON")
+	args, key := extractFirstPositionalArg(args, map[string]bool{"identity-file": true})
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -21,8 +25,32 @@ func (a App) readyPoolList(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *portableAccess {
+		if !flagWasSet(fs, "identity-file") {
+			return Exit(2, "--access requires typed pool identity")
+		}
+		coord.portablePool = true
+	}
 	var entries []CoordinatorReadyPoolEntry
-	if key == "" {
+	if flagWasSet(fs, "identity-file") {
+		identity, loadErr := loadReadyPoolIdentity(*identityFile)
+		if loadErr != nil {
+			return loadErr
+		}
+		if key == "" {
+			return Exit(2, "typed ready-pool listing requires a pool key")
+		}
+		entries, err = coord.TypedReadyPool(ctx, key)
+		if err == nil {
+			filtered := entries[:0]
+			for _, entry := range entries {
+				if entry.Identity != nil && readyPoolIdentitiesEqual(*entry.Identity, identity) {
+					filtered = append(filtered, entry)
+				}
+			}
+			entries = filtered
+		}
+	} else if key == "" {
 		entries, err = coord.ReadyPools(ctx)
 	} else {
 		entries, err = coord.ReadyPool(ctx, key)
@@ -31,10 +59,52 @@ func (a App) readyPoolList(ctx context.Context, args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(entries)
+		return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(entries))
 	}
 	renderReadyPoolEntries(a.Stdout, entries)
 	return nil
+}
+
+func (a App) readyPoolIdentity(ctx context.Context, args []string) error {
+	fs := newFlagSet("pool identity", a.Stderr)
+	id := fs.String("id", "", "existing coordinator lease id")
+	repoFlag := fs.String("repo", "", "repository owner/name")
+	ref := fs.String("ref", "", "source ref")
+	commit := fs.String("commit", "", "source commit")
+	fingerprint := fs.String("fingerprint", "", "repository setup fingerprint")
+	cacheCompatibility := fs.String("cache-compatibility", "", "operator-declared exact-match cache compatibility")
+	args, key := extractFirstPositionalArg(args, map[string]bool{
+		"id": true, "repo": true, "ref": true, "commit": true, "fingerprint": true,
+		"cache-compatibility": true,
+	})
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if key == "" || strings.TrimSpace(*id) == "" || strings.TrimSpace(*cacheCompatibility) == "" {
+		return Exit(2, "usage: crabbox pool identity <key> --id <lease-id> --cache-compatibility <value>")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	repo, _ := findRepo()
+	input := readyPoolIdentityMetadata(cfg, repo, *repoFlag, *ref, *commit, *fingerprint)
+	input["leaseID"] = strings.TrimSpace(*id)
+	input["cacheCompatibility"] = strings.TrimSpace(*cacheCompatibility)
+	coord, err := readyPoolCoordinatorFromConfig(cfg)
+	if err != nil {
+		return err
+	}
+	identity, err := coord.GenerateReadyPoolIdentity(ctx, key, input)
+	if err != nil {
+		return err
+	}
+	if err := validateReadyPoolSeedIdentity(identity, input); err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(a.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(identity)
 }
 
 func (a App) readyPoolRegister(ctx context.Context, args []string) error {
@@ -44,6 +114,10 @@ func (a App) readyPoolRegister(ctx context.Context, args []string) error {
 	ref := fs.String("ref", "", "source ref")
 	commit := fs.String("commit", "", "source commit")
 	fingerprint := fs.String("fingerprint", "", "repo setup fingerprint")
+	compatibilityKey := fs.String("compatibility-key", "", "provider-neutral capability and size key")
+	identityFile := fs.String("identity-file", "", "generated typed ready-pool identity JSON")
+	portableAccess := fs.Bool("access", false, "opt in to bounded portable access (requires typed identity)")
+	cacheCompatibility := fs.String("cache-compatibility", "", "derive typed identity using this operator-declared cache compatibility")
 	image := fs.String("image", "", "base image id or name")
 	sshHost := fs.String("ssh-host", "", "proven SSH host")
 	sshUser := fs.String("ssh-user", "", "proven SSH user")
@@ -55,11 +129,28 @@ func (a App) readyPoolRegister(ctx context.Context, args []string) error {
 		return err
 	}
 	if key == "" || *id == "" {
-		return exit(2, "usage: crabbox pool register <key> --id <lease-id>")
+		return Exit(2, "usage: crabbox pool register <key> --id <lease-id>")
+	}
+	if flagWasSet(fs, "identity-file") && flagWasSet(fs, "cache-compatibility") {
+		return Exit(2, "--identity-file and --cache-compatibility are mutually exclusive")
+	}
+	if flagWasSet(fs, "cache-compatibility") && strings.TrimSpace(*cacheCompatibility) == "" {
+		return Exit(2, "--cache-compatibility must not be empty")
+	}
+	var identity *CoordinatorReadyPoolIdentityV1
+	if flagWasSet(fs, "identity-file") {
+		parsed, identityErr := loadReadyPoolIdentity(*identityFile)
+		if identityErr != nil {
+			return identityErr
+		}
+		identity = &parsed
 	}
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
+	}
+	if hasCapacityMinimums(cfg) {
+		return Exit(2, "resource requirements are unsupported with ready pools")
 	}
 	repo, _ := findRepo()
 	input := map[string]any{"leaseID": strings.TrimSpace(*id)}
@@ -74,6 +165,7 @@ func (a App) readyPoolRegister(ctx context.Context, args []string) error {
 		input["commit"] = commitValue
 	}
 	addStringInput(input, "fingerprint", *fingerprint)
+	addStringInput(input, "compatibilityKey", *compatibilityKey)
 	addStringInput(input, "image", *image)
 	addStringInput(input, "sshHost", firstNonBlank(*sshHost, readyPoolClaimSSHHost(*id)))
 	addStringInput(input, "sshUser", *sshUser)
@@ -83,7 +175,34 @@ func (a App) readyPoolRegister(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := coord.RegisterReadyPoolLease(ctx, key, input)
+	if *portableAccess {
+		if !flagWasSet(fs, "identity-file") && !flagWasSet(fs, "cache-compatibility") {
+			return Exit(2, "--access requires typed pool identity")
+		}
+		coord.portablePool = true
+	}
+	var res CoordinatorReadyPoolResponse
+	if flagWasSet(fs, "cache-compatibility") {
+		generationInput := mapsCloneAny(input)
+		generationInput["cacheCompatibility"] = strings.TrimSpace(*cacheCompatibility)
+		generated, generationErr := coord.GenerateReadyPoolIdentity(ctx, key, generationInput)
+		if generationErr != nil {
+			return generationErr
+		}
+		identity = &generated
+	}
+	if identity != nil {
+		if err := validateReadyPoolSeedIdentity(*identity, input); err != nil {
+			return err
+		}
+		input["identity"] = *identity
+		res, err = coord.RegisterTypedReadyPoolLease(ctx, key, input)
+		if err == nil {
+			err = validateTypedReadyPoolResponseIdentity(res, *identity)
+		}
+	} else {
+		res, err = coord.RegisterReadyPoolLease(ctx, key, input)
+	}
 	if err != nil {
 		return err
 	}
@@ -100,6 +219,13 @@ func (a App) readyPoolBorrow(ctx context.Context, args []string) error {
 	ref := fs.String("ref", "", "source ref")
 	commit := fs.String("commit", "", "source commit")
 	fingerprint := fs.String("fingerprint", "", "repo setup fingerprint")
+	compatibilityKey := fs.String("compatibility-key", "", "provider-neutral capability and size key")
+	identityFile := fs.String("identity-file", "", "generated typed ready-pool identity JSON")
+	receiptFile := fs.String("receipt-file", "", "owner-only access receipt file (created exclusively)")
+	requiredClass := fs.String("class", "", "required lease size class")
+	requiredType := fs.String("type", "", "required exact provider machine type")
+	duration := fs.Duration("duration", 30*time.Minute, "bounded borrow duration, maximum 30m")
+	portableAccess := fs.Bool("access", false, "opt in to bounded portable access (requires typed identity)")
 	provider := fs.String("provider", "", "provider filter")
 	target := fs.String("target", "", "target OS filter")
 	jsonOut := fs.Bool("json", false, "print JSON")
@@ -108,36 +234,172 @@ func (a App) readyPoolBorrow(ctx context.Context, args []string) error {
 		return err
 	}
 	if key == "" {
-		return exit(2, "usage: crabbox pool borrow <key>")
+		return Exit(2, "usage: crabbox pool borrow <key>")
 	}
-	coord, err := readyPoolCoordinator()
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	res, err := coord.BorrowReadyPoolLease(ctx, key, readyPoolBorrowInput(*repo, *ref, *commit, *fingerprint, *provider, *target))
+	if hasCapacityMinimums(cfg) {
+		return Exit(2, "resource requirements are unsupported with ready pools")
+	}
+	var identity *CoordinatorReadyPoolIdentityV1
+	if flagWasSet(fs, "identity-file") {
+		parsed, identityErr := loadReadyPoolIdentity(*identityFile)
+		if identityErr != nil {
+			return identityErr
+		}
+		if providerErr := bindReadyPoolIdentityProviderConfig(&cfg, fs, provider, parsed); providerErr != nil {
+			return providerErr
+		}
+		identity = &parsed
+	}
+	coord, err := readyPoolCoordinatorFromConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if *portableAccess {
+		if !flagWasSet(fs, "identity-file") && !flagWasSet(fs, "cache-compatibility") {
+			return Exit(2, "--access requires typed pool identity")
+		}
+		coord.portablePool = true
+	}
+	input := readyPoolBorrowInput(*repo, *ref, *commit, *fingerprint, *compatibilityKey, *provider, *target)
+	addStringInput(input, "class", *requiredClass)
+	addStringInput(input, "serverType", *requiredType)
+	var res CoordinatorReadyPoolResponse
+	if identity != nil {
+		localRepo, _ := findRepo()
+		metadata := readyPoolIdentityMetadata(cfg, localRepo, *repo, *ref, *commit, *fingerprint)
+		for field, value := range metadata {
+			input[field] = value
+		}
+		if providerErr := bindReadyPoolIdentityProvider(input, *identity); providerErr != nil {
+			return providerErr
+		}
+		input["identity"] = *identity
+		if *portableAccess {
+			var receiptPath string
+			res, receiptPath, err = borrowPortablePool(ctx, coord, key, input, *identity, *receiptFile, *duration, a.Stderr)
+			if err != nil && receiptPath != "" {
+				fmt.Fprintf(a.Stderr, "access cleanup receipt retained: %s\n", receiptPath)
+			}
+		} else {
+			res, err = borrowValidatedTypedReadyPoolLease(ctx, coord, key, input, *identity)
+		}
+	} else {
+		res, err = coord.BorrowReadyPoolLease(ctx, key, input)
+	}
 	if err != nil {
 		return err
 	}
 	if *jsonOut {
 		return json.NewEncoder(a.Stdout).Encode(res)
 	}
+	if *portableAccess {
+		fmt.Fprintf(a.Stdout, "borrowed pool=%s lease=%s hard_deadline=%s ssh=%s@%s:%s\n", res.Entry.Key, res.Entry.LeaseID, res.Grant.ExpiresAt, blank(res.Entry.SSHUser, res.Lease.SSHUser), blank(res.Entry.SSHHost, res.Lease.Host), blank(res.Entry.SSHPort, res.Lease.SSHPort))
+		return nil
+	}
 	fmt.Fprintf(a.Stdout, "borrowed pool=%s lease=%s state=%s token=%s ssh=%s@%s:%s\n", res.Entry.Key, res.Entry.LeaseID, res.Entry.State, res.Entry.BorrowToken, blank(res.Entry.SSHUser, res.Lease.SSHUser), blank(res.Entry.SSHHost, res.Lease.Host), blank(res.Entry.SSHPort, res.Lease.SSHPort))
+	return nil
+}
+
+func (a App) readyPoolHeartbeat(ctx context.Context, args []string) error {
+	fs := newFlagSet("pool heartbeat", a.Stderr)
+	receiptFile := fs.String("receipt-file", "", "protected portable access receipt")
+	id := fs.String("id", "", "borrowed lease id")
+	borrowToken := fs.String("borrow-token", "", "borrow token from pool borrow")
+	identityFile := fs.String("identity-file", "", "generated typed ready-pool identity JSON")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	args, key := extractFirstPositionalArg(args, map[string]bool{"id": true, "borrow-token": true, "identity-file": true, "receipt-file": true})
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if *receiptFile != "" {
+		if flagWasSet(fs, "borrow-token") || flagWasSet(fs, "id") {
+			return Exit(2, "--receipt-file cannot be combined with --id or --borrow-token")
+		}
+		receipt, err := readPoolAccessReceipt(*receiptFile)
+		if err != nil {
+			return err
+		}
+		if key != "" && key != receipt.Pool {
+			return Exit(2, "receipt pool does not match requested pool")
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		coord, err := readyPoolCoordinatorFromConfig(cfg)
+		if err != nil {
+			return err
+		}
+		return heartbeatPortablePool(ctx, coord, *receiptFile)
+	}
+	if key == "" || *id == "" || *borrowToken == "" {
+		return Exit(2, "usage: crabbox pool heartbeat <key> --id <lease-id> --borrow-token <token>")
+	}
+	coord, err := readyPoolCoordinator()
+	if err != nil {
+		return err
+	}
+	var res CoordinatorReadyPoolResponse
+	if flagWasSet(fs, "identity-file") {
+		if _, identityErr := loadReadyPoolIdentity(*identityFile); identityErr != nil {
+			return identityErr
+		}
+		res, err = coord.HeartbeatTypedReadyPoolBorrow(ctx, key, *id, *borrowToken)
+	} else {
+		res, err = coord.HeartbeatReadyPoolBorrow(ctx, key, *id, *borrowToken)
+	}
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return json.NewEncoder(a.Stdout).Encode(res)
+	}
+	fmt.Fprintf(a.Stdout, "heartbeat pool=%s lease=%s state=%s expires=%s\n", res.Entry.Key, res.Entry.LeaseID, res.Entry.State, res.Entry.BorrowExpiresAt)
 	return nil
 }
 
 func (a App) readyPoolReturn(ctx context.Context, args []string) error {
 	fs := newFlagSet("pool return", a.Stderr)
 	id := fs.String("id", "", "lease id")
+	receiptFile := fs.String("receipt-file", "", "protected portable access receipt")
 	result := fs.String("result", "ready", "return result: ready, drain, or release")
 	reason := fs.String("reason", "", "short reason")
 	borrowToken := fs.String("borrow-token", "", "borrow token from pool borrow")
+	identityFile := fs.String("identity-file", "", "generated typed ready-pool identity JSON")
 	jsonOut := fs.Bool("json", false, "print JSON")
-	args, key := extractFirstPositionalArg(args, map[string]bool{"id": true, "result": true, "reason": true, "borrow-token": true})
+	args, key := extractFirstPositionalArg(args, map[string]bool{"id": true, "result": true, "reason": true, "borrow-token": true, "identity-file": true, "receipt-file": true})
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
+	if *receiptFile != "" {
+		if flagWasSet(fs, "borrow-token") || flagWasSet(fs, "id") {
+			return Exit(2, "--receipt-file cannot be combined with --id or --borrow-token")
+		}
+		receipt, err := readPoolAccessReceipt(*receiptFile)
+		if err != nil {
+			return err
+		}
+		if key != "" && key != receipt.Pool {
+			return Exit(2, "receipt pool does not match requested pool")
+		}
+		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		coord, err := readyPoolCoordinatorFromConfig(cfg)
+		if err != nil {
+			return err
+		}
+		returnCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		defer cancel()
+		return returnPortablePool(returnCtx, coord, *receiptFile, *result)
+	}
 	if key == "" || *id == "" {
-		return exit(2, "usage: crabbox pool return <key> --id <lease-id>")
+		return Exit(2, "usage: crabbox pool return <key> --id <lease-id>")
 	}
 	if err := validateReadyPoolReturnResult(*result); err != nil {
 		return err
@@ -146,7 +408,28 @@ func (a App) readyPoolReturn(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := coord.ReturnReadyPoolLease(ctx, key, *id, *result, *reason, *borrowToken)
+	var res CoordinatorReadyPoolResponse
+	if flagWasSet(fs, "identity-file") {
+		input := map[string]any{
+			"leaseID": strings.TrimSpace(*id), "result": strings.TrimSpace(*result),
+			"reason": strings.TrimSpace(*reason), "borrowToken": strings.TrimSpace(*borrowToken),
+		}
+		if strings.TrimSpace(*result) != "ready" {
+			res, err = coord.ReturnTypedReadyPoolLease(ctx, key, input)
+		} else {
+			identity, identityErr := loadReadyPoolIdentity(*identityFile)
+			if identityErr != nil {
+				input["result"] = "drain"
+				input["reason"] = "typed ready-pool identity unavailable or invalid"
+				res, err = coord.ReturnTypedReadyPoolLease(ctx, key, input)
+				return errors.Join(identityErr, err)
+			}
+			input["identity"] = identity
+			res, err = coord.ReturnTypedReadyPoolLease(ctx, key, input)
+		}
+	} else {
+		res, err = coord.ReturnReadyPoolLease(ctx, key, *id, *result, *reason, *borrowToken)
+	}
 	if err != nil {
 		return err
 	}
@@ -160,25 +443,66 @@ func (a App) readyPoolReturn(ctx context.Context, args []string) error {
 func (a App) readyPoolEnsure(ctx context.Context, args []string) error {
 	fs := newFlagSet("pool ensure", a.Stderr)
 	minReady := fs.Int("min-ready", 1, "minimum ready leases")
-	create := fs.Bool("create", false, "create one missing ready lease with prewarm")
+	maxReady := fs.Int("max-ready", -1, "maximum ready, busy, and in-flight leases (default min-ready)")
+	compatibilityKey := fs.String("compatibility-key", "", "provider-neutral capability and size key")
+	identityFile := fs.String("identity-file", "", "generated typed ready-pool identity JSON")
+	portableAccess := fs.Bool("access", false, "opt in to bounded portable access (requires typed identity)")
+	create := fs.Bool("create", false, "claim and create missing ready leases with prewarm")
 	jsonOut := fs.Bool("json", false, "print JSON")
-	args, key := extractFirstPositionalArg(args, map[string]bool{"min-ready": true})
+	args, key := extractFirstPositionalArg(args, map[string]bool{"min-ready": true, "max-ready": true, "compatibility-key": true, "identity-file": true})
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if key == "" {
-		return exit(2, "usage: crabbox pool ensure <key> [--create] [prewarm flags...]")
+		return Exit(2, "usage: crabbox pool ensure <key> [--create] [prewarm flags...]")
 	}
 	if err := validateReadyPoolEnsurePrewarmArgs(fs.Args()); err != nil {
 		return err
+	}
+	if *minReady < 0 || *minReady > 100 {
+		return Exit(2, "--min-ready must be between 0 and 100")
+	}
+	if *maxReady < 0 {
+		*maxReady = *minReady
+	}
+	if *maxReady < *minReady || *maxReady > 100 {
+		return Exit(2, "--max-ready must be between min-ready and 100")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
+	if hasCapacityMinimums(cfg) {
+		return Exit(2, "resource requirements are unsupported with ready pools")
+	}
+	var identity *CoordinatorReadyPoolIdentityV1
+	explicitIdentityProvider := false
+	if flagWasSet(fs, "identity-file") {
+		parsed, identityErr := loadReadyPoolIdentity(*identityFile)
+		if identityErr != nil {
+			return identityErr
+		}
+		explicitProvider, providerErr := validateReadyPoolEnsureProviderArgs(fs.Args(), parsed)
+		if providerErr != nil {
+			return providerErr
+		}
+		if explicitProvider {
+			setProviderSelection(&cfg, parsed.Image.Provider, providerSelectionFlag)
+			explicitIdentityProvider = true
+		} else if providerErr := bindReadyPoolIdentityConfiguredProvider(&cfg, parsed); providerErr != nil {
+			return providerErr
+		}
+		identity = &parsed
+	}
 	coord, err := readyPoolCoordinatorFromConfig(cfg)
 	if err != nil {
 		return err
+	}
+	if *portableAccess {
+		if !flagWasSet(fs, "identity-file") && !flagWasSet(fs, "cache-compatibility") {
+			return Exit(2, "--access requires typed pool identity")
+		}
+		coord.portablePool = true
 	}
 	repo, err := findRepo()
 	if err != nil {
@@ -189,57 +513,159 @@ func (a App) readyPoolEnsure(ctx context.Context, args []string) error {
 		repoSlug = bestEffortGitHubRepoSlug(repo, cfg)
 	}
 	borrowInput := readyPoolRunBorrowInput(cfg, repo, repoSlug)
-	entries, err := coord.ReadyPool(ctx, key)
-	if err != nil {
-		return err
-	}
-	ready := countReadyPoolEntries(entries, borrowInput)
-	if ready >= *minReady {
-		if *jsonOut {
-			if err := json.NewEncoder(a.Stdout).Encode(map[string]any{"key": key, "ready": ready, "minReady": *minReady, "entries": entries}); err != nil {
-				return err
-			}
-		} else {
-			fmt.Fprintf(a.Stdout, "pool=%s ready=%d min_ready=%d\n", key, ready, *minReady)
+	addStringInput(borrowInput, "compatibilityKey", *compatibilityKey)
+	borrowInput["minReady"] = *minReady
+	borrowInput["maxReady"] = *maxReady
+	borrowInput["claim"] = *create
+	if identity != nil {
+		delete(borrowInput, "allowMissingCommit")
+		if err := validateReadyPoolSeedIdentity(*identity, borrowInput); err != nil {
+			return err
 		}
-		return nil
-	}
-	if !*create {
-		if *jsonOut {
-			if err := json.NewEncoder(a.Stdout).Encode(map[string]any{"key": key, "ready": ready, "minReady": *minReady, "entries": entries}); err != nil {
-				return err
-			}
+		if providerErr := bindReadyPoolIdentityProvider(borrowInput, *identity); providerErr != nil {
+			return providerErr
 		}
-		return exit(5, "pool=%s ready=%d min_ready=%d create=false", key, ready, *minReady)
+		borrowInput["identity"] = *identity
 	}
 	prewarmArgs := append([]string{}, fs.Args()...)
 	prewarmArgs = append(prewarmArgs, "--pool", key)
+	if *portableAccess {
+		prewarmArgs = append(prewarmArgs, "--pool-access")
+	}
+	if strings.TrimSpace(*compatibilityKey) != "" {
+		prewarmArgs = append(prewarmArgs, "--pool-compatibility-key", strings.TrimSpace(*compatibilityKey))
+	}
+	if identity != nil {
+		if !explicitIdentityProvider {
+			prewarmArgs = append(prewarmArgs, "--provider", identity.Image.Provider)
+		}
+		prewarmArgs = append(prewarmArgs, "--pool-identity-file", *identityFile)
+	}
 	prewarmApp := a
 	if *jsonOut {
 		prewarmApp.Stdout = a.Stderr
 	}
-	for next := ready; next < *minReady; next++ {
-		if err := prewarmApp.prewarm(ctx, prewarmArgs); err != nil {
+	for {
+		var res CoordinatorReadyPoolReconcileResponse
+		if identity != nil {
+			res, err = coord.ReconcileTypedReadyPool(ctx, key, borrowInput)
+		} else {
+			res, err = coord.ReconcileReadyPool(ctx, key, borrowInput)
+		}
+		if err != nil {
+			if identity == nil && readyPoolCoordinatorRouteUnsupported(err) {
+				fmt.Fprintln(a.Stderr, "notice: coordinator does not support atomic ready-pool reconciliation; using legacy count-then-create fallback")
+				entries, ready, legacyErr := ensureReadyPoolLegacy(
+					ctx,
+					coord,
+					key,
+					*minReady,
+					*create,
+					borrowInput,
+					func() error { return prewarmApp.prewarm(ctx, prewarmArgs) },
+				)
+				if legacyErr != nil {
+					return legacyErr
+				}
+				if ready < *minReady {
+					if *jsonOut {
+						if encodeErr := json.NewEncoder(a.Stdout).Encode(map[string]any{"key": key, "ready": ready, "minReady": *minReady, "entries": nonNullJSONCollection(entries)}); encodeErr != nil {
+							return encodeErr
+						}
+					}
+					return Exit(5, "pool=%s ready=%d min_ready=%d create=%t", key, ready, *minReady, *create)
+				}
+				return renderReadyPoolLegacyResult(a.Stdout, key, ready, *minReady, entries, *jsonOut)
+			}
 			return err
+		}
+		if res.Counts.Ready >= *minReady {
+			return renderReadyPoolReconcileResult(a.Stdout, res, *jsonOut)
+		}
+		if !*create {
+			if *jsonOut {
+				if err := json.NewEncoder(a.Stdout).Encode(res); err != nil {
+					return err
+				}
+			}
+			return Exit(5, "pool=%s ready=%d min_ready=%d create=false", key, res.Counts.Ready, *minReady)
+		}
+		if res.Claim == nil {
+			if *jsonOut {
+				if err := json.NewEncoder(a.Stdout).Encode(res); err != nil {
+					return err
+				}
+			}
+			return Exit(5, "pool=%s ready=%d in_flight=%d min_ready=%d max_ready=%d capped=%t", key, res.Counts.Ready, res.Counts.InFlight, *minReady, *maxReady, res.Capped)
+		}
+		if err := prewarmApp.prewarmWithPoolFillClaim(ctx, prewarmArgs, res.Claim.Token); err != nil {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			var releaseErr error
+			if identity != nil {
+				releaseErr = coord.ReleaseTypedReadyPoolFillClaim(releaseCtx, key, res.Claim.Token)
+			} else {
+				releaseErr = coord.ReleaseReadyPoolFillClaim(releaseCtx, key, res.Claim.Token)
+			}
+			cancel()
+			if releaseErr != nil {
+				fmt.Fprintf(a.Stderr, "warning: release ready-pool fill claim failed: %v\n", releaseErr)
+			}
+			return err
+		}
+	}
+}
+
+func ensureReadyPoolLegacy(
+	ctx context.Context,
+	coord *CoordinatorClient,
+	key string,
+	minReady int,
+	create bool,
+	borrowInput map[string]any,
+	prewarm func() error,
+) ([]CoordinatorReadyPoolEntry, int, error) {
+	entries, err := coord.ReadyPool(ctx, key)
+	if err != nil {
+		return nil, 0, err
+	}
+	ready := countReadyPoolEntries(entries, borrowInput)
+	if ready >= minReady || !create {
+		return entries, ready, nil
+	}
+	for next := ready; next < minReady; next++ {
+		if err := prewarm(); err != nil {
+			return nil, 0, err
 		}
 	}
 	entries, err = coord.ReadyPool(ctx, key)
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
-	ready = countReadyPoolEntries(entries, borrowInput)
-	if ready < *minReady {
-		if *jsonOut {
-			if err := json.NewEncoder(a.Stdout).Encode(map[string]any{"key": key, "ready": ready, "minReady": *minReady, "entries": entries}); err != nil {
-				return err
-			}
-		}
-		return exit(5, "pool=%s ready=%d min_ready=%d create=true", key, ready, *minReady)
+	return entries, countReadyPoolEntries(entries, borrowInput), nil
+}
+
+func renderReadyPoolLegacyResult(
+	w io.Writer,
+	key string,
+	ready int,
+	minReady int,
+	entries []CoordinatorReadyPoolEntry,
+	jsonOut bool,
+) error {
+	if jsonOut {
+		return json.NewEncoder(w).Encode(map[string]any{
+			"key": key, "ready": ready, "minReady": minReady, "entries": nonNullJSONCollection(entries),
+		})
 	}
-	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(map[string]any{"key": key, "ready": ready, "minReady": *minReady, "entries": entries})
+	fmt.Fprintf(w, "pool=%s ready=%d min_ready=%d\n", key, ready, minReady)
+	return nil
+}
+
+func renderReadyPoolReconcileResult(w io.Writer, res CoordinatorReadyPoolReconcileResponse, jsonOut bool) error {
+	if jsonOut {
+		return json.NewEncoder(w).Encode(res)
 	}
-	fmt.Fprintf(a.Stdout, "pool=%s ready=%d min_ready=%d\n", key, ready, *minReady)
+	fmt.Fprintf(w, "pool=%s ready=%d busy=%d in_flight=%d min_ready=%d max_ready=%d satisfied=%t reconciling=%t\n", res.Desired.Key, res.Counts.Ready, res.Counts.Busy, res.Counts.InFlight, res.Desired.MinReady, res.Desired.MaxReady, res.Satisfied, res.Reconciling)
 	return nil
 }
 
@@ -258,8 +684,17 @@ func validateReadyPoolEnsurePrewarmArgs(args []string) error {
 			continue
 		}
 		switch {
+		case arg == "--min-vcpus" || arg == "--min-memory-mib" || strings.HasPrefix(arg, "--min-vcpus=") || strings.HasPrefix(arg, "--min-memory-mib="):
+			_, value, inline := strings.Cut(arg, "=")
+			if !inline && i+1 < len(args) {
+				i++
+				value = args[i]
+			}
+			if parsed, err := strconv.ParseInt(value, 0, 32); err != nil || parsed != 0 {
+				return Exit(2, "resource requirements are unsupported with ready pools")
+			}
 		case arg == "--repo" || arg == "--ref" || strings.HasPrefix(arg, "--repo=") || strings.HasPrefix(arg, "--ref="):
-			return exit(2, "pool ensure --create does not support forwarded --repo or --ref overrides")
+			return Exit(2, "pool ensure --create does not support forwarded --repo or --ref overrides")
 		}
 	}
 	return nil
@@ -271,20 +706,96 @@ func readyPoolCoordinatorFromConfig(cfg Config) (*CoordinatorClient, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, exit(2, "ready pools require broker.url or CRABBOX_COORDINATOR")
+		return nil, Exit(2, "ready pools require broker.url or CRABBOX_COORDINATOR")
 	}
 	return coord, nil
 }
 
-func readyPoolBorrowInput(repo, ref, commit, fingerprint, provider, target string) map[string]any {
+func readyPoolBorrowInput(repo, ref, commit, fingerprint, compatibilityKey, provider, target string) map[string]any {
 	input := map[string]any{}
 	addStringInput(input, "repo", repo)
 	addStringInput(input, "ref", ref)
 	addStringInput(input, "commit", commit)
 	addStringInput(input, "fingerprint", fingerprint)
+	addStringInput(input, "compatibilityKey", compatibilityKey)
 	addStringInput(input, "provider", provider)
 	addStringInput(input, "target", target)
 	return input
+}
+
+func bindReadyPoolIdentityProvider(input map[string]any, identity CoordinatorReadyPoolIdentityV1) error {
+	requested := readyPoolInputString(input, "provider")
+	if requested != "" {
+		provider, err := canonicalProviderName(requested)
+		if err != nil || provider != identity.Image.Provider {
+			return Exit(2, "typed ready-pool provider %q does not match identity provider %q", requested, identity.Image.Provider)
+		}
+	}
+	input["provider"] = identity.Image.Provider
+	return nil
+}
+
+func bindReadyPoolIdentityProviderConfig(cfg *Config, fs *flag.FlagSet, providerValue *string, identity CoordinatorReadyPoolIdentityV1) error {
+	if providerValue == nil {
+		return Exit(2, "typed ready-pool provider selection is unavailable")
+	}
+	if flagWasSet(fs, "provider") {
+		provider, err := canonicalProviderName(*providerValue)
+		if err != nil || provider != identity.Image.Provider {
+			return Exit(2, "typed ready-pool provider %q does not match identity provider %q", *providerValue, identity.Image.Provider)
+		}
+		*providerValue = identity.Image.Provider
+		return nil
+	}
+	if err := bindReadyPoolIdentityConfiguredProvider(cfg, identity); err != nil {
+		return err
+	}
+	*providerValue = identity.Image.Provider
+	return nil
+}
+
+func bindReadyPoolIdentityConfiguredProvider(cfg *Config, identity CoordinatorReadyPoolIdentityV1) error {
+	if providerSelectionIsActionable(*cfg) {
+		provider, err := canonicalProviderName(cfg.Provider)
+		if err != nil || provider != identity.Image.Provider {
+			return Exit(2, "configured typed ready-pool provider %q does not match identity provider %q", cfg.Provider, identity.Image.Provider)
+		}
+	} else {
+		setProviderSelection(cfg, identity.Image.Provider, providerSelectionLeaseContext)
+	}
+	return nil
+}
+
+func validateReadyPoolIdentityProviderConfig(cfg Config, identity CoordinatorReadyPoolIdentityV1) error {
+	provider, err := canonicalProviderName(cfg.Provider)
+	if err != nil || provider != identity.Image.Provider {
+		return Exit(2, "routed typed ready-pool provider %q does not match identity provider %q", cfg.Provider, identity.Image.Provider)
+	}
+	_, err = validateReadyPoolIdentityProvider(provider)
+	return err
+}
+
+func validateReadyPoolEnsureProviderArgs(args []string, identity CoordinatorReadyPoolIdentityV1) (bool, error) {
+	found := false
+	for index := 0; index < len(args); index++ {
+		arg := strings.TrimSpace(args[index])
+		var provider string
+		switch {
+		case (arg == "--provider" || arg == "-provider") && index+1 < len(args):
+			index++
+			provider = args[index]
+		case strings.HasPrefix(arg, "--provider=") || strings.HasPrefix(arg, "-provider="):
+			provider = strings.TrimPrefix(strings.TrimPrefix(arg, "--provider="), "-provider=")
+		default:
+			continue
+		}
+		found = true
+		canonical, err := canonicalProviderName(provider)
+		if err != nil || canonical != identity.Image.Provider {
+			return false, Exit(2, "typed ready-pool provider %q does not match identity provider %q", provider, identity.Image.Provider)
+		}
+	}
+	return found, nil
 }
 
 func readyPoolRegisterCommit(cfg Config, repo Repo, ref, explicitCommit string) string {
@@ -296,7 +807,7 @@ func readyPoolRegisterCommit(cfg Config, repo Repo, ref, explicitCommit string) 
 }
 
 func readyPoolRunBorrowInput(cfg Config, repo Repo, repoSlug string) map[string]any {
-	input := readyPoolBorrowInput(repoSlug, firstNonBlank(cfg.Actions.Ref, repo.BaseRef), readyPoolRunBorrowCommit(cfg, repo), "", "", "")
+	input := readyPoolBorrowInput(repoSlug, firstNonBlank(cfg.Actions.Ref, repo.BaseRef), readyPoolRunBorrowCommit(cfg, repo), "", "", "", "")
 	if readyPoolRunAllowsMissingCommit(cfg, repo) {
 		input["allowMissingCommit"] = true
 	}
@@ -305,11 +816,12 @@ func readyPoolRunBorrowInput(cfg Config, repo Repo, repoSlug string) map[string]
 
 func readyPoolRunBorrowInputForRun(cfg Config, repo Repo, repoSlug string, noSync bool) (map[string]any, error) {
 	input := readyPoolRunBorrowInput(cfg, repo, repoSlug)
+	input["heartbeat"] = true
 	if !noSync {
 		return input, nil
 	}
 	if readyPoolInputString(input, "commit") == "" {
-		return nil, exit(2, "--pool --no-sync requires an exact commit match; omit --no-sync or use a checked-out branch/SHA ref")
+		return nil, Exit(2, "--pool --no-sync requires an exact commit match; omit --no-sync or use a checked-out branch/SHA ref")
 	}
 	delete(input, "allowMissingCommit")
 	return input, nil
@@ -347,6 +859,56 @@ func addStringInput(input map[string]any, key, value string) {
 	}
 }
 
+func readyPoolIdentityMetadata(cfg Config, repo Repo, repository, ref, commit, fingerprint string) map[string]any {
+	input := map[string]any{}
+	addStringInput(input, "repo", firstNonBlank(repository, cfg.Actions.Repo, bestEffortGitHubRepoSlug(repo, cfg)))
+	refValue := firstNonBlank(ref, cfg.Actions.Ref, repo.BaseRef)
+	addStringInput(input, "ref", refValue)
+	addStringInput(input, "commit", readyPoolRegisterCommit(cfg, repo, refValue, commit))
+	addStringInput(input, "fingerprint", fingerprint)
+	return input
+}
+
+func mapsCloneAny(source map[string]any) map[string]any {
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func borrowValidatedTypedReadyPoolLease(ctx context.Context, coord *CoordinatorClient, key string, input map[string]any, identity CoordinatorReadyPoolIdentityV1) (CoordinatorReadyPoolResponse, error) {
+	if err := validateReadyPoolSeedIdentity(identity, input); err != nil {
+		return CoordinatorReadyPoolResponse{}, err
+	}
+	response, err := coord.BorrowTypedReadyPoolLease(ctx, key, input)
+	if err != nil {
+		return response, err
+	}
+	if err = validateTypedReadyPoolResponseIdentity(response, identity); err == nil {
+		err = readyPoolIdentityMatchesLease(identity, response.Lease)
+	}
+	if err == nil {
+		return response, nil
+	}
+	if response.Entry.LeaseID != "" && response.Entry.BorrowToken != "" {
+		returnInput := map[string]any{
+			"leaseID": response.Entry.LeaseID, "borrowToken": response.Entry.BorrowToken,
+			"result": "drain", "reason": "typed ready-pool identity mismatch",
+		}
+		if response.Entry.Identity != nil {
+			returnInput["identity"] = *response.Entry.Identity
+		}
+		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		_, drainErr := coord.ReturnTypedReadyPoolLease(drainCtx, key, returnInput)
+		cancel()
+		if drainErr != nil {
+			return response, errors.Join(err, fmt.Errorf("drain mismatched ready-pool entry: %w", drainErr))
+		}
+	}
+	return response, err
+}
+
 func bestEffortGitHubRepoSlug(repo Repo, cfg Config) string {
 	ghRepo, err := resolveGitHubRepo(repo, cfg.Actions.Repo)
 	if err != nil {
@@ -356,7 +918,7 @@ func bestEffortGitHubRepoSlug(repo Repo, cfg Config) string {
 }
 
 func readyPoolClaimSSHHost(leaseID string) string {
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		return ""
 	}
@@ -364,7 +926,7 @@ func readyPoolClaimSSHHost(leaseID string) string {
 }
 
 func readyPoolClaimSSHPort(leaseID string) string {
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil || claim.SSHPort <= 0 {
 		return ""
 	}
@@ -372,7 +934,7 @@ func readyPoolClaimSSHPort(leaseID string) string {
 }
 
 func readyPoolClaimWorkRoot(leaseID string) string {
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		return ""
 	}
@@ -382,14 +944,15 @@ func readyPoolClaimWorkRoot(leaseID string) string {
 func poolRegisterValueFlags() map[string]bool {
 	return map[string]bool{
 		"id": true, "repo": true, "ref": true, "commit": true, "fingerprint": true,
-		"image": true, "ssh-host": true, "ssh-user": true, "ssh-port": true, "work-root": true,
+		"compatibility-key": true, "identity-file": true, "cache-compatibility": true, "image": true,
+		"ssh-host": true, "ssh-user": true, "ssh-port": true, "work-root": true,
 	}
 }
 
 func poolBorrowValueFlags() map[string]bool {
 	return map[string]bool{
 		"repo": true, "ref": true, "commit": true, "fingerprint": true,
-		"provider": true, "target": true,
+		"compatibility-key": true, "identity-file": true, "provider": true, "target": true, "receipt-file": true, "duration": true, "class": true, "type": true,
 	}
 }
 
@@ -398,7 +961,7 @@ func validateReadyPoolReturnResult(result string) error {
 	case "ready", "drain", "release":
 		return nil
 	default:
-		return exit(2, "--result must be ready, drain, or release")
+		return Exit(2, "--result must be ready, drain, or release")
 	}
 }
 
@@ -407,16 +970,41 @@ func validateReadyPoolRunReturnPolicy(policy string) error {
 	case "", "auto", "ready", "drain", "release":
 		return nil
 	default:
-		return exit(2, "--pool-return must be auto, ready, drain, or release")
+		return Exit(2, "--pool-return must be auto, ready, drain, or release")
 	}
 }
 
-func readyPoolRunReturnResult(policy string, runFailure error) string {
+func readyPoolRunNeedsTrustedRemote(policy string) bool {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "drain", "release":
+		return false
+	default:
+		return true
+	}
+}
+
+func readyPoolRunShouldScrub(policy string, runFailure error) bool {
 	switch strings.TrimSpace(policy) {
-	case "ready", "drain", "release":
+	case "drain", "release":
+		return false
+	case "ready", "", "auto":
+		return runFailure == nil
+	default:
+		return false
+	}
+}
+
+func readyPoolRunReturnResult(policy string, runFailure error, scrubErr error, metadataCompatible bool) string {
+	switch strings.TrimSpace(policy) {
+	case "drain", "release":
 		return strings.TrimSpace(policy)
+	case "ready":
+		if readyPoolRunShouldScrub(policy, runFailure) && scrubErr == nil && metadataCompatible {
+			return "ready"
+		}
+		return "drain"
 	case "", "auto":
-		if runFailure == nil {
+		if readyPoolRunShouldScrub(policy, runFailure) && scrubErr == nil && metadataCompatible {
 			return "ready"
 		}
 		return "drain"
@@ -425,15 +1013,44 @@ func readyPoolRunReturnResult(policy string, runFailure error) string {
 	}
 }
 
+func readyPoolPreparedCommitMatches(recordedCommit, preparedCommit string) bool {
+	recordedCommit = strings.TrimSpace(recordedCommit)
+	return recordedCommit == "" || strings.EqualFold(recordedCommit, strings.TrimSpace(preparedCommit))
+}
+
+func readyPoolEntryRequiresHydration(entry CoordinatorReadyPoolEntry) bool {
+	return strings.TrimSpace(entry.Commit) == ""
+}
+
+func readyPoolRunRequiresHydrationProof(entry CoordinatorReadyPoolEntry, hydratedByActions bool) bool {
+	return hydratedByActions || readyPoolEntryRequiresHydration(entry)
+}
+
 func readyPoolReturnNeedsHydrationStop(result string) bool {
 	return result == "drain" || result == "release"
 }
 
-func readyPoolRunReturnReason(runFailure error) string {
-	if runFailure == nil {
-		return "run succeeded"
+func readyPoolRunReturnReason(runFailure error, result, preparedCommit string, scrubErr error, metadataCompatible bool) string {
+	if result == "ready" {
+		outcome := "run succeeded"
+		if runFailure != nil {
+			outcome = "run failed"
+		}
+		if preparedCommit != "" {
+			return outcome + "; scrubbed for reuse at " + preparedCommit
+		}
+		return outcome + "; scrubbed for reuse"
 	}
-	return "run failed"
+	if scrubErr != nil {
+		return "pool scrub failed"
+	}
+	if !metadataCompatible {
+		return "pool hydration or recorded commit is stale"
+	}
+	if runFailure != nil {
+		return "run lifecycle failed"
+	}
+	return "pool drain requested"
 }
 
 func applyReadyPoolEndpoint(target SSHTarget, entry CoordinatorReadyPoolEntry) SSHTarget {
@@ -455,14 +1072,17 @@ func countReadyPoolEntries(entries []CoordinatorReadyPoolEntry, borrowInput map[
 	now := time.Now()
 	for _, entry := range entries {
 		expiresAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(entry.ExpiresAt))
-		if entry.State == "ready" && err == nil && expiresAt.After(now) && readyPoolEntryMatchesBorrowInput(entry, borrowInput) {
+		if entry.State == "ready" && err == nil && expiresAt.After(now) && readyPoolEntryMatchesLegacyBorrowInput(entry, borrowInput) {
 			ready++
 		}
 	}
 	return ready
 }
 
-func readyPoolEntryMatchesBorrowInput(entry CoordinatorReadyPoolEntry, input map[string]any) bool {
+func readyPoolEntryMatchesLegacyBorrowInput(entry CoordinatorReadyPoolEntry, input map[string]any) bool {
+	if entry.Identity != nil {
+		return false
+	}
 	for _, field := range []struct {
 		name  string
 		value string
@@ -473,22 +1093,19 @@ func readyPoolEntryMatchesBorrowInput(entry CoordinatorReadyPoolEntry, input map
 		{name: "provider", value: entry.Provider},
 		{name: "target", value: entry.TargetOS},
 	} {
-		if !readyPoolStringMatches(field.value, readyPoolInputString(input, field.name)) {
+		if !readyPoolLegacyStringMatches(field.value, readyPoolInputString(input, field.name)) {
 			return false
 		}
 	}
 	commit := readyPoolInputString(input, "commit")
-	if commit == "" {
-		return true
-	}
-	if entry.Commit == commit {
+	if commit == "" || entry.Commit == commit {
 		return true
 	}
 	allowMissingCommit, _ := input["allowMissingCommit"].(bool)
 	return allowMissingCommit && entry.Commit == ""
 }
 
-func readyPoolStringMatches(got, want string) bool {
+func readyPoolLegacyStringMatches(got, want string) bool {
 	want = strings.TrimSpace(want)
 	return want == "" || strings.TrimSpace(got) == want
 }

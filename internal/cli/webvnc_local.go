@@ -27,6 +27,7 @@ const (
 )
 
 const localWebVNCSecurityTypePassword byte = 2
+const localWebVNCSecurityTypeNone byte = 1
 
 const (
 	localWebVNCReadTimeout   = 10 * time.Second
@@ -43,6 +44,14 @@ type localWebVNCSourceIdentity struct {
 
 type localWebVNCConnContextKey struct{}
 
+type localWebVNCAuthenticationMode int
+
+const (
+	localWebVNCAuthAuto localWebVNCAuthenticationMode = iota
+	localWebVNCAuthVNC
+	localWebVNCAuthARD
+)
+
 // webVNCLocal serves the embedded noVNC viewer for an already-tunneled VNC
 // socket. The source and browser listeners are both restricted to IPv4
 // loopback; callers pass the VNC password through stdin so it never appears in
@@ -52,7 +61,9 @@ func (a App) webVNCLocal(ctx context.Context, args []string) error {
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage:")
 		fmt.Fprintln(fs.Output(), "  crabbox webvnc local --vnc-host 127.0.0.1 --vnc-port <port> --username <user> --password-stdin [--security-type auto|vnc] [--local-port <port>] [--open]")
+		fmt.Fprintln(fs.Output(), "  --redact-credentials=false  reveal viewer credentials (unsafe)")
 	}
+	redactCredentials := registerWebVNCCredentialOutputFlag(fs)
 	vncHost := fs.String("vnc-host", "127.0.0.1", "loopback VNC source host")
 	vncPort := fs.String("vnc-port", "", "loopback VNC source port")
 	username := fs.String("username", "", "VNC username")
@@ -63,32 +74,35 @@ func (a App) webVNCLocal(ctx context.Context, args []string) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
+	if *redactCredentials {
+		a.Stdout = webVNCRedactingWriter{Writer: a.Stdout}
+	}
 	if !localWebVNCSupported() {
-		return exit(2, "webvnc local is supported only on macOS and Linux")
+		return Exit(2, "webvnc local is supported only on macOS and Linux")
 	}
 	if *vncHost != vncLoopbackHost {
-		return exit(2, "--vnc-host must be exactly %s", vncLoopbackHost)
+		return Exit(2, "--vnc-host must be exactly %s", vncLoopbackHost)
 	}
 	if !validWebVNCDaemonPort(*vncPort) {
-		return exit(2, "--vnc-port must be an integer between 1 and 65535")
+		return Exit(2, "--vnc-port must be an integer between 1 and 65535")
 	}
 	if err := validateLocalWebVNCUsername(*username); err != nil {
 		return err
 	}
 	if *securityType != localWebVNCSecurityAuto && *securityType != localWebVNCSecurityVNC {
-		return exit(2, "--security-type must be auto or vnc")
+		return Exit(2, "--security-type must be auto or vnc")
 	}
 	if !*passwordStdin {
-		return exit(2, "webvnc local requires --password-stdin")
+		return Exit(2, "webvnc local requires --password-stdin")
 	}
 
 	sourceIdentity, err := localWebVNCListenerIdentity(*vncPort)
 	if err != nil {
-		return exit(5, "pin local VNC source %s:%s: %v", *vncHost, *vncPort, err)
+		return Exit(5, "pin local VNC source %s:%s: %v", *vncHost, *vncPort, err)
 	}
 	dialVNC := pinnedLocalWebVNCDialer(*vncHost, *vncPort, sourceIdentity)
 	if err := probeLocalWebVNC(ctx, dialVNC); err != nil {
-		return exit(5, "probe local VNC source %s:%s: %v", *vncHost, *vncPort, err)
+		return Exit(5, "probe local VNC source %s:%s: %v", *vncHost, *vncPort, err)
 	}
 	bridgeCtx, cancelBridge := context.WithCancelCause(ctx)
 	defer cancelBridge(context.Canceled)
@@ -100,13 +114,13 @@ func (a App) webVNCLocal(ctx context.Context, args []string) error {
 
 	reservation, err := reserveLocalWebVNCBrowserPort(*localPort, *vncPort)
 	if err != nil {
-		return exit(5, "reserve local WebVNC port: %v", err)
+		return Exit(5, "reserve local WebVNC port: %v", err)
 	}
 	webPort := reservation.port
 	webListener, err := reservation.listener()
 	if err != nil {
 		reservation.release()
-		return exit(5, "open local WebVNC listener: %v", err)
+		return Exit(5, "open local WebVNC listener: %v", err)
 	}
 	defer webListener.Close()
 
@@ -125,10 +139,17 @@ func (a App) webVNCLocal(ctx context.Context, args []string) error {
 		webPort,
 		credentials,
 		*openViewer,
-		*securityType == localWebVNCSecurityVNC,
+		localWebVNCAuthenticationModeForSecurityType(*securityType),
 		dialVNC,
 		nil,
 	)
+}
+
+func localWebVNCAuthenticationModeForSecurityType(securityType string) localWebVNCAuthenticationMode {
+	if securityType == localWebVNCSecurityVNC {
+		return localWebVNCAuthVNC
+	}
+	return localWebVNCAuthAuto
 }
 
 func reserveLocalWebVNCBrowserPort(requested string, excluded ...string) (*webVNCDaemonPortReservation, error) {
@@ -189,14 +210,14 @@ func validateLocalWebVNCUsername(username string) error {
 	if username == "" || username != strings.TrimSpace(username) || strings.IndexFunc(username, func(r rune) bool {
 		return r < 32 || r == 127
 	}) >= 0 {
-		return exit(2, "--username must be non-empty and contain no surrounding whitespace or control characters")
+		return Exit(2, "--username must be non-empty and contain no surrounding whitespace or control characters")
 	}
 	return nil
 }
 
 func readLocalWebVNCPassword(ctx context.Context, input io.Reader) (string, error) {
 	if input == nil {
-		return "", exit(2, "read VNC password from stdin: stdin is unavailable")
+		return "", Exit(2, "read VNC password from stdin: stdin is unavailable")
 	}
 	if err := context.Cause(ctx); err != nil {
 		return "", err
@@ -220,19 +241,19 @@ func readLocalWebVNCPassword(ctx context.Context, input io.Reader) (string, erro
 		data, err = read.data, read.err
 	}
 	if err != nil {
-		return "", exit(2, "read VNC password from stdin: %v", err)
+		return "", Exit(2, "read VNC password from stdin: %v", err)
 	}
 	if len(data) > maxLocalWebVNCPasswordBytes {
-		return "", exit(2, "VNC password from stdin exceeds %d bytes", maxLocalWebVNCPasswordBytes)
+		return "", Exit(2, "VNC password from stdin exceeds %d bytes", maxLocalWebVNCPasswordBytes)
 	}
 	password := string(data)
 	password = strings.TrimSuffix(password, "\n")
 	password = strings.TrimSuffix(password, "\r")
 	if password == "" {
-		return "", exit(2, "VNC password from stdin is empty")
+		return "", Exit(2, "VNC password from stdin is empty")
 	}
 	if strings.ContainsAny(password, "\r\n\x00") {
-		return "", exit(2, "VNC password from stdin must be one line without NUL bytes")
+		return "", Exit(2, "VNC password from stdin must be one line without NUL bytes")
 	}
 	return password, nil
 }
@@ -291,20 +312,24 @@ func (a App) serveLocalWebVNCBridge(
 	webPort string,
 	credentials rfbCredentials,
 	openViewer bool,
-	forceVNCAuthentication bool,
+	authMode localWebVNCAuthenticationMode,
 	dialVNC localWebVNCDialer,
 	handoffOutput func(macOSWebVNCHandoff),
+	childEnvDenylist ...string,
 ) error {
 	// A per-session token is handed to the browser through a mode-0600 temporary
-	// viewer file. It is used only in a credential POST body and WebSocket
-	// subprotocol, so neither the password nor its bearer capability appears in
-	// argv, browser URLs, cookies, or DNS.
+	// viewer file. Legacy VNC modes use it in a credential POST body; every mode
+	// uses it as the WebSocket subprotocol. ARD authentication stays in this
+	// process, so the ARD viewer receives no credential endpoint.
 	session, err := newMacOSWebVNCSession()
 	if err != nil {
-		return exit(5, "generate viewer session: %v", err)
+		return Exit(5, "generate viewer session: %v", err)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/credentials", macOSWebVNCCredentialsHandler(session, credentials))
+	viewerNeedsCredentials := authMode == localWebVNCAuthAuto || authMode == localWebVNCAuthVNC
+	if viewerNeedsCredentials {
+		mux.HandleFunc("/credentials", macOSWebVNCCredentialsHandler(session, credentials))
+	}
 	mux.HandleFunc("/websockify", func(w http.ResponseWriter, r *http.Request) {
 		if !macOSWebVNCProtocolAllowed(r, session.Protocol) {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -339,8 +364,12 @@ func (a App) serveLocalWebVNCBridge(
 			return
 		}
 		defer tcp.Close()
-		if forceVNCAuthentication {
+		switch authMode {
+		case localWebVNCAuthVNC:
 			_ = relayWebSocketVNCWithVNCAuthentication(relayCtx, ws, tcp)
+			return
+		case localWebVNCAuthARD:
+			_ = relayWebSocketVNCWithARDAuthentication(relayCtx, ws, tcp, credentials)
 			return
 		}
 		relayWebSocketVNC(relayCtx, ws, tcp)
@@ -364,7 +393,7 @@ func (a App) serveLocalWebVNCBridge(
 	}()
 	defer func() { _ = srv.Close() }()
 
-	handoff, err := createMacOSWebVNCHandoff(webPort, session)
+	handoff, err := createMacOSWebVNCHandoff(webPort, session, viewerNeedsCredentials)
 	if err != nil {
 		return err
 	}
@@ -375,7 +404,7 @@ func (a App) serveLocalWebVNCBridge(
 		handoffOutput(handoff)
 	}
 	if openViewer {
-		if err := openLocalURL(handoff.URL); err != nil {
+		if err := openLocalURLWithEnvironment(handoff.URL, childEnvDenylist...); err != nil {
 			return err
 		}
 		fmt.Fprintf(a.Stdout, "opened: %s\n", handoff.URL)
@@ -384,8 +413,209 @@ func (a App) serveLocalWebVNCBridge(
 	case <-ctx.Done():
 		return context.Cause(ctx)
 	case err := <-serverErrors:
-		return exit(5, "serve local WebVNC: %v", err)
+		return Exit(5, "serve local WebVNC: %v", err)
 	}
+}
+
+func relayWebSocketVNCWithARDAuthentication(ctx context.Context, ws *websocket.Conn, tcp net.Conn, credentials rfbCredentials) error {
+	return relayWebSocketVNCWithARDAuthenticationWithTimeout(ctx, ws, tcp, credentials, localWebVNCReadTimeout)
+}
+
+func relayWebSocketVNCWithARDAuthenticationWithTimeout(ctx context.Context, ws *websocket.Conn, tcp net.Conn, credentials rfbCredentials, negotiationTimeout time.Duration) error {
+	return relayWebSocketVNCWithMacOSAuthenticationWithTimeout(ctx, ws, tcp, credentials, localWebVNCAuthARD, negotiationTimeout)
+}
+
+func relayWebSocketVNCWithMacOSAuthenticationWithTimeout(ctx context.Context, ws *websocket.Conn, tcp net.Conn, credentials rfbCredentials, authMode localWebVNCAuthenticationMode, negotiationTimeout time.Duration) error {
+	browser := websocket.NetConn(context.Background(), ws, websocket.MessageBinary)
+	authenticationName := rfbAuthenticationModeName(authMode)
+	err := forceRFBMacOSAuthenticationWithTimeout(ctx, browser, tcp, credentials, authMode, negotiationTimeout)
+	if cause := context.Cause(ctx); cause != nil {
+		_ = ws.Close(websocket.StatusGoingAway, "bridge stopped")
+		return cause
+	}
+	if err != nil {
+		message := authenticationName + " authentication negotiation failed"
+		if errors.Is(err, context.DeadlineExceeded) {
+			message = authenticationName + " authentication negotiation timed out"
+		}
+		_ = ws.Close(websocket.StatusPolicyViolation, message)
+		return fmt.Errorf("%s: %w", message, err)
+	}
+	errors := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(tcp, browser)
+		errors <- err
+	}()
+	go func() {
+		_, err := io.Copy(browser, tcp)
+		errors <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case err := <-errors:
+		return err
+	}
+}
+
+func rfbAuthenticationModeName(authMode localWebVNCAuthenticationMode) string {
+	switch authMode {
+	case localWebVNCAuthARD:
+		return "ARD"
+	case localWebVNCAuthVNC:
+		return "VNC"
+	default:
+		return "RFB"
+	}
+}
+
+func forceRFBMacOSAuthenticationWithTimeout(ctx context.Context, browser, server net.Conn, credentials rfbCredentials, authMode localWebVNCAuthenticationMode, negotiationTimeout time.Duration) (err error) {
+	deadline, hasDeadline := rfbAuthenticationDeadline(ctx, negotiationTimeout)
+	if hasDeadline {
+		if err := browser.SetDeadline(deadline); err != nil {
+			return fmt.Errorf("set RFB browser authentication deadline: %w", err)
+		}
+		if err := server.SetDeadline(deadline); err != nil {
+			_ = browser.SetDeadline(time.Time{})
+			return fmt.Errorf("set RFB server authentication deadline: %w", err)
+		}
+	}
+	cancellationDone := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		defer close(cancellationDone)
+		_ = browser.SetDeadline(time.Now())
+		_ = server.SetDeadline(time.Now())
+	})
+	defer func() {
+		if err != nil {
+			cause := context.Cause(ctx)
+			// WebSocket deadlines can report a closed connection. Classify using
+			// the negotiation's deadline before clearing the transport deadlines.
+			if cause == nil && hasDeadline && !time.Now().Before(deadline) {
+				cause = context.DeadlineExceeded
+			}
+			if cause != nil {
+				err = fmt.Errorf("%w: %w", err, cause)
+			}
+		}
+		if !stopCancellation() {
+			<-cancellationDone
+		}
+		_ = browser.SetDeadline(time.Time{})
+		_ = server.SetDeadline(time.Time{})
+	}()
+
+	serverVersion := make([]byte, 12)
+	if _, err := io.ReadFull(server, serverVersion); err != nil {
+		return fmt.Errorf("read RFB server version: %w", err)
+	}
+	browserServerVersion, err := rfbClientVersionForServer(serverVersion)
+	if err != nil {
+		return fmt.Errorf("invalid RFB server version: %w", err)
+	}
+	if _, err := browser.Write(browserServerVersion); err != nil {
+		return fmt.Errorf("write RFB server version: %w", err)
+	}
+
+	browserVersion := make([]byte, 12)
+	if _, err := io.ReadFull(browser, browserVersion); err != nil {
+		return fmt.Errorf("read RFB browser version: %w", err)
+	}
+	major, minor, err := parseRFBVersion(browserVersion)
+	if err != nil {
+		return fmt.Errorf("invalid RFB browser version: %w", err)
+	}
+	if _, err := server.Write(browserVersion); err != nil {
+		return fmt.Errorf("write RFB browser version: %w", err)
+	}
+
+	legacyVersion := major == 3 && minor < 7
+	var securityType byte
+	if legacyVersion {
+		security := make([]byte, 4)
+		if _, err := io.ReadFull(server, security); err != nil {
+			return fmt.Errorf("read RFB 3.3 security type: %w", err)
+		}
+		selected := binary.BigEndian.Uint32(security)
+		if selected == 0 {
+			reason, reasonErr := readRFBReason(server)
+			if reasonErr != nil {
+				return reasonErr
+			}
+			return fmt.Errorf("RFB server rejected security negotiation: %s", reason)
+		}
+		if selected > 255 {
+			return fmt.Errorf("unsupported RFB 3.3 security type %d", selected)
+		}
+		securityType = byte(selected)
+		if expected := rfbSecurityTypeForAuthenticationMode(authMode); expected != 0 && securityType != expected {
+			return fmt.Errorf("RFB server selected security type %d, want %d", securityType, expected)
+		}
+	} else {
+		securityType, err = negotiateRFBSecurityTypeForMode(server, credentials, authMode)
+		if err != nil {
+			return err
+		}
+	}
+	switch securityType {
+	case rfbSecurityARD:
+		if err := negotiateRFBARDAuth(server, credentials); err != nil {
+			return err
+		}
+	case rfbSecurityVNC:
+		if err := negotiateRFBVNCAuth(server, credentials); err != nil {
+			return err
+		}
+	case rfbSecurityNone:
+	default:
+		return fmt.Errorf("unsupported RFB security type %d", securityType)
+	}
+	// RFB 3.7 advances directly after selecting None; RFB 3.8 added a
+	// SecurityResult for the None security type.
+	if securityType != rfbSecurityNone || (major == 3 && minor >= 8) {
+		if err := readRFBSecurityResult(server); err != nil {
+			return err
+		}
+	}
+
+	if legacyVersion {
+		security := make([]byte, 4)
+		binary.BigEndian.PutUint32(security, uint32(localWebVNCSecurityTypeNone))
+		if _, err := browser.Write(security); err != nil {
+			return fmt.Errorf("write RFB 3.3 no-auth security type: %w", err)
+		}
+		return nil
+	}
+
+	if _, err := browser.Write([]byte{1, localWebVNCSecurityTypeNone}); err != nil {
+		return fmt.Errorf("write filtered RFB no-auth security type: %w", err)
+	}
+	selected := []byte{0}
+	if _, err := io.ReadFull(browser, selected); err != nil {
+		return fmt.Errorf("read RFB browser security selection: %w", err)
+	}
+	if selected[0] != localWebVNCSecurityTypeNone {
+		return fmt.Errorf("RFB browser did not select no authentication")
+	}
+	if major == 3 && minor == 7 {
+		return nil
+	}
+	if _, err := browser.Write([]byte{0, 0, 0, 0}); err != nil {
+		return fmt.Errorf("write RFB no-auth security result: %w", err)
+	}
+	return nil
+}
+
+func rfbAuthenticationDeadline(ctx context.Context, timeout time.Duration) (time.Time, bool) {
+	deadline, ok := ctx.Deadline()
+	if timeout <= 0 {
+		return deadline, ok
+	}
+	timeoutDeadline := time.Now().Add(timeout)
+	if !ok || timeoutDeadline.Before(deadline) {
+		return timeoutDeadline, true
+	}
+	return deadline, true
 }
 
 func relayWebSocketVNCWithVNCAuthentication(ctx context.Context, ws *websocket.Conn, tcp net.Conn) error {
@@ -466,10 +696,11 @@ func forceRFBVNCAuthentication(ctx context.Context, browser, server net.Conn) er
 	if _, err := io.ReadFull(server, serverVersion); err != nil {
 		return fmt.Errorf("read RFB server version: %w", err)
 	}
-	if err := validateRFBServerVersion(serverVersion); err != nil {
+	browserServerVersion, err := rfbClientVersionForServer(serverVersion)
+	if err != nil {
 		return fmt.Errorf("invalid RFB server version: %w", err)
 	}
-	if _, err := browser.Write(serverVersion); err != nil {
+	if _, err := browser.Write(browserServerVersion); err != nil {
 		return fmt.Errorf("write RFB server version: %w", err)
 	}
 
@@ -545,6 +776,29 @@ func validateRFBServerVersion(version []byte) error {
 		return nil
 	default:
 		return fmt.Errorf("unsupported protocol version %q", string(version))
+	}
+}
+
+func rfbClientVersionForServer(version []byte) ([]byte, error) {
+	if err := validateRFBServerVersion(version); err != nil {
+		return nil, err
+	}
+	switch string(version) {
+	case "RFB 003.889\n", "RFB 004.000\n", "RFB 004.001\n", "RFB 005.000\n":
+		return []byte("RFB 003.008\n"), nil
+	}
+	_, minor, err := parseRFBVersion(version)
+	if err != nil {
+		return nil, err
+	}
+	switch minor {
+	case 7:
+		return []byte("RFB 003.007\n"), nil
+	case 8:
+		return []byte("RFB 003.008\n"), nil
+	default:
+		// RFC 6143 requires unknown protocol versions to fall back to 3.3.
+		return []byte("RFB 003.003\n"), nil
 	}
 }
 

@@ -20,6 +20,14 @@ type failureStreamCapture struct {
 	bundlePath    string
 	bundleCleanup func()
 	capture       *countingWriteCloser
+	captureBytes  int64
+	captureClosed bool
+}
+
+type streamCaptureMetadata struct {
+	Label string
+	Path  string
+	Bytes int64
 }
 
 func openFailureStreamCaptures(stdoutPath, stderrPath string) (*failureStreamCaptures, error) {
@@ -75,7 +83,7 @@ func (c *failureStreamCapture) writer(base io.Writer, phase *phaseMarkerWriter, 
 	if c.explicitPath != "" {
 		file, err := openPrivateRunOutputFile(c.explicitPath)
 		if err != nil {
-			return nil, false, exit(2, "capture %s: %v", c.label, err)
+			return nil, false, Exit(2, "capture %s: %v", c.label, err)
 		}
 		c.capture = &countingWriteCloser{WriteCloser: file}
 		fmt.Fprintf(status, "capturing %s to %s\n", c.label, c.explicitPath)
@@ -98,6 +106,27 @@ func (c *failureStreamCaptures) closeAfterStream(streamErr error, code int, stat
 	return c.stderr.closeAfterStream(streamErr, code, status)
 }
 
+func (c *failureStreamCaptures) metadata() []streamCaptureMetadata {
+	if c == nil {
+		return nil
+	}
+	metadata := make([]streamCaptureMetadata, 0, 2)
+	if stdout, ok := c.stdout.metadata(); ok {
+		metadata = append(metadata, stdout)
+	}
+	if stderr, ok := c.stderr.metadata(); ok {
+		metadata = append(metadata, stderr)
+	}
+	return metadata
+}
+
+func (c *failureStreamCapture) metadata() (streamCaptureMetadata, bool) {
+	if c == nil || c.explicitPath == "" || !c.captureClosed {
+		return streamCaptureMetadata{}, false
+	}
+	return streamCaptureMetadata{Label: c.label, Path: c.explicitPath, Bytes: c.captureBytes}, true
+}
+
 func (c *failureStreamCapture) closeAfterStream(streamErr error, code int, status io.Writer) error {
 	if c == nil {
 		return nil
@@ -105,18 +134,23 @@ func (c *failureStreamCapture) closeAfterStream(streamErr error, code int, statu
 	if c.capture != nil {
 		if streamErr != nil && !isSSHCommandExitError(streamErr) {
 			_ = c.capture.Close()
-			return exit(2, "capture %s: %v", c.label, streamErr)
+			c.captureBytes = c.capture.N
+			c.captureClosed = true
+			return Exit(2, "capture %s: %v", c.label, streamErr)
 		}
-		if err := c.capture.Close(); err != nil && code == 0 {
-			return exit(2, "capture %s close: %v", c.label, err)
+		closeErr := c.capture.Close()
+		c.captureBytes = c.capture.N
+		c.captureClosed = true
+		if closeErr != nil && code == 0 {
+			return Exit(2, "capture %s close: %v", c.label, closeErr)
 		}
-		fmt.Fprintf(status, "captured %s=%s bytes=%d\n", c.label, c.explicitPath, c.capture.N)
+		fmt.Fprintf(status, "captured %s=%s bytes=%d\n", c.label, c.explicitPath, c.captureBytes)
 		c.capture = nil
 		return nil
 	}
 	if c.bundleFile != nil {
 		if err := c.bundleFile.Close(); err != nil && code == 0 {
-			return exit(2, "failure bundle %s close: %v", c.label, err)
+			return Exit(2, "failure bundle %s close: %v", c.label, err)
 		}
 		c.bundleFile = nil
 	}
@@ -129,6 +163,8 @@ func (c *failureStreamCapture) closeQuiet() error {
 	}
 	if c.capture != nil {
 		err := c.capture.Close()
+		c.captureBytes = c.capture.N
+		c.captureClosed = true
 		c.capture = nil
 		return err
 	}

@@ -93,7 +93,7 @@ Repo-local config cannot set `apiToken`, `apiUrl`, `itemId`,
 `paymentMethodId`, `templateId`, `dataCenterId`, or enable `allowPurchase`.
 This prevents a repository from selecting the Hostinger account, redirecting
 credentials, or choosing billable inputs. Set those through flags, environment
-variables, private user config, or an explicit `CRABBOX_CONFIG` file.
+variables, private user config, or an explicit `CRABBOX_CONFIG` file outside the active repository.
 
 Provider flags:
 
@@ -172,7 +172,7 @@ crabbox warmup --provider hostinger --hostinger-allow-purchase
 ```
 
 ```yaml
-# Private user config, or a file explicitly selected with CRABBOX_CONFIG.
+# Private user config, or a file outside the active repository selected with CRABBOX_CONFIG.
 hostinger:
   allowPurchase: true
 ```
@@ -210,6 +210,15 @@ mapping for a later resolve by VPS id or hostname. If a later setup step fails,
 Crabbox keeps the local claim and SSH key for recovery and stops the VPS unless
 `--keep` was set. The subscription remains account-owned and may continue
 billing in every case.
+
+Cancelling during a bootstrap SSH retry interrupts its five-second backoff
+immediately. Acquisition still performs the bounded, ownership-checked rollback
+described above; cancellation does not discard the recovery claim or SSH key.
+
+Acquisition readiness has a ten-minute budget covering both provider reads and
+polling delays. Caller cancellation interrupts readiness reads and backoff while
+preserving its cause. A completed ready or terminal observation still wins over
+concurrent cancellation.
 
 Hostinger may reject an API purchase with HTTP `402` even when `doctor` reports
 an active default payment method. This means the payment or order requires
@@ -268,6 +277,9 @@ crabbox stop --provider hostinger "<lease-or-slug>"
 ```
 
 Only `hostinger.releaseAction: stop` is supported. Any other value is rejected.
+The two-minute stop budget includes submission and confirmation. Cancellation
+interrupts confirmation reads and backoff without being reported as a timeout;
+completed stopped observations and provider failures retain their own outcomes.
 If stop confirmation times out or fails, the local claim and SSH key remain
 available for recovery. After confirmed stop, Crabbox marks the claim stopped
 and retains the stored per-lease private key so the VPS can be restarted and

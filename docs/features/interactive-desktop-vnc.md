@@ -10,16 +10,32 @@ Read when:
 - deciding which layer owns desktop setup, browser state, screenshots, or
   credentials.
 
-Crabbox treats desktop access as a lease capability, not a separate remote
-access product. A desktop lease keeps the normal Crabbox boundaries: provider
-lifecycle, per-lease SSH keys, SSH tunnels, idle expiry, cleanup, and run
-history. VNC is one way to inspect or drive the visible session inside that
-boundary.
+Use this guide to choose desktop, VNC/WebVNC, browser, Code, or coordinator
+portal access. An agent can run a UI test remotely, then hand the same desktop
+to a human to inspect or drive. These surfaces stay inside the lease's ownership,
+access, expiry, and cleanup rules.
+
+## Choose An Access Surface
+
+| Need | Request / command | What you get |
+| --- | --- | --- |
+| Run a headless browser test | `warmup --browser`, then `run --id ... -- <test>` | A supported browser binary and environment paths; no logged-in profile. |
+| See a browser or application | `warmup --desktop --browser` | A visible desktop and browser on a supported target. |
+| Open that desktop in a native viewer | `vnc --id ... --open` | A local SSH tunnel to the runner's VNC service. |
+| View or hand over that desktop in a browser | `webvnc --id ... --open --take-control` | A noVNC viewer through the coordinator, or a local viewer on supported direct providers. |
+| Edit the remote checkout in browser VS Code | `warmup --code`, then `code --id ... --open` | code-server on a supported Linux lease, reached through the authenticated coordinator bridge. |
+| Watch leases and inspect run evidence | Open the coordinator's `/portal` | Authorized lease inventory, bridge health, sharing, run logs, events, results, and telemetry. |
+| Reach your app's HTTP port | `tunnel --id ... 3000` or provider-supported `ports --publish 3000` | A local SSH forward or a provider-native preview URL; not a desktop viewer. |
+
+Choose the provider and target first: `crabbox providers --json` reports the
+declared capabilities, and the provider page explains target-specific limits.
+`url-bridge` means provider URL support, not VNC or Code. Tailscale selects a
+route to the SSH endpoint; it does not expose the VNC service directly.
 
 ## Quick Start
 
 ```sh
-crabbox warmup --desktop --browser
+crabbox warmup --desktop --browser --slug blue-lobster
 crabbox webvnc --id blue-lobster --open
 crabbox webvnc status --id blue-lobster
 crabbox desktop doctor --id blue-lobster
@@ -27,8 +43,8 @@ crabbox vnc --id blue-lobster --open
 crabbox screenshot --id blue-lobster --output desktop.png
 ```
 
-AWS Windows and EC2 Mac use the same `vnc` command once the desktop lease
-exists:
+AWS Windows, EC2 Mac, and External Mac leases use the same `vnc` command once
+the desktop lease exists:
 
 ```sh
 crabbox warmup --provider aws --target windows --desktop
@@ -37,6 +53,13 @@ crabbox vnc --id crimson-crab --open
 crabbox warmup --provider aws --target macos --desktop --market on-demand
 crabbox vnc --id silver-squid --open
 ```
+
+For External macOS, first configure the adapter's trusted target, desktop
+account, and password environment reference, then validate the real
+Screen Sharing credential path with `crabbox webvnc --provider external
+--target macos --id <lease> --preflight`. See the
+[External provider](../providers/external.md) and [macOS VNC](vnc-macos.md)
+docs.
 
 Static hosts are existing machines, so VNC against them is explicit and
 host-managed:
@@ -50,10 +73,12 @@ crabbox vnc --provider ssh --target windows --static-host win-dev.local --host-m
 
 Crabbox owns:
 
-- the lease lifecycle and cleanup;
+- lease lifecycle and cleanup orchestration through the selected provider or
+  External adapter;
 - per-lease SSH keys and `known_hosts` scoping;
 - SSH local forwarding to the target's loopback VNC service;
-- generated per-lease VNC or OS passwords for managed desktop leases;
+- generated per-lease VNC or OS passwords for Crabbox-bootstrapped desktops,
+  plus protected consumption of operator-managed External macOS credentials;
 - `desktop=true`, `browser=true`, `code=true`, and `desktop_env` lease labels;
 - screenshots, video, and launch/input commands that run inside the lease.
 
@@ -68,12 +93,16 @@ A scenario layer on top of Crabbox owns:
 
 | Target | Managed by Crabbox | Desktop access | Primary page |
 | --- | --- | --- | --- |
-| Linux on Hetzner | Yes | Xvfb/XFCE + x11vnc, or Wayland + WayVNC, over SSH tunnel | [Linux VNC](vnc-linux.md) |
-| Linux on AWS | Yes | Xvfb/XFCE + x11vnc, or Wayland + WayVNC, over SSH tunnel | [Linux VNC](vnc-linux.md) |
-| Linux on Azure | Yes | Xvfb/XFCE + x11vnc, or Wayland + WayVNC, over SSH tunnel | [Linux VNC](vnc-linux.md) |
+| Linux on Hetzner | Yes | TigerVNC/XFCE, or Wayland + WayVNC, over SSH tunnel | [Linux VNC](vnc-linux.md) |
+| Linux on AWS | Yes | TigerVNC/XFCE, or Wayland + WayVNC, over SSH tunnel | [Linux VNC](vnc-linux.md) |
+| Linux on Azure | Yes | TigerVNC/XFCE, or Wayland + WayVNC, over SSH tunnel | [Linux VNC](vnc-linux.md) |
 | AWS Windows | Yes | VNC service over SSH tunnel | [Windows VNC](vnc-windows.md) |
 | Azure Windows | Yes | VNC service over SSH tunnel | [Windows VNC](vnc-windows.md) |
 | AWS EC2 Mac | Yes | Screen Sharing/VNC over SSH tunnel | [macOS VNC](vnc-macos.md) |
+| Tart macOS | Yes | Screen Sharing over the clone's SSH tunnel | [Tart](../providers/tart.md) |
+| Parallels macOS | Yes | Screen Sharing over the owned clone's SSH tunnel | [Parallels](../providers/parallels.md) |
+| External macOS | External adapter | Screen Sharing/ARD over SSH tunnel with an operator-managed account | [macOS VNC](vnc-macos.md) |
+| External Windows | External adapter | SSH/run by default; VNC only when the adapter supplies Crabbox-compatible desktop capability, service, and credential file | [External provider](../providers/external.md) |
 | Local Docker container | Yes | Loopback VNC over SSH tunnel | [Linux VNC](vnc-linux.md) |
 | Static Linux | Host-managed | Existing loopback VNC service | [Linux VNC](vnc-linux.md) |
 | Static macOS | Host-managed | Existing Screen Sharing/VNC | [macOS VNC](vnc-macos.md) |
@@ -93,8 +122,8 @@ local-to-portal path.
   `crabbox webvnc` process keeps the SSH tunnel open, connects to the
   coordinator with a one-use bridge ticket, and the authenticated portal serves
   bundled noVNC. The portal never connects to the runner directly, so the local
-  bridge must keep running. `--open` preloads the VNC password into the local
-  browser fragment.
+  bridge must keep running. `--open` gives the browser a one-use credential
+  handoff ticket; usernames and passwords never enter the URL.
 - `crabbox vnc` is for a native VNC client: when WebVNC status or reset reports
   the portal path is unhealthy, or when you need a native client feature.
 
@@ -109,12 +138,21 @@ crabbox vnc --id blue-lobster --open
 ```
 
 WebVNC is available on coordinator-managed desktop leases and on direct desktop
-providers. Direct providers normally use a localhost viewer. With
-`broker.mode: registered`, direct leases instead use the outbound coordinator
-bridge, so KubeVirt, external, static SSH, local Docker, and other SSH desktop
-leases can appear in and be shared from the portal. Blacksmith remains
-unsupported. Native `crabbox vnc` works against every managed and host-managed
-desktop in the support matrix.
+providers. Authenticated direct macOS providers such as Tart and Parallels are
+registered automatically for the provider lease lifetime, so they use the same portal
+chrome and controls as Linux and Windows. Other direct providers can opt into
+the outbound coordinator bridge with `broker.mode: registered`; without that
+mode they keep their localhost viewer. Blacksmith remains unsupported. Native
+`crabbox vnc` works against every managed and host-managed desktop in the
+support matrix.
+
+External macOS uses the direct Screen Sharing bridge too. Crabbox resolves the
+operator-managed account password from its approved environment reference,
+authenticates the ARD session in the local relay, and never sends that account
+credential to the browser. Because the coordinator authenticates portal access,
+the toolbar copies a clean, ticket-free URL for these relay-authenticated
+sessions; access remains subject to the lease ACL. Use `webvnc --preflight` to
+test the exact SSH, RFB, and ARD authentication path without opening a viewer.
 
 For kept registered desktop leases, `broker.autoWebVNC: true` starts the bridge
 daemon automatically. The daemon heartbeats the registration while connected;
@@ -150,9 +188,11 @@ crabbox screenshot --id blue-lobster --output desktop.png
 ```
 
 Screenshot capture is loopback-based: Linux uses `grim` (Wayland) or
-`scrot`/`import` (X11), macOS uses `screencapture`, and native Windows uses an
-interactive screen capture task. Static hosts only support screenshots on Linux
-targets, since macOS and Windows static hosts are existing machines.
+`scrot`/`import` (X11), managed macOS captures the Screen Sharing framebuffer
+over RFB, and native Windows uses an interactive screen capture task. External
+macOS uses its approved operator credential for ARD authentication on that RFB
+connection. Static hosts only support screenshots on Linux targets, since
+macOS and Windows static hosts are existing machines.
 
 For a durable proof bundle instead of a single image, use `crabbox artifacts`:
 
@@ -177,9 +217,11 @@ crabbox desktop launch --id blue-lobster --browser --url https://example.com --w
 For human demos, launched browsers stay windowed so the desktop panel, title
 bar, and surrounding session remain visible. Use `--fullscreen` only when you
 want browser-only video or capture output. `--webvnc` (and its `--open` /
-`--take-control` companions) bridges the launched desktop into the portal and
-requires a coordinator-backed Hetzner, AWS, or Azure lease. The local container
-provider uses local noVNC over SSH. `--egress` routes the launched browser
+`--take-control` companions) bridges the launched desktop into the portal.
+Authenticated Tart, Parallels, and External macOS leases use the same direct
+Screen Sharing bridge; when registered, they use the same portal as
+coordinator-managed leases. The local container provider uses local noVNC over
+SSH. `--egress` routes the launched browser
 through the lease-local egress proxy (default
 `127.0.0.1:3128`) and currently requires `--browser`; see
 [mediated egress](egress.md).
@@ -248,8 +290,9 @@ Managed VNC is tunnel-first:
 - `crabbox vnc` forwards a local port (the first free port in `5901`–`5999`) to
   remote `127.0.0.1:5900`.
 - `--network tailscale` changes only the SSH endpoint used by that tunnel.
-- Remote-host providers such as Parallels carry their SSH proxy command into
-  VNC, screenshots, and input commands using the same tunnel model.
+- Remote-host providers such as Parallels and External carry their SSH proxy
+  command into VNC, screenshots, and input commands using the same tunnel
+  model.
 - WebVNC keeps the same local SSH tunnel and adds an authenticated browser
   websocket through the coordinator. Browser websockets are paired with local
   bridge backend sessions inside the coordinator Durable Object: one viewer is
@@ -284,8 +327,11 @@ to `daemon start`, `daemon status`, and `daemon stop` respectively.
 
 ## Browser State
 
-`--browser` guarantees a browser binary and env such as `BROWSER` and
+`--browser` requests a supported browser binary and env such as `BROWSER` and
 `CHROME_BIN`; it does not create, unlock, sync, or migrate a logged-in profile.
+It can be used without `--desktop` for headless testing. The local-container
+provider may select Firefox, so these variables do not guarantee Chromium or
+CDP compatibility; choose an image with the engine your tests require.
 On managed Linux leases these env vars point to a Crabbox wrapper that disables
 Chrome/Chromium first-run and default-browser prompts and pins a per-lease
 profile for repeatable VNC use. Manual browser login through VNC lasts only for
@@ -297,12 +343,69 @@ storage-state file or a short-lived app token. Avoid syncing full browser
 profile directories between operating systems; browser credentials are often
 machine- and user-encrypted.
 
+## Code In The Browser
+
+For browser VS Code, use a Linux lease with the `code` capability and a
+configured coordinator login. AWS, Azure, and Hetzner support this managed path.
+The operator must configure an isolated `CRABBOX_CODE_ORIGIN_TEMPLATE` with
+wildcard TLS and WebSocket ingress; without it, browser Code fails closed.
+Windows, macOS, and static SSH are unsupported for `crabbox code`.
+
+```sh
+crabbox warmup --provider hetzner --code --slug editor-check
+crabbox run --id editor-check --sync-only
+crabbox code --id editor-check --open
+```
+
+Sync first: `warmup` prepares the box, and `code` opens its workspace without
+uploading the local checkout. The editor follows the synced workspace, or the
+Actions hydration workspace when one exists. It listens on `127.0.0.1:8080`
+with code-server auth disabled; the authenticated coordinator and ticketed CLI
+bridge control access. Keep `crabbox code` running while editing. Closing that
+process closes the tunnel, not the lease. See the [Code command](../commands/code.md)
+for folder mapping, origin configuration, and troubleshooting.
+
+## Portal, Sharing, And Cleanup
+
+Open `/portal` on your coordinator to see authorized leases and bridge state.
+Lease pages link to WebVNC and Code; run pages at `/portal/runs/<run-id>` show
+retained output, events, results, and available resource trends. Inspecting a run
+does not require a live desktop. To interact with one, its bridge must be running.
+
+The owner or a user with `manage` access can share a lease with a named user or
+the organization. WebVNC's first viewer controls the desktop; later viewers
+observe until they choose **take control**. Sharing grants lease access; sending
+a URL alone does not. Observer mode is a collaboration feature for trusted users,
+not a hostile-client isolation boundary.
+
+Direct providers keep provider credentials and cleanup authority in the CLI.
+`broker.mode: registered` adds coordinator inventory and sharing; kept registered
+desktops can start their bridge with `broker.autoWebVNC: true` (environment:
+`CRABBOX_COORDINATOR_AUTO_WEBVNC`). Authenticated direct macOS desktops also have
+automatic registration as described above. See [Portal](portal.md) for exact
+registration and access rules.
+
+Stop each lease when finished:
+
+```sh
+crabbox stop blue-lobster
+crabbox stop editor-check
+```
+
+The portal's lifecycle action depends on ownership: managed leases can be
+stopped, runtime-adapter workspaces can be deleted, and ordinary registered
+direct leases can only be deregistered there. Removing a registration does not
+delete its provider machine. Preserve recovery claims if provider cleanup fails;
+expiry and labels alone are not proof of resource ownership.
+
 ## Security Rules
 
 - Never expose managed VNC directly to the public internet.
 - Do not expose managed VNC directly on a Tailscale interface.
 - Prefer SSH local forwarding such as `localhost:5901 -> 127.0.0.1:5900`.
-- Generate per-lease passwords for managed desktop leases.
+- Generate per-lease passwords for Crabbox-bootstrapped desktop leases. For an
+  External Mac, keep the existing account password in an operator secret store
+  and configure only its approved environment-variable name.
 - Redact passwords from logs, provider metadata, and run records.
 - Keep TTL and idle-timeout cleanup in force.
 - Require `--host-managed` before opening static-host VNC prompts.
@@ -311,11 +414,12 @@ machine- and user-encrypted.
 
 - [Linux VNC](vnc-linux.md): Hetzner/AWS/Azure Linux desktop services and static Linux.
 - [Windows VNC](vnc-windows.md): AWS/Azure managed Windows, native Windows static hosts, and WSL2 boundaries.
-- [macOS VNC](vnc-macos.md): AWS EC2 Mac and static Mac Screen Sharing.
+- [macOS VNC](vnc-macos.md): AWS EC2 Mac, External adapters, and static Mac Screen Sharing.
+- [External provider](../providers/external.md): adapter routing and operator-managed desktop credentials.
 - [Capabilities](capabilities.md): how `--desktop`, `--browser`, and `--code` are requested and validated.
 - [Portal](portal.md): the authenticated web UI that hosts WebVNC and Code panes.
 - [Mediated egress](egress.md): per-app browser/app egress through the operator machine.
 - [AWS](aws.md): AWS target matrix, capacity, AMIs, and EC2 Mac host requirements.
 - [Hetzner](hetzner.md): Linux-only managed Hetzner behavior.
 - [Blacksmith Testbox](blacksmith-testbox.md): delegated Testbox behavior and why VNC is not a Crabbox feature there.
-- Command references: [vnc](../commands/vnc.md), [webvnc](../commands/webvnc.md), [screenshot](../commands/screenshot.md), [desktop](../commands/desktop.md), [artifacts](../commands/artifacts.md), [egress](../commands/egress.md).
+- Command references: [vnc](../commands/vnc.md), [webvnc](../commands/webvnc.md), [code](../commands/code.md), [tunnel](../commands/tunnel.md), [ports](../commands/ports.md), [screenshot](../commands/screenshot.md), [desktop](../commands/desktop.md), [artifacts](../commands/artifacts.md), [egress](../commands/egress.md).

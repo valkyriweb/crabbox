@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -58,7 +59,7 @@ type fakeControllerWorkspaceRunner struct {
 
 type shutdownAwareControllerRunner struct {
 	*fakeControllerWorkspaceRunner
-	stopStarted  chan struct{}
+	stopStarted  chan context.Context
 	stopCanceled chan error
 }
 
@@ -93,7 +94,7 @@ func (r *blockingProviderIdentityRunner) ProviderIdentity(ctx context.Context) (
 }
 
 func (r *shutdownAwareControllerRunner) Stop(ctx context.Context, _ string, _ controllerWorkspaceRequest) error {
-	r.stopStarted <- struct{}{}
+	r.stopStarted <- ctx
 	<-ctx.Done()
 	err := context.Cause(ctx)
 	r.stopCanceled <- err
@@ -1329,109 +1330,133 @@ func TestControllerImmediateDeleteCancelsBeforeWarmup(t *testing.T) {
 }
 
 func TestControllerDeleteCancelsActiveWarmup(t *testing.T) {
-	runner := newFakeControllerWorkspaceRunner()
-	runner.started = make(chan string, 1)
-	runner.blockWarmup = make(chan struct{})
-	service, cancel := testControllerService(t, runner, 1)
-	defer cancel()
-	created := controllerHTTP(service, http.MethodPost, "/v1/workspaces", "test-token", controllerWorkspaceRequest{ID: "active-cancel-box"})
-	if created.Code != http.StatusAccepted {
-		t.Fatalf("create status=%d", created.Code)
-	}
-	select {
-	case <-runner.started:
-	case <-time.After(time.Second):
-		t.Fatal("warmup did not start")
-	}
-	ageControllerCreateRecoveryWindow(t, service, "active-cancel-box")
-	deleted := controllerHTTP(service, http.MethodDelete, "/v1/workspaces/active-cancel-box", "test-token", nil)
-	if deleted.Code != http.StatusAccepted {
-		t.Fatalf("delete status=%d body=%s", deleted.Code, deleted.Body.String())
-	}
-	waitControllerWorkspaceStatus(t, service, "active-cancel-box", "stopped")
-	service.mu.Lock()
-	_, tracked := service.createOps["active-cancel-box"]
-	service.mu.Unlock()
-	if tracked {
-		t.Fatal("completed warmup cancellation remained in active create map")
-	}
-	warmups, stops, _ := runner.counts()
-	if warmups != 1 || stops != 0 {
-		t.Fatalf("warmup cancellation calls warmups=%d stops=%d", warmups, stops)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		runner := newFakeControllerWorkspaceRunner()
+		runner.started = make(chan string, 1)
+		runner.blockWarmup = make(chan struct{})
+		service, cancel := testControllerService(t, runner, 1)
+		defer cancel()
+		created := controllerHTTP(service, http.MethodPost, "/v1/workspaces", "test-token", controllerWorkspaceRequest{ID: "active-cancel-box"})
+		if created.Code != http.StatusAccepted {
+			t.Fatalf("create status=%d", created.Code)
+		}
+		select {
+		case <-runner.started:
+		case <-time.After(time.Second):
+			t.Fatal("warmup did not start")
+		}
+		ageControllerCreateRecoveryWindow(t, service, "active-cancel-box")
+		deleted := controllerHTTP(service, http.MethodDelete, "/v1/workspaces/active-cancel-box", "test-token", nil)
+		if deleted.Code != http.StatusAccepted {
+			t.Fatalf("delete status=%d body=%s", deleted.Code, deleted.Body.String())
+		}
+		waitControllerWorkspaceStatus(t, service, "active-cancel-box", "stopped")
+		service.mu.Lock()
+		_, tracked := service.createOps["active-cancel-box"]
+		service.mu.Unlock()
+		if tracked {
+			t.Fatal("completed warmup cancellation remained in active create map")
+		}
+		warmups, stops, _ := runner.counts()
+		if warmups != 1 || stops != 0 {
+			t.Fatalf("warmup cancellation calls warmups=%d stops=%d", warmups, stops)
+		}
+	})
 }
 
 func TestControllerExpiryTransitionCancelsActiveWarmup(t *testing.T) {
-	runner := newFakeControllerWorkspaceRunner()
-	runner.started = make(chan string, 1)
-	runner.blockWarmup = make(chan struct{})
-	service, cancel := testControllerService(t, runner, 1)
-	defer cancel()
-	created := controllerHTTP(service, http.MethodPost, "/v1/workspaces", "test-token", controllerWorkspaceRequest{ID: "active-expiry-box"})
-	if created.Code != http.StatusAccepted {
-		t.Fatalf("create status=%d", created.Code)
-	}
-	select {
-	case <-runner.started:
-	case <-time.After(time.Second):
-		t.Fatal("warmup did not start")
-	}
-	ageControllerCreateRecoveryWindow(t, service, "active-expiry-box")
-	if err := service.updateRecord("active-expiry-box", func(record *controllerWorkspaceRecord) bool {
-		record.Status = "stopping"
-		record.StatusAfterCleanup = "expired"
-		record.FailureAfterCleanup = "workspace TTL expired during provisioning"
-		record.Message = "workspace TTL expired during provisioning; cleanup requested"
-		record.UpdatedAt = service.now().UTC().Format(time.RFC3339Nano)
-		return true
-	}); err != nil {
-		t.Fatal(err)
-	}
-	service.enqueue("active-expiry-box")
-	waitControllerWorkspaceStatus(t, service, "active-expiry-box", "expired")
-	service.mu.Lock()
-	_, tracked := service.createOps["active-expiry-box"]
-	service.mu.Unlock()
-	if tracked {
-		t.Fatal("expired warmup remained in active create map")
-	}
+	// Keep scheduling and state-file I/O latency out of the logical deadlines.
+	synctest.Test(t, func(t *testing.T) {
+		runner := newFakeControllerWorkspaceRunner()
+		runner.started = make(chan string, 1)
+		runner.blockWarmup = make(chan struct{})
+		service, cancel := testControllerService(t, runner, 1)
+		defer cancel()
+		created := controllerHTTP(service, http.MethodPost, "/v1/workspaces", "test-token", controllerWorkspaceRequest{ID: "active-expiry-box"})
+		if created.Code != http.StatusAccepted {
+			t.Fatalf("create status=%d", created.Code)
+		}
+		select {
+		case <-runner.started:
+		case <-time.After(time.Second):
+			t.Fatal("warmup did not start")
+		}
+		ageControllerCreateRecoveryWindow(t, service, "active-expiry-box")
+		if err := service.updateRecord("active-expiry-box", func(record *controllerWorkspaceRecord) bool {
+			record.Status = "stopping"
+			record.StatusAfterCleanup = "expired"
+			record.FailureAfterCleanup = "workspace TTL expired during provisioning"
+			record.Message = "workspace TTL expired during provisioning; cleanup requested"
+			record.UpdatedAt = service.now().UTC().Format(time.RFC3339Nano)
+			return true
+		}); err != nil {
+			t.Fatal(err)
+		}
+		service.enqueue("active-expiry-box")
+		waitControllerWorkspaceStatus(t, service, "active-expiry-box", "expired")
+		service.mu.Lock()
+		_, tracked := service.createOps["active-expiry-box"]
+		service.mu.Unlock()
+		if tracked {
+			t.Fatal("expired warmup remained in active create map")
+		}
+	})
 }
 
 func TestControllerShutdownCancelsActiveCleanup(t *testing.T) {
-	runner := &shutdownAwareControllerRunner{
-		fakeControllerWorkspaceRunner: newFakeControllerWorkspaceRunner(),
-		stopStarted:                   make(chan struct{}, 1),
-		stopCanceled:                  make(chan error, 1),
-	}
-	service, cancel := testControllerService(t, runner, 1)
-	created := controllerHTTP(service, http.MethodPost, "/v1/workspaces", "test-token", controllerWorkspaceRequest{ID: "shutdown-cleanup-box"})
-	if created.Code != http.StatusAccepted {
-		cancel()
-		t.Fatalf("create status=%d", created.Code)
-	}
-	waitControllerWorkspaceStatus(t, service, "shutdown-cleanup-box", "ready")
-	deleted := controllerHTTP(service, http.MethodDelete, "/v1/workspaces/shutdown-cleanup-box", "test-token", nil)
-	if deleted.Code != http.StatusAccepted {
-		cancel()
-		t.Fatalf("delete status=%d", deleted.Code)
-	}
-	select {
-	case <-runner.stopStarted:
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatal("provider cleanup did not start")
-	}
-	cancel()
-	service.waitForShutdown()
-	select {
-	case err := <-runner.stopCanceled:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("cleanup cancellation=%v", err)
+	// Keep scheduling and state-file I/O latency out of the cleanup deadlines.
+	synctest.Test(t, func(t *testing.T) {
+		runner := &shutdownAwareControllerRunner{
+			fakeControllerWorkspaceRunner: newFakeControllerWorkspaceRunner(),
+			stopStarted:                   make(chan context.Context, 1),
+			stopCanceled:                  make(chan error, 1),
 		}
-	case <-time.After(time.Second):
-		t.Fatal("controller shutdown did not cancel provider cleanup")
-	}
-	waitControllerWorkspaceInactive(t, service, "shutdown-cleanup-box")
+		service, cancel := testControllerService(t, runner, 1)
+		shutdownDone := make(chan struct{})
+		shutdown := sync.OnceFunc(func() {
+			go func() {
+				cancel() // The helper also waits for active reconciliations.
+				close(shutdownDone)
+			}()
+		})
+		defer func() {
+			shutdown()
+			select {
+			case <-shutdownDone:
+			case <-time.After(time.Second):
+				t.Error("controller shutdown did not finish active reconciliation")
+			}
+		}()
+		created := controllerHTTP(service, http.MethodPost, "/v1/workspaces", "test-token", controllerWorkspaceRequest{ID: "shutdown-cleanup-box"})
+		if created.Code != http.StatusAccepted {
+			t.Fatalf("create status=%d", created.Code)
+		}
+		waitControllerWorkspaceStatus(t, service, "shutdown-cleanup-box", "ready")
+		deleted := controllerHTTP(service, http.MethodDelete, "/v1/workspaces/shutdown-cleanup-box", "test-token", nil)
+		if deleted.Code != http.StatusAccepted {
+			t.Fatalf("delete status=%d", deleted.Code)
+		}
+		var stopCtx context.Context
+		select {
+		case stopCtx = <-runner.stopStarted:
+		case <-time.After(time.Second):
+			t.Fatal("provider cleanup did not start")
+		}
+		synctest.Wait()
+		if err := context.Cause(stopCtx); err != nil {
+			t.Fatalf("provider cleanup was already canceled before shutdown: %v", err)
+		}
+		shutdown()
+		select {
+		case err := <-runner.stopCanceled:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cleanup cancellation=%v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("controller shutdown did not cancel provider cleanup")
+		}
+		waitControllerWorkspaceInactive(t, service, "shutdown-cleanup-box")
+	})
 }
 
 func TestControllerWarmupFailureCleansProvisionedResource(t *testing.T) {
@@ -1493,7 +1518,13 @@ func TestControllerPreAcquireAckFailureRetainsStoppingUntilStableAbsence(t *test
 	defer cancel()
 	service.opts.CreateTimeout = 2 * time.Second
 	base := time.Now().UTC()
-	service.now = func() time.Time { return base }
+	var clockMu sync.RWMutex
+	currentTime := base
+	service.now = func() time.Time {
+		clockMu.RLock()
+		defer clockMu.RUnlock()
+		return currentTime
+	}
 
 	created := controllerHTTP(service, http.MethodPost, "/v1/workspaces", "test-token", controllerWorkspaceRequest{ID: "pre-ack-absent-box"})
 	if created.Code != http.StatusAccepted {
@@ -1508,7 +1539,7 @@ func TestControllerPreAcquireAckFailureRetainsStoppingUntilStableAbsence(t *test
 	var stopping controllerWorkspaceRecord
 	for time.Now().Before(deadline) {
 		current, ok := service.workspace("pre-ack-absent-box")
-		if ok && current.Status == "stopping" && current.FailureAfterCleanup != "" {
+		if ok && current.Status == "stopping" && current.FailureAfterCleanup != "" && current.ProviderAbsentSince != "" {
 			stopping = current
 			break
 		}
@@ -1517,18 +1548,17 @@ func TestControllerPreAcquireAckFailureRetainsStoppingUntilStableAbsence(t *test
 	if stopping.Status != "stopping" || stopping.AttemptLeaseID == "" || stopping.Slug == "" || stopping.CreateObserved {
 		t.Fatalf("pre-ack failure did not retain stable cleanup identity: %#v", stopping)
 	}
-	time.Sleep(100 * time.Millisecond)
+	waitControllerWorkspaceInactive(t, service, stopping.Request.ID)
 	current, _ := service.workspace(stopping.Request.ID)
 	if current.Status != "stopping" || current.AttemptLeaseID != stopping.AttemptLeaseID || current.Slug != stopping.Slug {
 		t.Fatalf("workspace escaped late-materialization recovery window: %#v", current)
 	}
 
-	service.now = func() time.Time { return base.Add(3 * time.Second) }
+	clockMu.Lock()
+	currentTime = base.Add(3 * time.Second)
+	clockMu.Unlock()
 	service.enqueue(stopping.Request.ID)
-	failed := waitControllerWorkspaceStatus(t, service, stopping.Request.ID, "failed")
-	if failed.Message != "workspace provisioning failed before provider identity acknowledgment" {
-		t.Fatalf("failure message=%q", failed.Message)
-	}
+	waitControllerWorkspaceStatusMessage(t, service, stopping.Request.ID, "failed", "workspace provisioning failed before provider identity acknowledgment")
 	runner.mu.Lock()
 	warmups := runner.warmupCalls
 	stops := runner.stopCalls
@@ -1731,6 +1761,8 @@ func TestControllerInventoryFailureDoesNotRepeatSuccessfulProviderRelease(t *tes
 	runner.confirmAbsentErr = errors.New("controller provider inventory exceeded 1048576-byte output limit")
 	service, cancel := testControllerService(t, runner, 1)
 	defer cancel()
+	// This fixture drives retries manually; keep the automatic timer out of the assertions.
+	service.opts.RetryDelay = time.Hour
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	record := controllerWorkspaceRecord{
 		Request: controllerWorkspaceRequest{ID: "inventory-overflow-box"}, ProviderRoute: "external", ProviderScope: "test-provider-scope",
@@ -2070,14 +2102,17 @@ func TestControllerRestartDoesNotTreatUnreadyInspectionAsReady(t *testing.T) {
 	defer cancel()
 	service, err := newControllerService(ctx, controllerServiceOptions{
 		StateFile: path, MaxConcurrent: 1, Profile: request.Profile,
-		CreateTimeout: time.Second, InspectTimeout: time.Second, StopTimeout: time.Second,
+		// CreateTimeout also bounds provisioning staleness (provisioningExpired);
+		// keep it far above race-detector scheduling latency so the unready
+		// inspection is judged inside the provisioning window.
+		CreateTimeout: time.Hour, InspectTimeout: time.Second, StopTimeout: time.Second,
 		ConnectionTimeout: time.Second,
 	}, runner, "token", &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	service.startReconciliation()
-	time.Sleep(100 * time.Millisecond)
+	waitControllerWorkspaceStatusMessage(t, service, request.ID, "provisioning", "workspace provisioning; waiting for provider")
 	warmups, _, _ := runner.counts()
 	if warmups != 0 {
 		t.Fatalf("unready inspection started duplicate warmup; calls=%d", warmups)
@@ -2794,6 +2829,8 @@ func TestControllerTerminalTransitionWriteFailureRevokesDesktopBeforeProvider(t 
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("desktop reopened through memory-backed terminal barrier: status=%d body=%s", response.Code, response.Body.String())
 	}
+	// Finish the reconciliation queued by the 503 response before advancing fixture phases.
+	waitControllerWorkspaceInactive(t, service, record.Request.ID)
 	runner.mu.Lock()
 	connections := runner.connectionCalls
 	runner.mu.Unlock()
@@ -3480,7 +3517,7 @@ func controllerHTTP(handler http.Handler, method, path, token string, body any) 
 
 func waitControllerWorkspaceStatus(t *testing.T, service *controllerService, id, want string) controllerWorkspaceRecord {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if record, ok := service.workspace(id); ok && record.Status == want {
 			return record
@@ -3488,7 +3525,24 @@ func waitControllerWorkspaceStatus(t *testing.T, service *controllerService, id,
 		time.Sleep(10 * time.Millisecond)
 	}
 	record, _ := service.workspace(id)
+	if record.Status == want {
+		return record
+	}
 	t.Fatalf("workspace %s status=%q want=%q message=%q", id, record.Status, want, record.Message)
+	return controllerWorkspaceRecord{}
+}
+
+func waitControllerWorkspaceStatusMessage(t *testing.T, service *controllerService, id, status, message string) controllerWorkspaceRecord {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if record, ok := service.workspace(id); ok && record.Status == status && record.Message == message {
+			return record
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	record, _ := service.workspace(id)
+	t.Fatalf("workspace %s status=%q message=%q want status=%q message=%q", id, record.Status, record.Message, status, message)
 	return controllerWorkspaceRecord{}
 }
 

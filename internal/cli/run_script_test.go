@@ -1,9 +1,51 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestLoadRunScriptUsesContentHashedStandalonePath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "scripts")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(dir, "check.sh")
+	if err := os.WriteFile(source, []byte("#!/bin/sh\necho first\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first, err := loadRunScript(source, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched, err := regexp.MatchString(`^\.crabbox/scripts/[0-9a-f]{12}-check\.sh$`, filepath.ToSlash(first.RemotePath)); err != nil || !matched {
+		t.Fatalf("remote path=%q, want content-hashed standalone path", first.RemotePath)
+	}
+
+	if err := os.WriteFile(source, []byte("#!/bin/sh\necho second\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	second, err := loadRunScript(source, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RemotePath == second.RemotePath {
+		t.Fatalf("remote path did not change with script content: %q", first.RemotePath)
+	}
+}
 
 func TestRemoteRunScriptCommandUsesUploadedFile(t *testing.T) {
 	spec := &RunScriptSpec{
@@ -11,7 +53,7 @@ func TestRemoteRunScriptCommandUsesUploadedFile(t *testing.T) {
 		RemotePath: ".crabbox/scripts/abc-live.sh",
 		Shebang:    true,
 	}
-	got := remoteRunScriptCommandWithEnvFile("/work/repo", map[string]string{"OPENAI_API_KEY": "sk-test"}, "", spec, []string{"arg one"})
+	got := remoteRunScriptCommandWithEnvFiles("/work/repo", map[string]string{"OPENAI_API_KEY": "sk-test"}, nil, spec, []string{"arg one"})
 	for _, want := range []string{
 		"cd '/work/repo'",
 		"OPENAI_API_KEY='sk-test'",
@@ -25,11 +67,235 @@ func TestRemoteRunScriptCommandUsesUploadedFile(t *testing.T) {
 	}
 }
 
-func TestRemoteRunScriptCommandWithoutShebangUsesBash(t *testing.T) {
-	spec := &RunScriptSpec{RemotePath: ".crabbox/scripts/abc-script.sh"}
-	got := remoteRunScriptCommandWithEnvFile("/work/repo", nil, "", spec, nil)
-	if !strings.Contains(got, `exec bash "$@"`) {
-		t.Fatalf("remote command should run script through bash: %q", got)
+func TestRemoteRunScriptPreservesSmokeExitWithoutLogoutHooks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell execution")
+	}
+	smoke, err := os.ReadFile("../../scripts/devtools-image-smoke-linux.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(smoke)
+	start, end := strings.Index(source, "cleanup_smoke() {"), strings.Index(source, "export TMPDIR=\"$smoke_dir\"")
+	if start < 0 || end <= start {
+		t.Fatal("smoke cleanup owner not found")
+	}
+	for _, scenario := range []struct {
+		name, body string
+		code       int
+	}{
+		{"success", "echo devtools-smoke-ok", 0},
+		{"body failure", "exit 7", 7},
+		{"cleanup failure", "rm() { return 23; }; echo devtools-smoke-ok", 1},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			home := t.TempDir()
+			mustWriteTestFile(t, filepath.Join(home, ".bash_profile"), ":\n")
+			mustWriteTestFile(t, filepath.Join(home, ".bash_logout"), "printf logout >\"$HOME/logout-ran\"\nfalse\n")
+			data := "set -euo pipefail\nsmoke_dir=\"$HOME/smoke\"\nmkdir \"$smoke_dir\"\ncache_probe=\"\"\n" + source[start:end] + scenario.body + "\n"
+			spec, err := loadRunScript("", true, strings.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(home, filepath.FromSlash(spec.RemotePath))
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			mustWriteTestFile(t, path, data)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "/bin/sh", "-c", remoteRunScriptCommandWithEnvFiles(home, nil, nil, spec, nil))
+			cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin", "SHLVL=0", "BASH_ENV=/dev/null", "ENV=/dev/null"}
+			out, err := cmd.CombinedOutput()
+			if got := exitCode(err); got != scenario.code {
+				t.Fatalf("exit=%d want=%d err=%v output=%q", got, scenario.code, err, out)
+			}
+			if _, err := os.Stat(filepath.Join(home, "logout-ran")); !os.IsNotExist(err) {
+				t.Fatalf("smoke ran login logout hook: %v", err)
+			}
+		})
+	}
+}
+
+func TestRemoteRunScriptCommandUsesWorkdirAndUploadedScriptIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell execution")
+	}
+	workdir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remotePath := ".crabbox/scripts/abc-check.sh"
+	fullPath := filepath.Join(workdir, filepath.FromSlash(remotePath))
+	script := `#!/bin/sh
+set -eu
+if [ "$PWD" = "$1" ]; then echo PWD_WORKDIR=yes; fi
+case "$0" in
+  .crabbox/scripts/abc-check.sh|"$1"/.crabbox/scripts/abc-check.sh) echo ZERO_UPLOAD=yes ;;
+esac
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+upload_dir=$(cd "$1/.crabbox/scripts" && pwd -P)
+if [ "$script_dir" = "$upload_dir" ]; then echo DIR_UPLOAD=yes; fi
+printf '%s\n%s\n' "$FIXTURE_VALUE" "$3"
+printf x >> "$1/invocations"
+exit "$2"
+`
+	upload := exec.Command("sh", "-c", "umask 022; "+remoteUploadRunScriptCommand(workdir, remotePath))
+	upload.Env = []string{"HOME=" + t.TempDir(), "PATH=" + os.Getenv("PATH")}
+	input, err := upload.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uploadOutput bytes.Buffer
+	upload.Stdout, upload.Stderr = &uploadOutput, &uploadOutput
+	if err := upload.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = input.Close()
+		if upload.ProcessState == nil {
+			_ = upload.Process.Kill()
+			_ = upload.Wait()
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		info, err := os.Stat(fullPath)
+		if err == nil {
+			if info.Mode().Perm() != 0o600 {
+				t.Errorf("script is readable before upload completes: mode=%04o want=0600", info.Mode().Perm())
+			}
+			break
+		}
+		if !os.IsNotExist(err) || time.Now().After(deadline) {
+			t.Fatalf("wait for upload: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := fmt.Fprint(input, script); err != nil {
+		t.Fatal(err)
+	}
+	if err := input.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := upload.Wait(); err != nil {
+		t.Fatalf("upload: %v\n%s", err, uploadOutput.String())
+	}
+	if info, err := os.Stat(fullPath); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("completed upload mode: info=%v err=%v", info, err)
+	}
+	spec := &RunScriptSpec{Source: "./scripts/check.sh", RemotePath: remotePath, Shebang: true}
+	first, second := filepath.Join(workdir, "first.env"), filepath.Join(workdir, "second.env")
+	mustWriteTestFile(t, first, "export FIXTURE_VALUE=first\n")
+	mustWriteTestFile(t, second, "export FIXTURE_VALUE=second\n")
+	withoutBash := t.TempDir()
+	dirname, err := exec.LookPath("dirname")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dirname, filepath.Join(withoutBash, "dirname")); err != nil {
+		t.Fatal(err)
+	}
+	for _, bashPresent := range []bool{true, false} {
+		for _, code := range []int{0, 23, 127} {
+			t.Run(fmt.Sprintf("bash=%t/exit=%d", bashPresent, code), func(t *testing.T) {
+				path := os.Getenv("PATH")
+				if !bashPresent {
+					path = withoutBash
+				}
+				mustWriteTestFile(t, filepath.Join(workdir, "invocations"), "")
+				command := remoteRunScriptCommandWithEnvFiles(workdir, map[string]string{"PATH": path, "FIXTURE_VALUE": "forwarded"}, []string{first, second}, spec, []string{workdir, strconv.Itoa(code), "literal 'value';*"})
+				run := exec.Command("/bin/sh", "-c", command)
+				run.Env = upload.Env
+				output, err := run.CombinedOutput()
+				want := "PWD_WORKDIR=yes\nZERO_UPLOAD=yes\nDIR_UPLOAD=yes\nforwarded\nliteral 'value';*\n"
+				if exitCode(err) != code || string(output) != want {
+					t.Fatalf("exit=%d want=%d output=%q err=%v", exitCode(err), code, output, err)
+				}
+				if calls, err := os.ReadFile(filepath.Join(workdir, "invocations")); err != nil || string(calls) != "x" {
+					t.Fatalf("script invocations=%q err=%v", calls, err)
+				}
+			})
+		}
+	}
+}
+
+func TestRemoteRunScriptPreservesLoginStartupDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX script launcher")
+	}
+	home, workdir := t.TempDir(), t.TempDir()
+	mustWriteTestFile(t, filepath.Join(home, ".bash_profile"), "export FIXTURE_VALUE=profile\ncd \"$HOME\"\n")
+	path := filepath.Join(workdir, "script.sh")
+	mustWriteTestFile(t, path, "#!/bin/sh\nprintf '%s\\n%s' \"$FIXTURE_VALUE\" \"$PWD\"\n")
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, shebang := range []bool{true, false} {
+		command := remoteRunScriptCommandWithEnvFiles(workdir, nil, nil, &RunScriptSpec{RemotePath: path, Shebang: shebang}, nil)
+		cmd := exec.Command("/bin/sh", "-c", command)
+		cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "BASH_ENV=" + os.DevNull, "ENV=" + os.DevNull}
+		if out, err := cmd.CombinedOutput(); err != nil || string(out) != "profile\n"+home {
+			t.Fatalf("shebang=%t startup directory changed: output=%q err=%v", shebang, out, err)
+		}
+	}
+}
+
+func TestRemoteRunScriptLocatesUploadAfterShellStartup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell execution")
+	}
+	for _, relative := range []bool{false, true} {
+		for _, shebang := range []bool{false, true} {
+			t.Run(fmt.Sprintf("relative=%t/shebang=%t", relative, shebang), func(t *testing.T) {
+				root, err := filepath.EvalSymlinks(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				workdir := filepath.Join(root, "-worker ' workspace")
+				workdirArg := workdir
+				if relative {
+					workdirArg = filepath.Base(workdir)
+				}
+				home := filepath.Join(root, "home")
+				for _, dir := range []string{workdir, home} {
+					if err := os.MkdirAll(dir, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				startup := filepath.Join(root, "shell-startup")
+				envFile := filepath.Join(root, "environment")
+				mustWriteTestFile(t, envFile, "cd "+shellQuote(root)+"\n")
+				if err := os.WriteFile(startup, []byte("if shopt -q login_shell; then cd "+shellQuote(home)+"; fi\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				env := []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "BASH_ENV=" + startup}
+				data := "set -eu\n[ \"$PWD\" = \"$1\" ]\n[ \"$2\" = \"argument with ' quotes\" ]\n[ \"$0\" = \"$3\" ]\nprintf 'uploaded-script-executed\\n'\n"
+				if shebang {
+					data = "#!/bin/sh\n" + data
+				}
+				spec, err := loadRunScript("", true, strings.NewReader(data))
+				if err != nil {
+					t.Fatal(err)
+				}
+				upload := exec.Command("sh", "-c", remoteUploadRunScriptCommand(workdirArg, spec.RemotePath))
+				upload.Dir = root
+				upload.Env, upload.Stdin = env, strings.NewReader(data)
+				if output, err := upload.CombinedOutput(); err != nil {
+					t.Fatalf("upload script: %v\n%s", err, output)
+				}
+				if uploaded, err := os.ReadFile(filepath.Join(workdir, filepath.FromSlash(spec.RemotePath))); err != nil || string(uploaded) != data {
+					t.Fatalf("script upload did not reach the workdir: data=%q err=%v", uploaded, err)
+				}
+				run := exec.Command("sh", "-c", remoteRunScriptCommandWithEnvFiles(workdirArg, nil, []string{envFile}, spec, []string{home, "argument with ' quotes", filepath.Join(workdir, filepath.FromSlash(spec.RemotePath))}))
+				run.Dir = root
+				run.Env = env
+				output, err := run.CombinedOutput()
+				if err != nil || !strings.Contains(string(output), "uploaded-script-executed") {
+					t.Fatalf("uploaded script execution after startup cd: %v\n%s", err, output)
+				}
+			})
+		}
 	}
 }
 
@@ -48,9 +314,8 @@ func TestWindowsRemoteRunScriptCommandUsesPowerShellFile(t *testing.T) {
 		`Set-Location -LiteralPath 'C:\crabbox\repo'`,
 		`Import-CrabboxEnvFile '.crabbox\env\run.env'`,
 		`$env:API_TOKEN = 'secret'`,
-		`$__crabboxScript = '.crabbox\scripts\abc-script.ps1'`,
-		`$__crabboxArgs = @('arg one')`,
-		`powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $__crabboxScript @__crabboxArgs`,
+		`$__crabboxStart.Arguments = '"-NoLogo" "-NoProfile" "-NonInteractive" "-ExecutionPolicy" "Bypass" "-File" ".crabbox\scripts\abc-script.ps1" "arg one"'`,
+		`$__crabboxStart.UseShellExecute = $false`,
 	} {
 		if !strings.Contains(decoded, want) {
 			t.Fatalf("windows script command missing %q in %q", want, decoded)
@@ -89,8 +354,190 @@ func TestRunScriptRecordCommand(t *testing.T) {
 }
 
 func TestSafeScriptNameKeepsBasenameAndHash(t *testing.T) {
-	got := safeScriptName("../bad live.sh", "abc123")
-	if got != "abc123-badlive.sh" {
-		t.Fatalf("safe name=%q", got)
+	for _, source := range []string{"../bad live.sh", "bad 'live.sh", "bad\nlive.sh", "bad$live.sh"} {
+		got := safeScriptName(source, "abc123")
+		if got != "abc123-badlive.sh" {
+			t.Fatalf("source=%q safe name=%q", source, got)
+		}
+	}
+}
+
+func TestRunScriptFailureBundleScopesRetainedUploads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX command fixture; native Windows capture has local-only coverage")
+	}
+	for _, mode := range []string{"file", "stdin", "no-script", "removed", "failed-upload"} {
+		t.Run(mode, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("COPYFILE_DISABLE", "1")
+			dir := t.TempDir()
+			isolateRunTestUserDirs(t, dir)
+			t.Chdir(dir)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			go func() {
+				for {
+					conn, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					_ = conn.Close()
+				}
+			}()
+			_, port, _ := net.SplitHostPort(listener.Addr().String())
+			ssh := `#!/bin/sh
+for arg do
+  if [ "$arg" = -G ]; then exec /usr/bin/ssh "$@"; fi
+done
+cmd=""
+for arg do cmd="$arg"; done
+# Decode the transport envelope so the fixture can fail an upload deliberately.
+while :; do
+  case "$cmd" in
+    *'payload_b64="'*'"; decoded=; if command -v base64'*)
+      payload=${cmd#*'payload_b64="'}
+      payload=${payload%%'"; decoded=; if command -v base64'*}
+      cmd=$(printf %s "$payload" | /usr/bin/base64 --decode 2>/dev/null) ||
+        cmd=$(printf %s "$payload" | /usr/bin/base64 -D) ;;
+    *) break ;;
+  esac
+done
+case "$cmd" in
+  *"/usr/local/bin/crabbox-ready"*) exit 0 ;;
+  *"cat > "*".crabbox/scripts/"*)
+    if [ "${CRABBOX_TEST_FAIL_UPLOAD:-}" = 1 ]; then exit 7; fi ;;
+esac
+exec sh -c "$cmd"
+`
+			if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(ssh), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "config.yaml"))
+			t.Setenv("CRABBOX_FAKE_SSH_PORT", port)
+			t.Setenv("CRABBOX_WORK_ROOT", filepath.Join(dir, "remote ' workspace"))
+			releases := 0
+			runEnvProfileTestReleaseHook = func() error { releases++; return nil }
+			t.Cleanup(func() { runEnvProfileTestReleaseHook = nil })
+			var stdout, stderr bytes.Buffer
+			app := App{Stdout: &stdout, Stderr: &stderr}
+			firstPath := filepath.Join(dir, "first success ' script.sh")
+			firstData := []byte("#!/bin/sh\nprintf 'earlier-success\\n'\n")
+			if err := os.WriteFile(firstPath, firstData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			first, err := loadRunScript(firstPath, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := app.runCommand(context.Background(), []string{"--provider", "run-env-profile-test", "--no-sync", "--keep", "--script", firstPath}); err != nil {
+				t.Fatalf("first run: %v\n%s", err, stderr.String())
+			}
+			uploads, err := filepath.Glob(filepath.Join(dir, "remote ' workspace", "*", "*", filepath.FromSlash(first.RemotePath)))
+			if err != nil || len(uploads) != 1 {
+				t.Fatalf("retained upload: %v %v\n%s", uploads, err, stderr.String())
+			}
+			store := filepath.Dir(uploads[0])
+			noise := make([]byte, 8*1024*1024)
+			if _, err := rand.Read(noise); err != nil {
+				t.Fatal(err)
+			}
+			for name, data := range map[string][]byte{"arbitrary.bin": noise, "prior.log": []byte("old log"), "junit.xml": []byte("old report"), "TEST-prior.xml": []byte("old test report")} {
+				if err := os.WriteFile(filepath.Join(store, name), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			currentData := []byte("#!/bin/sh\nprintf 'current-failure\\n' >&2\nexit 23\n")
+			if mode == "removed" {
+				currentData = []byte("#!/bin/sh\nrm -- \"$0\"\nexit 29\n")
+			}
+			currentPath := filepath.Join(dir, "--current ' failure.sh")
+			if err := os.WriteFile(currentPath, currentData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			current, err := loadRunScript(currentPath, false, nil)
+			if mode == "stdin" {
+				current, err = loadRunScript("", true, bytes.NewReader(currentData))
+				app.Stdin = bytes.NewReader(currentData)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"--provider", "run-env-profile-test", "--id", "cbx_env_profile_test", "--no-sync", "--keep-on-failure", "--timing-json"}
+			switch mode {
+			case "stdin":
+				args = append(args, "--script-stdin")
+			case "no-script":
+				args = append(args, "--", "sh", "-c", "exit 23")
+			default:
+				args = append(args, "--script", currentPath)
+			}
+			if mode == "failed-upload" {
+				t.Setenv("CRABBOX_TEST_FAIL_UPLOAD", "1")
+			}
+			stderr.Reset()
+			runErr := app.runCommand(context.Background(), args)
+			wantCode := 23
+			if mode == "removed" {
+				wantCode = 29
+			}
+			if mode == "failed-upload" {
+				wantCode = 7
+			}
+			if ExitCodeForError(runErr, 0) != wantCode || releases != 0 {
+				t.Fatalf("failure=%v releases=%d\n%s", runErr, releases, stderr.String())
+			}
+			bundles, err := filepath.Glob(filepath.Join(".crabbox", "captures", "*.tar.gz"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "failed-upload" {
+				if len(bundles) != 0 || !strings.Contains(fmt.Sprint(runErr), "upload script") {
+					t.Fatalf("upload failure reached capture: %v err=%v\n%s", bundles, runErr, stderr.String())
+				}
+				return
+			}
+			lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+			var timing map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &timing); err != nil {
+				t.Fatalf("final timing JSON: %v\n%s", err, stderr.String())
+			}
+			if string(timing["exitCode"]) != strconv.Itoa(wantCode) || timing["leaseStopped"] != nil || timing["leaseStopError"] != nil {
+				t.Fatalf("retained reused run must omit no-attempt cleanup fields: %s", lines[len(lines)-1])
+			}
+			if len(bundles) != 1 {
+				t.Fatalf("bundles=%v\n%s", bundles, stderr.String())
+			}
+			contents := readTarGzContents(t, bundles[0])
+			prefix := "crabbox-artifacts/remote/"
+			if mode == "file" || mode == "stdin" {
+				if !bytes.Equal(contents[prefix+current.RemotePath], currentData) {
+					t.Errorf("current uploaded script bytes missing: %s", current.RemotePath)
+				}
+			}
+			for name, data := range contents {
+				if strings.HasPrefix(name, prefix+".crabbox/scripts/") && (name != prefix+current.RemotePath || mode == "no-script" || mode == "removed") {
+					t.Errorf("unrelated upload entry %s (%d bytes)", name, len(data))
+				}
+			}
+			var metadata struct {
+				ExitCode int `json:"exitCode"`
+			}
+			if err := json.Unmarshal(contents["crabbox-artifacts/crabbox-run.json"], &metadata); err != nil || metadata.ExitCode != wantCode {
+				t.Fatalf("metadata=%+v err=%v", metadata, err)
+			}
+			if data, err := os.ReadFile(uploads[0]); err != nil || !bytes.Equal(data, firstData) {
+				t.Fatal("capture modified retained earlier upload")
+			}
+			remoteArchives, _ := filepath.Glob(filepath.Join(filepath.Dir(store), "*.tar.gz"))
+			if len(remoteArchives) != 0 {
+				t.Fatalf("remote capture residue: %v", remoteArchives)
+			}
+			info, _ := os.Stat(bundles[0])
+			t.Logf("mode=%s exit=%d retained=true bundleBytes=%d current=%s noiseBytes=%d remoteArchives=0", mode, wantCode, info.Size(), current.RemotePath, len(noise))
+		})
 	}
 }

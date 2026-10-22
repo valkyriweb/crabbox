@@ -1,5 +1,24 @@
+import { requireAWSRegion } from "./aws-region";
+import { hasImageRequirements, normalizeImageRequirements } from "./image-capabilities";
+import {
+  isLeasePolicyOverrides,
+  type LeasePolicy,
+  type PolicyOverrides,
+} from "./lease-policy-overrides.mjs";
+import { MISSING_ORG_KEY, orgLabelFromKey } from "./org-identity";
 import { normalizeOSImage, osImageSpec } from "./os-image";
-import type { LeaseRequest, Provider, TargetOS, WindowsMode } from "./types";
+import type {
+  Env,
+  CapacityRequirements,
+  ImageRequirements,
+  LeaseImageIdentity,
+  LeaseRequest,
+  Provider,
+  TargetOS,
+  WindowsMode,
+} from "./types";
+
+export type { LeasePolicy } from "./lease-policy-overrides.mjs";
 
 export const awsMacOSInstanceTypeCandidates = [
   "mac2.metal",
@@ -16,6 +35,9 @@ export const awsMacOSInstanceTypeCandidates = [
 export const workspaceProviderKeyPrefix = "crabbox-workspace-";
 
 export interface LeaseConfig {
+  lifetimePolicy?: LeaseRequest["lifetimePolicy"];
+  policyNotice?: string;
+  leasePolicy?: LeasePolicy;
   provider: Provider;
   target: TargetOS;
   architecture: Architecture;
@@ -24,6 +46,7 @@ export interface LeaseConfig {
   desktop: boolean;
   desktopEnv: "xfce" | "wayland" | "gnome";
   browser: boolean;
+  imageRequirements: ImageRequirements;
   code: boolean;
   tailscale: boolean;
   tailscaleTags: string[];
@@ -44,19 +67,28 @@ export interface LeaseConfig {
   hostID: string;
   location: string;
   image: string;
+  selectedImage?: LeaseImageIdentity;
   awsRegion: string;
   awsAMI: string;
   awsUseStockImage?: boolean;
   awsPromotedAMIs: Record<string, string>;
   awsSnapshot: string;
   awsSGID: string;
+  awsSGName: string;
   awsSubnetID: string;
   awsProfile: string;
   awsRootGB: number;
+  awsInstanceTypes: string[];
+  awsPrivate: boolean;
+  awsRequireSSM: boolean;
+  awsSSMBootstrapCommand: string;
+  awsSSMLogGroup: string;
   awsSSHCIDRs: string[];
+  awsSSHCIDRsPinned: boolean;
   awsMacHostID: string;
   azureLocation: string;
   azureImage: string;
+  azureImageExplicit?: boolean;
   azureSnapshot: string;
   azureOSDisk: AzureOSDiskMode;
   gcpProject: string;
@@ -71,6 +103,7 @@ export interface LeaseConfig {
   gcpRootGB: number;
   gcpServiceAccount: string;
   capacityMarket: "spot" | "on-demand";
+  capacityRequirements?: CapacityRequirements;
   capacityStrategy:
     | "most-available"
     | "price-capacity-optimized"
@@ -95,29 +128,84 @@ export interface LeaseConfig {
   exposedPorts: string[];
 }
 
-export type AzureOSDiskMode = "managed" | "ephemeral" | "ephemeral-preview";
+export type AzureOSDiskMode = "managed" | "ephemeral";
 export type Architecture = "amd64" | "arm64";
 
+export class InvalidCapacityRequirementsError extends Error {}
+
+export function normalizeCapacityRequirements(
+  input: CapacityRequirements | undefined,
+): CapacityRequirements | undefined {
+  const normalized: CapacityRequirements = {};
+  for (const name of ["minVCPUs", "minMemoryMiB"] as const) {
+    const value = input?.[name];
+    if (value === undefined) continue;
+    if (!Number.isInteger(value) || value < 0 || value > 2147483647) {
+      throw new InvalidCapacityRequirementsError(
+        `capacity.${name} must be an integer from 0 to 2147483647`,
+      );
+    }
+    if (value > 0) normalized[name] = value;
+  }
+  return Object.keys(normalized).length ? normalized : undefined;
+}
+
 export interface LeaseConfigDefaults {
+  leasePolicy?: LeasePolicy;
   azureOSDisk?: string;
   azureImage?: string;
   azureWindowsARM64Image?: string;
+  allowAzurePromotedImage?: boolean;
 }
 
 const maxRequestedPondNameLength = 41;
 const maxExposedPort = 65_535;
 const maxExposedPortsPerLease = 10;
 
+export class InvalidAWSImageSourceError extends Error {}
+
 export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults = {}): LeaseConfig {
   const provider = input.provider ?? "hetzner";
-  if (provider !== "hetzner" && provider !== "aws" && provider !== "azure" && provider !== "gcp") {
+  if (
+    provider !== "hetzner" &&
+    provider !== "aws" &&
+    provider !== "azure" &&
+    provider !== "gcp" &&
+    provider !== "daytona"
+  ) {
     throw new Error(`unsupported provider: ${String(provider)}`);
+  }
+  if (input.awsUseStockImage !== undefined && typeof input.awsUseStockImage !== "boolean") {
+    throw new InvalidAWSImageSourceError("awsUseStockImage must be a boolean");
+  }
+  const awsUseStockImage = input.awsUseStockImage ?? false;
+  const imageRequirements = normalizeImageRequirements(input.imageRequirements);
+  if (awsUseStockImage) {
+    if (provider !== "aws") {
+      throw new InvalidAWSImageSourceError("awsUseStockImage requires provider=aws");
+    }
+    if (input.awsAMI || input.awsSnapshot) {
+      throw new InvalidAWSImageSourceError(
+        "awsUseStockImage cannot be combined with awsAMI or awsSnapshot",
+      );
+    }
+    if (hasImageRequirements(imageRequirements)) {
+      throw new InvalidAWSImageSourceError(
+        "awsUseStockImage cannot be combined with image capability requirements",
+      );
+    }
   }
   const target = normalizeTarget(input.target ?? input.targetOS ?? "linux");
   const requestedArchitecture = normalizeArchitecture(input.architecture);
   const architectureExplicit = Boolean(input.architecture?.trim());
   const os = normalizeOSImage(input.os);
   const osExplicit = Boolean(input.os?.trim());
+  const selectedOS = osImageSpec(os);
+  if (selectedOS.provider && (provider !== selectedOS.provider || target !== selectedOS.target)) {
+    throw new Error(
+      `os ${os} requires provider=${selectedOS.provider} target=${selectedOS.target}`,
+    );
+  }
   const linuxOSImage = target === "linux" ? osImageSpec(os) : undefined;
   const windowsMode = normalizeWindowsMode(input.windowsMode ?? "normal");
   const architecture = architectureExplicit
@@ -127,7 +215,14 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     provider === "azure" && target === "windows" && architecture === "arm64"
       ? defaults.azureWindowsARM64Image
       : undefined;
+  const operatorAzureImage =
+    provider === "azure" && target === "windows" && architecture === "arm64"
+      ? undefined
+      : defaults.azureImage?.trim();
+  const selectedOperatorAzureImage =
+    target === "linux" && osExplicit ? undefined : operatorAzureImage;
   const inputAzureImage = input.azureImage?.trim() || undefined;
+  const azureImageExplicit = Boolean(inputAzureImage || selectedOperatorAzureImage);
   const azureImage =
     inputAzureImage ??
     defaultAzureImage ??
@@ -135,14 +230,19 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
       ? architecture === "arm64"
         ? (linuxOSImage?.azureArm64Image ?? "")
         : (linuxOSImage?.azureImage ?? "")
-      : "");
+      : (selectedOperatorAzureImage ?? ""));
   if (
     target !== "linux" &&
     !(provider === "aws" && target === "windows") &&
     !(provider === "aws" && target === "macos") &&
     !(provider === "azure" && target === "windows")
   ) {
-    if (provider === "hetzner" || provider === "azure" || provider === "gcp") {
+    if (
+      provider === "hetzner" ||
+      provider === "azure" ||
+      provider === "gcp" ||
+      provider === "daytona"
+    ) {
       throw new Error(unsupportedManagedTargetMessage(provider, target));
     }
     throw new Error(`unsupported target for brokered ${provider}: ${target}`);
@@ -161,15 +261,24 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
         "brokered provider=azure target=windows architecture=arm64 supports windowsMode=normal only; windowsMode=wsl2 requires nested virtualization, which Azure Cobalt ARM64 VM sizes do not support",
       );
     }
-    if (
-      provider === "azure" &&
-      target === "windows" &&
-      !azureWindowsARM64HasExplicitImage(azureImage)
-    ) {
-      throw new Error(
-        "brokered provider=azure target=windows architecture=arm64 requires azureImage with an ARM64 Windows image; the built-in Windows default is x64",
-      );
+    if (!defaults.allowAzurePromotedImage) {
+      assertAzureWindowsARM64Image({ provider, target, architecture, azureImage });
     }
+  }
+  if (provider === "daytona" && architectureExplicit) {
+    throw new Error(
+      "brokered provider=daytona takes architecture from the configured Daytona snapshot",
+    );
+  }
+  if (provider === "daytona" && (input.desktop || input.browser || input.code || input.tailscale)) {
+    throw new Error(
+      "brokered provider=daytona currently supports SSH, sync, and run only; desktop/browser/code/tailscale are unavailable",
+    );
+  }
+  if (provider === "daytona" && input.serverTypeExplicit) {
+    throw new Error(
+      "brokered provider=daytona takes CPU, memory, and disk from the configured Daytona snapshot",
+    );
   }
   if (
     provider === "azure" &&
@@ -202,16 +311,18 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
   const azureSnapshot = input.azureSnapshot ?? "";
   const serverTypeAzureOSDisk = azureSnapshot ? "managed" : azureOSDisk;
   const serverType =
-    input.serverType ??
-    serverTypeForConfig(
-      provider,
-      target,
-      windowsMode,
-      machineClass,
-      architecture,
-      serverTypeAzureOSDisk,
-    );
-  if (input.serverType) {
+    provider === "daytona"
+      ? "snapshot"
+      : (input.serverType ??
+        serverTypeForConfig(
+          provider,
+          target,
+          windowsMode,
+          machineClass,
+          architecture,
+          serverTypeAzureOSDisk,
+        ));
+  if (input.serverType && provider !== "daytona") {
     validateArchitectureServerType(
       provider,
       target,
@@ -220,18 +331,36 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
       serverType,
     );
   }
-  const ttlSeconds = clampTTL(input.ttlSeconds ?? 5400);
-  const idleTimeoutSeconds = clampIdleTimeout(input.idleTimeoutSeconds ?? 1800);
+  const policy = defaults.leasePolicy ?? resolveLeasePolicy({});
+  const { ttlSeconds, idleTimeoutSeconds, policyNotice } = clampLeaseDurations(input, policy);
   const awsSSHCIDRs =
     provider === "aws"
       ? validatedCIDRs(input.awsSSHCIDRs ?? [], "awsSSHCIDRs")
       : validCIDRs(input.awsSSHCIDRs ?? []);
+  const awsInstanceTypes = validatedAWSInstanceTypes(input.awsInstanceTypes ?? []);
+  const capacityRequirements = normalizeCapacityRequirements(input.capacity);
+  if (capacityRequirements && (provider !== "aws" || target !== "linux")) {
+    throw new InvalidCapacityRequirementsError(
+      "capacity minimums currently require provider=aws and target=linux",
+    );
+  }
+  const awsPrivate = input.awsPrivate ?? false;
+  const awsRequireSSM = input.awsRequireSSM ?? false;
+  if ((awsPrivate || awsRequireSSM || awsInstanceTypes.length > 0) && provider !== "aws") {
+    throw new Error("private AWS workspace settings require provider=aws");
+  }
+  if (awsPrivate && target !== "linux") {
+    throw new Error("private AWS workspaces currently require target=linux");
+  }
+  if (awsPrivate && !awsRequireSSM) {
+    throw new Error("private AWS workspaces require SSM management");
+  }
   const gcpSSHCIDRs =
     provider === "gcp"
       ? validatedCIDRs(input.gcpSSHCIDRs ?? [], "gcpSSHCIDRs")
       : validCIDRs(input.gcpSSHCIDRs ?? []);
   const sshPublicKey = input.sshPublicKey?.trim() ?? "";
-  if (!sshPublicKey) {
+  if (!sshPublicKey && !awsPrivate) {
     throw new Error("sshPublicKey is required");
   }
   const sshUser = input.sshUser ?? defaultSSHUser(provider, target, windowsMode);
@@ -240,7 +369,19 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
   if (tailscaleExitNodeAllowLanAccess && !tailscaleExitNode) {
     throw new Error("tailscaleExitNodeAllowLanAccess requires tailscaleExitNode");
   }
+  const requestedAWSRegion =
+    typeof input.awsRegion === "string" ? input.awsRegion.trim() : input.awsRegion;
+  const awsRegion = requireAWSRegion(requestedAWSRegion || "eu-west-1", "awsRegion");
+  const capacityRegions =
+    provider === "aws"
+      ? uniqueStrings(
+          (input.capacity?.regions ?? [])
+            .filter((region) => typeof region !== "string" || region.trim() !== "")
+            .map((region) => requireAWSRegion(region, "capacity.regions entry")),
+        )
+      : (input.capacity?.regions ?? []);
   return {
+    ...(input.lifetimePolicy ? { lifetimePolicy: input.lifetimePolicy } : {}),
     provider,
     target,
     architecture,
@@ -249,6 +390,7 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     desktop: input.desktop ?? false,
     desktopEnv,
     browser: input.browser ?? false,
+    imageRequirements,
     code: input.code ?? false,
     tailscale: input.tailscale ?? false,
     tailscaleTags: normalizeTailscaleTags(input.tailscaleTags ?? ["tag:crabbox"]),
@@ -266,19 +408,27 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     hostID: input.hostId ?? input.hostID ?? "",
     location: input.location ?? "fsn1",
     image: input.image ?? linuxOSImage?.hetznerImage ?? "ubuntu-24.04",
-    awsRegion: input.awsRegion ?? "eu-west-1",
+    awsRegion,
     awsAMI: input.awsAMI ?? "",
-    awsUseStockImage: false,
+    awsUseStockImage,
     awsPromotedAMIs: {},
     awsSnapshot: input.awsSnapshot ?? "",
     awsSGID: input.awsSGID ?? "",
+    awsSGName: "",
     awsSubnetID: input.awsSubnetID ?? "",
     awsProfile: input.awsProfile ?? "",
-    awsRootGB: input.awsRootGB ?? 400,
+    awsRootGB: input.awsRootGB ?? 0,
+    awsInstanceTypes,
+    awsPrivate,
+    awsRequireSSM,
+    awsSSMBootstrapCommand: input.awsSSMBootstrapCommand ?? "",
+    awsSSMLogGroup: input.awsSSMLogGroup ?? "",
     awsSSHCIDRs,
+    awsSSHCIDRsPinned: input.awsSSHCIDRsPinned ?? (input.awsSSHCIDRs?.length ?? 0) > 0,
     awsMacHostID: input.awsMacHostID ?? "",
     azureLocation: input.azureLocation ?? "",
     azureImage,
+    azureImageExplicit,
     azureSnapshot,
     azureOSDisk,
     gcpProject: input.gcpProject ?? "",
@@ -293,18 +443,25 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     gcpRootGB: input.gcpRootGB ?? 0,
     gcpServiceAccount: input.gcpServiceAccount ?? "",
     capacityMarket: input.capacity?.market ?? "spot",
+    ...(capacityRequirements ? { capacityRequirements } : {}),
     capacityStrategy: input.capacity?.strategy ?? "most-available",
     capacityFallback: input.capacity?.fallback ?? "on-demand-after-120s",
-    capacityRegions: input.capacity?.regions ?? [],
+    capacityRegions,
     capacityAvailabilityZones: input.capacity?.availabilityZones ?? [],
     capacityHints: input.capacity?.hints ?? true,
     sshUser,
-    sshPort: input.sshPort ?? "2222",
-    sshFallbackPorts: validPorts(input.sshFallbackPorts ?? ["22"]),
-    providerKey: input.providerKey ?? "crabbox-steipete",
-    workRoot: input.workRoot ?? defaultWorkRoot(target, windowsMode, sshUser),
+    sshPort: provider === "daytona" ? "22" : (input.sshPort ?? "2222"),
+    sshFallbackPorts: provider === "daytona" ? [] : validPorts(input.sshFallbackPorts ?? ["22"]),
+    providerKey: input.providerKey?.trim() ?? "",
+    workRoot:
+      input.workRoot ??
+      (provider === "daytona"
+        ? "/home/daytona/crabbox"
+        : defaultWorkRoot(target, windowsMode, sshUser)),
     ttlSeconds,
     idleTimeoutSeconds,
+    leasePolicy: policy,
+    ...(policyNotice ? { policyNotice } : {}),
     keep: input.keep ?? false,
     sshPublicKey,
     sshHostPrivateKey: "",
@@ -450,6 +607,21 @@ function providerServerTypeName(provider: Provider): string {
   return "server type";
 }
 
+export function assertAzureWindowsARM64Image(
+  config: Pick<LeaseConfig, "provider" | "target" | "architecture" | "azureImage">,
+): void {
+  if (
+    config.provider === "azure" &&
+    config.target === "windows" &&
+    config.architecture === "arm64" &&
+    !azureWindowsARM64HasExplicitImage(config.azureImage)
+  ) {
+    throw new Error(
+      "brokered provider=azure target=windows architecture=arm64 requires azureImage with an ARM64 Windows image; the built-in Windows default is x64",
+    );
+  }
+}
+
 function azureWindowsARM64HasExplicitImage(image: string | undefined): boolean {
   const normalized = image?.trim() ?? "";
   if (!normalized) return false;
@@ -469,6 +641,8 @@ export function awsPromotedAMIConfigKey(region: string, serverType: string): str
   return `${region.trim().toLowerCase()}\0${serverType.trim().toLowerCase()}`;
 }
 
+export class InvalidAzureOSDiskModeError extends Error {}
+
 export function normalizeAzureOSDiskMode(value: string | undefined): AzureOSDiskMode {
   const normalized = (value ?? "").trim().toLowerCase();
   switch (normalized) {
@@ -480,9 +654,11 @@ export function normalizeAzureOSDiskMode(value: string | undefined): AzureOSDisk
     case "ephemeral":
       return "ephemeral";
     case "ephemeral-preview":
-      return "ephemeral-preview";
+      throw new InvalidAzureOSDiskModeError(
+        "azureOSDisk=ephemeral-preview has been removed; use ephemeral (--azure-os-disk ephemeral)",
+      );
     default:
-      throw new Error("azureOSDisk must be auto, managed, ephemeral, or ephemeral-preview");
+      throw new InvalidAzureOSDiskModeError("azureOSDisk must be auto, managed, or ephemeral");
   }
 }
 
@@ -497,6 +673,9 @@ function defaultWorkRoot(target: TargetOS, windowsMode: WindowsMode, sshUser: st
 }
 
 function defaultSSHUser(provider: Provider, target: TargetOS, windowsMode: WindowsMode): string {
+  if (provider === "daytona") {
+    return "daytona";
+  }
   if (provider === "aws" && target === "macos") {
     return "ec2-user";
   }
@@ -544,6 +723,12 @@ export function normalizeTailscaleTags(values: string[]): string[] {
 }
 
 function normalizeTarget(value: string): TargetOS {
+  const target = parseTarget(value);
+  if (target) return target;
+  throw new Error(`target must be linux, macos, or windows`);
+}
+
+export function parseTarget(value: string): TargetOS | undefined {
   const normalized = value.trim().toLowerCase();
   if (normalized === "" || normalized === "linux" || normalized === "ubuntu") {
     return "linux";
@@ -559,7 +744,7 @@ function normalizeTarget(value: string): TargetOS {
   if (normalized === "win" || normalized === "windows") {
     return "windows";
   }
-  throw new Error(`target must be linux, macos, or windows`);
+  return undefined;
 }
 
 function normalizeWindowsMode(value: string): WindowsMode {
@@ -594,6 +779,19 @@ export function validatedCIDRs(values: string[], fieldName: string): string[] {
     throw new Error(`${fieldName} entries must be valid IPv4 or IPv6 CIDR ranges`);
   }
   return valid;
+}
+
+export function validatedAWSInstanceTypes(values: string[]): string[] {
+  const normalized = uniqueStrings(values.map((value) => value.trim()).filter(Boolean));
+  if (
+    normalized.length > 8 ||
+    normalized.some(
+      (value) => value.length > 64 || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(value),
+    )
+  ) {
+    throw new Error("awsInstanceTypes must contain at most 8 valid EC2 instance types");
+  }
+  return normalized;
 }
 
 function isValidCIDR(cidr: string): boolean {
@@ -696,6 +894,9 @@ export function serverTypeForClass(machineClass: string): string {
 }
 
 export function serverTypeForProviderClass(provider: Provider, machineClass: string): string {
+  if (provider === "daytona") {
+    return "snapshot";
+  }
   if (provider === "aws") {
     return awsInstanceTypeCandidatesForClass(machineClass)[0] ?? machineClass;
   }
@@ -716,6 +917,9 @@ export function serverTypeForConfig(
   architecture: Architecture = "amd64",
   azureOSDisk: AzureOSDiskMode = "managed",
 ): string {
+  if (provider === "daytona") {
+    return "snapshot";
+  }
   if (provider === "aws") {
     return (
       awsInstanceTypeCandidatesForTargetClass(target, machineClass, windowsMode, architecture)[0] ??
@@ -739,38 +943,70 @@ export function serverTypeForConfig(
   return serverTypeForClass(machineClass);
 }
 
-export function gcpMachineTypeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "standard":
-      return ["c4-standard-32", "c3-standard-22", "n2-standard-32", "n2d-standard-32"];
-    case "fast":
-      return [
-        "c4-standard-64",
-        "c3-standard-44",
-        "n2-standard-64",
-        "n2d-standard-64",
-        "c4-standard-32",
-      ];
-    case "large":
-      return [
-        "c4-standard-96",
-        "c3-standard-88",
-        "n2-standard-80",
-        "n2d-standard-96",
-        "c4-standard-64",
-      ];
-    case "beast":
-      return [
-        "c4-standard-192",
-        "c4-standard-96",
-        "c3-standard-176",
-        "c3-standard-88",
-        "n2d-standard-224",
-        "n2-standard-128",
-      ];
-    default:
-      return [machineClass];
+function candidatesForClass(
+  table: Readonly<Record<string, readonly string[]>>,
+  machineClass: string,
+): string[] {
+  if (typeof machineClass !== "string" || !Object.hasOwn(table, machineClass)) {
+    return [machineClass];
   }
+  return [...(table[machineClass] ?? [])];
+}
+
+// Mirror internal/cli/gcp.go; config.test.ts checks the canonical family set.
+export const gcpHyperdiskOnlyFamilies: ReadonlySet<string> = new Set([
+  "a3-ultragpu",
+  "a4",
+  "a4x",
+  "c4",
+  "c4a",
+  "c4d",
+  "c4n",
+  "g4",
+  "h4d",
+  "m4",
+  "m4n",
+  "n4",
+  "n4a",
+  "n4d",
+  "x4",
+  "x5",
+  "z4d",
+]);
+
+export function gcpBootDiskTypeForMachineType(machineType: string): string {
+  const name = machineType.slice(machineType.lastIndexOf("/") + 1);
+  const [family = "", variant = ""] = name.toLowerCase().split("-", 2);
+  return gcpHyperdiskOnlyFamilies.has(family) ||
+    gcpHyperdiskOnlyFamilies.has(`${family}-${variant}`)
+    ? "hyperdisk-balanced"
+    : "pd-balanced";
+}
+
+const gcpMachineTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["c4-standard-4", "c3-standard-4", "n2-standard-4", "n2d-standard-4"],
+  small: ["c4-standard-8", "c3-standard-8", "n2-standard-8", "n2d-standard-8", "c4-standard-4"],
+  standard: ["c4-standard-32", "c3-standard-22", "n2-standard-32", "n2d-standard-32"],
+  fast: ["c4-standard-64", "c3-standard-44", "n2-standard-64", "n2d-standard-64", "c4-standard-32"],
+  large: [
+    "c4-standard-96",
+    "c3-standard-88",
+    "n2-standard-80",
+    "n2d-standard-96",
+    "c4-standard-64",
+  ],
+  beast: [
+    "c4-standard-192",
+    "c4-standard-96",
+    "c3-standard-176",
+    "c3-standard-88",
+    "n2d-standard-224",
+    "n2-standard-128",
+  ],
+};
+
+export function gcpMachineTypeCandidatesForClass(machineClass: string): string[] {
+  return candidatesForClass(gcpMachineTypeCandidates, machineClass);
 }
 
 export function azureVMSizeCandidatesForTargetClass(
@@ -787,13 +1023,13 @@ export function azureVMSizeCandidatesForTargetClass(
     candidates =
       architecture === "arm64"
         ? windowsMode === "wsl2"
-          ? [machineClass]
+          ? providerClassLiteralCandidates(machineClass)
           : azureARM64VMSizeCandidatesForClass(machineClass)
         : azureWindowsVMSizeCandidatesForClass(machineClass);
   } else {
-    candidates = [machineClass];
+    candidates = providerClassLiteralCandidates(machineClass);
   }
-  if (azureOSDisk === "ephemeral-preview") {
+  if (azureOSDisk === "ephemeral") {
     return azureEphemeralFullCachingCandidates(target, candidates, architecture, windowsMode);
   }
   return candidates;
@@ -803,6 +1039,72 @@ export function azureVMSizeCandidatesForClass(machineClass: string): string[] {
   return azureVMSizeCandidatesForArchitectureClass("amd64", machineClass);
 }
 
+const azureVMSizeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: [
+    "Standard_D2ads_v6",
+    "Standard_D2ds_v6",
+    "Standard_D2ads_v5",
+    "Standard_D2ds_v5",
+    "Standard_F2s_v2",
+  ],
+  small: [
+    "Standard_D8ads_v6",
+    "Standard_D8ds_v6",
+    "Standard_F8s_v2",
+    "Standard_D8ads_v5",
+    "Standard_D8ds_v5",
+    "Standard_D4ads_v6",
+    "Standard_D4ds_v6",
+    "Standard_F4s_v2",
+  ],
+  standard: [
+    "Standard_D32ads_v6",
+    "Standard_D32ds_v6",
+    "Standard_F32s_v2",
+    "Standard_D32ads_v5",
+    "Standard_D32ds_v5",
+    "Standard_D16ads_v6",
+    "Standard_D16ds_v6",
+    "Standard_F16s_v2",
+  ],
+  fast: [
+    "Standard_D64ads_v6",
+    "Standard_D64ds_v6",
+    "Standard_F64s_v2",
+    "Standard_D64ads_v5",
+    "Standard_D64ds_v5",
+    "Standard_D48ads_v6",
+    "Standard_D48ds_v6",
+    "Standard_F48s_v2",
+    "Standard_D32ads_v6",
+    "Standard_D32ds_v6",
+    "Standard_F32s_v2",
+  ],
+  large: [
+    "Standard_D96ads_v6",
+    "Standard_D96ds_v6",
+    "Standard_D96ads_v5",
+    "Standard_D96ds_v5",
+    "Standard_D64ads_v6",
+    "Standard_D64ds_v6",
+    "Standard_F64s_v2",
+    "Standard_D48ads_v6",
+    "Standard_D48ds_v6",
+    "Standard_F48s_v2",
+  ],
+  beast: [
+    "Standard_D192ds_v6",
+    "Standard_D128ds_v6",
+    "Standard_D96ads_v6",
+    "Standard_D96ds_v6",
+    "Standard_D96ads_v5",
+    "Standard_D96ds_v5",
+    "Standard_D64ads_v6",
+    "Standard_D64ds_v6",
+    "Standard_F64s_v2",
+  ],
+};
+
 export function azureVMSizeCandidatesForArchitectureClass(
   architecture: Architecture,
   machineClass: string,
@@ -810,89 +1112,34 @@ export function azureVMSizeCandidatesForArchitectureClass(
   if (architecture === "arm64") {
     return azureARM64VMSizeCandidatesForClass(machineClass);
   }
-  switch (machineClass) {
-    case "standard":
-      return [
-        "Standard_D32ads_v6",
-        "Standard_D32ds_v6",
-        "Standard_F32s_v2",
-        "Standard_D32ads_v5",
-        "Standard_D32ds_v5",
-        "Standard_D16ads_v6",
-        "Standard_D16ds_v6",
-        "Standard_F16s_v2",
-      ];
-    case "fast":
-      return [
-        "Standard_D64ads_v6",
-        "Standard_D64ds_v6",
-        "Standard_F64s_v2",
-        "Standard_D64ads_v5",
-        "Standard_D64ds_v5",
-        "Standard_D48ads_v6",
-        "Standard_D48ds_v6",
-        "Standard_F48s_v2",
-        "Standard_D32ads_v6",
-        "Standard_D32ds_v6",
-        "Standard_F32s_v2",
-      ];
-    case "large":
-      return [
-        "Standard_D96ads_v6",
-        "Standard_D96ds_v6",
-        "Standard_D96ads_v5",
-        "Standard_D96ds_v5",
-        "Standard_D64ads_v6",
-        "Standard_D64ds_v6",
-        "Standard_F64s_v2",
-        "Standard_D48ads_v6",
-        "Standard_D48ds_v6",
-        "Standard_F48s_v2",
-      ];
-    case "beast":
-      return [
-        "Standard_D192ds_v6",
-        "Standard_D128ds_v6",
-        "Standard_D96ads_v6",
-        "Standard_D96ds_v6",
-        "Standard_D96ads_v5",
-        "Standard_D96ds_v5",
-        "Standard_D64ads_v6",
-        "Standard_D64ds_v6",
-        "Standard_F64s_v2",
-      ];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(azureVMSizeCandidates, machineClass);
 }
 
+const azureARM64VMSizeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["Standard_D2pds_v6", "Standard_D2ps_v6"],
+  small: ["Standard_D8pds_v6", "Standard_D8ps_v6", "Standard_D4pds_v6", "Standard_D4ps_v6"],
+  standard: ["Standard_D32pds_v6", "Standard_D32ps_v6", "Standard_D16pds_v6", "Standard_D16ps_v6"],
+  fast: [
+    "Standard_D64pds_v6",
+    "Standard_D64ps_v6",
+    "Standard_D48pds_v6",
+    "Standard_D48ps_v6",
+    "Standard_D32pds_v6",
+    "Standard_D32ps_v6",
+  ],
+  large: [
+    "Standard_D96pds_v6",
+    "Standard_D96ps_v6",
+    "Standard_D64pds_v6",
+    "Standard_D64ps_v6",
+    "Standard_D48pds_v6",
+    "Standard_D48ps_v6",
+  ],
+  beast: ["Standard_D96pds_v6", "Standard_D96ps_v6", "Standard_D64pds_v6", "Standard_D64ps_v6"],
+};
+
 export function azureARM64VMSizeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "standard":
-      return ["Standard_D32pds_v6", "Standard_D32ps_v6", "Standard_D16pds_v6", "Standard_D16ps_v6"];
-    case "fast":
-      return [
-        "Standard_D64pds_v6",
-        "Standard_D64ps_v6",
-        "Standard_D48pds_v6",
-        "Standard_D48ps_v6",
-        "Standard_D32pds_v6",
-        "Standard_D32ps_v6",
-      ];
-    case "large":
-      return [
-        "Standard_D96pds_v6",
-        "Standard_D96ps_v6",
-        "Standard_D64pds_v6",
-        "Standard_D64ps_v6",
-        "Standard_D48pds_v6",
-        "Standard_D48ps_v6",
-      ];
-    case "beast":
-      return ["Standard_D96pds_v6", "Standard_D96ps_v6", "Standard_D64pds_v6", "Standard_D64ps_v6"];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(azureARM64VMSizeCandidates, machineClass);
 }
 
 export function azureVMSizeIsARM64(vmSize: string): boolean {
@@ -923,18 +1170,28 @@ export function azureSupportsEphemeralOS(vmSize: string): boolean {
 }
 
 export function azureSupportsEphemeralFullCaching(vmSize: string): boolean {
-  if (!azureSupportsEphemeralOS(vmSize)) return false;
+  return azureSupportsEphemeralOS(vmSize) && azureFullCachingSeriesEligible(vmSize);
+}
+
+export function azureFullCachingSeriesEligible(vmSize: string): boolean {
   const cores = azureVMSizeVCPUCount(vmSize);
-  return cores !== undefined && cores > 4;
+  return (
+    cores !== undefined &&
+    cores >= 8 &&
+    /^standard_(?:[nlmh][a-z]*[0-9]+[^ ]*|[de][a-z]*[0-9]+[^ ]*_v[567]|f[a-z]*[0-9]+[^ ]*_v[67])$/.test(
+      vmSize.trim().toLowerCase(),
+    )
+  );
 }
 
 function azureVMSizeVCPUCount(vmSize: string): number | undefined {
   const match = vmSize
     .trim()
     .toLowerCase()
-    .match(/^standard_[a-z]+(\d+)/);
+    .match(/^standard_[a-z]+(\d+)(?:-(\d+))?/);
   if (!match?.[1]) return undefined;
-  return Number.parseInt(match[1], 10);
+  // Constrained sizes put the active vCPU count after the base count.
+  return Number.parseInt(match[2] ?? match[1], 10);
 }
 
 function azureEphemeralFullCachingCandidates(
@@ -956,43 +1213,53 @@ function azureEphemeralFullCachingCandidates(
   return candidates;
 }
 
+const azureWindowsVMSizeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: [
+    "Standard_D2ads_v6",
+    "Standard_D2ds_v6",
+    "Standard_D2ads_v5",
+    "Standard_D2ds_v5",
+    "Standard_D2as_v6",
+  ],
+  small: [
+    "Standard_D8ads_v6",
+    "Standard_D8ds_v6",
+    "Standard_D8ads_v5",
+    "Standard_D8ds_v5",
+    "Standard_D8as_v6",
+  ],
+  standard: [
+    "Standard_D2ads_v6",
+    "Standard_D2ds_v6",
+    "Standard_D2ads_v5",
+    "Standard_D2ds_v5",
+    "Standard_D2as_v6",
+  ],
+  fast: [
+    "Standard_D4ads_v6",
+    "Standard_D4ds_v6",
+    "Standard_D4ads_v5",
+    "Standard_D4ds_v5",
+    "Standard_D4as_v6",
+  ],
+  large: [
+    "Standard_D8ads_v6",
+    "Standard_D8ds_v6",
+    "Standard_D8ads_v5",
+    "Standard_D8ds_v5",
+    "Standard_D8as_v6",
+  ],
+  beast: [
+    "Standard_D16ads_v6",
+    "Standard_D16ds_v6",
+    "Standard_D16ads_v5",
+    "Standard_D16ds_v5",
+    "Standard_D8ads_v6",
+  ],
+};
+
 export function azureWindowsVMSizeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "standard":
-      return [
-        "Standard_D2ads_v6",
-        "Standard_D2ds_v6",
-        "Standard_D2ads_v5",
-        "Standard_D2ds_v5",
-        "Standard_D2as_v6",
-      ];
-    case "fast":
-      return [
-        "Standard_D4ads_v6",
-        "Standard_D4ds_v6",
-        "Standard_D4ads_v5",
-        "Standard_D4ds_v5",
-        "Standard_D4as_v6",
-      ];
-    case "large":
-      return [
-        "Standard_D8ads_v6",
-        "Standard_D8ds_v6",
-        "Standard_D8ads_v5",
-        "Standard_D8ds_v5",
-        "Standard_D8as_v6",
-      ];
-    case "beast":
-      return [
-        "Standard_D16ads_v6",
-        "Standard_D16ds_v6",
-        "Standard_D16ads_v5",
-        "Standard_D16ds_v5",
-        "Standard_D8ads_v6",
-      ];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(azureWindowsVMSizeCandidates, machineClass);
 }
 
 export function awsInstanceTypeCandidatesForTargetClass(
@@ -1005,29 +1272,54 @@ export function awsInstanceTypeCandidatesForTargetClass(
     return awsMacOSInstanceTypeCandidates;
   }
   if (target === "windows") {
+    if (architecture === "arm64") {
+      return providerClassLiteralCandidates(machineClass);
+    }
     if (windowsMode === "wsl2") {
       switch (machineClass) {
+        case "tiny":
+          return ["m8i.large", "m8i-flex.large", "c8i.xlarge", "r8i.large"];
+        case "small":
+          return [
+            "c8i.2xlarge",
+            "m8i.xlarge",
+            "m8i-flex.xlarge",
+            "r8i.large",
+            "c8i.xlarge",
+            "m8i.large",
+          ];
         case "standard":
           return ["m8i.large", "m8i-flex.large", "c8i.large", "r8i.large"];
         case "fast":
-          return ["m8i.xlarge", "m8i-flex.xlarge", "c8i.xlarge", "r8i.xlarge"];
+          return ["m8i.xlarge", "m8i-flex.xlarge", "c8i.xlarge", "r8i.xlarge", "m8i.large"];
         case "large":
-          return ["m8i.2xlarge", "m8i-flex.2xlarge", "c8i.2xlarge", "r8i.2xlarge"];
+          return ["m8i.2xlarge", "m8i-flex.2xlarge", "c8i.2xlarge", "r8i.2xlarge", "m8i.large"];
         case "beast":
-          return ["m8i.4xlarge", "m8i-flex.4xlarge", "c8i.4xlarge", "r8i.4xlarge", "m8i.2xlarge"];
+          return [
+            "m8i.4xlarge",
+            "m8i-flex.4xlarge",
+            "c8i.4xlarge",
+            "r8i.4xlarge",
+            "m8i.2xlarge",
+            "m8i.large",
+          ];
         default:
           return [machineClass];
       }
     }
     switch (machineClass) {
+      case "tiny":
+        return ["m7a.large", "m7i.large", "t3.large"];
+      case "small":
+        return ["c7a.2xlarge", "c7i.2xlarge", "m7a.xlarge", "m7i.xlarge", "t3.xlarge", "t3.large"];
       case "standard":
         return ["m7i.large", "m7a.large", "t3.large"];
       case "fast":
-        return ["m7i.xlarge", "m7a.xlarge", "t3.xlarge"];
+        return ["m7i.xlarge", "m7a.xlarge", "t3.xlarge", "t3.large"];
       case "large":
-        return ["m7i.2xlarge", "m7a.2xlarge", "t3.2xlarge"];
+        return ["m7i.2xlarge", "m7a.2xlarge", "t3.2xlarge", "t3.large"];
       case "beast":
-        return ["m7i.4xlarge", "m7a.4xlarge", "m7i.2xlarge"];
+        return ["m7i.4xlarge", "m7a.4xlarge", "m7i.2xlarge", "t3.large"];
       default:
         return [machineClass];
     }
@@ -1035,24 +1327,99 @@ export function awsInstanceTypeCandidatesForTargetClass(
   return awsInstanceTypeCandidatesForArchitectureClass(architecture, machineClass);
 }
 
-export function serverTypeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "standard":
-      return ["ccx33", "cpx62", "cx53"];
-    case "fast":
-      return ["ccx43", "cpx62", "cx53"];
-    case "large":
-      return ["ccx53", "ccx43", "cpx62", "cx53"];
-    case "beast":
-      return ["ccx63", "ccx53", "ccx43", "cpx62", "cx53"];
-    default:
-      return [machineClass];
+const canonicalProviderClasses = new Set(["tiny", "small", "standard", "fast", "large", "beast"]);
+
+export function isCanonicalProviderClass(machineClass: string): boolean {
+  return canonicalProviderClasses.has(machineClass);
+}
+
+export function concreteStoredServerType(serverType: string, machineClass: string): string {
+  return serverType !== machineClass && !isCanonicalProviderClass(serverType) && serverType.trim()
+    ? serverType
+    : "";
+}
+
+export function uniqueProviderMachineCandidates(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (!value.trim() || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
   }
+  return out;
+}
+
+export function implicitProviderMachineCandidates(
+  config: Pick<LeaseConfig, "class" | "serverType">,
+  profileCandidates: string[],
+): string[] {
+  const storedType = concreteStoredServerType(config.serverType, config.class);
+  if (profileCandidates.length === 0 && isCanonicalProviderClass(config.class)) {
+    return storedType ? [storedType] : [];
+  }
+  const candidates = profileCandidates.length > 0 ? profileCandidates : [config.class];
+  return storedType ? uniqueProviderMachineCandidates([storedType, ...candidates]) : candidates;
+}
+
+function providerClassLiteralCandidates(machineClass: string): string[] {
+  return isCanonicalProviderClass(machineClass) ? [] : [machineClass];
+}
+
+const serverTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["ccx13", "cpx22", "cx23"],
+  small: ["ccx23", "cpx32", "cx33"],
+  standard: ["ccx33", "cpx62", "cx53"],
+  fast: ["ccx43", "cpx62", "cx53"],
+  large: ["ccx53", "ccx43", "cpx62", "cx53"],
+  beast: ["ccx63", "ccx53", "ccx43", "cpx62", "cx53"],
+};
+
+export function serverTypeCandidatesForClass(machineClass: string): string[] {
+  return candidatesForClass(serverTypeCandidates, machineClass);
 }
 
 export function awsInstanceTypeCandidatesForClass(machineClass: string): string[] {
   return awsInstanceTypeCandidatesForArchitectureClass("amd64", machineClass);
 }
+
+const awsInstanceTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["m7a.large", "m7i.large", "c7a.xlarge", "c7i.xlarge", "t3.small"],
+  small: ["c7a.2xlarge", "c7i.2xlarge", "m7a.xlarge", "m7i.xlarge", "c7a.xlarge", "t3.small"],
+  standard: ["c7a.8xlarge", "c7i.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "c7a.4xlarge", "t3.small"],
+  fast: [
+    "c7a.16xlarge",
+    "c7i.16xlarge",
+    "m7a.16xlarge",
+    "m7i.16xlarge",
+    "c7a.12xlarge",
+    "c7a.8xlarge",
+    "t3.small",
+  ],
+  large: [
+    "c7a.24xlarge",
+    "c7i.24xlarge",
+    "m7a.24xlarge",
+    "m7i.24xlarge",
+    "r7a.24xlarge",
+    "c7a.16xlarge",
+    "c7a.12xlarge",
+    "t3.small",
+  ],
+  beast: [
+    "c7a.48xlarge",
+    "c7i.48xlarge",
+    "m7a.48xlarge",
+    "m7i.48xlarge",
+    "r7a.48xlarge",
+    "c7a.32xlarge",
+    "c7i.32xlarge",
+    "m7a.32xlarge",
+    "c7a.24xlarge",
+    "c7a.16xlarge",
+    "t3.small",
+  ],
+};
 
 export function awsInstanceTypeCandidatesForArchitectureClass(
   architecture: Architecture,
@@ -1061,59 +1428,27 @@ export function awsInstanceTypeCandidatesForArchitectureClass(
   if (architecture === "arm64") {
     return awsARM64InstanceTypeCandidatesForClass(machineClass);
   }
-  switch (machineClass) {
-    case "standard":
-      return ["c7a.8xlarge", "c7i.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "c7a.4xlarge"];
-    case "fast":
-      return [
-        "c7a.16xlarge",
-        "c7i.16xlarge",
-        "m7a.16xlarge",
-        "m7i.16xlarge",
-        "c7a.12xlarge",
-        "c7a.8xlarge",
-      ];
-    case "large":
-      return [
-        "c7a.24xlarge",
-        "c7i.24xlarge",
-        "m7a.24xlarge",
-        "m7i.24xlarge",
-        "r7a.24xlarge",
-        "c7a.16xlarge",
-        "c7a.12xlarge",
-      ];
-    case "beast":
-      return [
-        "c7a.48xlarge",
-        "c7i.48xlarge",
-        "m7a.48xlarge",
-        "m7i.48xlarge",
-        "r7a.48xlarge",
-        "c7a.32xlarge",
-        "c7i.32xlarge",
-        "m7a.32xlarge",
-        "c7a.24xlarge",
-        "c7a.16xlarge",
-      ];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(awsInstanceTypeCandidates, machineClass);
 }
 
+const awsARM64InstanceTypeCandidates: Readonly<Record<string, readonly string[]>> = {
+  tiny: ["m7g.large", "c7g.xlarge", "r7g.large", "t4g.small"],
+  small: ["c7g.2xlarge", "m7g.xlarge", "r7g.large", "c7g.xlarge", "t4g.small"],
+  standard: ["c7g.8xlarge", "m7g.8xlarge", "r7g.8xlarge", "c7g.4xlarge", "t4g.small"],
+  fast: [
+    "c7g.16xlarge",
+    "m7g.16xlarge",
+    "r7g.16xlarge",
+    "c7g.12xlarge",
+    "c7g.8xlarge",
+    "t4g.small",
+  ],
+  large: ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge", "t4g.small"],
+  beast: ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge", "t4g.small"],
+};
+
 export function awsARM64InstanceTypeCandidatesForClass(machineClass: string): string[] {
-  switch (machineClass) {
-    case "standard":
-      return ["c7g.8xlarge", "m7g.8xlarge", "r7g.8xlarge", "c7g.4xlarge"];
-    case "fast":
-      return ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge", "c7g.8xlarge"];
-    case "large":
-      return ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge"];
-    case "beast":
-      return ["c7g.16xlarge", "m7g.16xlarge", "r7g.16xlarge", "c7g.12xlarge"];
-    default:
-      return [machineClass];
-  }
+  return candidatesForClass(awsARM64InstanceTypeCandidates, machineClass);
 }
 
 export function awsInstanceTypeIsARM64(instanceType: string): boolean {
@@ -1124,16 +1459,65 @@ export function awsInstanceTypeIsARM64(instanceType: string): boolean {
   return /^[cmr][0-9]+g[dn]?$/.test(family);
 }
 
-function clampTTL(ttlSeconds: number): number {
-  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
-    return 5400;
+function parsedPolicyOverrides(env: Partial<Env>): PolicyOverrides | undefined {
+  if (!env.CRABBOX_LEASE_POLICY_OVERRIDES) return {};
+  try {
+    const value: unknown = JSON.parse(env.CRABBOX_LEASE_POLICY_OVERRIDES);
+    return isLeasePolicyOverrides(value) ? value : undefined;
+  } catch {
+    return undefined;
   }
-  return Math.min(Math.trunc(ttlSeconds), 86_400);
 }
 
-function clampIdleTimeout(seconds: number): number {
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    return 1800;
-  }
-  return Math.min(Math.trunc(seconds), 86_400);
+// Pure validation lets the coordinator log once at construction, without logging on every read.
+export function leasePolicyOverridesInvalid(env: Partial<Env>): boolean {
+  return parsedPolicyOverrides(env) === undefined;
+}
+
+export function resolveLeasePolicy(env: Partial<Env>, owner = "", org = ""): LeasePolicy {
+  const seconds = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 86_400) : fallback;
+  };
+  const global: LeasePolicy = {
+    defaultTTLSeconds: seconds(env.CRABBOX_LEASE_DEFAULT_TTL_SECONDS, 1800),
+    defaultIdleTimeoutSeconds: seconds(env.CRABBOX_LEASE_DEFAULT_IDLE_TIMEOUT_SECONDS, 1800),
+    maxTTLSeconds: seconds(env.CRABBOX_LEASE_MAX_TTL_SECONDS, 14_400),
+    extension: env.CRABBOX_LEASE_EXTENSION === "deny" ? "deny" : "allow",
+    autoExtend: env.CRABBOX_LEASE_AUTO_EXTEND === "deny" ? "deny" : "allow",
+  };
+  const overrides = parsedPolicyOverrides(env);
+  const policy = {
+    ...global,
+    ...(org === MISSING_ORG_KEY ? undefined : overrides?.orgs?.[orgLabelFromKey(org) ?? org]),
+    ...overrides?.owners?.[owner],
+  };
+  policy.defaultTTLSeconds = Math.min(policy.defaultTTLSeconds, policy.maxTTLSeconds);
+  policy.defaultIdleTimeoutSeconds = Math.min(
+    policy.defaultIdleTimeoutSeconds,
+    policy.maxTTLSeconds,
+  );
+  return policy;
+}
+
+export function clampLeaseDurations(
+  input: { ttlSeconds?: number; idleTimeoutSeconds?: number },
+  policy: LeasePolicy,
+): { ttlSeconds: number; idleTimeoutSeconds: number; policyNotice?: string } {
+  const positive = (value: number | undefined, fallback: number): number =>
+    value !== undefined && Number.isFinite(value) && value > 0
+      ? Math.max(1, Math.trunc(value))
+      : fallback;
+  const requestedTTL = positive(input.ttlSeconds, policy.defaultTTLSeconds);
+  const ttlSeconds = Math.min(
+    requestedTTL,
+    policy.extension === "deny" ? policy.defaultTTLSeconds : policy.maxTTLSeconds,
+  );
+  const requestedIdle = positive(input.idleTimeoutSeconds, policy.defaultIdleTimeoutSeconds);
+  const idleTimeoutSeconds = Math.min(requestedIdle, ttlSeconds, policy.maxTTLSeconds);
+  const policyNotice =
+    requestedTTL !== ttlSeconds || requestedIdle !== idleTimeoutSeconds
+      ? `Lease policy clamped lifetime to ${ttlSeconds}s and idle timeout to ${idleTimeoutSeconds}s (maximum ${policy.maxTTLSeconds}s; extension ${policy.extension}).`
+      : undefined;
+  return { ttlSeconds, idleTimeoutSeconds, ...(policyNotice ? { policyNotice } : {}) };
 }

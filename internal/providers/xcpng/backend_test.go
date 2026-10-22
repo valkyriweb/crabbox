@@ -19,7 +19,7 @@ const xcpNgTestVMUUID = "11111111-1111-1111-1111-111111111111"
 
 type fakeLifecycleClient struct {
 	calls           []string
-	servers         []Server
+	servers         []core.Server
 	templateRef     string
 	srRef           string
 	networkRef      string
@@ -33,7 +33,7 @@ type fakeLifecycleClient struct {
 	attachedDisk    xcpNgConfigDrive
 	guestIP         string
 	discoveredIP    string
-	getServer       map[string]Server
+	getServer       map[string]core.Server
 	errOn           map[string]error
 	mutated         bool
 	deleted         []string
@@ -44,6 +44,7 @@ type fakeLifecycleClient struct {
 	closeCanceled   bool
 	setLabels       map[string]map[string]string
 	afterGuestIP    func()
+	afterSetLabels  func()
 	diskReq         xcpNgDiskAttachRequest
 }
 
@@ -65,14 +66,14 @@ func (f *fakeLifecycleClient) Close(ctx context.Context) error {
 	return f.fail("close")
 }
 
-func (f *fakeLifecycleClient) DoctorInventory(context.Context, xcpNgConfig) ([]Server, error) {
+func (f *fakeLifecycleClient) DoctorInventory(context.Context, xcpNgConfig) ([]core.Server, error) {
 	f.record("doctor-inventory")
 	return f.servers, f.fail("doctor-inventory")
 }
 
-func (f *fakeLifecycleClient) ListCrabboxServers(context.Context) ([]Server, error) {
+func (f *fakeLifecycleClient) ListCrabboxServers(context.Context) ([]core.Server, error) {
 	f.record("list")
-	out := make([]Server, 0, len(f.servers))
+	out := make([]core.Server, 0, len(f.servers))
 	for _, server := range f.servers {
 		if isCrabboxLease(server) {
 			out = append(out, server)
@@ -279,14 +280,14 @@ func (f *fakeLifecycleClient) DiscoverGuestIPv4(context.Context, xapiRef) (strin
 	return f.discoveredIP, nil
 }
 
-func (f *fakeLifecycleClient) GetServer(_ context.Context, id string) (Server, error) {
+func (f *fakeLifecycleClient) GetServer(_ context.Context, id string) (core.Server, error) {
 	f.record("get")
 	if f.getServer != nil {
 		if server, ok := f.getServer[id]; ok {
 			return server, nil
 		}
 	}
-	return Server{}, xapiHTTPError{StatusCode: 404, Body: "not found"}
+	return core.Server{}, xapiHTTPError{StatusCode: 404, Body: "not found"}
 }
 
 func (f *fakeLifecycleClient) SetLabels(_ context.Context, id string, labels map[string]string) error {
@@ -296,6 +297,9 @@ func (f *fakeLifecycleClient) SetLabels(_ context.Context, id string, labels map
 		f.setLabels = map[string]map[string]string{}
 	}
 	f.setLabels[id] = labels
+	if f.afterSetLabels != nil {
+		f.afterSetLabels()
+	}
 	return f.fail("set-labels")
 }
 
@@ -325,7 +329,7 @@ func (f *fakeLifecycleClient) DeleteConfigDrive(ctx context.Context, drive xcpNg
 
 func TestDoctorUsesReadOnlyPlacementAndInventory(t *testing.T) {
 	fake := &fakeLifecycleClient{
-		servers:     []Server{crabboxServer("OpaqueRef:vm-1", "cbx_lease", "ready", time.Now().Add(time.Hour))},
+		servers:     []core.Server{crabboxServer("OpaqueRef:vm-1", "cbx_lease", "ready", time.Now().Add(time.Hour))},
 		templateRef: "OpaqueRef:tpl",
 		srRef:       "OpaqueRef:sr",
 	}
@@ -443,6 +447,33 @@ func TestAcquireLifecycleCallOrderAndTarget(t *testing.T) {
 	}
 	if labels := fake.setLabels[xcpNgTestVMUUID]; labels["state"] != "ready" || labels["lease"] != "cbx_testlease" || labels["provider"] != "xcp-ng" {
 		t.Fatalf("labels=%#v", labels)
+	}
+}
+
+func TestAcquireRollsBackVMWhenExactClaimCannotBePersisted(t *testing.T) {
+	fake := &fakeLifecycleClient{
+		templateRef: "OpaqueRef:tpl",
+		srRef:       "OpaqueRef:sr",
+		networkRef:  "OpaqueRef:net",
+		hostRef:     "OpaqueRef:host",
+		guestIP:     "192.0.2.44",
+	}
+	backend := newTestBackend(t, fake)
+	stateFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(stateFile, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake.afterSetLabels = func() {
+		if err := os.Setenv("XDG_STATE_HOME", stateFile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := backend.Acquire(context.Background(), core.AcquireRequest{RequestedSlug: "blue"})
+	if err == nil || !strings.Contains(err.Error(), "persist exact xcp-ng VM ownership claim") {
+		t.Fatalf("err=%v, want exact claim persistence failure", err)
+	}
+	if !reflect.DeepEqual(fake.deleted, []string{xcpNgTestVMUUID}) {
+		t.Fatalf("deleted=%v, want rollback of exactly the newly created VM", fake.deleted)
 	}
 }
 
@@ -661,7 +692,7 @@ func TestWaitForGuestIPv4ReturnsDiscoveryConfigurationErrorImmediately(t *testin
 }
 
 func TestResolveRejectsExistingNonCrabboxVM(t *testing.T) {
-	fake := &fakeLifecycleClient{getServer: map[string]Server{"OpaqueRef:user": {CloudID: "OpaqueRef:user", Name: "user-vm", Labels: map[string]string{"crabbox": "false"}}}}
+	fake := &fakeLifecycleClient{getServer: map[string]core.Server{"OpaqueRef:user": {CloudID: "OpaqueRef:user", Name: "user-vm", Labels: map[string]string{"crabbox": "false"}}}}
 	backend := newTestBackend(t, fake)
 	if _, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "OpaqueRef:user"}); err == nil || !strings.Contains(err.Error(), "not Crabbox-managed") {
 		t.Fatalf("err=%v", err)
@@ -674,7 +705,7 @@ func TestResolveStatusOnlySkipsGuestIPAndUsesLivePowerState(t *testing.T) {
 	managed.PublicNet.IPv4.IP = ""
 	managed.PrivateNet.IPv4.IP = ""
 	fake := &fakeLifecycleClient{
-		getServer: map[string]Server{"cbx_status": managed},
+		getServer: map[string]core.Server{"cbx_status": managed},
 		errOn: map[string]error{
 			"guest-ip-by-id":    errors.New("guest tools unavailable"),
 			"discover-guest-ip": errors.New("guest network unavailable"),
@@ -701,7 +732,7 @@ func TestResolveStatusOnlyPreservesHealthyRunningEndpoint(t *testing.T) {
 	managed.PublicNet.IPv4.IP = ""
 	managed.PrivateNet.IPv4.IP = ""
 	fake := &fakeLifecycleClient{
-		getServer: map[string]Server{"cbx_status": managed},
+		getServer: map[string]core.Server{"cbx_status": managed},
 		guestIP:   "192.0.2.55",
 	}
 	backend := newTestBackend(t, fake)
@@ -724,7 +755,7 @@ func TestResolveStatusOnlyToleratesUnavailableRunningEndpoint(t *testing.T) {
 	managed.PublicNet.IPv4.IP = ""
 	managed.PrivateNet.IPv4.IP = ""
 	fake := &fakeLifecycleClient{
-		getServer: map[string]Server{"cbx_status": managed},
+		getServer: map[string]core.Server{"cbx_status": managed},
 		errOn: map[string]error{
 			"guest-ip-by-id":    errors.New("guest tools unavailable"),
 			"discover-guest-ip": errors.New("guest network unavailable"),
@@ -756,8 +787,8 @@ func TestResolveByAliasFallsBackToMACDiscoveryWhenGuestMetricsFail(t *testing.T)
 	managed.PublicNet.IPv4.IP = ""
 	managed.PrivateNet.IPv4.IP = ""
 	fake := &fakeLifecycleClient{
-		servers:      []Server{managed},
-		getServer:    map[string]Server{xcpNgTestVMUUID: managed},
+		servers:      []core.Server{managed},
+		getServer:    map[string]core.Server{xcpNgTestVMUUID: managed},
 		discoveredIP: "192.0.2.77",
 		errOn:        map[string]error{"guest-ip": errors.New("guest metrics unavailable")},
 	}
@@ -785,14 +816,20 @@ func TestTargetForServerRestoresStoredTargetLabels(t *testing.T) {
 	server.Labels["target"] = "linux"
 	server.Labels["work_root"] = "/srv/crabbox"
 
-	target := backend.targetForServer(server)
+	target, err := backend.targetForServer(server, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if target.SSH.TargetOS != "linux" || target.SSH.WindowsMode != "" {
 		t.Fatalf("ssh target=%#v", target.SSH)
 	}
 
 	server.Labels["target"] = "windows"
 	server.Labels["windows_mode"] = "wsl2"
-	target = backend.targetForServer(server)
+	target, err = backend.targetForServer(server, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if target.SSH.TargetOS != "windows" || target.SSH.WindowsMode != "wsl2" {
 		t.Fatalf("windows ssh target=%#v", target.SSH)
 	}
@@ -800,14 +837,16 @@ func TestTargetForServerRestoresStoredTargetLabels(t *testing.T) {
 
 func TestListResolveTouchReleaseUseOnlyCrabboxMetadata(t *testing.T) {
 	managed := crabboxServer(xcpNgTestVMUUID, "cbx_lease", "ready", time.Now().Add(time.Hour))
-	unmanaged := Server{CloudID: "OpaqueRef:vm-2", Name: "crabbox-prefix-only", Labels: map[string]string{"provider": "xcp-ng"}}
+	unmanaged := core.Server{CloudID: "OpaqueRef:vm-2", Name: "crabbox-prefix-only", Labels: map[string]string{"provider": "xcp-ng"}}
 	fake := &fakeLifecycleClient{
-		servers: []Server{managed, unmanaged},
-		getServer: map[string]Server{
-			"cbx_lease": managed,
+		servers: []core.Server{managed, unmanaged},
+		getServer: map[string]core.Server{
+			"cbx_lease":     managed,
+			xcpNgTestVMUUID: managed,
 		},
 	}
 	backend := newTestBackend(t, fake)
+	claimXCPNgServer(t, backend, managed)
 	backend.Cfg.XCPNg.Template = ""
 	backend.Cfg.XCPNg.TemplateUUID = ""
 	backend.Cfg.XCPNg.SR = ""
@@ -846,8 +885,9 @@ func TestReleaseRemovesStoredKey(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", home)
 	managed := crabboxServer(xcpNgTestVMUUID, "cbx_release", "ready", time.Now().Add(time.Hour))
-	fake := &fakeLifecycleClient{getServer: map[string]Server{"cbx_release": managed}}
+	fake := &fakeLifecycleClient{getServer: map[string]core.Server{"cbx_release": managed, xcpNgTestVMUUID: managed}}
 	backend := newTestBackend(t, fake)
+	claimXCPNgServer(t, backend, managed)
 	removeStoredTestboxKey = func(leaseID string) { core.RemoveStoredTestboxKey(leaseID) }
 	keyPath, err := core.TestboxKeyPath("cbx_release")
 	if err != nil {
@@ -867,22 +907,105 @@ func TestReleaseRemovesStoredKey(t *testing.T) {
 	}
 }
 
+func TestReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		claimVM     string
+		claimURL    string
+		liveVM      string
+		liveLease   string
+		deleteErr   error
+		wantErr     string
+		wantAttempt bool
+	}{
+		{name: "missing claim", liveVM: xcpNgTestVMUUID, liveLease: "cbx_owned", wantErr: "no exact local ownership claim"},
+		{name: "exact claim", claimVM: xcpNgTestVMUUID, liveVM: xcpNgTestVMUUID, liveLease: "cbx_owned", wantAttempt: true},
+		{name: "wrong vm", claimVM: "22222222-2222-2222-2222-222222222222", liveVM: xcpNgTestVMUUID, liveLease: "cbx_owned", wantErr: "cloud ID mismatch"},
+		{name: "wrong endpoint", claimVM: xcpNgTestVMUUID, claimURL: "https://another-pool.example.test", liveVM: xcpNgTestVMUUID, liveLease: "cbx_owned", wantErr: "provider scope mismatch"},
+		{name: "live identity changed", claimVM: xcpNgTestVMUUID, liveVM: "22222222-2222-2222-2222-222222222222", liveLease: "cbx_owned", wantErr: "without exact live Crabbox ownership metadata"},
+		{name: "live lease changed", claimVM: xcpNgTestVMUUID, liveVM: xcpNgTestVMUUID, liveLease: "cbx_other", wantErr: "without exact live Crabbox ownership metadata"},
+		{name: "delete failure preserves claim", claimVM: xcpNgTestVMUUID, liveVM: xcpNgTestVMUUID, liveLease: "cbx_owned", deleteErr: errors.New("xapi unavailable"), wantErr: "xapi unavailable", wantAttempt: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := crabboxServer(xcpNgTestVMUUID, "cbx_owned", "ready", time.Now().Add(time.Hour))
+			live := crabboxServer(tc.liveVM, tc.liveLease, "ready", time.Now().Add(time.Hour))
+			fake := &fakeLifecycleClient{getServer: map[string]core.Server{xcpNgTestVMUUID: live}}
+			if tc.deleteErr != nil {
+				fake.errOn = map[string]error{"delete": tc.deleteErr}
+			}
+			backend := newTestBackend(t, fake)
+			if tc.claimVM != "" {
+				claimCfg := backend.Cfg
+				if tc.claimURL != "" {
+					claimCfg.XCPNg.APIURL = tc.claimURL
+				}
+				claimed := server
+				claimed.CloudID = tc.claimVM
+				if err := core.ClaimLeaseTargetForRepoConfig("cbx_owned", "owned", claimCfg, claimed, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{Server: server, LeaseID: "cbx_owned"}})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v want=%q", err, tc.wantErr)
+				}
+				if tc.claimVM != "" {
+					if _, exists, claimErr := core.ReadLeaseClaimWithPresence("cbx_owned"); claimErr != nil || !exists {
+						t.Fatalf("claim exists=%t err=%v", exists, claimErr)
+					}
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(fake.deleted) > 0; got != tc.wantAttempt {
+				t.Fatalf("delete attempts=%v wantAttempt=%t", fake.deleted, tc.wantAttempt)
+			}
+		})
+	}
+}
+
+func TestCleanupSkipsUnclaimedAndWrongScopedVMs(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	unclaimed := crabboxServer("vm-unclaimed", "cbx_unclaimed", "ready", now.Add(-time.Minute))
+	wrongScope := crabboxServer("vm-wrong-scope", "cbx_wrong", "ready", now.Add(-time.Minute))
+	owned := crabboxServer("vm-owned", "cbx_owned", "ready", now.Add(-time.Minute))
+	fake := &fakeLifecycleClient{servers: []core.Server{unclaimed, wrongScope, owned}, getServer: map[string]core.Server{"vm-owned": owned}}
+	backend := newTestBackend(t, fake)
+	backend.RT.Clock = fixedClock{t: now}
+	wrongCfg := backend.Cfg
+	wrongCfg.XCPNg.APIURL = "https://another-pool.example.test"
+	if err := core.ClaimLeaseTargetForRepoConfig("cbx_wrong", "wrong", wrongCfg, wrongScope, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+	claimXCPNgServer(t, backend, owned)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fake.deleted, []string{"vm-owned"}) {
+		t.Fatalf("deleted=%v, want only exactly claimed VM", fake.deleted)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence("cbx_wrong"); err != nil || !exists {
+		t.Fatalf("wrong-scope claim exists=%t err=%v", exists, err)
+	}
+}
+
 func TestCleanupIsMetadataAndExpiryGated(t *testing.T) {
 	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
-	fake := &fakeLifecycleClient{servers: []Server{
-		crabboxServer("OpaqueRef:expired", "cbx_expired", "ready", now.Add(-time.Minute)),
+	expired := crabboxServer("OpaqueRef:expired", "cbx_expired", "ready", now.Add(-time.Minute))
+	fake := &fakeLifecycleClient{servers: []core.Server{
+		expired,
 		crabboxServer("OpaqueRef:fresh", "cbx_fresh", "ready", now.Add(time.Hour)),
 		{CloudID: "OpaqueRef:prefix", Name: "crabbox-prefix-only", Labels: map[string]string{"provider": "xcp-ng"}},
-	}}
+	}, getServer: map[string]core.Server{"OpaqueRef:expired": expired}}
 	backend := newTestBackend(t, fake)
+	claimXCPNgServer(t, backend, expired)
 	backend.Cfg.XCPNg.Template = ""
 	backend.Cfg.XCPNg.TemplateUUID = ""
 	backend.Cfg.XCPNg.SR = ""
 	backend.Cfg.XCPNg.SRUUID = ""
 	backend.RT.Clock = fixedClock{t: now}
-	var removedClaims []string
 	var removedKeys []string
-	removeLeaseClaim = func(leaseID string) { removedClaims = append(removedClaims, leaseID) }
 	removeStoredTestboxKey = func(leaseID string) { removedKeys = append(removedKeys, leaseID) }
 	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
 		t.Fatal(err)
@@ -890,8 +1013,11 @@ func TestCleanupIsMetadataAndExpiryGated(t *testing.T) {
 	if !reflect.DeepEqual(fake.deleted, []string{"OpaqueRef:expired"}) {
 		t.Fatalf("deleted=%v", fake.deleted)
 	}
-	if !reflect.DeepEqual(removedClaims, []string{"cbx_expired"}) || !reflect.DeepEqual(removedKeys, []string{"cbx_expired"}) {
-		t.Fatalf("removed claims=%v keys=%v", removedClaims, removedKeys)
+	if _, exists, err := core.ReadLeaseClaimWithPresence("cbx_expired"); err != nil || exists {
+		t.Fatalf("claim exists=%t err=%v", exists, err)
+	}
+	if !reflect.DeepEqual(removedKeys, []string{"cbx_expired"}) {
+		t.Fatalf("removed keys=%v", removedKeys)
 	}
 }
 
@@ -903,7 +1029,7 @@ func TestRunISOE2ELinuxReadOnlyAcceptsLocalInstallerPath(t *testing.T) {
 	}
 	fake := &fakeLifecycleClient{srRef: "OpaqueRef:sr", networkRef: "OpaqueRef:net", hostRef: "OpaqueRef:host", iso: xcpNgISOMediaRef{Source: "local-file", NameLabel: isoPath}}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 	summary, err := RunISOE2E(context.Background(), ISOE2EOptions{Config: testConfig(), Mode: "read-only", OS: "linux", ISO: isoPath, EvidenceDir: filepath.Join(dir, "evidence")})
 	if err != nil {
@@ -928,7 +1054,7 @@ func TestRunISOE2EMutateRequiresNetworkBeforeCreatingVM(t *testing.T) {
 		hostRef: "OpaqueRef:host",
 	}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 
 	cfg := testConfig()
@@ -962,7 +1088,7 @@ func TestRunISOE2EReportsLogoutFailureInSummary(t *testing.T) {
 		errOn:      map[string]error{"close": errors.New("logout failed")},
 	}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 
 	summary, err := RunISOE2E(context.Background(), ISOE2EOptions{Config: testConfig(), Mode: "read-only", OS: "linux", ISO: isoPath, EvidenceDir: filepath.Join(dir, "evidence")})
@@ -990,7 +1116,7 @@ func TestRunISOE2EJoinsLogoutFailureWithPrimaryFailure(t *testing.T) {
 		},
 	}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 
 	summary, err := RunISOE2E(context.Background(), ISOE2EOptions{Config: testConfig(), Mode: "read-only", OS: "linux", ISO: isoPath, EvidenceDir: filepath.Join(dir, "evidence")})
@@ -1015,7 +1141,7 @@ func TestRunISOE2EWindowsReadOnlyBlocksARMInstaller(t *testing.T) {
 	}
 	fake := &fakeLifecycleClient{srRef: "OpaqueRef:sr", networkRef: "OpaqueRef:net", hostRef: "OpaqueRef:host", iso: xcpNgISOMediaRef{Source: "local-file", NameLabel: isoPath}}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 	summary, err := RunISOE2E(context.Background(), ISOE2EOptions{Config: testConfig(), Mode: "read-only", OS: "windows", ISO: isoPath, EvidenceDir: filepath.Join(dir, "evidence")})
 	if err == nil {
@@ -1057,7 +1183,7 @@ func TestRunISOE2EWindowsUsesResolvedInstallerNameForVTPM(t *testing.T) {
 		errOn: map[string]error{"create-fresh-vm": errors.New("stop after request capture")},
 	}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 
 	_, err := RunISOE2E(context.Background(), ISOE2EOptions{
@@ -1101,14 +1227,14 @@ func TestRunISOE2EWindowsMutateGeneratesAndAttachesBootstrapBeforeStart(t *testi
 	oldPassword := isoE2EGenerateWindowsPassword
 	var sshTimeout time.Duration
 	var sshContextDeadline time.Time
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	isoE2EWaitForSSHReady = func(ctx context.Context, _ *core.SSHTarget, _ string, timeout time.Duration) error {
 		sshTimeout = timeout
 		sshContextDeadline, _ = ctx.Deadline()
 		return nil
 	}
 	isoE2ERunSSHQuiet = func(context.Context, core.SSHTarget, string) error { return nil }
-	isoE2EEnsureTestboxKey = func(Config, string) (string, string, error) {
+	isoE2EEnsureTestboxKey = func(core.Config, string) (string, string, error) {
 		return filepath.Join(dir, "id_ed25519"), "ssh-ed25519 AAAATEST crabbox", nil
 	}
 	isoE2EWriteWindowsAnswerISO = func(_ context.Context, _ string, payload xcpNgWindowsAutounattendPayload) (string, error) {
@@ -1164,7 +1290,7 @@ func TestPrepareWindowsAnswerMediaRetainsGeneratedISOOnlyWhenRequested(t *testin
 	oldEnsure := isoE2EEnsureTestboxKey
 	oldWrite := isoE2EWriteWindowsAnswerISO
 	oldPassword := isoE2EGenerateWindowsPassword
-	isoE2EEnsureTestboxKey = func(Config, string) (string, string, error) {
+	isoE2EEnsureTestboxKey = func(core.Config, string) (string, string, error) {
 		return filepath.Join(dir, "id_ed25519"), "ssh-ed25519 AAAATEST crabbox", nil
 	}
 	isoE2EWriteWindowsAnswerISO = func(context.Context, string, xcpNgWindowsAutounattendPayload) (string, error) {
@@ -1321,7 +1447,7 @@ func TestRunISOE2EWindowsMutateFallsBackToSourceUncoveredWithProvidedAnswerISO(t
 		attachedDisk: xcpNgConfigDrive{VDIRef: "OpaqueRef:disk-vdi", VBDRef: "OpaqueRef:disk-vbd", Name: "install-disk", DestroyVDI: true},
 	}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 	summary, err := RunISOE2E(context.Background(), ISOE2EOptions{Config: testConfig(), Mode: "mutate", OS: "windows", ISO: isoPath, AnswerISO: answerPath, EvidenceDir: filepath.Join(dir, "evidence"), MutateGate: true})
 	if err == nil {
@@ -1357,7 +1483,7 @@ func TestRunISOE2EWindowsMutateClassifiesGuestMetricsBlocker(t *testing.T) {
 		errOn:        map[string]error{"guest-ip": errors.New("no guest ipv4 address reported by XCP-ng guest metrics")},
 	}
 	oldClient := newLifecycleClient
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	t.Cleanup(func() { newLifecycleClient = oldClient })
 	summary, err := RunISOE2E(context.Background(), ISOE2EOptions{Config: testConfig(), Mode: "mutate", OS: "windows", ISO: isoPath, AnswerISO: answerPath, EvidenceDir: filepath.Join(dir, "evidence"), Timeout: 25 * time.Second, MutateGate: true})
 	if err == nil {
@@ -1391,10 +1517,10 @@ func TestRunISOE2ELinuxMutatePassesWithImportedMediaAndSSHProof(t *testing.T) {
 	oldNow := isoE2ECurrentTime
 	oldRemaster := isoE2ERemasterUbuntuISO
 	oldSeed := isoE2EWriteLinuxSeedISO
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	isoE2EWaitForSSHReady = func(context.Context, *core.SSHTarget, string, time.Duration) error { return nil }
 	isoE2ERunSSHQuiet = func(context.Context, core.SSHTarget, string) error { return nil }
-	isoE2EEnsureTestboxKey = func(Config, string) (string, string, error) {
+	isoE2EEnsureTestboxKey = func(core.Config, string) (string, string, error) {
 		return filepath.Join(dir, "id_ed25519"), "ssh-ed25519 AAAATEST crabbox", nil
 	}
 	isoE2ECurrentTime = func() time.Time { return time.Unix(1700000000, 0).UTC() }
@@ -1458,8 +1584,8 @@ func TestRunISOE2ELinuxMutateClassifiesGuestMetricsBlocker(t *testing.T) {
 	oldEnsure := isoE2EEnsureTestboxKey
 	oldRemaster := isoE2ERemasterUbuntuISO
 	oldSeed := isoE2EWriteLinuxSeedISO
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
-	isoE2EEnsureTestboxKey = func(Config, string) (string, string, error) {
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
+	isoE2EEnsureTestboxKey = func(core.Config, string) (string, string, error) {
 		return filepath.Join(dir, "id_ed25519"), "ssh-ed25519 AAAATEST crabbox", nil
 	}
 	isoE2ERemasterUbuntuISO = func(context.Context, string, string) (string, error) { return isoPath, nil }
@@ -1511,10 +1637,10 @@ func TestRunISOE2ELinuxMutateUsesGuestMetricsForInstallCompletion(t *testing.T) 
 	oldEnsure := isoE2EEnsureTestboxKey
 	oldRemaster := isoE2ERemasterUbuntuISO
 	oldSeed := isoE2EWriteLinuxSeedISO
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	isoE2EWaitForSSHReady = func(context.Context, *core.SSHTarget, string, time.Duration) error { return nil }
 	isoE2ERunSSHQuiet = func(context.Context, core.SSHTarget, string) error { return nil }
-	isoE2EEnsureTestboxKey = func(Config, string) (string, string, error) {
+	isoE2EEnsureTestboxKey = func(core.Config, string) (string, string, error) {
 		return filepath.Join(dir, "id_ed25519"), "ssh-ed25519 AAAATEST crabbox", nil
 	}
 	isoE2ERemasterUbuntuISO = func(context.Context, string, string) (string, error) { return isoPath, nil }
@@ -1594,8 +1720,8 @@ func TestRunISOE2ELinuxMutateCleansImportedInstallerWhenAttachFails(t *testing.T
 	oldEnsure := isoE2EEnsureTestboxKey
 	oldRemaster := isoE2ERemasterUbuntuISO
 	oldSeed := isoE2EWriteLinuxSeedISO
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
-	isoE2EEnsureTestboxKey = func(Config, string) (string, string, error) {
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
+	isoE2EEnsureTestboxKey = func(core.Config, string) (string, string, error) {
 		return filepath.Join(dir, "id_ed25519"), "ssh-ed25519 AAAATEST crabbox", nil
 	}
 	isoE2ERemasterUbuntuISO = func(context.Context, string, string) (string, error) { return isoPath, nil }
@@ -1726,7 +1852,7 @@ func TestWindowsAnswerPreparationRegistersOwnedKeyBeforeLaterFailure(t *testing.
 	oldExists := isoE2EStoredTestboxKeyExists
 	oldPassword := isoE2EGenerateWindowsPassword
 	isoE2EStoredTestboxKeyExists = func(string) bool { return false }
-	isoE2EEnsureTestboxKey = func(Config, string) (string, string, error) {
+	isoE2EEnsureTestboxKey = func(core.Config, string) (string, string, error) {
 		return "/tmp/owned-key", "ssh-ed25519 AAAATEST", nil
 	}
 	isoE2EGenerateWindowsPassword = func() (string, error) {
@@ -1782,7 +1908,7 @@ func TestISOE2ERuntimeKeepsRecoveryHandlesFromFailedAllocations(t *testing.T) {
 
 func TestCleanupDryRunDoesNotDelete(t *testing.T) {
 	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
-	fake := &fakeLifecycleClient{servers: []Server{crabboxServer("OpaqueRef:expired", "cbx_expired", "ready", now.Add(-time.Minute))}}
+	fake := &fakeLifecycleClient{servers: []core.Server{crabboxServer("OpaqueRef:expired", "cbx_expired", "ready", now.Add(-time.Minute))}}
 	backend := newTestBackend(t, fake)
 	backend.RT.Clock = fixedClock{t: now}
 	if err := backend.Cleanup(context.Background(), core.CleanupRequest{DryRun: true}); err != nil {
@@ -1809,23 +1935,22 @@ func TestValidationSplitsConnectionFromProvisioningPlacement(t *testing.T) {
 
 func newTestBackend(t *testing.T, fake *fakeLifecycleClient) *leaseBackend {
 	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	oldClient := newLifecycleClient
 	oldLeaseID := newLeaseID
 	oldKey := ensureTestboxKeyForConfig
 	oldWait := waitForSSHReady
 	oldBootstrapTimeout := bootstrapWaitTimeout
 	oldPollInterval := guestIPPollInterval
-	oldRemove := removeLeaseClaim
 	oldRemoveStoredKey := removeStoredTestboxKey
-	newLifecycleClient = func(context.Context, Config) (lifecycleClient, error) { return fake, nil }
+	newLifecycleClient = func(context.Context, core.Config) (lifecycleClient, error) { return fake, nil }
 	newLeaseID = func() string { return "cbx_testlease" }
-	ensureTestboxKeyForConfig = func(Config, string) (string, string, error) {
+	ensureTestboxKeyForConfig = func(core.Config, string) (string, string, error) {
 		return "/tmp/crabbox-test-key", "ssh-ed25519 AAAATEST crabbox", nil
 	}
-	waitForSSHReady = func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error { return nil }
-	bootstrapWaitTimeout = func(Config) time.Duration { return 10 * time.Millisecond }
+	waitForSSHReady = func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error { return nil }
+	bootstrapWaitTimeout = func(core.Config) time.Duration { return 10 * time.Millisecond }
 	guestIPPollInterval = time.Millisecond
-	removeLeaseClaim = func(string) {}
 	removeStoredTestboxKey = func(string) {}
 	t.Cleanup(func() {
 		newLifecycleClient = oldClient
@@ -1834,16 +1959,22 @@ func newTestBackend(t *testing.T, fake *fakeLifecycleClient) *leaseBackend {
 		waitForSSHReady = oldWait
 		bootstrapWaitTimeout = oldBootstrapTimeout
 		guestIPPollInterval = oldPollInterval
-		removeLeaseClaim = oldRemove
 		removeStoredTestboxKey = oldRemoveStoredKey
 	})
 	cfg := testConfig()
-	backend := NewLeaseBackend(Provider{}.Spec(), cfg, Runtime{Stderr: &bytes.Buffer{}}).(*leaseBackend)
+	backend := NewLeaseBackend(Provider{}.Spec(), cfg, core.Runtime{Stderr: &bytes.Buffer{}}).(*leaseBackend)
 	return backend
 }
 
-func testConfig() Config {
-	cfg := Config{}
+func claimXCPNgServer(t *testing.T, backend *leaseBackend, server core.Server) {
+	t.Helper()
+	if err := core.ClaimLeaseTargetForRepoConfig(server.Labels["lease"], server.Labels["slug"], backend.Cfg, server, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testConfig() core.Config {
+	cfg := core.Config{}
 	cfg.Provider = "xcp-ng"
 	cfg.TargetOS = "linux"
 	cfg.SSHUser = "crabbox"
@@ -1861,7 +1992,7 @@ func testConfig() Config {
 	return cfg
 }
 
-func crabboxServer(id, lease, state string, expires time.Time) Server {
+func crabboxServer(id, lease, state string, expires time.Time) core.Server {
 	labels := map[string]string{
 		"crabbox":     "true",
 		"created_by":  "crabbox",
@@ -1873,7 +2004,7 @@ func crabboxServer(id, lease, state string, expires time.Time) Server {
 		"expires_at":  core.LeaseLabelTime(expires),
 		"server_type": "template-ubuntu",
 	}
-	server := Server{CloudID: id, Name: "crabbox-" + strings.TrimPrefix(lease, "cbx_"), Status: state, Labels: labels, Provider: "xcp-ng"}
+	server := core.Server{CloudID: id, Name: "crabbox-" + strings.TrimPrefix(lease, "cbx_"), Status: state, Labels: labels, Provider: "xcp-ng"}
 	server.PublicNet.IPv4.IP = "192.0.2.44"
 	return server
 }

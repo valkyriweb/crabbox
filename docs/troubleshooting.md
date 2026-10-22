@@ -36,6 +36,7 @@ lifecycle call. Auth failures stop a lease before it reaches a provider.
 
 - `401` or `403` responses;
 - `missing broker token`;
+- `coordinator refused cross-origin redirect`;
 - a GitHub `Invalid redirect_uri` error during browser login;
 - a Cloudflare Access challenge page returned instead of JSON.
 
@@ -44,7 +45,7 @@ lifecycle call. Auth failures stop a lease before it reaches a provider.
 ```sh
 crabbox config show
 printenv CRABBOX_COORDINATOR
-printenv CRABBOX_COORDINATOR_TOKEN
+test -n "${CRABBOX_COORDINATOR_TOKEN:-}" && echo 'coordinator token is set' || echo 'coordinator token is unset'
 printenv CRABBOX_PUBLIC_URL
 ```
 
@@ -54,7 +55,12 @@ printenv CRABBOX_PUBLIC_URL
   log in with `crabbox login`).
 - Point the CLI at the coordinator URL, or at the Access-protected route only when
   that is intended.
-- Ensure `CRABBOX_COORDINATOR_TOKEN` matches the coordinator's `CRABBOX_SHARED_TOKEN`.
+- Configure the final coordinator origin directly. The Go transport permits
+  same-origin redirects, but cross-origin redirects are rejected and the curl
+  fallback intentionally follows no redirects.
+- For shared-token automation, check that the configured token matches the
+  operator's current shared token without printing either value. For GitHub
+  login, run `crabbox whoami` and sign in again if the session is rejected.
 - For self-hosted GitHub browser login, create a GitHub OAuth app and set its
   callback URL to `https://<your-coordinator-host>/v1/auth/github/callback`.
 - Ensure the coordinator's `CRABBOX_PUBLIC_URL` uses the same public origin as that
@@ -64,6 +70,12 @@ See [broker auth & routing](features/broker-auth-routing.md) for the full token
 precedence and Access integration.
 
 ## SSH host key or control socket fails
+
+Readiness stops immediately when SSH reports a host-key verification failure.
+Waiting for guest bootstrap cannot repair host trust. Verify the lease identity
+and the provider's host-key scope before reconnecting; Crabbox does not remove
+trusted keys or disable verification to recover. Other startup failures continue
+to use the bounded readiness wait.
 
 **Symptoms**
 
@@ -81,8 +93,12 @@ crabbox ssh --id swift-crab
 **Fixes**
 
 - Upgrade to a build that quotes SSH config values containing spaces.
-- Keep per-lease keys under the Crabbox config `testboxes/<lease>` directory
-  (see [SSH keys](features/ssh-keys.md)).
+- Keep the same `XDG_STATE_HOME` for acquire, reuse and cleanup. An absolute
+  value selects `<state>/crabbox/testboxes/<lease>`; unset or empty retains the
+  OS user-config `crabbox/testboxes/<lease>` location. Changing `CRABBOX_CONFIG`
+  does not move keys, and changing the state root does not migrate or find old
+  leases. Return to the original root rather than copying key files (see
+  [SSH keys](features/ssh-keys.md)).
 - Do not manually override `UserKnownHostsFile` or `ControlPath` unless you are
   debugging SSH itself.
 
@@ -118,7 +134,7 @@ crabbox usage --scope org --org example-org
 - `crabbox doctor --provider azure` reports `missing=AZURE_TENANT_ID,...`;
 - the class falls back from a dedicated machine to a smaller one;
 - an AWS Spot request cannot be fulfilled;
-- AWS reports `VcpuLimitExceeded` for large On-Demand instances;
+- AWS reports `VcpuLimitExceeded` for an On-Demand instance;
 - server creation fails before SSH is reachable.
 
 **Checks**
@@ -149,6 +165,13 @@ CRABBOX_CAPACITY_REGIONS=eu-west-1,eu-west-2,eu-central-1,us-east-1,us-west-2 \
 - Raise the AWS `Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances`
   quota for the C/M/R/T/Z families, or the matching Spot quota when using Spot.
 - Raise the Hetzner dedicated-core quota when dedicated classes are required.
+
+For `VcpuLimitExceeded`, check account-wide usage in the reported region and
+quota bucket. `doctor` compares the VM size with the quota ceiling and leaves
+usage unchecked, even when that comparison reports `ok`. An owner's Crabbox
+lease count does not measure the shared AWS quota. Ask resource owners to
+release unused capacity or request a quota increase. A smaller type helps only
+if enough quota remains; C, M, and R families share the Standard quota bucket.
 
 Brokered AWS launches record provisioning attempts and use AWS Service Quotas
 when available, reporting the quota code, applied vCPU limit, requested type, and
@@ -187,8 +210,8 @@ crabbox admin leases --state active
 - Use `crabbox stop <id-or-slug>` for active leases; reserve provider/admin
   cleanup (`crabbox cleanup`, `crabbox admin delete`) for confirmed orphans.
 
-The broker also sweeps untracked AWS instances and idle Mac dedicated hosts on a
-schedule. See [lifecycle & cleanup](features/lifecycle-cleanup.md).
+The broker also sweeps untracked AWS instances, Azure per-lease resource sets,
+and idle Mac dedicated hosts on a schedule. See [lifecycle & cleanup](features/lifecycle-cleanup.md).
 
 ## SSH never becomes ready
 
@@ -325,8 +348,9 @@ crabbox run --id cbx_... --sync-only --debug
 
 - Inspect the printed sync candidate estimate (`crabbox sync-plan`) before
   retrying.
-- Lower `sync.timeout` for quick failure in agent loops, or raise it for
-  intentionally large source transfers.
+- Lower `sync.timeout` to detect rsync I/O stalls sooner, or raise it when long
+  periods without protocol I/O are expected. Progressing rsync transfers may
+  exceed this duration; manifest staging and archive sync use wall-clock limits.
 - Tune `sync.warnFiles`, `sync.warnBytes`, `sync.failFiles`, and `sync.failBytes`
   in repo config.
 - Stop and warm a fresh lease if the remote workspace looks corrupted.

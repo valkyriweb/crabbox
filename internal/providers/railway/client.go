@@ -1,23 +1,27 @@
 package railway
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-// railwayAPI is the minimal Railway GraphQL surface the provider needs.
+// railwayAPI is the Railway GraphQL client surface.
 //
 // Railway has no synchronous exec endpoint, so the provider models a "sandbox"
-// as a Railway service inside a project. Run redeploys the latest deployment
-// via deploymentRedeploy and surfaces deployment logs; List enumerates
-// services across visible projects; Status fetches the latest deployment for a
-// service; Stop calls deploymentStop on that latest deployment.
+// as a Railway service inside a project. Run rejects arbitrary commands before
+// calling the API; List enumerates services across visible projects; Status
+// fetches the latest deployment for a service; Stop calls deploymentStop only
+// for the exact claimed deployment.
 type railwayAPI interface {
 	TriggerDeploy(ctx context.Context, projectID, environmentID, serviceID string) (string, error)
 	BuildLogs(ctx context.Context, deploymentID string, limit int) ([]string, error)
@@ -150,24 +154,43 @@ func (s railwayDeploymentStatus) ExitCode() int {
 	return 1
 }
 
-func newRailwayClient(cfg Config, rt Runtime) (railwayAPI, error) {
+func newRailwayClient(cfg core.Config, rt core.Runtime) (railwayAPI, error) {
 	apiToken := strings.TrimSpace(cfg.Railway.APIToken)
 	if apiToken == "" {
-		return nil, exit(2, "provider=%s requires RAILWAY_API_TOKEN", providerName)
+		return nil, core.Exit(2, "provider=%s requires RAILWAY_API_TOKEN", providerName)
 	}
-	apiURL := strings.TrimRight(strings.TrimSpace(blank(cfg.Railway.APIURL, "https://backboard.railway.com/graphql/v2")), "/")
+	apiURL := strings.TrimRight(strings.TrimSpace(core.Blank(cfg.Railway.APIURL, core.RailwayConfigDefaultAPIURL)), "/")
 	parsed, err := url.Parse(apiURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, exit(2, "%s url %q is invalid", providerName, apiURL)
+		return nil, core.Exit(2, "%s url %q is invalid", providerName, apiURL)
 	}
-	if parsed.Scheme != "https" && !isLoopbackHTTPURL(parsed) {
-		return nil, exit(2, "%s url %q must use https unless it targets localhost", providerName, apiURL)
+	if parsed.Scheme != "https" && !shared.IsLoopbackHTTPURL(parsed) {
+		return nil, core.Exit(2, "%s url %q must use https unless it targets localhost", providerName, apiURL)
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
-	return &railwayClient{apiToken: apiToken, apiURL: apiURL, httpClient: httpClient}, nil
+	return &railwayClient{apiToken: apiToken, apiURL: apiURL, httpClient: shared.SecureHTTPClient(httpClient, parsed, newRailwayRedirectError)}, nil
+}
+
+func newRailwayRedirectError(destination *url.URL) error {
+	return &railwayRedirectError{origin: railwayRedirectOrigin(destination)}
+}
+
+type railwayRedirectError struct {
+	origin string
+}
+
+func (e *railwayRedirectError) Error() string {
+	return fmt.Sprintf("%s refused cross-origin redirect to %s", providerName, e.origin)
+}
+
+func railwayRedirectOrigin(value *url.URL) string {
+	if value == nil || value.Scheme == "" || value.Host == "" {
+		return "<redacted>"
+	}
+	return value.Scheme + "://" + value.Host
 }
 
 type graphqlRequest struct {
@@ -185,11 +208,7 @@ type graphqlResponse struct {
 }
 
 func (c *railwayClient) do(ctx context.Context, query string, vars map[string]any, out any) error {
-	body, err := json.Marshal(graphqlRequest{Query: query, Variables: vars})
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL, bytes.NewReader(body))
+	req, err := shared.NewCompactJSONRequest(ctx, http.MethodPost, c.apiURL, graphqlRequest{Query: query, Variables: vars})
 	if err != nil {
 		return err
 	}
@@ -198,6 +217,11 @@ func (c *railwayClient) do(ctx context.Context, query string, vars map[string]an
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// net/http wraps CheckRedirect failures with the untrusted Location URL.
+		var redirectErr *railwayRedirectError
+		if errors.As(err, &redirectErr) {
+			return redirectErr
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -209,7 +233,7 @@ func (c *railwayClient) do(ctx context.Context, query string, vars map[string]an
 		return fmt.Errorf("railway response exceeds %d bytes", railwayMaxGraphQLResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &railwayAPIError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(data))}
+		return &railwayAPIError{StatusCode: resp.StatusCode, Status: resp.Status, Body: shared.RedactErrorSecrets(strings.TrimSpace(string(data)), c.apiToken)}
 	}
 	var envelope graphqlResponse
 	if err := json.Unmarshal(data, &envelope); err != nil {
@@ -220,7 +244,7 @@ func (c *railwayClient) do(ctx context.Context, query string, vars map[string]an
 		for _, e := range envelope.Errors {
 			msgs = append(msgs, e.Message)
 		}
-		return &railwayAPIError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.Join(msgs, "; ")}
+		return &railwayAPIError{StatusCode: resp.StatusCode, Status: resp.Status, Body: shared.RedactErrorSecrets(strings.Join(msgs, "; "), c.apiToken)}
 	}
 	if out != nil {
 		if err := json.Unmarshal(envelope.Data, out); err != nil {
@@ -599,12 +623,4 @@ func (c *railwayClient) GetService(ctx context.Context, serviceID string) (railw
 		return railwayService{}, fmt.Errorf("service %s not found", serviceID)
 	}
 	return railwayService{ID: out.Service.ID, Name: out.Service.Name, ProjectID: out.Service.ProjectID}, nil
-}
-
-func isLoopbackHTTPURL(parsed *url.URL) bool {
-	if parsed.Scheme != "http" {
-		return false
-	}
-	host := strings.ToLower(parsed.Hostname())
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }

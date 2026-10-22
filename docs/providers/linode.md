@@ -36,7 +36,36 @@ crabbox cleanup --provider linode --dry-run
 numeric Linode instance id. `--type` is the exact Linode type slug; there is no
 separate Linode size flag.
 
+Fixed-lease orchestrators can use `warmup --lease-id cbx_abcdef123456 --keep=true`.
+Repeating the request with the same local state, Linode account, repository, and
+creation inputs reuses the original instance and SSH key. A changed owner or
+intent returns `lease_id_conflict` (exit 4). Fixed claims bind the account EUUID,
+creation fingerprint, and attempt nonce to the instance label and Crabbox tags.
+After a lost create response, replay reconciles that exact attempt from inventory;
+empty or ambiguous inventory retains the claim without allocating a replacement.
+Preserve the local claim and SSH key when recovering an interrupted dispatch.
+
+`inspect`, `status`, `heartbeat`, and `stop` resolve fixed leases by lease ID.
+Stopping retains a terminal receipt, so repeated stops are safe and the released
+ID cannot create another instance. A lost stored SSH key blocks acquisition
+replay; it does not block an identity-verified stop.
+
 ## Configuration
+
+An explicit class selects these Linux/amd64 primary sizes:
+
+| Class | Instance type | vCPU | RAM (GiB) |
+| --- | --- | --- | --- |
+| `tiny` | `g6-standard-1` | 1 | 2 |
+| `small` | `g6-standard-2` | 2 | 4 |
+| `standard` | `g6-standard-4` | 4 | 8 |
+| `fast` | `g6-standard-6` | 6 | 16 |
+| `large` | `g6-standard-8` | 8 | 32 |
+| `beast` | `g6-standard-16` | 16 | 64 |
+
+`standard` now selects `g6-standard-4`, increasing size and cost from the old
+`g6-standard-1` mapping. Use `--class tiny` or `--type g6-standard-1` to keep
+the old size. Omit `linode.type` when you want `class` to choose the machine:
 
 ```yaml
 provider: linode
@@ -45,7 +74,7 @@ class: standard
 linode:
   region: us-ord
   image: linode/ubuntu24.04
-  type: g6-standard-1
+  # type: g6-standard-1 # optional exact override; takes precedence over class
   firewall: ""
   sshCIDRs: []
 ```
@@ -60,6 +89,15 @@ Config keys under `linode:`:
 | `firewall` | `cfg.Linode.FirewallID` | empty | Optional numeric existing Linode firewall id to attach at create time. |
 | `sshCIDRs` | `cfg.Linode.SSHCIDRs` | empty | Reserved for firewall-aware follow-up work; Phase 1 does not create firewall rules. |
 
+Acquisition trims the selected native type. A blank explicit `--type` falls back
+to `linode.type`, then the class default. The create request, lease metadata, and
+recovery records use that same resolved type.
+
+An explicit class selects the corresponding [machine class](../commands/providers.md)
+instead of the inherited `g6-standard-1` default. Explicit `linode.type`
+configuration (including `g6-standard-1`) still takes precedence over the class,
+and `--type` takes precedence over both.
+
 The portable `--os ubuntu:24.04` selector maps to `linode/ubuntu24.04`. Linode
 does not currently offer the portable default Ubuntu 26.04 image in this
 provider, so provisioning with an explicit `--os ubuntu:26.04` is rejected
@@ -67,6 +105,15 @@ unless `linode.image` or `CRABBOX_LINODE_IMAGE` provides an explicit image slug.
 Validation occurs when Crabbox acquires a new Linode, after CLI overrides;
 `config show`, provider overrides, and cleanup commands remain available when
 the configured portable selector is unsupported.
+
+The five file/environment bindings are declared together in
+`internal/cli/config_linode.go`; this adds no provider-specific flags. Raw
+initial configuration keeps the image selected by the portable-OS mapping,
+including an empty unsupported image. Later effective defaults remain separate
+from acquisition validation. Empty scalar input leaves the prior value intact;
+accepted image/type input remains explicit even when equal to its default.
+Nonempty YAML CIDR lists retain their entries as written, while environment
+lists trim entries and discard blanks.
 
 Linode leases default to `root` on SSH port `22` with no fallback port. Explicit
 generic `ssh.user` and `ssh.port` values remain authoritative. The effective
@@ -114,8 +161,9 @@ and adjust token scopes before retrying. Do not broaden scopes inside scripts.
 3. Wait for a public IPv4 address and Crabbox SSH bootstrap readiness.
 4. Add ready-state Crabbox tags and claim the lease locally.
 5. Run normal Crabbox sync/run/ssh workflows over SSH.
-6. Delete the Linode instance on `stop`; `cleanup` deletes only resources with a
-   complete Crabbox Linode ownership tag set.
+6. Delete the Linode instance on `stop`; `cleanup` deletes only resources with
+   complete Crabbox Linode ownership tags and an exact account- and
+   instance-bound local claim.
 
 If instance creation returns an indeterminate transport or server failure,
 Crabbox retains the SSH credentials and records a pending local recovery claim.
@@ -138,11 +186,33 @@ crabbox:target:linux
 crabbox:expires_at:<unix-seconds>
 ```
 
-Release and cleanup require a complete ownership predicate: Crabbox marker,
-provider marker, lease id, slug, and Linux target. Linodes with partial,
-foreign, or malformed Crabbox-like tags are skipped/refused.
+Read-only inventory requires a complete ownership predicate: Crabbox marker,
+provider marker, canonical lease id, slug, and Linux target. Reuse and deletion
+also require an exact local claim for the same Linode account, lease, and
+instance id. Linodes with partial, foreign, malformed, claimless, or mismatched
+ownership are skipped or refused; a claimless Linode must first be adopted
+through explicit supported `--reclaim` reuse.
 
-Tag updates replace only Crabbox's namespaced tags and preserve unrelated
+After instance deletion or confirmed absence, cleanup removes generated SSH
+credentials and host-trust files before retiring the local claim, under the same
+unchanged-claim lock. Provider or SSH-artifact cleanup failures retain the claim
+for retry; a retry after successful instance deletion only finalizes local state.
+Terminal cleanup honors caller cancellation while waiting for the claim lock;
+confirmed successful deletion still completes local finalization.
+
+Failed acquisition uses the same cleanup sequence after recording an exact
+recovery claim. Incomplete cleanup is reported alongside the acquisition error
+and prevents a fresh allocation retry. If another claim already exists, rollback
+still deletes the instance created by this attempt, but preserves that claim and
+the SSH files instead of replacing or retiring another owner's local state.
+Rollback remains independent of acquisition cancellation. Its existing
+30-second provider-deletion timeout starts after claim-lock admission; this is
+not a deadline for the entire recovery-claim and finalization sequence.
+
+Heartbeat and Tailscale metadata updates require the same exact account- and
+instance-bound local claim. Crabbox holds the claim lock while updating Linode
+tags, rejects replaced or stale claim snapshots, preserves the existing idle
+timeout unless an override was explicitly requested, and keeps unrelated
 operator tags already attached to the instance. Direct mode has no coordinator
 alarm. Use:
 
@@ -171,10 +241,17 @@ create ingress rules in this phase.
 The repeatable live check is opt-in:
 
 ```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=linode scripts/live-smoke.sh
+```
+
+The top-level smoke dispatches to the provider-specific script:
+
+```sh
 CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=linode scripts/live-linode-smoke.sh
 ```
 
-The script builds `bin/crabbox`, uses `LINODE_TOKEN` from the environment,
+The script builds `bin/crabbox` unless `CRABBOX_BIN` points at an existing
+binary, uses `LINODE_TOKEN` from the environment,
 requires an empty Crabbox-owned Linode inventory, creates a small
 `g6-standard-1` instance, waits for ready status, runs `echo ok`, verifies
 `list --json`, stops the lease, runs dry-run cleanup, and verifies the
@@ -216,5 +293,4 @@ in `crabbox list --provider linode --json` or the Linode console.
 
 - [Provider reference](README.md)
 - [Provider backends](../provider-backends.md)
-- [Provider feature overview](../features/providers.md)
 - [Operations](../operations.md)

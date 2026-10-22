@@ -66,6 +66,19 @@ func (b pondReleaseRetentionBackend) RetainLeaseClaimAfterRelease(LeaseTarget) b
 	return b.retain
 }
 
+type pondReleaseRetentionVerifierBackend struct {
+	retain bool
+	err    error
+}
+
+func (b pondReleaseRetentionVerifierBackend) Spec() ProviderSpec {
+	return ProviderSpec{Name: "test"}
+}
+
+func (b pondReleaseRetentionVerifierBackend) RetainLeaseClaimAfterReleaseWithClaim(LeaseTarget, LeaseClaim) (bool, error) {
+	return b.retain, b.err
+}
+
 func (f *fakeTailnetBridgeProvider) ValidateTailnetPeer(context.Context, string) (TailscaleMetadata, error) {
 	return f.meta, f.validateErr
 }
@@ -102,7 +115,7 @@ func withTempClaims(t *testing.T, claims []leaseClaim) {
 	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "")
 	t.Setenv("CRABBOX_PROVIDER", "")
 	for _, claim := range claims {
-		if err := claimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, claim.Provider, claim.ProviderScope, claim.Pond, claim.RepoRoot, 30*time.Minute, false); err != nil {
+		if err := ClaimLeaseForRepoProviderScopePond(claim.LeaseID, claim.Slug, claim.Provider, claim.ProviderScope, claim.Pond, claim.RepoRoot, 30*time.Minute, false); err != nil {
 			t.Fatalf("seed claim %s: %v", claim.LeaseID, err)
 		}
 	}
@@ -626,34 +639,53 @@ func TestPondPeersCommandRejectsBadPort(t *testing.T) {
 	}
 }
 
-func TestPondConnectKongStripsCommandPath(t *testing.T) {
-	withTempClaims(t, nil)
-	t.Setenv("HOME", t.TempDir())
-	var out, errBuf strings.Builder
-	app := App{Stdout: &out, Stderr: &errBuf}
-	if err := app.Run(context.Background(), []string{"pond", "connect", "alpha", "--export"}); err != nil {
-		t.Fatalf("pond connect through Kong: %v", err)
-	}
-	if !strings.Contains(errBuf.String(), `pond "alpha" has no SSH-mesh-capable members`) {
-		t.Fatalf("expected stripped pond name alpha, stdout=%q stderr=%q", out.String(), errBuf.String())
-	}
-	if strings.Contains(errBuf.String(), `pond "pond"`) {
-		t.Fatalf("Kong command path leaked into pond name: %q", errBuf.String())
+func TestPondLifecyclePreservesNames(t *testing.T) {
+	clearConfigEnv(t)
+	t.Chdir(t.TempDir())
+	for _, command := range []string{"connect", "disconnect", "release"} {
+		for _, tc := range []struct {
+			args []string
+			pond string
+		}{
+			{args: []string{"alpha"}, pond: "alpha"},
+			{args: []string{"pond"}, pond: "pond"},
+			{args: []string{"--", "--help"}, pond: "help"},
+		} {
+			args := append([]string{"pond", command}, tc.args...)
+			if command == "connect" && tc.pond == "alpha" {
+				args = append(args, "--export")
+			}
+			t.Run(strings.Join(args, " "), func(t *testing.T) {
+				var stdout, stderr strings.Builder
+				if err := (App{Stdout: &stdout, Stderr: &stderr}).Run(t.Context(), args); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(stdout.String()+stderr.String(), `pond "`+tc.pond+`" has no `) {
+					t.Fatalf("pond name changed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+				}
+			})
+		}
 	}
 }
 
-func TestPondReleaseKongStripsCommandPath(t *testing.T) {
-	withTempClaims(t, nil)
-	var out, errBuf strings.Builder
-	app := App{Stdout: &out, Stderr: &errBuf}
-	if err := app.Run(context.Background(), []string{"pond", "release", "alpha"}); err != nil {
-		t.Fatalf("pond release through Kong: %v", err)
-	}
-	if !strings.Contains(out.String(), `pond "alpha" has no active leases`) {
-		t.Fatalf("expected stripped pond name alpha, stdout=%q stderr=%q", out.String(), errBuf.String())
-	}
-	if strings.Contains(out.String(), `pond "pond-release-alpha"`) {
-		t.Fatalf("Kong command path leaked into pond name: %q", out.String())
+func TestPondLifecycleRejectsInvalidArguments(t *testing.T) {
+	clearConfigEnv(t)
+	t.Chdir(t.TempDir())
+	for _, command := range []string{"disconnect", "release"} {
+		for _, tail := range [][]string{nil, {"alpha", "beta"}, {"--unknown"}, {"alpha", "--unknown"}} {
+			args := append([]string{"pond", command}, tail...)
+			t.Run(strings.Join(args, " "), func(t *testing.T) {
+				var stdout, stderr strings.Builder
+				err := (App{Stdout: &stdout, Stderr: &stderr}).Run(t.Context(), args)
+				var exitErr ExitError
+				if !AsExitError(err, &exitErr) || exitErr.Code != 2 {
+					t.Fatalf("expected argument error, got %v", err)
+				}
+				if stdout.Len() != 0 {
+					t.Fatalf("invalid arguments reached pond operation: %s", &stdout)
+				}
+			})
+		}
 	}
 }
 
@@ -670,10 +702,14 @@ func TestFinalizePondReleaseClaimUsesProviderPolicy(t *testing.T) {
 			withTempClaims(t, []leaseClaim{claim})
 			lease := LeaseTarget{LeaseID: claim.LeaseID}
 
-			if got := finalizePondReleaseClaim(pondReleaseRetentionBackend{retain: tc.retain}, lease, claim); got != tc.retain {
+			got, err := finalizePondReleaseClaim(pondReleaseRetentionBackend{retain: tc.retain}, lease, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.retain {
 				t.Fatalf("retained=%v want %v", got, tc.retain)
 			}
-			claims, err := listLeaseClaims()
+			claims, err := ListLeaseClaims()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -684,6 +720,27 @@ func TestFinalizePondReleaseClaimUsesProviderPolicy(t *testing.T) {
 				t.Fatalf("released claim remains: %#v", claims)
 			}
 		})
+	}
+}
+
+func TestFinalizePondReleaseClaimPreservesClaimOnRetentionError(t *testing.T) {
+	claim := leaseClaim{LeaseID: "cbx_retention_error", Slug: "retained", Provider: "test", Pond: "demo", RepoRoot: "/repo"}
+	withTempClaims(t, []leaseClaim{claim})
+	want := errors.New("cannot re-attest durable claim")
+	retained, err := finalizePondReleaseClaim(
+		pondReleaseRetentionVerifierBackend{err: want},
+		LeaseTarget{LeaseID: claim.LeaseID},
+		claim,
+	)
+	if retained || !errors.Is(err, want) {
+		t.Fatalf("retained=%t err=%v", retained, err)
+	}
+	claims, listErr := ListLeaseClaims()
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(claims) != 1 || claims[0].LeaseID != claim.LeaseID {
+		t.Fatalf("retention error erased claim: %#v", claims)
 	}
 }
 
@@ -943,86 +1000,6 @@ func TestPondPeersHandlesBlacksmithAsNone(t *testing.T) {
 	}
 }
 
-// TestDoctorPondReachabilityMatrixAsymmetric pins the asymmetry that
-// `crabbox doctor --pond` reports between the transport planes. The
-// matrix must not pretend `url -> tailnet` is reachable, and it must
-// flag `* -> ssh` and `ssh -> *` as warnings (operator-side bridge
-// required) rather than ok.
-func TestDoctorPondReachabilityMatrixAsymmetric(t *testing.T) {
-	peers := []BridgePeer{
-		{Slug: "web", Provider: "hetzner", Transport: TransportTailnet, Endpoint: "100.64.1.3"},
-		{Slug: "api", Provider: "islo", Transport: TransportURL, Endpoint: "https://api.share.islo.dev"},
-		{Slug: "db", Provider: "runpod", Transport: TransportSSH, Endpoint: "ssh://1.2.3.4:22"},
-		{Slug: "what", Provider: "blacksmith", Transport: TransportNone, Note: "blacksmith owns connectivity"},
-	}
-	matrix := buildPondReachabilityMatrix("alpha", peers)
-	if got, want := len(matrix.Transports), 4; got != want {
-		t.Fatalf("transports=%d want %d (%v)", got, want, matrix.Transports)
-	}
-	cellState := func(from, to string) string {
-		for _, cell := range matrix.Cells {
-			if cell.From == from && cell.To == to {
-				return cell.State
-			}
-		}
-		t.Fatalf("cell %s -> %s missing", from, to)
-		return ""
-	}
-	if got := cellState(TransportURL, TransportTailnet); got != reachNo {
-		t.Fatalf("url -> tailnet should be NO (no public endpoint on tailnet), got %q", got)
-	}
-	if got := cellState(TransportTailnet, TransportURL); got != reachOK {
-		t.Fatalf("tailnet -> url should be OK (outbound HTTPS), got %q", got)
-	}
-	if got := cellState(TransportTailnet, TransportSSH); got != reachWarn {
-		t.Fatalf("tailnet -> ssh should be WARN (operator-side bridge), got %q", got)
-	}
-	if got := cellState(TransportSSH, TransportSSH); got != reachWarn {
-		t.Fatalf("ssh -> ssh should be WARN (no shared mesh), got %q", got)
-	}
-	if got := cellState(TransportSSH, TransportURL); got != reachOK {
-		t.Fatalf("ssh -> url should be OK (outbound HTTPS), got %q", got)
-	}
-	if got := cellState(TransportNone, TransportTailnet); got != reachNo {
-		t.Fatalf("none -> tailnet should be NO (provider owns its own connectivity), got %q", got)
-	}
-	for _, want := range []string{TransportTailnet, TransportURL, TransportSSH, TransportNone} {
-		found := false
-		for _, got := range matrix.Transports {
-			if got == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("matrix transports missing %q (have %v)", want, matrix.Transports)
-		}
-	}
-	if matrix.Breakdown[TransportTailnet] != 1 || matrix.Breakdown[TransportURL] != 1 || matrix.Breakdown[TransportSSH] != 1 || matrix.Breakdown[TransportNone] != 1 {
-		t.Fatalf("unexpected breakdown: %#v", matrix.Breakdown)
-	}
-}
-
-// TestRenderPondReachabilityMatrixIncludesAsymmetricNotes checks the
-// human renderer surfaces the per-cell notes verbatim so reviewers can
-// audit the claims without parsing JSON.
-func TestRenderPondReachabilityMatrixIncludesAsymmetricNotes(t *testing.T) {
-	peers := []BridgePeer{
-		{Slug: "web", Provider: "hetzner", Transport: TransportTailnet, Endpoint: "100.64.1.3"},
-		{Slug: "api", Provider: "islo", Transport: TransportURL, Endpoint: "https://x"},
-	}
-	matrix := buildPondReachabilityMatrix("alpha", peers)
-	var buf strings.Builder
-	renderPondReachabilityMatrix(&buf, matrix)
-	out := buf.String()
-	if !strings.Contains(out, "tailnet -> url") {
-		t.Fatalf("renderer should label rows by transport pair, got:\n%s", out)
-	}
-	if !strings.Contains(out, "no public endpoint on tailnet members") {
-		t.Fatalf("renderer should surface the url -> tailnet asymmetry note, got:\n%s", out)
-	}
-}
-
 // mutateClaim is a helper for tests that need to overlay endpoint
 // metadata onto a seeded lease claim. It re-reads the claim sidecar
 // produced by withTempClaims, applies the mutation, and writes it back
@@ -1030,7 +1007,7 @@ func TestRenderPondReachabilityMatrixIncludesAsymmetricNotes(t *testing.T) {
 // changes stay covered by the on-disk format.
 func mutateClaim(t *testing.T, leaseID string, fn func(*leaseClaim)) {
 	t.Helper()
-	claim, err := readLeaseClaim(leaseID)
+	claim, err := ReadLeaseClaim(leaseID)
 	if err != nil {
 		t.Fatalf("readLeaseClaim %s: %v", leaseID, err)
 	}

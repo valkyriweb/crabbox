@@ -2,6 +2,50 @@ package cli
 
 import "testing"
 
+func TestDefaultVersionIsDevelopmentIdentity(t *testing.T) {
+	if version != "dev" {
+		t.Fatalf("default version=%q want dev", version)
+	}
+	if got := resolveVersion(version, "(devel)"); got != "dev" {
+		t.Fatalf("plain source version=%q want dev", got)
+	}
+}
+
+func TestResolveVersionUsesTaggedBuildInfoForDevDefault(t *testing.T) {
+	got := resolveVersion("dev", "v1.2.3")
+	if got != "1.2.3" {
+		t.Fatalf("version=%q want 1.2.3", got)
+	}
+}
+
+func TestResolveVersionUsesPseudoBuildInfoForRevisionInstall(t *testing.T) {
+	got := resolveVersion("dev", "v1.2.4-0.20260810123456-abcdef123456")
+	if got != "1.2.4-0.20260810123456-abcdef123456" {
+		t.Fatalf("version=%q want normalized pseudo-version", got)
+	}
+}
+
+func TestResolveVersionIgnoresPseudoVersionForLocalVCSBuild(t *testing.T) {
+	got := resolveVersionForBuild("dev", "v1.2.4-0.20260810123456-abcdef123456", true)
+	if got != "dev" {
+		t.Fatalf("version=%q want dev", got)
+	}
+}
+
+func TestResolveVersionKeepsInjectedReleaseForLocalVCSBuild(t *testing.T) {
+	got := resolveVersionForBuild("v1.2.3", "v1.2.4-0.20260810123456-abcdef123456", true)
+	if got != "1.2.3" {
+		t.Fatalf("version=%q want injected release", got)
+	}
+}
+
+func TestResolveVersionKeepsDevForDirtyBuildInfo(t *testing.T) {
+	got := resolveVersion("dev", "v1.2.4-0.20260810123456-abcdef123456+dirty")
+	if got != "dev" {
+		t.Fatalf("version=%q want dev", got)
+	}
+}
+
 func TestResolveVersionPrefersInjectedRelease(t *testing.T) {
 	got := resolveVersion("v1.2.3", "v9.9.9")
 	if got != "1.2.3" {
@@ -30,10 +74,10 @@ func TestResolveVersionIgnoresDevelBuildInfo(t *testing.T) {
 	}
 }
 
-func TestResolveVersionIgnoresPseudoBuildInfo(t *testing.T) {
+func TestResolveVersionUsesPseudoBuildInfoBeforeInjectedDevFallback(t *testing.T) {
 	got := resolveVersion("0.13.0-dev", "v0.13.1-0.20260514070813-eb9404600773")
-	if got != "0.13.0-dev" {
-		t.Fatalf("version=%q want 0.13.0-dev", got)
+	if got != "0.13.1-0.20260514070813-eb9404600773" {
+		t.Fatalf("version=%q want normalized pseudo-version", got)
 	}
 }
 

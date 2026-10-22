@@ -20,11 +20,7 @@ func (a App) jobList(_ context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	names := make([]string, 0, len(cfg.Jobs))
-	for name := range cfg.Jobs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := configuredJobNames(cfg)
 	if len(names) == 0 {
 		fmt.Fprintln(a.Stdout, "no jobs configured")
 		return nil
@@ -34,6 +30,15 @@ func (a App) jobList(_ context.Context, args []string) error {
 		fmt.Fprintf(a.Stdout, "%s provider=%s target=%s hydrate_actions=%t stop=%s\n", name, blank(job.Provider, "-"), blank(job.Target, "-"), job.Hydrate.Actions, blank(job.Stop, "auto"))
 	}
 	return nil
+}
+
+func configuredJobNames(cfg Config) []string {
+	names := make([]string, 0, len(cfg.Jobs))
+	for name := range cfg.Jobs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (a App) jobRun(ctx context.Context, args []string) (err error) {
@@ -47,18 +52,32 @@ func (a App) jobRun(ctx context.Context, args []string) (err error) {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return exit(2, "usage: crabbox job run <name>")
+		return Exit(2, "usage: crabbox job run <name>")
 	}
 	name := fs.Arg(0)
-	cfg, err := loadConfig()
+	cfg, err := loadConfigInputs()
 	if err != nil {
 		return err
 	}
 	job, ok := cfg.Jobs[name]
 	if !ok {
-		return exit(2, "job %q is not configured", name)
+		return Exit(2, "job %q is not configured", name)
 	}
 	if err := validateJobConfig(name, job); err != nil {
+		return err
+	}
+	// Jobs supply the same selectors as their generated child commands. Resolve
+	// those before validating inherited defaults, including for dry runs.
+	selectors := newFlagSet("job selectors", io.Discard)
+	registerLeaseCreateFlags(selectors, cfg)
+	if err := parseFlags(selectors, jobLeaseCreateArgsFor(cfg, job, false)); err != nil {
+		return err
+	}
+	if err := applyConfigSelectorFlags(&cfg, selectors); err != nil {
+		return err
+	}
+	cfg, err = resolveLoadedConfig(cfg, "", "")
+	if err != nil {
 		return err
 	}
 	stopPolicy := normalizeJobStopPolicy(job.Stop, *stopOverride)
@@ -69,21 +88,25 @@ func (a App) jobRun(ctx context.Context, args []string) (err error) {
 	createdLease := leaseID == ""
 	plannedLease := blank(leaseID, "<lease>")
 	runNoHydrate := *noHydrate || !job.Hydrate.Actions
+	if err := validateJobRunOptions(cfg, job, leaseID); err != nil {
+		return Exit(2, "job %q: %v", name, err)
+	}
 	if *dryRun {
 		for _, line := range jobPlanCommands(cfg, name, job, plannedLease, createdLease, runNoHydrate, *githubRunner, stopPolicy) {
 			fmt.Fprintln(a.Stdout, line)
 		}
 		return nil
 	}
+	a.synthesizedFlagInputs = true
 	if createdLease {
 		var out bytes.Buffer
-		warmupApp := App{Stdout: io.MultiWriter(a.Stdout, &out), Stderr: a.Stderr}
+		warmupApp := App{Stdout: io.MultiWriter(a.Stdout, &out), Stderr: a.Stderr, synthesizedFlagInputs: true}
 		if err := warmupApp.warmup(ctx, append(jobLeaseCreateArgs(cfg, job), "--keep=true")); err != nil {
 			return err
 		}
 		leaseID = parseWarmupLeaseID(out.String())
 		if leaseID == "" {
-			return exit(2, "job %q could not parse warmup lease id", name)
+			return Exit(2, "job %q could not parse warmup lease id", name)
 		}
 	}
 	shouldStop := false
@@ -117,9 +140,44 @@ func (a App) jobRun(ctx context.Context, args []string) (err error) {
 	return err
 }
 
+func validateJobRunOptions(cfg Config, job JobConfig, leaseID string) error {
+	if hasCapacityMinimums(cfg) {
+		return Exit(2, "resource requirements are unsupported for composite jobs; use warmup")
+	}
+	markSynthesizedFlagInputs(&cfg, true)
+	if !job.NoSync {
+		return nil
+	}
+	// Reuse run's lease flags and claim routing, with external mutations disabled.
+	// Provider-level validation does not require configuring a backend or auth.
+	fs := newFlagSet("job run options", io.Discard)
+	flags := registerLeaseCreateFlags(fs, cfg)
+	if err := parseFlags(fs, jobLeaseCreateArgsFor(cfg, job, false)); err != nil {
+		return err
+	}
+	if err := applyLeaseCreateFlagsForLeaseMode(&cfg, fs, flags, leaseID, false); err != nil {
+		return err
+	}
+	if !providerSelectionIsActionable(cfg) {
+		return nil
+	}
+	provider, err := ProviderFor(cfg.Provider)
+	if err != nil {
+		return err
+	}
+	if validator, ok := provider.(RunOptionsValidator); ok {
+		command := strings.Fields(job.Command)
+		if job.Shell {
+			command = []string{job.Command}
+		}
+		return validator.ValidateRunOptions(RunRequest{NoSync: job.NoSync, ShellMode: job.Shell, Command: command})
+	}
+	return nil
+}
+
 func validateJobConfig(name string, job JobConfig) error {
 	if strings.TrimSpace(job.Command) == "" && !job.SyncOnly {
-		return exit(2, "job %q requires command or syncOnly", name)
+		return Exit(2, "job %q requires command or syncOnly", name)
 	}
 	return nil
 }
@@ -136,7 +194,7 @@ func validateJobStopPolicy(policy string) error {
 	case "", "auto", "always", "success", "failure", "never":
 		return nil
 	default:
-		return exit(2, "--stop must be auto, always, success, failure, or never")
+		return Exit(2, "--stop must be auto, always, success, failure, or never")
 	}
 }
 

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -82,28 +83,28 @@ func parseArtifactPublishOptions(args []string, stderr io.Writer) (artifactPubli
 		}
 	}
 	if opts.Directory == "" {
-		return artifactPublishOptions{}, exit(2, "artifacts publish requires --dir")
+		return artifactPublishOptions{}, Exit(2, "artifacts publish requires --dir")
 	}
 	if opts.PR < 0 {
-		return artifactPublishOptions{}, exit(2, "artifacts publish --pr must be positive")
+		return artifactPublishOptions{}, Exit(2, "artifacts publish --pr must be positive")
 	}
 	if opts.Expires <= 0 {
-		return artifactPublishOptions{}, exit(2, "artifacts publish --expires must be positive")
+		return artifactPublishOptions{}, Exit(2, "artifacts publish --expires must be positive")
 	}
 	switch opts.Storage {
 	case "auto", "broker", "local":
 	case "s3", "cloudflare", "r2":
 		if opts.Bucket == "" {
-			return artifactPublishOptions{}, exit(2, "artifacts publish --storage %s requires --bucket", opts.Storage)
+			return artifactPublishOptions{}, Exit(2, "artifacts publish --storage %s requires --bucket", opts.Storage)
 		}
 	default:
-		return artifactPublishOptions{}, exit(2, "artifacts publish --storage must be auto, broker, local, s3, cloudflare, or r2")
+		return artifactPublishOptions{}, Exit(2, "artifacts publish --storage must be auto, broker, local, s3, cloudflare, or r2")
 	}
 	if opts.Storage == "r2" && opts.EndpointURL == "" {
-		return artifactPublishOptions{}, exit(2, "artifacts publish --storage r2 requires --endpoint-url or CRABBOX_ARTIFACTS_R2_ENDPOINT_URL")
+		return artifactPublishOptions{}, Exit(2, "artifacts publish --storage r2 requires --endpoint-url or CRABBOX_ARTIFACTS_R2_ENDPOINT_URL")
 	}
 	if (opts.Storage == "cloudflare" || opts.Storage == "r2") && opts.PR > 0 && !opts.NoComment && opts.BaseURL == "" {
-		return artifactPublishOptions{}, exit(2, "artifacts publish --storage %s --pr requires --base-url for inline-ready R2 asset links", opts.Storage)
+		return artifactPublishOptions{}, Exit(2, "artifacts publish --storage %s --pr requires --base-url for inline-ready R2 asset links", opts.Storage)
 	}
 	return opts, nil
 }
@@ -127,31 +128,327 @@ func normalizeArtifactStorage(storage string) string {
 	}
 }
 
-func listArtifactBundleFiles(dir string) ([]artifactFile, error) {
+func listArtifactBundleRoot(root *os.Root, dir string) ([]artifactFile, error) {
 	var files []artifactFile
-	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+	var directoryInfos []os.FileInfo
+	var generatedOutputs []artifactBundleOutput
+	err := fs.WalkDir(root.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if entry.IsDir() {
-			return nil
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("artifact bundle contains symlink: %s", filepath.ToSlash(path))
 		}
 		name := entry.Name()
-		if name == "published-artifacts.md" || name == artifactManifestFilename {
+		generatedOutput := name == "published-artifacts.md" || name == artifactManifestFilename
+		rootEntry := !strings.Contains(path, "/")
+		reservedOutputPath := rootEntry && generatedOutput
+		if reservedOutputPath && info.IsDir() {
+			return fmt.Errorf("artifact bundle contains directory at reserved output path: %s", filepath.ToSlash(path))
+		}
+		if info.IsDir() {
+			directoryInfos = append(directoryInfos, info)
 			return nil
 		}
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("artifact bundle contains non-regular file: %s", filepath.ToSlash(path))
 		}
-		files = append(files, artifactFile{Kind: artifactKindForPath(path), Name: filepath.ToSlash(rel), Path: path})
+		if generatedOutput {
+			generatedOutputs = append(generatedOutputs, artifactBundleOutput{
+				rootName: filepath.ToSlash(path),
+				info:     info,
+			})
+			return nil
+		}
+		rootName := filepath.ToSlash(path)
+		files = append(files, artifactFile{
+			Kind:       artifactKindForPath(rootName),
+			Name:       rootName,
+			Path:       filepath.Join(dir, filepath.FromSlash(rootName)),
+			rootName:   rootName,
+			sourceInfo: info,
+		})
 		return nil
 	})
 	if err != nil {
-		return nil, exit(2, "read artifact directory: %v", err)
+		return nil, Exit(2, "read artifact directory: %v", err)
+	}
+	for i := range files {
+		files[i].bundleDirInfos = directoryInfos
+		files[i].bundleOutputs = generatedOutputs
 	}
 	sortArtifactFiles(files)
 	return files, nil
+}
+
+func artifactDirectoryInfo(path string) (os.FileInfo, error) {
+	dir, err := openArtifactReadOnly(path)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := dir.Stat()
+	closeErr := dir.Close()
+	if statErr != nil {
+		return nil, statErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("not a directory: %s", path)
+	}
+	return info, nil
+}
+
+func validateArtifactBundleRoot(root *os.Root, absDirectory string) (string, os.FileInfo, error) {
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		return "", nil, Exit(2, "read artifact directory: %v", err)
+	}
+	resolvedDirectory, err := filepath.EvalSymlinks(absDirectory)
+	if err != nil {
+		return "", nil, Exit(2, "read artifact directory: %v", err)
+	}
+	resolvedInfo, err := artifactDirectoryInfo(resolvedDirectory)
+	if err != nil {
+		return "", nil, Exit(2, "read artifact directory: %v", err)
+	}
+	if !os.SameFile(rootInfo, resolvedInfo) {
+		return "", nil, Exit(2, "artifact directory changed while opening it")
+	}
+	return resolvedDirectory, rootInfo, nil
+}
+
+func prepareArtifactFiles(root *os.Root, files []artifactFile, snapshot bool) (_ []artifactFile, cleanup func(), err error) {
+	cleanup = func() {}
+	var snapshotFile *os.File
+	if snapshot {
+		snapshotFile, cleanup, err = createArtifactSnapshotFile(root)
+		if err != nil {
+			return nil, cleanup, err
+		}
+	}
+	defer func() {
+		if err != nil {
+			cleanup()
+			cleanup = func() {}
+		}
+	}()
+	prepared := make([]artifactFile, 0, len(files))
+	var offset int64
+	for _, file := range files {
+		if strings.TrimSpace(file.rootName) == "" || file.sourceInfo == nil {
+			return nil, cleanup, Exit(2, "artifact %s is missing validated bundle identity", file.Name)
+		}
+		source, err := openArtifactRootReadOnly(root, file.rootName)
+		if err != nil {
+			return nil, cleanup, Exit(2, "open validated artifact %s: %v", file.Name, err)
+		}
+		info, statErr := source.Stat()
+		if statErr != nil {
+			_ = source.Close()
+			return nil, cleanup, Exit(2, "stat validated artifact %s: %v", file.Name, statErr)
+		}
+		if !info.Mode().IsRegular() || !os.SameFile(file.sourceInfo, info) {
+			_ = source.Close()
+			return nil, cleanup, Exit(2, "artifact %s changed after validation", file.Name)
+		}
+		hash := sha256.New()
+		var writer io.Writer = hash
+		operation := "hash validated artifact"
+		if snapshotFile != nil {
+			writer = io.MultiWriter(snapshotFile, hash)
+			operation = "snapshot artifact"
+		}
+		size, copyErr := io.Copy(writer, source)
+		closeErr := source.Close()
+		if copyErr != nil {
+			return nil, cleanup, Exit(2, "%s %s: %v", operation, file.Name, copyErr)
+		}
+		if closeErr != nil {
+			return nil, cleanup, Exit(2, "close validated artifact %s: %v", file.Name, closeErr)
+		}
+		if snapshotFile != nil {
+			file.snapshotFile = snapshotFile
+			file.snapshotOffset = offset
+		}
+		file.snapshotSize = size
+		file.snapshotHash = hex.EncodeToString(hash.Sum(nil))
+		file.snapshotValid = true
+		prepared = append(prepared, file)
+		offset += size
+	}
+	return prepared, cleanup, nil
+}
+
+func snapshotArtifactData(root *os.Root, file artifactFile, data []byte) ([]artifactFile, func(), error) {
+	snapshot, cleanup, err := createArtifactSnapshotFile(root)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if n, writeErr := snapshot.Write(data); writeErr != nil {
+		cleanup()
+		return nil, func() {}, Exit(2, "write private snapshot for artifact %s: %v", file.Name, writeErr)
+	} else if n != len(data) {
+		cleanup()
+		return nil, func() {}, Exit(2, "write private snapshot for artifact %s: %v", file.Name, io.ErrShortWrite)
+	}
+	file = validatedArtifactData(file, data)
+	file.snapshotFile = snapshot
+	return []artifactFile{file}, cleanup, nil
+}
+
+func validatedArtifactData(file artifactFile, data []byte) artifactFile {
+	hash := sha256.Sum256(data)
+	file.snapshotSize = int64(len(data))
+	file.snapshotHash = hex.EncodeToString(hash[:])
+	file.snapshotValid = true
+	return file
+}
+
+func createArtifactSnapshotFile(root *os.Root) (*os.File, func(), error) {
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		return nil, func() {}, Exit(2, "inspect artifact directory for private snapshot: %v", err)
+	}
+	tempBase, err := resolveArtifactSnapshotBase(rootInfo, root.Name(), os.TempDir())
+	if err != nil {
+		return nil, func() {}, err
+	}
+	snapshot, err := os.CreateTemp(tempBase, "crabbox-artifact-publish-*")
+	if err != nil {
+		return nil, func() {}, Exit(2, "create private artifact snapshot: %v", err)
+	}
+	path := snapshot.Name()
+	cleanup := func() {
+		_ = snapshot.Truncate(0)
+		_ = snapshot.Close()
+		_ = os.Remove(path)
+	}
+	if _, err := resolveArtifactSnapshotBase(rootInfo, root.Name(), path); err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	return snapshot, cleanup, nil
+}
+
+func resolveArtifactSnapshotBase(rootInfo os.FileInfo, rootPath, path string) (string, error) {
+	absRoot, err := filepath.Abs(rootPath)
+	if err != nil {
+		return "", Exit(2, "resolve artifact directory for private snapshot: %v", err)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", Exit(2, "resolve private artifact snapshot: %v", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return "", Exit(2, "resolve private artifact snapshot: %v", err)
+	}
+	if artifactPathWithin(absRoot, absPath) {
+		return "", Exit(2, "temporary directory must be outside artifact directory for safe publishing")
+	}
+	if resolvedRoot, resolveRootErr := filepath.EvalSymlinks(absRoot); resolveRootErr == nil && artifactPathWithin(resolvedRoot, resolvedPath) {
+		return "", Exit(2, "temporary directory must be outside artifact directory for safe publishing")
+	}
+	for current := filepath.Dir(resolvedPath); ; current = filepath.Dir(current) {
+		info, statErr := artifactDirectoryInfo(current)
+		if statErr != nil {
+			return "", Exit(2, "inspect private artifact snapshot: %v", statErr)
+		}
+		if os.SameFile(rootInfo, info) {
+			return "", Exit(2, "temporary directory must be outside artifact directory for safe publishing")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return resolvedPath, nil
+}
+
+func requireArtifactSnapshot(file artifactFile) error {
+	if err := requireArtifactValidation(file); err != nil {
+		return err
+	}
+	if file.snapshotFile == nil || file.snapshotOffset < 0 {
+		return Exit(2, "artifact %s is missing a validated publish snapshot", file.Name)
+	}
+	return nil
+}
+
+func requireArtifactValidation(file artifactFile) error {
+	if !file.snapshotValid || strings.TrimSpace(file.snapshotHash) == "" || file.snapshotSize < 0 {
+		return Exit(2, "artifact %s is missing validated publish metadata", file.Name)
+	}
+	return nil
+}
+
+func writeArtifactBundleFile(root *os.Root, name string, data []byte, perm os.FileMode) error {
+	return writeArtifactBundleFileWithPrivacy(root, name, data, perm, false)
+}
+
+func writePrivateArtifactBundleFile(root *os.Root, name string, data []byte) error {
+	return writeArtifactBundleFileWithPrivacy(root, name, data, privateRunOutputFileMode, true)
+}
+
+func writeArtifactBundleFileWithPrivacy(root *os.Root, name string, data []byte, perm os.FileMode, private bool) error {
+	token, err := randomHex(12)
+	if err != nil {
+		return Exit(2, "create private temporary name for %s: %v", name, err)
+	}
+	tempName := "." + filepath.Base(name) + ".crabbox-" + token
+	createPerm := perm
+	preserveExistingMode := false
+	existingMode := os.FileMode(0)
+	if info, statErr := root.Lstat(name); statErr == nil {
+		if info.Mode().IsRegular() {
+			createPerm = 0o600
+			if !private {
+				// Preserve modes the user narrowed, but do not retain permissions
+				// broader than this shared output requests.
+				existingMode = info.Mode().Perm() & perm
+				preserveExistingMode = true
+			}
+		}
+	} else if !os.IsNotExist(statErr) {
+		return Exit(2, "inspect existing artifact output %s: %v", name, statErr)
+	}
+	file, err := openArtifactBundleTemp(root, tempName, createPerm, private)
+	if err != nil {
+		return Exit(2, "create private temporary artifact output for %s: %v", name, err)
+	}
+	removeTemp := true
+	defer func() {
+		_ = file.Close()
+		if removeTemp {
+			_ = root.Remove(tempName)
+		}
+	}()
+	n, err := file.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return Exit(2, "write artifact output %s: %v", name, err)
+	}
+	if preserveExistingMode {
+		if err := file.Chmod(existingMode); err != nil {
+			return Exit(2, "preserve artifact output permissions for %s: %v", name, err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		return Exit(2, "close artifact output %s: %v", name, err)
+	}
+	if err := root.Rename(tempName, name); err != nil {
+		return Exit(2, "replace artifact output %s: %v", name, err)
+	}
+	removeTemp = false
+	return nil
 }
 
 func publishArtifactFiles(ctx context.Context, opts artifactPublishOptions, files []artifactFile) ([]artifactFile, error) {
@@ -166,14 +463,24 @@ func publishArtifactFiles(ctx context.Context, opts artifactPublishOptions, file
 				out.URL = joinURLPath(opts.BaseURL, file.Name)
 			}
 		case "s3", "r2":
-			url, err := uploadArtifactS3(ctx, opts, file.Path, key)
+			if !opts.DryRun {
+				if err := requireArtifactSnapshot(file); err != nil {
+					return nil, err
+				}
+			}
+			url, err := uploadArtifactS3(ctx, opts, file, key, artifactContentType(file.Path))
 			if err != nil {
 				return nil, err
 			}
 			out.URL = url
 			out.Key = key
 		case "cloudflare":
-			url, err := uploadArtifactCloudflare(ctx, opts, file.Path, key)
+			if !opts.DryRun {
+				if err := requireArtifactSnapshot(file); err != nil {
+					return nil, err
+				}
+			}
+			url, err := uploadArtifactCloudflare(ctx, opts, file, key, artifactContentType(file.Path))
 			if err != nil {
 				return nil, err
 			}
@@ -187,7 +494,7 @@ func publishArtifactFiles(ctx context.Context, opts artifactPublishOptions, file
 
 func publishArtifactFilesBroker(ctx context.Context, coord *CoordinatorClient, opts artifactPublishOptions, files []artifactFile) ([]artifactFile, error) {
 	if !coord.hasConfiguredAuth() {
-		return nil, exit(2, "artifacts publish --storage broker requires a configured coordinator; run `crabbox login --url <broker-url>` or pass --storage local|s3|r2")
+		return nil, Exit(2, "artifacts publish --storage broker requires a configured coordinator; run `crabbox login --url <broker-url>` or pass --storage local|s3|r2")
 	}
 	ensureArtifactPublishPrefix(&opts)
 	input := CoordinatorArtifactUploadRequest{
@@ -195,19 +502,14 @@ func publishArtifactFilesBroker(ctx context.Context, coord *CoordinatorClient, o
 		Files:  make([]CoordinatorArtifactUploadInput, 0, len(files)),
 	}
 	for _, file := range files {
-		info, err := os.Stat(file.Path)
-		if err != nil {
-			return nil, exit(2, "stat artifact %s: %v", file.Name, err)
-		}
-		hash, err := fileSHA256(file.Path)
-		if err != nil {
+		if err := requireArtifactValidation(file); err != nil {
 			return nil, err
 		}
 		input.Files = append(input.Files, CoordinatorArtifactUploadInput{
 			Name:        file.Name,
-			Size:        info.Size(),
+			Size:        file.snapshotSize,
 			ContentType: artifactContentType(file.Path),
-			SHA256:      hash,
+			SHA256:      file.snapshotHash,
 		})
 	}
 	grants, err := coord.CreateArtifactUploads(ctx, input)
@@ -222,10 +524,10 @@ func publishArtifactFilesBroker(ctx context.Context, coord *CoordinatorClient, o
 	for _, file := range files {
 		grant, ok := byName[file.Name]
 		if !ok {
-			return nil, exit(2, "artifact broker did not return an upload grant for %s", file.Name)
+			return nil, Exit(2, "artifact broker did not return an upload grant for %s", file.Name)
 		}
 		if !opts.DryRun {
-			if err := uploadArtifactGrant(ctx, file.Path, grant); err != nil {
+			if err := uploadArtifactGrantSnapshot(ctx, file, grant); err != nil {
 				return nil, err
 			}
 		}
@@ -249,7 +551,7 @@ func defaultArtifactPublishPrefix(opts artifactPublishOptions, now time.Time) st
 	if opts.PR > 0 {
 		scope = "pr-" + strconv.Itoa(opts.PR)
 	}
-	bundle := normalizeLeaseSlug(filepath.Base(filepath.Clean(opts.Directory)))
+	bundle := NormalizeLeaseSlug(filepath.Base(filepath.Clean(opts.Directory)))
 	if bundle == "" || bundle == "." {
 		bundle = "bundle"
 	}
@@ -257,50 +559,44 @@ func defaultArtifactPublishPrefix(opts artifactPublishOptions, now time.Time) st
 	return strings.Join([]string{scope, bundle, stamp}, "/")
 }
 
-func fileSHA256(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", exit(2, "open artifact %s: %v", path, err)
+func uploadArtifactGrantSnapshot(ctx context.Context, file artifactFile, grant CoordinatorArtifactUploadGrant) error {
+	if err := requireArtifactSnapshot(file); err != nil {
+		return err
 	}
-	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", exit(2, "hash artifact %s: %v", path, err)
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	section := io.NewSectionReader(file.snapshotFile, file.snapshotOffset, file.snapshotSize)
+	return uploadArtifactGrantReader(ctx, section, file.snapshotSize, grant)
 }
 
-func uploadArtifactGrant(ctx context.Context, path string, grant CoordinatorArtifactUploadGrant) error {
+func uploadArtifactGrantReader(ctx context.Context, file io.ReaderAt, size int64, grant CoordinatorArtifactUploadGrant) error {
 	if grant.Upload.URL == "" {
-		return exit(2, "artifact broker returned an empty upload URL for %s", grant.Name)
+		return Exit(2, "artifact broker returned an empty upload URL for %s", grant.Name)
 	}
 	method := strings.ToUpper(strings.TrimSpace(grant.Upload.Method))
 	if method == "" {
 		method = http.MethodPut
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return exit(2, "open artifact %s: %v", grant.Name, err)
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return exit(2, "stat artifact %s: %v", grant.Name, err)
-	}
-	contentLength := info.Size()
+	contentLength := size
 	if expected, ok, err := grantContentLength(grant.Upload.Headers); err != nil {
-		return exit(2, "artifact broker returned an invalid content-length for %s: %v", grant.Name, err)
+		return Exit(2, "artifact broker returned an invalid content-length for %s: %v", grant.Name, err)
 	} else if ok {
-		if expected != info.Size() {
-			return exit(2, "artifact %s size changed after broker grant: got %d bytes, expected %d", grant.Name, info.Size(), expected)
+		if expected != size {
+			return Exit(2, "artifact %s size changed after broker grant: got %d bytes, expected %d", grant.Name, size, expected)
 		}
 		contentLength = expected
 	}
-	req, err := http.NewRequestWithContext(ctx, method, grant.Upload.URL, file)
+	// Keep redirect replays bound to the already-open file descriptor so a path
+	// replacement cannot change the bytes after the broker signs their length.
+	requestBody := func() io.ReadCloser {
+		return io.NopCloser(io.NewSectionReader(file, 0, contentLength))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, grant.Upload.URL, requestBody())
 	if err != nil {
-		return exit(2, "create artifact upload request for %s: %v", grant.Name, err)
+		return Exit(2, "create artifact upload request for %s: %v", grant.Name, artifactRequestError(err))
 	}
 	req.ContentLength = contentLength
+	req.GetBody = func() (io.ReadCloser, error) {
+		return requestBody(), nil
+	}
 	for key, value := range grant.Upload.Headers {
 		if strings.EqualFold(strings.TrimSpace(key), "content-length") {
 			continue
@@ -309,14 +605,14 @@ func uploadArtifactGrant(ctx context.Context, path string, grant CoordinatorArti
 			req.Header.Set(key, value)
 		}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := artifactHTTPClient(req.URL).Do(req)
 	if err != nil {
-		return exit(2, "upload artifact %s: %v", grant.Name, err)
+		return Exit(2, "upload artifact %s: %v", grant.Name, artifactRequestError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return exit(2, "upload artifact %s: http %d: %s", grant.Name, resp.StatusCode, strings.TrimSpace(string(body)))
+		return Exit(2, "upload artifact %s: http %d: %s", grant.Name, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
@@ -338,28 +634,36 @@ func grantContentLength(headers map[string]string) (int64, bool, error) {
 	return 0, false, nil
 }
 
-func uploadArtifactS3(ctx context.Context, opts artifactPublishOptions, path, key string) (string, error) {
+func uploadArtifactS3(ctx context.Context, opts artifactPublishOptions, file artifactFile, key, contentType string) (string, error) {
 	dest := "s3://" + opts.Bucket + "/" + key
 	args := awsBaseArgs(opts)
-	args = append(args, "s3", "cp", path, dest, "--content-type", artifactContentType(path))
+	source := file.Path
+	if !opts.DryRun {
+		source = "-"
+	}
+	args = append(args, "s3", "cp", source, dest, "--content-type", contentType)
 	if opts.ACL != "" {
 		args = append(args, "--acl", opts.ACL)
 	}
 	if opts.DryRun {
 		return artifactS3URL(opts, key), nil
 	}
-	if _, err := exec.LookPath("aws"); err != nil {
-		return "", exit(2, "aws CLI is required for artifacts publish --storage s3: %v", err)
+	if err := requireArtifactSnapshot(file); err != nil {
+		return "", err
 	}
-	if out, err := commandOutput(ctx, "aws", args...); err != nil {
-		return "", exit(2, "aws s3 upload failed: %v: %s", err, tailForError(out))
+	args = append(args, "--expected-size", strconv.FormatInt(file.snapshotSize, 10))
+	if _, err := exec.LookPath("aws"); err != nil {
+		return "", Exit(2, "aws CLI is required for artifacts publish --storage s3: %v", err)
+	}
+	if out, err := artifactPublisherCommandOutputWithInput(ctx, opts, nil, io.NewSectionReader(file.snapshotFile, file.snapshotOffset, file.snapshotSize), "aws", args...); err != nil {
+		return "", Exit(2, "aws s3 upload failed: %v: %s", err, tailForError(out))
 	}
 	if opts.Presign && opts.BaseURL == "" {
 		presignArgs := awsBaseArgs(opts)
 		presignArgs = append(presignArgs, "s3", "presign", dest, "--expires-in", fmt.Sprintf("%.0f", opts.Expires.Seconds()))
-		out, err := commandOutput(ctx, "aws", presignArgs...)
+		out, err := artifactPublisherCommandOutput(ctx, opts, nil, "aws", presignArgs...)
 		if err != nil {
-			return "", exit(2, "aws s3 presign failed: %v: %s", err, tailForError(out))
+			return "", Exit(2, "aws s3 presign failed: %v: %s", err, tailForError(out))
 		}
 		return strings.TrimSpace(out), nil
 	}
@@ -380,18 +684,34 @@ func awsBaseArgs(opts artifactPublishOptions) []string {
 	return args
 }
 
-func uploadArtifactCloudflare(ctx context.Context, opts artifactPublishOptions, path, key string) (string, error) {
+func uploadArtifactCloudflare(ctx context.Context, opts artifactPublishOptions, file artifactFile, key, contentType string) (string, error) {
 	if opts.DryRun {
 		return artifactCloudflareURL(opts, key), nil
 	}
-	if _, err := exec.LookPath("wrangler"); err != nil {
-		return "", exit(2, "wrangler CLI is required for artifacts publish --storage cloudflare: %v", err)
+	if err := requireArtifactSnapshot(file); err != nil {
+		return "", err
 	}
-	out, err := commandOutputWithEnv(ctx, artifactCloudflareEnv(), "wrangler", "r2", "object", "put", opts.Bucket+"/"+key, "--file", path, "--content-type", artifactContentType(path), "--remote")
+	if _, err := exec.LookPath("wrangler"); err != nil {
+		return "", Exit(2, "wrangler CLI is required for artifacts publish --storage cloudflare: %v", err)
+	}
+	out, err := artifactPublisherCommandOutputWithInput(ctx, opts, artifactCloudflareEnv(), io.NewSectionReader(file.snapshotFile, file.snapshotOffset, file.snapshotSize), "wrangler", "r2", "object", "put", opts.Bucket+"/"+key, "--pipe", "--content-type", contentType, "--remote")
 	if err != nil {
-		return "", exit(2, "wrangler r2 upload failed: %v: %s", err, tailForError(out))
+		return "", Exit(2, "wrangler r2 upload failed: %v: %s", err, tailForError(out))
 	}
 	return artifactCloudflareURL(opts, key), nil
+}
+
+func commandOutputWithEnvAndInput(ctx context.Context, env []string, input io.Reader, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	if env != nil {
+		cmd.Env = env
+	}
+	cmd.Stdin = input
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.String(), err
 }
 
 func artifactCloudflareEnv() []string {
@@ -409,6 +729,20 @@ func artifactCloudflareEnv() []string {
 		env = append(env, "CLOUDFLARE_ACCOUNT_ID="+accountID)
 	}
 	return env
+}
+
+func artifactPublisherCommandOutput(ctx context.Context, opts artifactPublishOptions, env []string, name string, args ...string) (string, error) {
+	return artifactPublisherCommandOutputWithInput(ctx, opts, env, nil, name, args...)
+}
+
+func artifactPublisherCommandOutputWithInput(ctx context.Context, opts artifactPublishOptions, env []string, input io.Reader, name string, args ...string) (string, error) {
+	if env == nil {
+		env = os.Environ()
+	}
+	if len(opts.ChildEnvDenylist) > 0 {
+		env = childEnvironmentWithout(env, opts.ChildEnvDenylist...)
+	}
+	return commandOutputWithEnvAndInput(ctx, env, input, name, args...)
 }
 
 func artifactS3URL(opts artifactPublishOptions, key string) string {
@@ -570,30 +904,344 @@ func artifactLocationHasImageExtension(location string) bool {
 	}
 }
 
+type artifactSummaryBinding struct {
+	path            string
+	resolvedPath    string
+	rootName        string
+	file            *os.File
+	fileInfo        os.FileInfo
+	symlinkTargets  []string
+	ambiguousParent bool
+	directoryInfos  []os.FileInfo
+}
+
+func bindArtifactSummaryFile(path string) (*artifactSummaryBinding, error) {
+	absPath, err := filepath.Abs(strings.TrimSpace(path))
+	if err != nil {
+		return nil, Exit(2, "resolve summary file: %v", err)
+	}
+	symlinkTargets, ambiguousParent, err := artifactSymlinkTargets(absPath)
+	if err != nil {
+		return nil, Exit(2, "read summary file: %v", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, Exit(2, "read summary file: %v", err)
+	}
+	file, err := openArtifactReadOnly(absPath)
+	if err != nil {
+		return nil, Exit(2, "read summary file: %v", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, Exit(2, "read summary file: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, Exit(2, "read summary file: not a regular file")
+	}
+	resolvedFile, err := openArtifactReadOnly(resolvedPath)
+	if err != nil {
+		_ = file.Close()
+		return nil, Exit(2, "read summary file: %v", err)
+	}
+	resolvedInfo, statErr := resolvedFile.Stat()
+	closeErr := resolvedFile.Close()
+	if statErr != nil {
+		_ = file.Close()
+		return nil, Exit(2, "read summary file: %v", statErr)
+	}
+	if closeErr != nil {
+		_ = file.Close()
+		return nil, Exit(2, "read summary file: %v", closeErr)
+	}
+	if !os.SameFile(info, resolvedInfo) {
+		_ = file.Close()
+		return nil, Exit(2, "summary file changed while opening it")
+	}
+	identityPaths := append([]string{filepath.Dir(absPath)}, symlinkTargets...)
+	return &artifactSummaryBinding{
+		path:            absPath,
+		resolvedPath:    resolvedPath,
+		file:            file,
+		fileInfo:        info,
+		symlinkTargets:  symlinkTargets,
+		ambiguousParent: ambiguousParent,
+		directoryInfos:  artifactDirectoryIdentities(identityPaths),
+	}, nil
+}
+
+func artifactDirectoryIdentities(paths []string) []os.FileInfo {
+	var identities []os.FileInfo
+	for _, path := range paths {
+		for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+			if info, err := artifactDirectoryInfo(current); err == nil {
+				identities = append(identities, info)
+			}
+			parent := filepath.Dir(current)
+			if parent == current {
+				break
+			}
+		}
+	}
+	return identities
+}
+
+func artifactSymlinkTargets(path string) ([]string, bool, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, false, err
+	}
+	seen := map[string]bool{}
+	var targets []string
+	parentReference := false
+	var visit func(string, int) error
+	visit = func(currentPath string, depth int) error {
+		if depth > 64 {
+			return fmt.Errorf("too many summary file symlinks")
+		}
+		for _, prefix := range artifactPathPrefixes(currentPath) {
+			info, err := os.Lstat(prefix)
+			if err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink == 0 || seen[prefix] {
+				continue
+			}
+			seen[prefix] = true
+			target, err := os.Readlink(prefix)
+			if err != nil {
+				return err
+			}
+			resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(prefix))
+			if err != nil {
+				return err
+			}
+			if !filepath.IsAbs(target) {
+				if len(resolvedParent) > 0 && !os.IsPathSeparator(resolvedParent[len(resolvedParent)-1]) {
+					resolvedParent += string(filepath.Separator)
+				}
+				target = resolvedParent + target
+			}
+			ambiguousParent := artifactPathHasSymlinkBeforeParentReference(target)
+			if ambiguousParent {
+				parentReference = true
+			}
+			targets = append(targets, target)
+			if ambiguousParent {
+				continue
+			}
+			if err := visit(target, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(absPath, 0); err != nil {
+		return nil, parentReference, err
+	}
+	return targets, parentReference, nil
+}
+
+func artifactPathHasSymlinkBeforeParentReference(path string) bool {
+	volume := filepath.VolumeName(path)
+	rest := strings.TrimPrefix(path, volume)
+	isSeparator := func(r rune) bool { return r <= 255 && os.IsPathSeparator(uint8(r)) }
+	rest = strings.TrimLeftFunc(rest, isSeparator)
+	current := volume + string(filepath.Separator)
+	sawSymlink := false
+	for _, part := range strings.FieldsFunc(rest, isSeparator) {
+		switch part {
+		case ".":
+			continue
+		case "..":
+			if sawSymlink {
+				return true
+			}
+			current = filepath.Dir(current)
+			continue
+		}
+		current = filepath.Join(current, part)
+		if info, err := os.Lstat(current); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			sawSymlink = true
+		}
+	}
+	return false
+}
+
+func artifactPathPrefixes(path string) []string {
+	volume := filepath.VolumeName(path)
+	rest := strings.TrimPrefix(path, volume)
+	isSeparator := func(r rune) bool { return r <= 255 && os.IsPathSeparator(uint8(r)) }
+	rest = strings.TrimLeftFunc(rest, isSeparator)
+	current := volume + string(filepath.Separator)
+	parts := strings.FieldsFunc(rest, isSeparator)
+	prefixes := make([]string, 0, len(parts))
+	for _, part := range parts {
+		current = filepath.Join(current, part)
+		prefixes = append(prefixes, current)
+	}
+	return prefixes
+}
+
+func artifactSummaryInsideBundle(directory, resolvedDirectory string, rootInfo os.FileInfo, binding *artifactSummaryBinding, files []artifactFile) bool {
+	if binding == nil {
+		return false
+	}
+	binding.rootName = artifactSummaryRootName(directory, resolvedDirectory, binding)
+	for _, file := range files {
+		if file.sourceInfo != nil && os.SameFile(binding.fileInfo, file.sourceInfo) {
+			return true
+		}
+	}
+	if len(files) > 0 {
+		for _, output := range files[0].bundleOutputs {
+			if output.info != nil && os.SameFile(binding.fileInfo, output.info) {
+				binding.rootName = output.rootName
+				return true
+			}
+		}
+	}
+	if binding.ambiguousParent {
+		return true
+	}
+	for _, target := range binding.symlinkTargets {
+		if artifactPathWithin(directory, target) || artifactPathWithin(resolvedDirectory, target) {
+			return true
+		}
+	}
+	for _, info := range binding.directoryInfos {
+		if rootInfo != nil && info != nil && os.SameFile(rootInfo, info) {
+			return true
+		}
+		if len(files) > 0 {
+			for _, bundleInfo := range files[0].bundleDirInfos {
+				if bundleInfo != nil && info != nil && os.SameFile(bundleInfo, info) {
+					return true
+				}
+			}
+		}
+	}
+	if artifactPathWithin(directory, binding.path) ||
+		artifactPathWithin(resolvedDirectory, binding.path) ||
+		artifactPathWithin(directory, binding.resolvedPath) ||
+		artifactPathWithin(resolvedDirectory, binding.resolvedPath) {
+		return true
+	}
+	return false
+}
+
+func artifactSummaryRootName(directory, resolvedDirectory string, binding *artifactSummaryBinding) string {
+	if binding == nil {
+		return ""
+	}
+	paths := append([]string{binding.path, binding.resolvedPath}, binding.symlinkTargets...)
+	for _, rootPath := range []string{directory, resolvedDirectory} {
+		for _, candidate := range paths {
+			rel, err := filepath.Rel(filepath.Clean(rootPath), filepath.Clean(candidate))
+			if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
+			return filepath.ToSlash(rel)
+		}
+	}
+	return ""
+}
+
+func artifactPathWithin(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != ".." && !filepath.IsAbs(rel) && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func artifactPublishSummaryText(summary string, binding *artifactSummaryBinding, insideBundle bool, root *os.Root, files []artifactFile) (string, error) {
+	if binding == nil {
+		return strings.TrimSpace(summary), nil
+	}
+	if !insideBundle {
+		data, err := io.ReadAll(binding.file)
+		if err != nil {
+			return "", Exit(2, "read summary file: %v", err)
+		}
+		return combineArtifactSummary(summary, data), nil
+	}
+	for _, file := range files {
+		if file.sourceInfo == nil || !os.SameFile(binding.fileInfo, file.sourceInfo) {
+			continue
+		}
+		summaryFile := file
+		if summaryFile.snapshotFile == nil {
+			data, err := io.ReadAll(binding.file)
+			if err != nil {
+				return "", Exit(2, "read validated summary file: %v", err)
+			}
+			if summaryFile.snapshotValid {
+				hash := sha256.Sum256(data)
+				if int64(len(data)) != summaryFile.snapshotSize || !strings.EqualFold(hex.EncodeToString(hash[:]), summaryFile.snapshotHash) {
+					return "", Exit(2, "summary file changed after artifact validation")
+				}
+			}
+			return combineArtifactSummary(summary, data), nil
+		}
+		data, readErr := io.ReadAll(io.NewSectionReader(summaryFile.snapshotFile, summaryFile.snapshotOffset, summaryFile.snapshotSize))
+		if readErr != nil {
+			return "", Exit(2, "read validated summary file: %v", readErr)
+		}
+		return combineArtifactSummary(summary, data), nil
+	}
+	if binding.rootName != "" {
+		file, err := openArtifactRootReadOnly(root, binding.rootName)
+		if err != nil {
+			return "", Exit(2, "summary file changed before artifact bundle validation: %v", err)
+		}
+		info, statErr := file.Stat()
+		closeErr := file.Close()
+		if statErr != nil {
+			return "", Exit(2, "stat validated summary file: %v", statErr)
+		}
+		if closeErr != nil {
+			return "", Exit(2, "close validated summary file: %v", closeErr)
+		}
+		if !info.Mode().IsRegular() || !os.SameFile(binding.fileInfo, info) {
+			return "", Exit(2, "summary file changed before artifact bundle validation")
+		}
+		data, err := io.ReadAll(binding.file)
+		if err != nil {
+			return "", Exit(2, "read validated summary file: %v", err)
+		}
+		return combineArtifactSummary(summary, data), nil
+	}
+	return "", Exit(2, "summary file changed before artifact bundle validation")
+}
+
+func combineArtifactSummary(summary string, data []byte) string {
+	if strings.TrimSpace(summary) != "" {
+		return strings.TrimSpace(summary) + "\n\n" + strings.TrimSpace(string(data))
+	}
+	return strings.TrimSpace(string(data))
+}
+
 func summaryText(summary, summaryFile string) (string, error) {
 	if strings.TrimSpace(summaryFile) == "" {
 		return strings.TrimSpace(summary), nil
 	}
 	data, err := os.ReadFile(summaryFile)
 	if err != nil {
-		return "", exit(2, "read summary file: %v", err)
+		return "", Exit(2, "read summary file: %v", err)
 	}
-	if strings.TrimSpace(summary) != "" {
-		return strings.TrimSpace(summary) + "\n\n" + strings.TrimSpace(string(data)), nil
-	}
-	return strings.TrimSpace(string(data)), nil
+	return combineArtifactSummary(summary, data), nil
 }
 
-func postGitHubPRComment(ctx context.Context, pr int, repo, bodyPath string) error {
-	args := []string{"issue", "comment", strconv.Itoa(pr), "--body-file", bodyPath}
-	if strings.TrimSpace(repo) != "" {
-		args = append(args, "--repo", strings.TrimSpace(repo))
+func postGitHubPRComment(ctx context.Context, opts artifactPublishOptions, body []byte) error {
+	args := []string{"issue", "comment", strconv.Itoa(opts.PR), "--body-file", "-"}
+	if strings.TrimSpace(opts.Repo) != "" {
+		args = append(args, "--repo", strings.TrimSpace(opts.Repo))
 	}
 	if _, err := exec.LookPath("gh"); err != nil {
-		return exit(2, "gh CLI is required for artifacts publish --pr: %v", err)
+		return Exit(2, "gh CLI is required for artifacts publish --pr: %v", err)
 	}
-	if out, err := commandOutput(ctx, "gh", args...); err != nil {
-		return exit(2, "gh issue comment failed: %v: %s", err, tailForError(out))
+	if out, err := artifactPublisherCommandOutputWithInput(ctx, opts, nil, bytes.NewReader(body), "gh", args...); err != nil {
+		return Exit(2, "gh issue comment failed: %v: %s", err, tailForError(out))
 	}
 	return nil
 }

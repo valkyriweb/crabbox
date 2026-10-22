@@ -10,6 +10,8 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
@@ -23,6 +25,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/servicequotas"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
+	"github.com/openclaw/crabbox/internal/rootdisk"
 )
 
 const (
@@ -30,6 +34,7 @@ const (
 	awsSSHIngressDescription = "Crabbox SSH"
 	awsSpotQuotaCode         = "L-34B43A08"
 	awsOnDemandQuotaCode     = "L-1216C47A"
+	awsEC2UserDataLimit      = 16 * 1024
 )
 
 var awsSnapshotDeleteBackoff = []time.Duration{
@@ -48,9 +53,35 @@ type AWSClient struct {
 	region        string
 }
 
+type AWSLaunchAttempt struct {
+	Region           string `json:"region"`
+	AvailabilityZone string `json:"availabilityZone,omitempty"`
+	SubnetID         string `json:"subnetID,omitempty"`
+	ServerType       string `json:"serverType"`
+	Market           string `json:"market"`
+	ImageID          string `json:"imageID"`
+	SecurityGroupID  string `json:"securityGroupID"`
+	HostID           string `json:"hostID,omitempty"`
+	KeyPairID        string `json:"keyPairID,omitempty"`
+	ClientToken      string `json:"clientToken"`
+	ParametersSHA256 string `json:"parametersSHA256"`
+}
+
+type AWSFixedCreateControl struct {
+	CreatedAt         time.Time
+	IntentFingerprint string
+	AccountID         string
+	KeyPairID         string
+	PinnedAttempt     *AWSLaunchAttempt
+	FailedTokens      map[string]bool
+	TerminalRejection bool
+	BeforeAttempt     func(AWSLaunchAttempt) error
+	DefiniteFailure   func(AWSLaunchAttempt) error
+}
+
 func newAWSClient(ctx context.Context, cfg Config) (*AWSClient, error) {
 	if cfg.AWSRegion == "" {
-		return nil, exit(3, "CRABBOX_AWS_REGION or AWS_REGION is required")
+		return nil, Exit(3, "CRABBOX_AWS_REGION or AWS_REGION is required")
 	}
 	return newAWSClientForRegion(ctx, cfg, cfg.AWSRegion)
 }
@@ -82,12 +113,44 @@ func (c *AWSClient) CapacityDoctorChecks(ctx context.Context, cfg Config) []Doct
 	if cfg.ServerType == "" {
 		cfg.ServerType = serverTypeForConfig(cfg)
 	}
+	vcpus := c.capacityInstanceTypeVCPUs(ctx, cfg)
+	cfg.AWSRegion = c.region
 	checks := make([]DoctorCheck, 0, 2)
 	for _, market := range awsCapacityDoctorMarkets(cfg) {
 		limit, known, err := c.appliedEC2ServiceQuota(ctx, awsQuotaCodeForMarket(market))
-		checks = append(checks, awsCapacityDoctorCheckForQuota(cfg, market, limit, known, err))
+		checks = append(checks, awsCapacityDoctorCheckForQuota(cfg, market, limit, known, err, vcpus))
 	}
 	return checks
+}
+
+func (c *AWSClient) capacityInstanceTypeVCPUs(ctx context.Context, cfg Config) map[string]int {
+	if c.ec2 == nil {
+		return nil
+	}
+	requested := []string{cfg.ServerType}
+	for _, candidate := range awsCapacityRecommendationCandidates(cfg) {
+		requested = appendUniqueStrings(requested, candidate.serverType)
+	}
+	instanceTypes := make([]types.InstanceType, len(requested))
+	for index, name := range requested {
+		instanceTypes[index] = types.InstanceType(name)
+	}
+	paginator := ec2.NewDescribeInstanceTypesPaginator(c.ec2, &ec2.DescribeInstanceTypesInput{
+		InstanceTypes: instanceTypes,
+	})
+	vcpus := make(map[string]int)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil
+		}
+		for _, info := range page.InstanceTypes {
+			if info.VCpuInfo != nil && aws.ToInt32(info.VCpuInfo.DefaultVCpus) > 0 {
+				vcpus[string(info.InstanceType)] = int(aws.ToInt32(info.VCpuInfo.DefaultVCpus))
+			}
+		}
+	}
+	return vcpus
 }
 
 func (c *AWSClient) appliedEC2ServiceQuota(ctx context.Context, quotaCode string) (float64, bool, error) {
@@ -163,18 +226,34 @@ func (c *AWSClient) ListCrabboxServers(ctx context.Context) ([]Server, error) {
 	return servers, nil
 }
 
-func (c *AWSClient) EnsureSSHKey(ctx context.Context, name, publicKey string) error {
+type awsKeyPairBinding struct {
+	ID      string
+	Managed bool
+	Created bool
+}
+
+func (c *AWSClient) ensureSSHKeyBinding(ctx context.Context, name, publicKey string) (awsKeyPairBinding, error) {
 	out, err := c.ec2.DescribeKeyPairs(ctx, &ec2.DescribeKeyPairsInput{
 		KeyNames:         []string{name},
 		IncludePublicKey: aws.Bool(true),
 	})
 	if err == nil {
-		return verifyAWSKeyPairMatches(name, publicKey, out.KeyPairs)
+		if err := verifyAWSKeyPairMatches(name, publicKey, out.KeyPairs); err != nil {
+			return awsKeyPairBinding{}, err
+		}
+		keyPairID, ownershipErr := validateAWSCleanupKeyPair(name, out.KeyPairs)
+		if ownershipErr != nil {
+			if IsAWSCleanupKeyOwnershipError(ownershipErr) {
+				return awsKeyPairBinding{}, nil
+			}
+			return awsKeyPairBinding{}, ownershipErr
+		}
+		return awsKeyPairBinding{ID: keyPairID, Managed: true}, nil
 	}
 	if !strings.Contains(err.Error(), "InvalidKeyPair.NotFound") {
-		return err
+		return awsKeyPairBinding{}, err
 	}
-	_, err = c.ec2.ImportKeyPair(ctx, &ec2.ImportKeyPairInput{
+	created, err := c.ec2.ImportKeyPair(ctx, &ec2.ImportKeyPairInput{
 		KeyName:           aws.String(name),
 		PublicKeyMaterial: []byte(publicKey),
 		TagSpecifications: []types.TagSpecification{
@@ -184,12 +263,24 @@ func (c *AWSClient) EnsureSSHKey(ctx context.Context, name, publicKey string) er
 			},
 		},
 	})
+	if err != nil {
+		return awsKeyPairBinding{}, err
+	}
+	keyPairID := strings.TrimSpace(aws.ToString(created.KeyPairId))
+	if keyPairID == "" {
+		return awsKeyPairBinding{}, Exit(5, "aws imported key pair %q without an immutable key pair id", name)
+	}
+	return awsKeyPairBinding{ID: keyPairID, Managed: true, Created: true}, nil
+}
+
+func (c *AWSClient) EnsureSSHKey(ctx context.Context, name, publicKey string) error {
+	_, err := c.ensureSSHKeyBinding(ctx, name, publicKey)
 	return err
 }
 
 func verifyAWSKeyPairMatches(name, publicKey string, keyPairs []types.KeyPairInfo) error {
 	if len(keyPairs) == 0 {
-		return exit(2, "aws key pair %q exists but DescribeKeyPairs returned no key material", name)
+		return Exit(2, "aws key pair %q exists but DescribeKeyPairs returned no key material", name)
 	}
 	existing := keyPairs[0]
 	if sameOpenSSHPublicKey(aws.ToString(existing.PublicKey), publicKey) {
@@ -203,12 +294,12 @@ func verifyAWSKeyPairMatches(name, publicKey string, keyPairs []types.KeyPairInf
 		return nil
 	}
 	if existing.PublicKey != nil && strings.TrimSpace(aws.ToString(existing.PublicKey)) != "" {
-		return exit(2, "aws key pair %q already exists with different public key; delete it or configure a unique provider key", name)
+		return Exit(2, "aws key pair %q already exists with different public key; delete it or configure a unique provider key", name)
 	}
 	if existing.KeyFingerprint == nil || strings.TrimSpace(aws.ToString(existing.KeyFingerprint)) == "" {
-		return exit(2, "aws key pair %q already exists but Crabbox cannot verify its public key; delete it or configure a unique provider key", name)
+		return Exit(2, "aws key pair %q already exists but Crabbox cannot verify its public key; delete it or configure a unique provider key", name)
 	}
-	return exit(2, "aws key pair %q already exists with fingerprint %s, expected %s; delete it or configure a unique provider key", name, aws.ToString(existing.KeyFingerprint), strings.Join(fingerprints, " or "))
+	return Exit(2, "aws key pair %q already exists with fingerprint %s, expected %s; delete it or configure a unique provider key", name, aws.ToString(existing.KeyFingerprint), strings.Join(fingerprints, " or "))
 }
 
 func sameOpenSSHPublicKey(left, right string) bool {
@@ -242,7 +333,7 @@ func awsImportedPublicKeyFingerprints(publicKey string) ([]string, error) {
 		derSum := md5.Sum(x509.MarshalPKCS1PublicKey(pub)) //nolint:gosec // AWS examples also derive imported RSA fingerprints from PKCS#1 DER.
 		return []string{colonHex(blobSum[:]), colonHex(derSum[:])}, nil
 	default:
-		return nil, exit(2, "unsupported AWS SSH public key type %q", keyType)
+		return nil, Exit(2, "unsupported AWS SSH public key type %q", keyType)
 	}
 }
 
@@ -274,18 +365,18 @@ func normalizeAWSKeyFingerprint(value string) string {
 func parseOpenSSHPublicKey(publicKey string) (string, []byte, error) {
 	fields := strings.Fields(strings.TrimSpace(publicKey))
 	if len(fields) < 2 {
-		return "", nil, exit(2, "invalid SSH public key")
+		return "", nil, Exit(2, "invalid SSH public key")
 	}
 	blob, err := base64.StdEncoding.DecodeString(fields[1])
 	if err != nil {
-		return "", nil, exit(2, "invalid SSH public key: %v", err)
+		return "", nil, Exit(2, "invalid SSH public key: %v", err)
 	}
 	innerType, rest, err := readSSHString(blob)
 	if err != nil {
-		return "", nil, exit(2, "invalid SSH public key: %v", err)
+		return "", nil, Exit(2, "invalid SSH public key: %v", err)
 	}
 	if innerType != fields[0] {
-		return "", nil, exit(2, "invalid SSH public key: type %q does not match blob type %q", fields[0], innerType)
+		return "", nil, Exit(2, "invalid SSH public key: type %q does not match blob type %q", fields[0], innerType)
 	}
 	_ = rest
 	return innerType, blob, nil
@@ -294,29 +385,29 @@ func parseOpenSSHPublicKey(publicKey string) (string, []byte, error) {
 func parseOpenSSHRSAPublicKey(blob []byte) (*rsa.PublicKey, error) {
 	keyType, rest, err := readSSHString(blob)
 	if err != nil {
-		return nil, exit(2, "invalid RSA public key: %v", err)
+		return nil, Exit(2, "invalid RSA public key: %v", err)
 	}
 	if keyType != "ssh-rsa" {
-		return nil, exit(2, "invalid RSA public key: type %q", keyType)
+		return nil, Exit(2, "invalid RSA public key: type %q", keyType)
 	}
 	eBytes, rest, err := readSSHBytes(rest)
 	if err != nil {
-		return nil, exit(2, "invalid RSA public key exponent: %v", err)
+		return nil, Exit(2, "invalid RSA public key exponent: %v", err)
 	}
 	nBytes, rest, err := readSSHBytes(rest)
 	if err != nil {
-		return nil, exit(2, "invalid RSA public key modulus: %v", err)
+		return nil, Exit(2, "invalid RSA public key modulus: %v", err)
 	}
 	if len(rest) != 0 {
-		return nil, exit(2, "invalid RSA public key: trailing data")
+		return nil, Exit(2, "invalid RSA public key: trailing data")
 	}
 	e := new(big.Int).SetBytes(eBytes)
 	if !e.IsInt64() || e.Sign() <= 0 || e.Int64() > int64(^uint(0)>>1) {
-		return nil, exit(2, "invalid RSA public key exponent")
+		return nil, Exit(2, "invalid RSA public key exponent")
 	}
 	n := new(big.Int).SetBytes(nBytes)
 	if n.Sign() <= 0 {
-		return nil, exit(2, "invalid RSA public key modulus")
+		return nil, Exit(2, "invalid RSA public key modulus")
 	}
 	return &rsa.PublicKey{N: n, E: int(e.Int64())}, nil
 }
@@ -349,8 +440,56 @@ func colonHex(data []byte) string {
 	return strings.Join(parts, ":")
 }
 
-func (c *AWSClient) DeleteSSHKey(ctx context.Context, name string) error {
-	_, err := c.ec2.DeleteKeyPair(ctx, &ec2.DeleteKeyPairInput{KeyName: aws.String(name)})
+type awsCleanupKeyOwnershipError struct{ err error }
+
+func (e *awsCleanupKeyOwnershipError) Error() string { return e.err.Error() }
+func (e *awsCleanupKeyOwnershipError) Unwrap() error { return e.err }
+
+// IsAWSCleanupKeyOwnershipError reports a cleanup-time key ownership mismatch
+// that must skip the instance instead of deleting either resource.
+func IsAWSCleanupKeyOwnershipError(err error) bool {
+	var ownershipErr *awsCleanupKeyOwnershipError
+	return errors.As(err, &ownershipErr)
+}
+
+func NewAWSCleanupKeyOwnershipError(message string) error {
+	return &awsCleanupKeyOwnershipError{err: errors.New(message)}
+}
+
+func validateAWSCleanupKeyPair(name string, keyPairs []types.KeyPairInfo) (string, error) {
+	if len(keyPairs) != 1 || strings.TrimSpace(aws.ToString(keyPairs[0].KeyName)) != strings.TrimSpace(name) {
+		return "", &awsCleanupKeyOwnershipError{err: fmt.Errorf("AWS cleanup key %q did not resolve to one exact key pair", name)}
+	}
+	tags := make(map[string]string, len(keyPairs[0].Tags))
+	for _, tag := range keyPairs[0].Tags {
+		tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+	}
+	if tags["crabbox"] != "true" || tags["created_by"] != "crabbox" {
+		return "", &awsCleanupKeyOwnershipError{err: fmt.Errorf("AWS cleanup key %q lacks canonical Crabbox ownership tags", name)}
+	}
+	keyPairID := strings.TrimSpace(aws.ToString(keyPairs[0].KeyPairId))
+	if keyPairID == "" {
+		return "", &awsCleanupKeyOwnershipError{err: fmt.Errorf("AWS cleanup key %q has no immutable key pair id", name)}
+	}
+	return keyPairID, nil
+}
+
+func (c *AWSClient) ResolveCleanupSSHKeyID(ctx context.Context, name string) (string, error) {
+	out, err := c.ec2.DescribeKeyPairs(ctx, &ec2.DescribeKeyPairsInput{KeyNames: []string{name}})
+	if err != nil {
+		if strings.Contains(err.Error(), "InvalidKeyPair.NotFound") {
+			return "", nil
+		}
+		return "", err
+	}
+	return validateAWSCleanupKeyPair(name, out.KeyPairs)
+}
+
+func (c *AWSClient) DeleteCleanupSSHKeyID(ctx context.Context, keyPairID string) error {
+	if keyPairID == "" {
+		return nil
+	}
+	_, err := c.ec2.DeleteKeyPair(ctx, &ec2.DeleteKeyPairInput{KeyPairId: aws.String(keyPairID)})
 	if err != nil && strings.Contains(err.Error(), "InvalidKeyPair.NotFound") {
 		return nil
 	}
@@ -358,6 +497,13 @@ func (c *AWSClient) DeleteSSHKey(ctx context.Context, name string) error {
 }
 
 func (c *AWSClient) CreateServerWithFallback(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any)) (Server, Config, error) {
+	return c.CreateServerWithFallbackControl(ctx, cfg, publicKey, leaseID, slug, keep, logf, nil)
+}
+
+func (c *AWSClient) CreateServerWithFallbackControl(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any), control *AWSFixedCreateControl) (Server, Config, error) {
+	if control != nil && control.PinnedAttempt != nil {
+		return Server{}, cfg, Exit(4, "lease_id_conflict: fixed AWS lease %s has an unresolved launch attempt", leaseID)
+	}
 	regions := awsRegionCandidates(cfg, c.region)
 	if len(regions) > 1 {
 		var errs []error
@@ -376,26 +522,70 @@ func (c *AWSClient) CreateServerWithFallback(ctx context.Context, cfg Config, pu
 			if logf != nil && region != c.region {
 				logf("fallback provisioning region=%s after capacity/quota rejection\n", region)
 			}
-			server, resolved, err := client.createServerWithFallbackInRegion(ctx, next, publicKey, leaseID, slug, keep, logf)
+			server, resolved, err := client.createServerWithFallbackInRegion(ctx, next, publicKey, leaseID, slug, keep, logf, control)
 			if err == nil {
 				return server, resolved, nil
 			}
 			errs = append(errs, fmt.Errorf("%s: %w", region, err))
-			if !isRetryableAWSRegionProvisioningError(err) {
+			if !shouldRetryAWSRegionAfterCreateError(err, control) {
 				return Server{}, resolved, joinErrors(errs)
 			}
 		}
 		return Server{}, cfg, joinErrors(errs)
 	}
-	return c.createServerWithFallbackInRegion(ctx, cfg, publicKey, leaseID, slug, keep, logf)
+	return c.createServerWithFallbackInRegion(ctx, cfg, publicKey, leaseID, slug, keep, logf, control)
 }
 
-func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any)) (Server, Config, error) {
+func shouldRetryAWSRegionAfterCreateError(err error, control *AWSFixedCreateControl) bool {
+	return (control == nil || control.PinnedAttempt == nil) && isRetryableAWSRegionProvisioningError(err)
+}
+
+func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any), control *AWSFixedCreateControl) (result Server, resolved Config, resultErr error) {
+	candidates, err := c.resourceQualifiedLaunchCandidates(ctx, cfg)
+	if err != nil {
+		return Server{}, cfg, err
+	}
 	if cfg.ProviderKey == "" {
 		cfg.ProviderKey = "crabbox-steipete"
 	}
-	if err := c.EnsureSSHKey(ctx, cfg.ProviderKey, publicKey); err != nil {
+	keyBinding, err := c.ensureSSHKeyBinding(ctx, cfg.ProviderKey, publicKey)
+	if err != nil {
 		return Server{}, cfg, err
+	}
+	if control != nil {
+		control.KeyPairID = keyBinding.ID
+	}
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		terminal := control != nil && control.TerminalRejection && control.PinnedAttempt != nil
+		cleanupKey := (keyBinding.Created && (control == nil || control.PinnedAttempt == nil)) ||
+			(terminal && keyBinding.Managed)
+		if cleanupKey {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+			defer cancel()
+			if err := c.DeleteCleanupSSHKeyID(cleanupCtx, keyBinding.ID); err != nil {
+				if code := awsAPIErrorCode(err); code != "" {
+					err = fmt.Errorf("AWS DeleteKeyPair rejected request (%s)", code)
+				}
+				resultErr = errors.Join(resultErr, fmt.Errorf("rollback AWS key pair %s: %w", keyBinding.ID, err))
+				return
+			}
+		}
+		if terminal && control.DefiniteFailure != nil {
+			if err := control.DefiniteFailure(*control.PinnedAttempt); err != nil {
+				resultErr = errors.Join(resultErr, err)
+				return
+			}
+			control.PinnedAttempt = nil
+		}
+	}()
+	bindCleanupKey := func(server Server) Server {
+		if keyBinding.Managed {
+			server.Labels["aws_key_pair_id"] = keyBinding.ID
+		}
+		return server
 	}
 	staticImageID := ""
 	if cfg.TargetOS != targetMacOS || cfg.AWSAMI != "" {
@@ -409,59 +599,55 @@ func (c *AWSClient) createServerWithFallbackInRegion(ctx context.Context, cfg Co
 	if err != nil {
 		return Server{}, cfg, err
 	}
-	candidates := awsLaunchCandidates(cfg)
 	useSpot := cfg.Capacity.Market != "on-demand"
+	var marketFallbackCandidates []string
 	var errs []error
-	for i, instanceType := range candidates {
+	tryCreate := func(instanceType string, spot bool, prefix string) (Server, Config, error) {
 		next := cfg
 		next.ServerType = instanceType
+		imageID, err := c.resolveLaunchAMI(ctx, next, staticImageID)
+		if err != nil {
+			return Server{}, next, fmt.Errorf("%s%s image: %w", prefix, instanceType, err)
+		}
+		server, err := c.createServer(ctx, next, publicKey, leaseID, slug, keep, imageID, securityGroupID, spot, control)
+		if err != nil {
+			return Server{}, next, fmt.Errorf("%s%s: %w", prefix, instanceType, err)
+		}
+		return bindCleanupKey(server), next, nil
+	}
+	for i, instanceType := range candidates {
 		if i > 0 && logf != nil {
 			logf("fallback provisioning type=%s after capacity/quota rejection\n", instanceType)
 		}
-		imageID, err := c.resolveLaunchAMI(ctx, next, staticImageID)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s image: %w", instanceType, err))
-			if !isRetryableAWSProvisioningError(err) {
-				return Server{}, next, joinErrors(errs)
-			}
-			continue
-		}
-		server, err := c.createServer(ctx, next, publicKey, leaseID, slug, keep, imageID, securityGroupID, useSpot)
+		server, next, err := tryCreate(instanceType, useSpot, "")
 		if err == nil {
 			return server, next, nil
 		}
-		errs = append(errs, fmt.Errorf("%s: %w", instanceType, err))
+		errs = append(errs, err)
 		if !isRetryableAWSProvisioningError(err) {
 			return Server{}, next, joinErrors(errs)
 		}
+		if useSpot {
+			marketFallbackCandidates = appendAWSMarketFallbackCandidate(marketFallbackCandidates, instanceType, err)
+		}
 	}
-	if useSpot && strings.HasPrefix(cfg.Capacity.Fallback, "on-demand") {
-		for _, instanceType := range candidates {
-			next := cfg
-			next.ServerType = instanceType
+	if len(marketFallbackCandidates) > 0 && strings.HasPrefix(cfg.Capacity.Fallback, "on-demand") {
+		for _, instanceType := range marketFallbackCandidates {
 			if logf != nil {
 				logf("fallback provisioning type=%s market=on-demand after spot rejection\n", instanceType)
 			}
-			imageID, err := c.resolveLaunchAMI(ctx, next, staticImageID)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("on-demand %s image: %w", instanceType, err))
-				if !isRetryableAWSProvisioningError(err) {
-					return Server{}, next, joinErrors(errs)
-				}
-				continue
-			}
-			server, err := c.createServer(ctx, next, publicKey, leaseID, slug, keep, imageID, securityGroupID, false)
+			server, next, err := tryCreate(instanceType, false, "on-demand ")
 			if err == nil {
 				return server, next, nil
 			}
-			errs = append(errs, fmt.Errorf("on-demand %s: %w", instanceType, err))
+			errs = append(errs, err)
 			if !isRetryableAWSProvisioningError(err) {
 				return Server{}, next, joinErrors(errs)
 			}
 		}
 	}
 	if cfg.ServerTypeExplicit {
-		return Server{}, cfg, fmt.Errorf("requested exact AWS instance type %s failed; remove --type to allow class fallback: %w", cfg.ServerType, joinErrors(errs))
+		return Server{}, cfg, fmt.Errorf("requested exact AWS instance type %s failed; remove --type to allow class fallback (regional quota limits still apply): %w", cfg.ServerType, joinErrors(errs))
 	}
 	return Server{}, cfg, joinErrors(errs)
 }
@@ -473,28 +659,70 @@ func (c *AWSClient) resolveLaunchAMI(ctx context.Context, cfg Config, staticImag
 	return c.resolveAMI(ctx, cfg)
 }
 
-func (c *AWSClient) createServer(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, imageID, securityGroupID string, spot bool) (Server, error) {
+func awsRunInstancesUserData(cfg Config, publicKey string) (string, error) {
+	userData := []byte(awsUserData(cfg, publicKey))
+	if cfg.TargetOS != targetWindows && cfg.TargetOS != targetMacOS {
+		compressed, err := GzipCloudInit(string(userData))
+		if err != nil {
+			return "", fmt.Errorf("gzip AWS Linux cloud-init user data: %w", err)
+		}
+		userData = compressed
+		if len(userData) > awsEC2UserDataLimit {
+			return "", fmt.Errorf("EC2 user-data limit is 16 KiB (%d raw bytes); compressed Linux cloud-init is %d bytes", awsEC2UserDataLimit, len(userData))
+		}
+	}
+	return base64.StdEncoding.EncodeToString(userData), nil
+}
+
+func (c *AWSClient) createServer(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, imageID, securityGroupID string, spot bool, control *AWSFixedCreateControl) (Server, error) {
 	_ = publicKey
-	name := leaseProviderName(leaseID, slug)
+	name := LeaseProviderName(leaseID, slug)
 	if cfg.Tailscale.Enabled && cfg.Tailscale.Hostname == "" {
-		cfg.Tailscale.Hostname = renderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
+		cfg.Tailscale.Hostname = RenderTailscaleHostname(cfg.Tailscale.HostnameTemplate, leaseID, slug, cfg.Provider)
 	}
 	now := time.Now().UTC()
-	labels := directLeaseLabels(cfg, leaseID, slug, "aws", mapMarket(spot), keep, now)
+	if control != nil && !control.CreatedAt.IsZero() {
+		now = control.CreatedAt.UTC()
+	}
+	labels := DirectLeaseLabels(cfg, leaseID, slug, "aws", mapMarket(spot), keep, now)
 	labels["aws_region"] = cfg.AWSRegion
-	userData := base64.StdEncoding.EncodeToString([]byte(awsUserData(cfg, publicKey)))
+	if control != nil {
+		labels["fixed_intent_sha256"] = control.IntentFingerprint
+		labels["aws_account_id"] = control.AccountID
+		if control.KeyPairID != "" {
+			labels["aws_key_pair_id"] = control.KeyPairID
+		}
+	}
+	userData, err := awsRunInstancesUserData(cfg, publicKey)
+	if err != nil {
+		return Server{}, err
+	}
 	rootGB := cfg.AWSRootGB
+	rootDevice := "/dev/sda1"
 	if rootGB <= 0 {
-		rootGB = 400
+		image, err := c.ec2.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{imageID}})
+		if err != nil {
+			return Server{}, fmt.Errorf("resolve AWS root disk minimum: %w", err)
+		}
+		if len(image.Images) != 1 {
+			return Server{}, fmt.Errorf("resolve AWS root disk minimum: expected one AMI %s", imageID)
+		}
+		rootDevice = aws.ToString(image.Images[0].RootDeviceName)
+		var minimum int32
+		for _, mapping := range image.Images[0].BlockDeviceMappings {
+			if aws.ToString(mapping.DeviceName) == rootDevice && mapping.Ebs != nil {
+				minimum = aws.ToInt32(mapping.Ebs.VolumeSize)
+			}
+		}
+		if rootDevice == "" || minimum <= 0 {
+			return Server{}, fmt.Errorf("resolve AWS root disk minimum: AMI %s has no root EBS volume size", imageID)
+		}
+		rootGB = max(int32(rootdisk.DefaultGB(cfg.Class)), minimum)
 	}
 	one := int32(1)
-	rootDevice := "/dev/sda1"
-	tagSpecifications := []types.TagSpecification{
-		{ResourceType: types.ResourceTypeInstance, Tags: awsTagsWithName(labels, name)},
-		{ResourceType: types.ResourceTypeVolume, Tags: awsTagsWithName(labels, name)},
-	}
-	if spot {
-		tagSpecifications = append(tagSpecifications, types.TagSpecification{ResourceType: types.ResourceTypeSpotInstancesRequest, Tags: awsTagsWithName(labels, name)})
+	clientToken := leaseID
+	if control != nil {
+		clientToken = awsFixedAttemptClientToken(leaseID, cfg, imageID, securityGroupID, spot)
 	}
 	input := &ec2.RunInstancesInput{
 		BlockDeviceMappings: []types.BlockDeviceMapping{
@@ -508,15 +736,14 @@ func (c *AWSClient) createServer(ctx context.Context, cfg Config, publicKey, lea
 				},
 			},
 		},
-		ClientToken:       aws.String(leaseID),
-		ImageId:           aws.String(imageID),
-		InstanceType:      types.InstanceType(cfg.ServerType),
-		KeyName:           aws.String(cfg.ProviderKey),
-		MaxCount:          aws.Int32(one),
-		MinCount:          aws.Int32(one),
-		SecurityGroupIds:  []string{securityGroupID},
-		TagSpecifications: tagSpecifications,
-		UserData:          aws.String(userData),
+		ClientToken:      aws.String(clientToken),
+		ImageId:          aws.String(imageID),
+		InstanceType:     types.InstanceType(cfg.ServerType),
+		KeyName:          aws.String(cfg.ProviderKey),
+		MaxCount:         aws.Int32(one),
+		MinCount:         aws.Int32(one),
+		SecurityGroupIds: []string{securityGroupID},
+		UserData:         aws.String(userData),
 	}
 	if spot {
 		input.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
@@ -543,6 +770,7 @@ func (c *AWSClient) createServer(ctx context.Context, cfg Config, publicKey, lea
 		}
 	}
 	applyAWSRunInstanceTargetOptions(input, cfg)
+	applyAWSGuestExpiryOptions(input, cfg)
 	if cfg.TargetOS == targetMacOS {
 		hostID := cfg.HostID
 		if hostID == "" {
@@ -554,14 +782,114 @@ func (c *AWSClient) createServer(ctx context.Context, cfg Config, publicKey, lea
 			input.Placement = &types.Placement{AvailabilityZone: aws.String(zone)}
 		}
 	}
-	out, err := c.ec2.RunInstances(ctx, input)
+	attempt := AWSLaunchAttempt{
+		Region:          cfg.AWSRegion,
+		SubnetID:        cfg.AWSSubnetID,
+		ServerType:      cfg.ServerType,
+		Market:          mapMarket(spot),
+		ImageID:         imageID,
+		SecurityGroupID: securityGroupID,
+		HostID:          cfg.HostID,
+		ClientToken:     clientToken,
+	}
+	if input.Placement != nil {
+		attempt.AvailabilityZone = aws.ToString(input.Placement.AvailabilityZone)
+		if attempt.HostID == "" {
+			attempt.HostID = aws.ToString(input.Placement.HostId)
+		}
+	}
+	if control != nil {
+		attempt.KeyPairID = control.KeyPairID
+		for key, value := range AWSFixedAttemptAttestationLabels(attempt) {
+			labels[key] = value
+		}
+	}
+	tagSpecifications := []types.TagSpecification{
+		{ResourceType: types.ResourceTypeInstance, Tags: awsTagsWithName(labels, name)},
+		{ResourceType: types.ResourceTypeVolume, Tags: awsTagsWithName(labels, name)},
+	}
+	if spot {
+		tagSpecifications = append(tagSpecifications, types.TagSpecification{ResourceType: types.ResourceTypeSpotInstancesRequest, Tags: awsTagsWithName(labels, name)})
+	}
+	input.TagSpecifications = tagSpecifications
+	parametersSHA256, err := awsRunInstancesParametersSHA256(input)
 	if err != nil {
 		return Server{}, err
 	}
+	attempt.ParametersSHA256 = parametersSHA256
+	if control != nil {
+		if control.FailedTokens[attempt.ClientToken] {
+			return Server{}, fmt.Errorf("fixed AWS launch attempt %s already failed without a resource: InsufficientInstanceCapacity", attempt.ClientToken)
+		}
+		if control.PinnedAttempt != nil {
+			return Server{}, Exit(4, "lease_id_conflict: fixed AWS lease %s has an unresolved launch attempt", leaseID)
+		} else if control.BeforeAttempt != nil {
+			if err := control.BeforeAttempt(attempt); err != nil {
+				return Server{}, err
+			}
+			control.PinnedAttempt = &attempt
+		}
+	}
+	out, err := c.ec2.RunInstances(ctx, input)
+	if err != nil {
+		code := awsAPIErrorCode(err)
+		switch code {
+		case "AuthFailure", "Blocked", "InvalidClientTokenId", "OptInRequired", "PendingVerification", "UnauthorizedOperation":
+			if control != nil {
+				control.TerminalRejection = true
+			}
+			err = fmt.Errorf("AWS RunInstances rejected request (%s)", code)
+		}
+		if control != nil && isRetryableAWSProvisioningError(err) && control.DefiniteFailure != nil {
+			if persistErr := control.DefiniteFailure(attempt); persistErr != nil {
+				return Server{}, errors.Join(err, persistErr)
+			}
+			control.PinnedAttempt = nil
+		}
+		return Server{}, err
+	}
 	if len(out.Instances) == 0 {
-		return Server{}, exit(5, "aws returned no instances")
+		return Server{}, Exit(5, "aws returned no instances")
 	}
 	return awsInstanceToServer(out.Instances[0]), nil
+}
+
+func awsAPIErrorCode(err error) string {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode()
+	}
+	return ""
+}
+
+func awsFixedAttemptClientToken(leaseID string, cfg Config, imageID, securityGroupID string, spot bool) string {
+	hostID := cfg.HostID
+	if hostID == "" {
+		hostID = cfg.AWSMacHostID
+	}
+	material := strings.Join([]string{
+		"crabbox-aws-fixed-attempt-v1",
+		leaseID,
+		cfg.AWSRegion,
+		awsAvailabilityZoneForRegion(cfg, cfg.AWSRegion),
+		cfg.AWSSubnetID,
+		cfg.ServerType,
+		mapMarket(spot),
+		imageID,
+		securityGroupID,
+		hostID,
+	}, "\x00")
+	digest := sha256.Sum256([]byte(material))
+	return "cbx-" + hex.EncodeToString(digest[:])[:60]
+}
+
+func awsRunInstancesParametersSHA256(input *ec2.RunInstancesInput) (string, error) {
+	data, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("encode AWS RunInstances parameters: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func mapMarket(spot bool) string {
@@ -572,19 +900,25 @@ func mapMarket(spot bool) string {
 }
 
 func (c *AWSClient) waitForServerIP(ctx context.Context, id string) (Server, error) {
-	deadline := time.Now().Add(10 * time.Minute)
+	ctx, cancel := context.WithTimeoutCause(ctx, 10*time.Minute, Exit(5, "timed out waiting for AWS instance public IP"))
+	defer cancel()
+	interval := 250 * time.Millisecond
 	for {
-		server, err := c.GetServer(ctx, id)
-		if err != nil {
+		server, err := c.getServerForAcquire(ctx, id)
+		if ctx.Err() != nil {
+			return Server{}, context.Cause(ctx)
+		}
+		// RunInstances can return an ID before DescribeInstances can see it.
+		if err != nil && awsAPIErrorCode(err) != "InvalidInstanceID.NotFound" {
 			return Server{}, err
 		}
-		if server.PublicNet.IPv4.IP != "" {
+		if err == nil && server.PublicNet.IPv4.IP != "" {
 			return server, nil
 		}
-		if time.Now().After(deadline) {
-			return Server{}, exit(5, "timed out waiting for AWS instance public IP")
+		if err := sleepContext(ctx, interval); err != nil {
+			return Server{}, context.Cause(ctx)
 		}
-		time.Sleep(5 * time.Second)
+		interval = min(interval*2, 5*time.Second)
 	}
 }
 
@@ -604,7 +938,7 @@ func (c *AWSClient) GetServer(ctx context.Context, id string) (Server, error) {
 			return awsInstanceToServer(instance), nil
 		}
 	}
-	return Server{}, exit(4, "aws instance not found: %s", id)
+	return Server{}, Exit(4, "aws instance not found: %s", id)
 }
 
 func (c *AWSClient) DeleteServer(ctx context.Context, id string) error {
@@ -617,7 +951,7 @@ func (c *AWSClient) DeleteServer(ctx context.Context, id string) error {
 func (c *AWSClient) CreateImageCheckpoint(ctx context.Context, instanceID, name string, noReboot bool) (CoordinatorImage, error) {
 	accountID, err := c.CallerAccountID(ctx)
 	if err != nil {
-		return CoordinatorImage{}, err
+		return CoordinatorImage{}, NativeCheckpointNotSubmittedError{Cause: err}
 	}
 	tags := awsTagsWithName(map[string]string{
 		"crabbox":           "true",
@@ -638,7 +972,7 @@ func (c *AWSClient) CreateImageCheckpoint(ctx context.Context, instanceID, name 
 	}
 	imageID := aws.ToString(out.ImageId)
 	if imageID == "" {
-		return CoordinatorImage{}, exit(5, "aws returned no image id")
+		return CoordinatorImage{}, Exit(5, "aws returned no image id")
 	}
 	return CoordinatorImage{
 		ID:         imageID,
@@ -672,7 +1006,7 @@ func (c *AWSClient) GetImageCheckpoint(ctx context.Context, imageID string) (Coo
 		return CoordinatorImage{}, err
 	}
 	if len(out.Images) == 0 {
-		return CoordinatorImage{}, exit(4, "aws image not found: %s", imageID)
+		return CoordinatorImage{}, Exit(4, "aws image not found: %s", imageID)
 	}
 	image := out.Images[0]
 	return CoordinatorImage{
@@ -689,27 +1023,36 @@ func (c *AWSClient) GetImageCheckpoint(ctx context.Context, imageID string) (Coo
 	}, nil
 }
 
-func (c *AWSClient) DeleteImageCheckpoint(ctx context.Context, imageID string, fallbackSnapshotIDs []string, expectedAccountID string) error {
+func (c *AWSClient) DeleteImageCheckpoint(ctx context.Context, imageID string, fallbackSnapshotIDs []string, expectedAccountID string, persist func([]string) error) error {
 	if err := c.GuardAccount(ctx, expectedAccountID); err != nil {
 		return err
 	}
 	out, err := c.ec2.DescribeImages(ctx, &ec2.DescribeImagesInput{
 		ImageIds: []string{imageID},
 	})
-	imageNotFound := err != nil && strings.Contains(err.Error(), "InvalidAMIID.NotFound")
-	if err != nil {
-		if !imageNotFound {
-			return err
-		}
-		if expectedAccountID == "" {
-			return exit(3, "cannot confirm direct AWS checkpoint delete for %s: image not found and checkpoint record has no accountId; switch to the original AWS account or use --local-only", imageID)
-		}
+	imageNotFound := err != nil && strings.Contains(err.Error(), "InvalidAMIID.NotFound") || err == nil && len(out.Images) == 0
+	if err != nil && !imageNotFound {
+		return err
+	}
+	if imageNotFound && expectedAccountID == "" {
+		return Exit(3, "cannot confirm direct AWS checkpoint delete for %s: image not found and checkpoint record has no accountId; switch to the original AWS account or use --local-only", imageID)
 	}
 	snapshotIDs := append([]string(nil), fallbackSnapshotIDs...)
 	if err == nil && len(out.Images) > 0 {
 		snapshotIDs = append(snapshotIDs, awsImageSnapshotIDs(out.Images[0])...)
 	}
 	snapshotIDs = uniqueStrings(snapshotIDs)
+	if len(snapshotIDs) == 0 {
+		return Exit(3, "cannot delete direct AWS checkpoint %s: backing snapshot identities are unavailable; retain the checkpoint and retry discovery", imageID)
+	}
+	if persist == nil {
+		return Exit(3, "direct AWS checkpoint deletion requires durable snapshot identity persistence")
+	}
+	// Deregistration removes the provider mapping. Retain the complete union before
+	// that boundary so an interrupted or partially failed deletion can resume.
+	if err := persist(snapshotIDs); err != nil {
+		return err
+	}
 	if _, err := c.ec2.DeregisterImage(ctx, &ec2.DeregisterImageInput{ImageId: aws.String(imageID)}); err != nil && !strings.Contains(err.Error(), "InvalidAMIID.NotFound") {
 		return err
 	}
@@ -723,7 +1066,7 @@ func (c *AWSClient) DeleteImageCheckpoint(ctx context.Context, imageID string, f
 
 func (c *AWSClient) CallerAccountID(ctx context.Context) (string, error) {
 	if c.sts == nil {
-		return "", exit(3, "aws sts client is unavailable")
+		return "", Exit(3, "aws sts client is unavailable")
 	}
 	out, err := c.sts.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
@@ -731,7 +1074,7 @@ func (c *AWSClient) CallerAccountID(ctx context.Context) (string, error) {
 	}
 	accountID := aws.ToString(out.Account)
 	if accountID == "" {
-		return "", exit(3, "aws returned no caller account id")
+		return "", Exit(3, "aws returned no caller account id")
 	}
 	return accountID, nil
 }
@@ -746,7 +1089,7 @@ func (c *AWSClient) GuardAccount(ctx context.Context, expectedAccountID string) 
 		return err
 	}
 	if accountID != expectedAccountID {
-		return exit(3, "direct AWS checkpoint account mismatch: current account %s does not match checkpoint account %s", accountID, expectedAccountID)
+		return Exit(3, "direct AWS checkpoint account mismatch: current account %s does not match checkpoint account %s", accountID, expectedAccountID)
 	}
 	return nil
 }
@@ -816,7 +1159,14 @@ func (c *AWSClient) resolveAMI(ctx context.Context, cfg Config) (string, error) 
 		return cfg.AWSAMI, nil
 	}
 	if cfg.TargetOS == targetWindows {
-		return c.resolveLatestAmazonAMI(ctx, "Windows_Server-2022-English-Full-Base-*", "x86_64")
+		spec, err := osImageSpecFor(cfg.OSImage)
+		if err != nil {
+			return "", err
+		}
+		if spec.Target != targetWindows {
+			spec = osImageSpecs["windows-server:2025"]
+		}
+		return c.resolveLatestAmazonAMI(ctx, spec.AWSName, "x86_64")
 	}
 	if cfg.TargetOS == targetMacOS {
 		name, architecture := awsMacOSAMIQueryForInstanceType(cfg.ServerType)
@@ -840,7 +1190,7 @@ func (c *AWSClient) resolveAMI(ctx context.Context, cfg Config) (string, error) 
 		return "", err
 	}
 	if len(out.Images) == 0 {
-		return "", exit(3, "no %s %s AMI found in %s; set CRABBOX_AWS_AMI", label, architecture, cfg.AWSRegion)
+		return "", Exit(3, "no AWS AMI found in %s for %s architecture=%s; set CRABBOX_AWS_AMI", c.region, label, architecture)
 	}
 	sort.Slice(out.Images, func(i, j int) bool {
 		return aws.ToString(out.Images[i].CreationDate) > aws.ToString(out.Images[j].CreationDate)
@@ -879,7 +1229,7 @@ func (c *AWSClient) resolveLatestAmazonAMI(ctx context.Context, name, architectu
 		return "", err
 	}
 	if len(out.Images) == 0 {
-		return "", exit(3, "no AWS AMI found in %s for name=%s architecture=%s; set CRABBOX_AWS_AMI", c.region, name, architecture)
+		return "", Exit(3, "no AWS AMI found in %s for name=%s architecture=%s; set CRABBOX_AWS_AMI", c.region, name, architecture)
 	}
 	sort.Slice(out.Images, func(i, j int) bool {
 		return aws.ToString(out.Images[i].CreationDate) > aws.ToString(out.Images[j].CreationDate)
@@ -935,7 +1285,7 @@ func (c *AWSClient) ensureSecurityGroup(ctx context.Context, cfg Config) (string
 		}
 	}
 	if groupID == "" {
-		return "", exit(3, "aws security group id is empty")
+		return "", Exit(3, "aws security group id is empty")
 	}
 	ports := sshPortCandidates(cfg.SSHPort, cfg.SSHFallbackPorts)
 	if group != nil {
@@ -1060,7 +1410,7 @@ func (c *AWSClient) defaultVPC(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if len(out.Vpcs) == 0 {
-		return "", exit(3, "no default VPC found; set CRABBOX_AWS_SUBNET_ID and CRABBOX_AWS_SECURITY_GROUP_ID")
+		return "", Exit(3, "no default VPC found; set CRABBOX_AWS_SUBNET_ID and CRABBOX_AWS_SECURITY_GROUP_ID")
 	}
 	return aws.ToString(out.Vpcs[0].VpcId), nil
 }
@@ -1076,7 +1426,7 @@ func (c *AWSClient) securityGroupVPC(ctx context.Context, cfg Config) (string, e
 		return "", err
 	}
 	if len(out.Subnets) == 0 {
-		return "", exit(3, "AWS subnet not found: %s", cfg.AWSSubnetID)
+		return "", Exit(3, "AWS subnet not found: %s", cfg.AWSSubnetID)
 	}
 	return aws.ToString(out.Subnets[0].VpcId), nil
 }
@@ -1084,7 +1434,7 @@ func (c *AWSClient) securityGroupVPC(ctx context.Context, cfg Config) (string, e
 func (c *AWSClient) allowTCP(ctx context.Context, groupID, port string, cidrs []string) error {
 	p, ok := parsePort32(port)
 	if !ok {
-		return exit(2, "invalid SSH port: %s", port)
+		return Exit(2, "invalid SSH port: %s", port)
 	}
 	ranges := make([]types.IpRange, 0, len(cidrs))
 	for _, cidr := range cidrs {
@@ -1120,18 +1470,50 @@ func awsInstanceToServer(instance types.Instance) Server {
 			name = value
 		}
 	}
+	securityGroupIDs := make([]string, 0, len(instance.SecurityGroups))
+	for _, group := range instance.SecurityGroups {
+		if groupID := strings.TrimSpace(aws.ToString(group.GroupId)); groupID != "" {
+			securityGroupIDs = append(securityGroupIDs, groupID)
+		}
+	}
+	sort.Strings(securityGroupIDs)
+	market := "on-demand"
+	if instance.InstanceLifecycle == types.InstanceLifecycleTypeSpot {
+		market = "spot"
+	}
+	availabilityZone := ""
+	if instance.Placement != nil {
+		availabilityZone = aws.ToString(instance.Placement.AvailabilityZone)
+	}
 	server := Server{
 		CloudID:  aws.ToString(instance.InstanceId),
 		Provider: "aws",
 		Name:     name,
 		Status:   string(instance.State.Name),
 		Labels:   labels,
+		ProviderMetadata: map[string]any{
+			"instanceProfileAttached": instance.IamInstanceProfile != nil,
+			"availabilityZone":        availabilityZone,
+			"subnetID":                aws.ToString(instance.SubnetId),
+			"imageID":                 aws.ToString(instance.ImageId),
+			"securityGroupIDs":        securityGroupIDs,
+			"market":                  market,
+		},
 	}
 	if instance.Placement != nil {
 		server.HostID = aws.ToString(instance.Placement.HostId)
 	}
 	server.PublicNet.IPv4.IP = aws.ToString(instance.PublicIpAddress)
 	server.ServerType.Name = string(instance.InstanceType)
+	server.ProviderMetadata["spotInstanceRequestID"] = aws.ToString(instance.SpotInstanceRequestId)
+	if instance.StateReason != nil {
+		server.ProviderMetadata["stateReasonCode"] = aws.ToString(instance.StateReason.Code)
+		server.ProviderMetadata["stateReasonMessage"] = aws.ToString(instance.StateReason.Message)
+	}
+	// A persisted readiness tag cannot override EC2's terminal state.
+	if server.Status == "shutting-down" || server.Status == "terminated" {
+		server.Labels["state"] = server.Status
+	}
 	return server
 }
 
@@ -1158,6 +1540,7 @@ func awsTagsWithName(labels map[string]string, name string) []types.Tag {
 func isRetryableAWSProvisioningError(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "InsufficientInstanceCapacity") ||
+		strings.Contains(s, "UnfulfillableCapacity") ||
 		strings.Contains(s, "MaxSpotInstanceCountExceeded") ||
 		strings.Contains(s, "VcpuLimitExceeded") ||
 		strings.Contains(s, "InvalidHostID.NotFound") ||
@@ -1170,6 +1553,31 @@ func isRetryableAWSProvisioningError(err error) bool {
 				strings.Contains(s, "eligible") ||
 				strings.Contains(s, "InstanceType") ||
 				strings.Contains(s, "instance type")))
+}
+
+func isAWSMarketFallbackError(err error) bool {
+	s := err.Error()
+	if strings.Contains(s, "InsufficientInstanceCapacity") ||
+		strings.Contains(s, "UnfulfillableCapacity") ||
+		strings.Contains(s, "MaxSpotInstanceCountExceeded") ||
+		strings.Contains(s, "VcpuLimitExceeded") {
+		return true
+	}
+	spotSpecific := strings.Contains(strings.ToLower(s), "spot")
+	return spotSpecific && (strings.Contains(s, "Unsupported") ||
+		strings.Contains(s, "InvalidParameterValue") ||
+		(strings.Contains(s, "InvalidParameterCombination") &&
+			(strings.Contains(s, "Free Tier") ||
+				strings.Contains(s, "eligible") ||
+				strings.Contains(s, "InstanceType") ||
+				strings.Contains(s, "instance type"))))
+}
+
+func appendAWSMarketFallbackCandidate(candidates []string, instanceType string, err error) []string {
+	if !isAWSMarketFallbackError(err) {
+		return candidates
+	}
+	return append(candidates, instanceType)
 }
 
 func isRetryableAWSRegionProvisioningError(err error) bool {
@@ -1192,24 +1600,28 @@ func awsAvailabilityZoneForRegion(cfg Config, region string) string {
 	return ""
 }
 
-func awsLaunchCandidates(cfg Config) []string {
+func AWSLaunchCandidates(cfg Config) []string {
 	if cfg.ServerTypeExplicit {
 		return []string{cfg.ServerType}
 	}
-	if cfg.TargetOS == targetMacOS {
-		return appendUniqueStrings([]string{cfg.ServerType}, awsInstanceTypeCandidatesForConfig(cfg)...)
+	candidates, matched := awsClassCandidatesForConfig(cfg)
+	if !matched && IsCanonicalProviderClass(cfg.Class) {
+		return nil
 	}
-	fallback := "t3.small"
-	if cfg.TargetOS == targetLinux && effectiveArchitectureForConfig(cfg) == ArchitectureARM64 {
-		fallback = "t4g.small"
-	}
-	if cfg.TargetOS == targetWindows {
-		fallback = "t3.large"
-		if cfg.WindowsMode == windowsModeWSL2 {
-			fallback = "m8i.large"
+	if !matched && cfg.TargetOS != targetMacOS {
+		fallback := "t3.small"
+		if cfg.TargetOS == targetLinux && effectiveArchitectureForConfig(cfg) == ArchitectureARM64 {
+			fallback = "t4g.small"
 		}
+		if cfg.TargetOS == targetWindows {
+			fallback = "t3.large"
+			if cfg.WindowsMode == windowsModeWSL2 {
+				fallback = "m8i.large"
+			}
+		}
+		candidates = appendUniqueExactStrings(candidates, fallback)
 	}
-	return appendUniqueStrings([]string{cfg.ServerType}, append(awsInstanceTypeCandidatesForConfig(cfg), fallback)...)
+	return appendUniqueExactStrings([]string{concreteStoredServerType(cfg)}, candidates...)
 }
 
 func awsCapacityDoctorMarkets(cfg Config) []string {
@@ -1231,20 +1643,42 @@ func awsQuotaCodeForMarket(market string) string {
 	return awsSpotQuotaCode
 }
 
-func awsCapacityDoctorCheckForQuota(cfg Config, market string, quotaValue float64, quotaKnown bool, quotaErr error) DoctorCheck {
+func awsUsesStandardVCPUQuota(serverType string) bool {
+	// Accelerators, HPC, and high-memory families have separate quota buckets.
+	if strings.HasPrefix(serverType, "im") || strings.HasPrefix(serverType, "is") {
+		return len(serverType) >= 3 && serverType[2] >= '0' && serverType[2] <= '9'
+	}
+	return len(serverType) >= 2 && strings.ContainsRune("acdhimrtz", rune(serverType[0])) && serverType[1] >= '0' && serverType[1] <= '9'
+}
+
+func awsCapacityDoctorCheckForQuota(cfg Config, market string, quotaValue float64, quotaKnown bool, quotaErr error, vcpus map[string]int) DoctorCheck {
 	serverType := strings.TrimSpace(cfg.ServerType)
 	if serverType == "" {
 		serverType = serverTypeForConfig(cfg)
 	}
 	quotaCode := awsQuotaCodeForMarket(market)
-	needed := awsInstanceTypeVCPUs(serverType)
+	needed := vcpus[serverType]
 	base := map[string]string{
 		"provider":             "aws",
+		"region":               cfg.AWSRegion,
 		"market":               market,
 		"quota_code":           quotaCode,
 		"default_class":        cfg.Class,
 		"default_type":         serverType,
 		"default_needed_vcpus": strconv.Itoa(needed),
+	}
+	if needed == 0 {
+		base["default_needed_vcpus"] = "unknown"
+	}
+	if !awsUsesStandardVCPUQuota(serverType) {
+		delete(base, "quota_code")
+		base["hint"] = "unsupported_instance_quota"
+		return DoctorCheck{
+			Status:  "skip",
+			Check:   "capacity",
+			Message: awsDoctorMessage("provider=aws capacity=unknown", base),
+			Details: base,
+		}
 	}
 	if quotaErr != nil {
 		base["hint"] = "allow_servicequotas_getservicequota"
@@ -1277,7 +1711,7 @@ func awsCapacityDoctorCheckForQuota(cfg Config, market string, quotaValue float6
 		}
 	}
 	if quotaValue < float64(needed) {
-		recommendedClass, recommendedType := awsRecommendedClassForQuota(cfg, limit)
+		recommendedClass, recommendedType := awsRecommendedClassForQuota(cfg, limit, vcpus)
 		if recommendedClass != "" {
 			base["recommended_class"] = recommendedClass
 			base["recommended_type"] = recommendedType
@@ -1290,11 +1724,14 @@ func awsCapacityDoctorCheckForQuota(cfg Config, market string, quotaValue float6
 			Details: base,
 		}
 	}
-	base["hint"] = "quota_satisfies_default_class"
+	base["capacity"] = "unknown"
+	base["quota_limit"] = "sufficient"
+	base["usage"] = "unchecked"
+	base["hint"] = "check_regional_quota_usage"
 	return DoctorCheck{
 		Status:  "ok",
 		Check:   "capacity",
-		Message: awsDoctorMessage("provider=aws capacity=ready", base),
+		Message: awsDoctorMessage("provider=aws", base),
 		Details: base,
 	}
 }
@@ -1322,30 +1759,40 @@ func awsDoctorMessage(prefix string, details map[string]string) string {
 	return b.String()
 }
 
-func awsRecommendedClassForQuota(cfg Config, limitVCPUs int) (string, string) {
-	if limitVCPUs <= 0 {
-		return "", ""
-	}
+type awsCapacityRecommendation struct {
+	machineClass string
+	serverType   string
+}
+
+func awsCapacityRecommendationCandidates(cfg Config) []awsCapacityRecommendation {
 	architecture := effectiveArchitectureForConfig(cfg)
-	classes := []string{"beast", "large", "fast", "standard"}
-	for _, class := range classes {
+	var out []awsCapacityRecommendation
+	for _, class := range []string{"beast", "large", "fast", "standard", "small", "tiny"} {
 		candidates := awsInstanceTypeCandidatesForTargetModeArchitectureClass(cfg.TargetOS, cfg.WindowsMode, architecture, class)
-		if len(candidates) == 0 {
-			continue
-		}
-		if awsInstanceTypeVCPUs(candidates[0]) <= limitVCPUs {
-			return class, candidates[0]
+		if len(candidates) > 0 {
+			out = append(out, awsCapacityRecommendation{class, candidates[0]})
 		}
 	}
 	for _, serverType := range awsInstanceTypeCandidatesForTargetModeArchitectureClass(cfg.TargetOS, cfg.WindowsMode, architecture, "standard") {
-		if awsInstanceTypeVCPUs(serverType) <= limitVCPUs {
-			return "standard", serverType
+		out = append(out, awsCapacityRecommendation{"standard", serverType})
+	}
+	return out
+}
+
+func awsRecommendedClassForQuota(cfg Config, limitVCPUs int, vcpus map[string]int) (string, string) {
+	if limitVCPUs <= 0 {
+		return "", ""
+	}
+	for _, candidate := range awsCapacityRecommendationCandidates(cfg) {
+		if needed := vcpus[candidate.serverType]; needed > 0 && needed <= limitVCPUs {
+			return candidate.machineClass, candidate.serverType
 		}
 	}
 	return "", ""
 }
 
-func awsInstanceTypeVCPUs(serverType string) int {
+// AWSInstanceTypeVCPUs estimates offline display values. Quota decisions use EC2 metadata.
+func AWSInstanceTypeVCPUs(serverType string) int {
 	_, size, ok := strings.Cut(strings.TrimSpace(serverType), ".")
 	if !ok || size == "" {
 		return 0
@@ -1393,4 +1840,14 @@ func parsePort32(port string) (int32, bool) {
 		return 0, false
 	}
 	return int32(n), true
+}
+
+// Only direct Linux guests own their expiry. IMDSv2 exposes the same launch
+// tags used by cleanup; guest poweroff must terminate rather than stop billing.
+func applyAWSGuestExpiryOptions(input *ec2.RunInstancesInput, cfg Config) {
+	if guestExpiryAdapter(cfg) != "aws" {
+		return
+	}
+	input.InstanceInitiatedShutdownBehavior = types.ShutdownBehaviorTerminate
+	input.MetadataOptions = &types.InstanceMetadataOptionsRequest{HttpEndpoint: types.InstanceMetadataEndpointStateEnabled, HttpTokens: types.HttpTokensStateRequired, InstanceMetadataTags: types.InstanceMetadataTagsStateEnabled}
 }

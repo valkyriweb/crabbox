@@ -192,11 +192,13 @@ The auth key is never stored in lease records, provider labels, run logs, or loc
 config. The short-lived key can still appear in user-data at the provider, so the
 Worker only mints one-off ephemeral keys — never long-lived reusable keys.
 
-The default installer mode runs Tailscale's package install script. Set
-`CRABBOX_TAILSCALE_INSTALL_MODE=pinned` to download a static Tailscale archive,
-verify the configured SHA-256 checksum, install the `tailscale` and `tailscaled`
-binaries, and record the client version. The built-in pinned defaults track the
-Islo Tailscale build so both bootstrap paths use the same binary version.
+The default `package` mode configures Tailscale's signed stable APT repository,
+verifies and scopes its pinned keyring with `signed-by`, installs the current
+package, and records the client version. Set
+`CRABBOX_TAILSCALE_INSTALL_MODE=pinned` to download a static
+archive, verify the configured SHA-256 checksum, and install the `tailscale` and
+`tailscaled` binaries. Neither mode pipes a downloaded installer script into a
+root shell.
 
 On release, `crabbox stop` attempts a best-effort remote `tailscale logout` before
 provider cleanup when SSH is still reachable. Coordinator cleanup does not delete a
@@ -205,8 +207,15 @@ trusted authorization for a privileged tailnet operation. One-off nodes are
 ephemeral and age out in Tailscale if remote logout is unavailable.
 
 If Tailscale rejects a requested subset or unowned tag, the coordinator returns
-`invalid_tailscale_tags` with exact-match/`tagOwners` guidance and preserves the raw
-Tailscale HTTP status and response body for diagnosis.
+`invalid_tailscale_tags` with exact-match/`tagOwners` guidance, the failed
+operation, and the HTTP status. Raw Tailscale response bodies are withheld from
+coordinator responses.
+
+Other Tailscale preparation failures return `tailscale_unavailable` before VM
+allocation. The CLI reports the error without repeating creation and cancels its
+ordinary create attempt. For an OAuth HTTP 401, repair the coordinator's Tailscale
+OAuth credentials before retrying the command. A temporary Tailscale API outage
+can be retried after the service recovers.
 
 Preflight the coordinator without leasing a machine:
 
@@ -260,7 +269,7 @@ Crabbox does not install or join Tailscale on the host.
 ## Related docs
 
 - [Network modes](network.md)
-- [Providers](providers.md)
+- [Provider Reference](../providers/README.md)
 - [Runner bootstrap](runner-bootstrap.md)
 - [Interactive desktop and VNC](interactive-desktop-vnc.md)
 - [Security](../security.md)

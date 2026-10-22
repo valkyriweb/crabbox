@@ -243,11 +243,31 @@ For brokered publishing, the CLI never receives object-store credentials. It
 sends artifact names, sizes, content types, and hashes to
 `POST /v1/artifacts/uploads`; the coordinator returns one short-lived upload URL
 per file plus the final URL to place in Markdown. Upload grants are signed with
-the declared `content-length`, so the object store rejects oversized PUTs during
-the grant window, and the broker caps each upload request at 5 GiB total before
-signing grants. When `--prefix` is omitted for hosted publishing, the CLI
-derives a unique prefix from the PR number, bundle directory, and current time
-so later QA comments do not overwrite earlier evidence.
+the declared `content-length` and, when supplied, the file's `sha256` as a
+base64 `x-amz-checksum-sha256`, so the object store rejects bodies whose size or
+contents do not match the grant. The `sha256` field may be omitted or blank; a
+nonblank value must be exactly 64 hexadecimal characters, with uppercase input
+normalized to lowercase. Malformed values receive the route's standard 400
+response instead of minting a grant without checksum enforcement. The broker
+caps each upload request at 5 GiB total before signing grants. When `--prefix`
+is omitted for hosted publishing, the CLI derives a unique prefix from the PR
+number, bundle directory, and current time so later QA comments do not overwrite
+earlier evidence.
+
+Artifact request setup and transport errors retain the operation and underlying
+failure without printing the request URL, which may contain a signed capability.
+
+The coordinator scopes each new grant under versioned base64url encodings of
+the exact authenticated organization and owner. These values are reversible,
+not hashed or encrypted, and appear in object paths for both public and signed
+URLs. A GitHub user's owner is its immutable `github:<numeric-id>` account
+identity. Caller prefixes cannot cross or replace that authorization namespace.
+
+`artifacts publish --pr` can place these URLs in public pull-request comments.
+Operators should weigh that identity disclosure before enabling
+`CRABBOX_ARTIFACTS_PUBLIC_READS`; the random capability namespace on public
+grants prevents easy guessing but does not hide the encoded identity from a URL
+recipient. This identity disclosure is an accepted Low/P3 residual risk.
 
 ## Manifest, list, and pull
 
@@ -271,6 +291,15 @@ published file:
   ]
 }
 ```
+
+When a generated manifest contains a signed or presigned bearer URL, Crabbox
+keeps the local manifest owner-only: mode `0600` on POSIX, with inherited
+extended ACLs removed on macOS, and a protected DACL owned by and limited to
+the current user on Windows. The generated
+`published-artifacts.md` summary uses the same protection only when it embeds a
+signed URL. Republishing tightens an older broad file instead of preserving its
+permissions. Manifests and summaries containing only local paths or public URLs
+keep their existing shared-output `0644` and mode-preservation behavior.
 
 Inspect or fetch that manifest later:
 

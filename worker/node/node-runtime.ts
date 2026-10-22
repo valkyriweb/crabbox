@@ -5,17 +5,26 @@ import type { Duplex } from "node:stream";
 import { PgBoss } from "pg-boss";
 import { WebSocket as NodeWebSocket, WebSocketServer, type RawData } from "ws";
 
-import type {
-  CoordinatorRuntime,
-  CoordinatorSocketHandlers,
-  CoordinatorWebSocketUpgrade,
-  CoordinatorWebSocketUpgradeOptions,
+import {
+  earliestProvisioningWake,
+  legacyAlarmKey,
+  mergedCoordinatorWake,
+  setLegacyWake,
+  type CoordinatorRuntime,
+  type CoordinatorStorageView,
+  type ProvisioningRuntime,
+  type CoordinatorSocketHandlers,
+  type CoordinatorWebSocketUpgrade,
+  type CoordinatorWebSocketUpgradeOptions,
 } from "../src/coordinator-runtime";
+import { AsyncOperationTracker } from "./async-operation-tracker";
 import { PostgresCoordinatorStorage } from "./postgres-storage";
 
 const alarmQueue = "coordinator-alarm";
+const alarmTimeStorageKey = "node-runtime:alarm-time";
 const reconcileQueue = "coordinator-reconcile";
 const bridgeDataAttachmentKinds = new Set([
+  "serve-relay",
   "webvnc-agent",
   "webvnc-viewer",
   "code-agent",
@@ -34,6 +43,7 @@ export interface NodeUpgradeContext {
 }
 
 export class NodeCoordinatorRuntime implements CoordinatorRuntime {
+  readonly provisioning: ProvisioningRuntime = this;
   readonly storage: PostgresCoordinatorStorage;
   readonly ephemeralWebSocketMaxPayloadBytes = 1024 * 1024;
   private readonly boss: PgBoss;
@@ -43,13 +53,19 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   private readonly sockets = new Set<NodeWebSocket>();
   private readonly socketAlive = new WeakMap<NodeWebSocket, boolean>();
   private readonly socketOperationTails = new WeakMap<NodeWebSocket, Promise<void>>();
-  private readonly activeSocketOperations = new Set<Promise<unknown>>();
+  private readonly activeSocketOperations = new AsyncOperationTracker();
   private socketClosures?: Promise<void>[];
   private shuttingDown = false;
   private alarmHandler?: () => Promise<void>;
   private operationRunner = async <T>(callback: () => Promise<T>): Promise<T> => callback();
   private alarmRun: Promise<void> = Promise.resolve();
   private readonly pingInterval: ReturnType<typeof setInterval>;
+  private provisioningTick?: () => Promise<void>;
+  private provisioningRun: Promise<void> | undefined;
+  private wakeHintRun: Promise<void> | undefined;
+  private wakeHintPending = false;
+  private provisioningScanner?: ReturnType<typeof setInterval>;
+  private readonly maintenance = new AsyncOperationTracker();
 
   constructor(connectionString: string) {
     this.storage = new PostgresCoordinatorStorage(connectionString);
@@ -68,6 +84,11 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   async start(alarmHandler: () => Promise<void>): Promise<void> {
     this.alarmHandler = alarmHandler;
     await this.storage.initialize();
+    await this.scanProvisioning();
+    this.provisioningScanner = setInterval(() => {
+      void this.scanProvisioning();
+    }, 1_000);
+    this.provisioningScanner.unref();
     await this.boss.start();
     await this.boss.createQueue(alarmQueue, {
       // "short" permits one queued successor while the current alarm is active.
@@ -109,6 +130,7 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   beginShutdown(): void {
     this.shuttingDown = true;
     clearInterval(this.pingInterval);
+    clearInterval(this.provisioningScanner);
     this.closeSocketsForShutdown();
   }
 
@@ -120,8 +142,11 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
   async stop(): Promise<void> {
     this.beginShutdown();
     await Promise.allSettled(this.socketClosures ?? []);
-    await this.drainSocketOperations();
+    await this.activeSocketOperations.drain();
     await this.alarmRun;
+    await this.provisioningRun;
+    await this.maintenance.drain();
+    if (this.wakeHintRun) await boundedWakeHint(this.wakeHintRun);
     await this.boss.stop({ graceful: true, timeout: 10_000 });
     await this.storage.close();
   }
@@ -193,11 +218,12 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
       this.socketAlive.set(nodeSocket, true);
     });
     nodeSocket.on("message", (data, isBinary) => {
-      void this.runSocketOperation(nodeSocket, attachment, () =>
-        handlers.message(webSocketData(data, isBinary)),
-      ).catch((error) => {
-        this.failSocket(nodeSocket, "message", error);
-      });
+      const message = webSocketData(data, isBinary);
+      void this.runSocketOperation(nodeSocket, attachment, () => handlers.message(message)).catch(
+        (error) => {
+          this.failSocket(nodeSocket, "message", error);
+        },
+      );
     });
     nodeSocket.on("close", (code, reason) => {
       this.sockets.delete(nodeSocket);
@@ -216,27 +242,113 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     });
   }
 
-  acceptEphemeralWebSocket(socket: WebSocket, handlers: CoordinatorSocketHandlers): void {
-    this.acceptWebSocket(socket, { kind: "workspace-terminal" }, [], handlers);
+  acceptEphemeralWebSocket(
+    socket: WebSocket,
+    handlers: CoordinatorSocketHandlers,
+    kind = "workspace-terminal",
+  ): void {
+    this.acceptWebSocket(socket, { kind }, [], handlers);
+  }
+
+  async getAlarm(): Promise<number | undefined> {
+    const value = await this.storage.get<unknown>(alarmTimeStorageKey);
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  }
+
+  take<T>(key: string): Promise<T | undefined> {
+    return this.storage.take<T>(key);
+  }
+
+  async commitAndWake<T>(
+    callback: (transaction: CoordinatorStorageView) => Promise<T>,
+  ): Promise<T> {
+    const result = await this.storage.transaction(async (transaction) => {
+      if ((await transaction.get(legacyAlarmKey)) === undefined) {
+        await transaction.put(
+          legacyAlarmKey,
+          (await transaction.get<number>(alarmTimeStorageKey)) ?? null,
+        );
+      }
+      const value = await callback(transaction);
+      const time = await mergedCoordinatorWake(transaction);
+      if (time === undefined) await transaction.delete(alarmTimeStorageKey);
+      else await transaction.put(alarmTimeStorageKey, time);
+      return value;
+    });
+    // A hung queue must not hold a committed provisioning claim or its scanner.
+    this.wakeHintPending = true;
+    if (!this.wakeHintRun) {
+      this.wakeHintRun = this.drainWakeHints().finally(() => {
+        this.wakeHintRun = undefined;
+      });
+      await boundedWakeHint(this.wakeHintRun);
+    }
+    return result;
+  }
+
+  private async drainWakeHints(): Promise<void> {
+    while (this.wakeHintPending && !this.shuttingDown) {
+      this.wakeHintPending = false;
+      // oxlint-disable-next-line eslint/no-await-in-loop -- one queue writer re-reads the latest committed outbox.
+      await this.sendWakeHint();
+    }
+  }
+
+  private async sendWakeHint(): Promise<void> {
+    try {
+      const time = await this.getAlarm();
+      await this.boss.deleteQueuedJobs(alarmQueue);
+      if (time !== undefined) {
+        await this.boss.send(alarmQueue, null, {
+          startAfter: new Date(Math.max(Date.now(), time)),
+          singletonKey: "fleet",
+          retryLimit: 5,
+          retryDelay: 5,
+          retryBackoff: true,
+        });
+      }
+    } catch {
+      console.error("coordinator wake hint failed; committed due work remains scheduled");
+    }
+  }
+
+  registerProvisioningTick(tick: () => Promise<void>): void {
+    this.provisioningTick = tick;
+  }
+
+  ownMaintenance(operation: Promise<void>): void {
+    this.maintenance.track(operation);
+  }
+
+  private async scanProvisioning(): Promise<void> {
+    if (this.shuttingDown || this.provisioningRun || !this.provisioningTick) return;
+    const run = async () => {
+      try {
+        const wake = await earliestProvisioningWake(this.storage);
+        if (wake !== undefined && wake <= Date.now()) await this.provisioningTick!();
+      } catch {
+        console.error("coordinator provisioning scan failed; retrying on next scan");
+      }
+    };
+    this.provisioningRun = run();
+    try {
+      await this.provisioningRun;
+    } finally {
+      this.provisioningRun = undefined;
+    }
   }
 
   async scheduleAlarm(time: number): Promise<void> {
-    await this.boss.deleteQueuedJobs(alarmQueue);
-    await this.boss.send(alarmQueue, null, {
-      startAfter: new Date(Math.max(Date.now(), time)),
-      singletonKey: "fleet",
-      retryLimit: 5,
-      retryDelay: 5,
-      retryBackoff: true,
-    });
+    await this.commitAndWake(async (transaction) => setLegacyWake(transaction, time));
   }
 
   async clearAlarm(): Promise<void> {
-    await this.boss.deleteQueuedJobs(alarmQueue);
+    await this.commitAndWake(async (transaction) => setLegacyWake(transaction));
   }
 
   private runAlarm(): Promise<void> {
     const run = this.alarmRun.then(async () => {
+      if (this.shuttingDown) return;
       if (!this.alarmHandler) {
         throw new Error("coordinator alarm handler is unavailable");
       }
@@ -277,11 +389,15 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
     callback: () => Promise<T> | T,
   ): Promise<T> {
     const operation = async () => callback();
+    const kind = socketAttachmentKind(attachment);
+    if (kind === "control") {
+      // Shared control handlers fence their mutations after network authorization.
+      return this.activeSocketOperations.track(operation());
+    }
     // Data-plane frames and code-agent replies must be able to complete an HTTP
-    // request that currently owns the lifecycle queue. Control frames mutate
-    // lease state and stay serialized with HTTP requests and alarms.
-    if (!isBridgeDataAttachment(attachment)) {
-      return this.trackSocketOperation(this.operationRunner(operation));
+    // request that currently owns the lifecycle queue.
+    if (!kind || !bridgeDataAttachmentKinds.has(kind)) {
+      return this.activeSocketOperations.track(this.operationRunner(operation));
     }
     const run = (this.socketOperationTails.get(socket) ?? Promise.resolve()).then(operation);
     this.socketOperationTails.set(
@@ -291,23 +407,19 @@ export class NodeCoordinatorRuntime implements CoordinatorRuntime {
         () => undefined,
       ),
     );
-    return this.trackSocketOperation(run);
+    return this.activeSocketOperations.track(run);
   }
+}
 
-  private trackSocketOperation<T>(operation: Promise<T>): Promise<T> {
-    this.activeSocketOperations.add(operation);
-    void operation.then(
-      () => this.activeSocketOperations.delete(operation),
-      () => this.activeSocketOperations.delete(operation),
-    );
-    return operation;
-  }
-
-  private async drainSocketOperations(): Promise<void> {
-    const active = [...this.activeSocketOperations];
-    if (active.length === 0) return;
-    await Promise.allSettled(active);
-    return this.drainSocketOperations();
+async function boundedWakeHint(hint: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, 1000);
+  });
+  try {
+    await Promise.race([hint, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -356,9 +468,9 @@ function webSocketData(data: RawData, isBinary: boolean): string | ArrayBuffer {
   return Uint8Array.from(buffer).buffer;
 }
 
-function isBridgeDataAttachment(attachment: unknown): boolean {
+function socketAttachmentKind(attachment: unknown): string | undefined {
   if (!attachment || typeof attachment !== "object" || !("kind" in attachment)) {
-    return false;
+    return undefined;
   }
-  return bridgeDataAttachmentKinds.has(String(attachment.kind));
+  return String(attachment.kind);
 }

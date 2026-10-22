@@ -26,6 +26,12 @@ crabbox pond release alpha
 crabbox doctor --pond alpha
 ```
 
+Use `--help` or `-h` on any subcommand to show its usage. For `connect`,
+`disconnect`, and `release`, help flags also work after the pond name and exit
+before loading operational state. `disconnect` and `release` require exactly
+one name and reject unknown flags. Use `--` before a name that starts with `-`
+to treat it as a literal name.
+
 Pond discovery reads **local claim sidecars** (the per-repo lease records this
 machine wrote), not the coordinator. Leases claimed on another operator machine
 do not appear. For coordinator-authoritative lease listings filtered by pond,
@@ -68,16 +74,19 @@ optional `note`:
 
 ### Transports
 
-A peer's `transport` is its provider's *primary* (recommended) plane; the full
-list of planes the provider supports is on `transports`. A provider opts into a
-plane by declaring the matching feature (`tailscale`, `ssh`, `url-bridge`), so
+A peer's `transport` is its recommended plane for the recorded lease; the full
+list of planes the provider supports is on `transports`. SSH leases without
+Tailscale enrollment keep their SSH endpoint. Once enrollment is recorded,
+the tailnet endpoint takes priority and missing tailnet addresses surface as
+`pending`. A provider opts into a plane by declaring the matching feature
+(`tailscale`, `ssh`, `url-bridge`), so
 one provider can advertise several — managed-Linux providers offer both the
 tailnet peer mesh and the operator-side SSH mesh.
 
 | Transport | Producers                                                                                                  | Endpoint shape                |
 | --------- | ---------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| `tailnet` | Hetzner / Azure / GCP (managed Linux with Tailscale)                                                       | tailnet IPv4 (or FQDN)        |
-| `ssh`     | AWS / Proxmox / static SSH / exe.dev / RunPod / Daytona / Sprites / Namespace / Semaphore                  | `ssh://<host>:<port>`         |
+| `tailnet` | AWS / Hetzner / Azure / GCP (managed Linux with Tailscale)                                                 | tailnet IPv4 (or FQDN)        |
+| `ssh`     | SSH leases without Tailscale enrollment, including AWS / Proxmox / static SSH / exe.dev / RunPod / Daytona / Sprites / Namespace / Semaphore | `ssh://<host>:<port>` |
 | `url`     | Islo / E2B / Railway                                                                                       | per-sandbox public HTTPS URL  |
 | `pending` | a tailnet- or SSH-capable provider whose claim has no endpoint recorded yet                                | empty (note explains)         |
 | `none`    | Blacksmith (owns its own connectivity), or any provider with no bridge adapter                             | empty (note explains)         |
@@ -90,8 +99,8 @@ the gap rather than mistaking it for "no shares published yet".
 
 | Provider                                                     | Transport | Notes                                                                                                       |
 | ------------------------------------------------------------ | --------- | ----------------------------------------------------------------------------------------------------------- |
-| Hetzner / Azure / GCP                                        | `tailnet` | Endpoint = tailnet IPv4 (or FQDN) from the local claim sidecar. Empty endpoint surfaces as `pending`.       |
-| AWS / Proxmox / static SSH                                   | `ssh`     | Endpoint = `ssh://<host>:<port>` from the claim. Empty host or port surfaces as `pending`.                  |
+| AWS / Hetzner / Azure / GCP                                  | `tailnet` or `ssh` | Tailscale enrollment selects the tailnet IPv4 (or FQDN) from the claim; an address still pending stays `pending`. Without enrollment, uses the recorded SSH endpoint. |
+| Proxmox / static SSH                                         | `ssh`     | Endpoint = `ssh://<host>:<port>` from the claim. Empty host or port surfaces as `pending`.                  |
 | exe.dev / RunPod / Daytona / Sprites / Namespace / Semaphore | `ssh`     | Endpoint = `ssh://<host>:<port>` from the claim. Empty host or port surfaces as `pending`.                  |
 | Islo                                                         | `url`     | Uses the Islo shares API. Existing shares are reused, so the call is idempotent.                            |
 | E2B                                                          | `url`     | Synthesizes the canonical per-port preview URL from the existing sandbox and config.                        |
@@ -129,7 +138,7 @@ availability against `127.0.0.1`.
 
 Without `--export`, the command starts the forwards, prints the export lines and
 the paths of the rendered files, then blocks until interrupted (Ctrl-C), keeping
-all tunnels alive:
+all tunnels alive. Ports for the same member share one owned SSH process:
 
 ```text
 pond "alpha" SSH-mesh ready (2 forwards)
@@ -139,13 +148,17 @@ wrote /Users/alice/.crabbox/pond/alpha/hosts
 wrote /Users/alice/.crabbox/pond/alpha/env
 ```
 
+Ctrl-Z is treated as teardown rather than suspension, so a stopped CLI cannot
+leave active forwarding processes behind.
+
 ### Export (daemon) mode
 
-With `--export`, the command starts each forward as a daemon process that
-survives the CLI exit, verifies none exit immediately (wrong key, host
-unreachable, …), records the PIDs in `~/.crabbox/pond/<name>/daemon.json`, prints
-the `export` lines to stdout, and exits. Daemon mode runs on macOS and Linux
-operator hosts only; on Windows, run `pond connect` without `--export`.
+With `--export`, the command starts one daemon process per member containing all
+of that member's forwards. The processes survive the CLI exit; Crabbox verifies
+none exit immediately (wrong key, host unreachable, …), records the PIDs in
+`~/.crabbox/pond/<name>/daemon.json`, prints the `export` lines to stdout, and
+exits. Daemon mode runs on macOS and Linux operator hosts only; on Windows, run
+`pond connect` without `--export`.
 
 ```bash
 eval $(crabbox pond connect alpha --export)
@@ -173,6 +186,9 @@ these aliases are operator-side conveniences, not lease-to-lease DNS:
 
 A lease declares the ports it wants reachable over the SSH mesh at warmup time
 with `--expose <port>` (repeatable, up to 10 distinct ports per lease).
+For coordinator-managed leases, these declarations cannot be changed by a later
+`run --id ... --expose ...`. To forward an existing loopback service without
+recreating the lease, use [`crabbox tunnel --id <lease> <port>`](tunnel.md).
 
 ## `pond disconnect`
 
@@ -205,6 +221,10 @@ providers). Leases on providers without a stop-capable backend are skipped with 
 warning. Individual stop failures are logged as warnings and do not block the
 remaining peers; the first error is returned so callers can tell whether the
 release was fully clean.
+
+Delegated providers own claim cleanup or retention, just as for `crabbox stop`.
+After a delegated stop succeeds, `pond release` leaves its resulting local state
+intact, including a replacement claim published before the stop returned.
 
 ## `doctor --pond`
 
@@ -242,5 +262,3 @@ The bridge plane is **HTTP-only** for URL-transport peers. Non-HTTP protocols
 (raw TCP/UDP, SSH on a custom port, Postgres, Redis, …) are not exposed by
 per-port HTTPS shares — use a tailnet-capable provider, or the SSH mesh via
 `pond connect`, for those.
-</content>
-</invoke>

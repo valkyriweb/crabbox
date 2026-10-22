@@ -55,7 +55,8 @@ Crabbox resolves the API key from, in order, `CRABBOX_OPENCOMPUTER_API_KEY`,
 `OPENCOMPUTER_API_KEY`, then the `oc` CLI config file (`~/.oc/config.json`,
 if already configured). It is sent only in the `X-API-Key` header, never
 persisted in Crabbox config and never placed on argv. If no key is resolvable,
-operations fail with a clear error.
+operations fail with a clear error. Provider error diagnostics redact the
+configured key before display.
 
 Local lease claims are scoped to the normalized API URL and a random ownership
 marker stored in both the local claim and the sandbox tags. The API key is
@@ -72,6 +73,11 @@ checked-in config from redirecting an automatically loaded API key. Overrides
 must use HTTPS and cannot contain userinfo, query parameters, or fragments;
 plain HTTP is accepted only for `localhost` or a loopback IP during local
 development.
+
+The API URL is not a Crabbox YAML field, including in trusted user files. Its
+raw config default stays empty so client construction can still select the
+external OC file's `api_url` before the built-in URL. Configuration generation
+does not read that file or resolve keys.
 
 ## Config
 
@@ -105,6 +111,26 @@ overrides (for example `CRABBOX_OPENCOMPUTER_WORKDIR`,
 `CRABBOX_OPENCOMPUTER_CPU`, `CRABBOX_OPENCOMPUTER_EXEC_TIMEOUT_SECS`). The API
 URL also reads `OPENCOMPUTER_API_URL`. `--opencomputer-forget-missing` is
 deliberately CLI-only so stale-claim removal always requires explicit intent.
+
+All eight bindings share one typed declaration. The four integer YAML fields
+apply whenever present, including zero and negative values; omitted/null fields
+preserve earlier values. Environment integer parsing retains the earlier value
+on malformed input, while explicit flags keep their existing value semantics.
+When OpenComputer is selected, decoded negative `cpu` or `memoryMB` values fail
+with exit 2 before fresh sandbox creation instead of silently omitting sizing.
+Existing lease reuse, inspection, and stop do not consume creation sizing.
+Zero still omits that dimension, and positive values are passed through for
+service-side tier validation. This creation check does not change the
+YAML/environment/flag decoding rules or timeout fallbacks. Nonempty workdir
+strings and explicit `burst: false` retain their existing behavior.
+
+Workdir and execution-timeout helpers share their compiled defaults. Raw-empty
+API URL resolution, service sizing, request-level timeout fallbacks, and
+missing-sandbox handling remain with their existing client/operation owners.
+Execution timeouts that cannot fit the local duration budget, including the
+30-second response grace, are rejected before run acquisition or reuse. The
+grace does not change the timeout sent to the service; inspection and stop do
+not consume this command budget.
 
 > **Sizing tiers.** When both `cpu` and `memoryMB` are set, they must form an
 > allowed tier (for example `1/1024`, `1/4096`, `2/8192`, `4/16384`). When only
@@ -156,6 +182,22 @@ crabbox run --provider opencomputer --allow-env API_TOKEN -- printenv API_TOKEN
    clears its local claim. For an existing lease, a 404 is account-ambiguous and
    keeps the claim by default; pass `--opencomputer-forget-missing` to `stop`
    only after confirming the sandbox is gone in the intended account.
+6. `run --lease-output <path>` writes the OpenComputer lease ID, slug,
+   reuse/retention state, and exact cleanup command for orchestration handoff.
+
+Command transport failures preserve their original error cause, including
+cancellation and deadlines, while retaining exit code 1 and the normal cleanup
+or `--keep-on-failure` behavior. Completed commands still mirror their remote
+exit code.
+
+Run outcomes and timing are finalized after cleanup. A failed automatic deletion
+now returns a failure with a retained recovery session. An existing command
+failure keeps its exit code if cleanup or timing output also fails, and
+`--keep-on-failure` also covers command preparation failures. Transport failures
+are classified as provider errors, not completed command exits; cancellation and
+deadline classifications remain distinct. Reused sandboxes are never
+automatically deleted, and standalone `stop` retains its stricter handling of a
+missing or inaccessible sandbox.
 
 ## Capabilities
 

@@ -1,0 +1,350 @@
+name: Publish Developer Image
+run-name: Publish developer image
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Developer image platform
+        required: true
+        type: choice
+        options:
+          - linux
+          - windows
+          - macos
+      region:
+        description: AWS region
+        required: true
+        default: eu-west-1
+        type: string
+      linux_type:
+        description: Linux source instance type
+        required: true
+        default: m7i.large
+        type: string
+      linux_os:
+        description: Linux image OS selector
+        required: true
+        default: ubuntu:26.04
+        type: choice
+        options:
+          - ubuntu:26.04
+          - ubuntu:24.04
+      measured:
+        description: Linux only - 12 planned leases instead of 3; provider retries can add attempts
+        required: false
+        type: boolean
+        default: false
+      max_p95_runner_total_ms:
+        description: Required positive millisecond cap for every measured cohort
+        required: false
+        type: string
+      linux_root_gb:
+        description: "Linux only - build from stock Ubuntu with this root size in GB (16-400); empty keeps the promoted-source rebuild"
+        required: false
+        default: ""
+        type: string
+      windows_type:
+        description: Windows source instance type
+        required: true
+        default: m7i.large
+        type: string
+      windows_os:
+        description: "Windows source OS (2025 starts from stock; 2022 retains promoted-source rebuild)"
+        required: true
+        default: windows-server:2022
+        type: choice
+        options:
+          - windows-server:2022
+          - windows-server:2025
+      macos_type:
+        description: macOS source instance type
+        required: true
+        default: mac-m4.metal
+        type: string
+      macos_host:
+        description: Use an available EC2 Mac host or allocate one
+        required: true
+        default: use-existing
+        type: choice
+        options:
+          - use-existing
+          - allocate
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devtools-image-publish-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Guard protected publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the protected default-branch workflow
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RUN_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          expected_ref="refs/heads/$DEFAULT_BRANCH"
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/devtools-image-publish.yml@$expected_ref"
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_REF" == "$expected_ref" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "$expected_workflow_ref" ]]
+          [[ "$REF_PROTECTED" == true ]]
+          [[ "$WORKFLOW_SHA" == "$RUN_SHA" ]]
+
+      - name: Validate publication inputs
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+          REGION: ${{ inputs.region }}
+          LINUX_TYPE: ${{ inputs.linux_type }}
+          LINUX_OS: ${{ inputs.linux_os }}
+          LINUX_ROOT_GB: ${{ inputs.linux_root_gb }}
+          WINDOWS_TYPE: ${{ inputs.windows_type }}
+          WINDOWS_OS: ${{ inputs.windows_os }}
+          MACOS_TYPE: ${{ inputs.macos_type }}
+          MACOS_HOST: ${{ inputs.macos_host }}
+          MEASURED: ${{ inputs.measured }}
+          MAX_P95_RUNNER_TOTAL_MS: ${{ inputs.max_p95_runner_total_ms }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET" =~ ^(linux|windows|macos)$ ]]
+          [[ "$REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]+$ ]]
+          [[ "$LINUX_TYPE" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$LINUX_OS" == ubuntu:26.04 || "$LINUX_OS" == ubuntu:24.04 ]] || {
+            printf '%s\n' 'linux_os must be ubuntu:26.04 or ubuntu:24.04' >&2
+            exit 2
+          }
+          if [[ -n "$LINUX_ROOT_GB" ]]; then
+            [[ "$TARGET" == linux && "$LINUX_ROOT_GB" =~ ^[1-9][0-9]{1,2}$ ]] &&
+              (( LINUX_ROOT_GB >= 16 && LINUX_ROOT_GB <= 400 )) || {
+                printf '%s\n' 'linux_root_gb is Linux only and must be an integer from 16-400' >&2
+                exit 2
+              }
+          fi
+          [[ "$WINDOWS_TYPE" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$WINDOWS_OS" == windows-server:2022 || "$WINDOWS_OS" == windows-server:2025 ]] || {
+            printf '%s\n' 'windows_os must be windows-server:2022 or windows-server:2025' >&2
+            exit 2
+          }
+          [[ "$MACOS_TYPE" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$MACOS_HOST" =~ ^(use-existing|allocate)$ ]]
+          if [[ "$MEASURED" == true ]]; then
+            [[ "$TARGET" == linux ]]
+            [[ "$MAX_P95_RUNNER_TOTAL_MS" =~ ^[1-9][0-9]*$ ]]
+            echo "Measured campaign: 12 planned leases; no hard launch-attempt or dollar cap."
+          else
+            [[ -z "$MAX_P95_RUNNER_TOTAL_MS" ]]
+          fi
+
+  publish:
+    name: Build, smoke, and promote
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: image-publisher
+    env:
+      CRABBOX_COORDINATOR: ${{ vars.CRABBOX_COORDINATOR }}
+      CRABBOX_COORDINATOR_TOKEN: ${{ secrets.CRABBOX_COORDINATOR_ADMIN_TOKEN }}
+      CRABBOX_COORDINATOR_ADMIN_TOKEN: ${{ secrets.CRABBOX_COORDINATOR_ADMIN_TOKEN }}
+      CRABBOX_OWNER: image-publisher@openclaw.invalid
+      CRABBOX_ORG: openclaw
+      CRABBOX_ACCESS_CLIENT_ID: ${{ secrets.CRABBOX_ACCESS_CLIENT_ID }}
+      CRABBOX_ACCESS_CLIENT_SECRET: ${{ secrets.CRABBOX_ACCESS_CLIENT_SECRET }}
+      TARGET: ${{ inputs.target }}
+      REGION: ${{ inputs.region }}
+      LINUX_TYPE: ${{ inputs.linux_type }}
+      LINUX_OS: ${{ inputs.linux_os }}
+      LINUX_ROOT_GB: ${{ inputs.linux_root_gb }}
+      WINDOWS_TYPE: ${{ inputs.windows_type }}
+      WINDOWS_OS: ${{ inputs.windows_os }}
+      MACOS_TYPE: ${{ inputs.macos_type }}
+      MACOS_HOST: ${{ inputs.macos_host }}
+      MEASURED: ${{ inputs.measured }}
+      MAX_P95_RUNNER_TOTAL_MS: ${{ inputs.max_p95_runner_total_ms }}
+    steps:
+      - name: Check out protected source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Initialize measured publication outcome
+        if: inputs.measured
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_outcome="$RUNNER_TEMP/devtools-image-proof/manifest.json"
+          mkdir -p "$(dirname "$public_outcome")"
+          node scripts/devtools-image-proof.mjs initialize \
+            "$public_outcome" \
+            scripts/install-linux-developer-tools.sh \
+            "$REGION" "$LINUX_TYPE" standard "$MAX_P95_RUNNER_TOTAL_MS" \
+            1 1 1 0 0 2h 30m "$([[ -n "$LINUX_ROOT_GB" ]] && echo 1 || echo 0)" "${LINUX_ROOT_GB:-0}"
+
+      - name: Verify publisher configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$CRABBOX_COORDINATOR" ]]; then
+            echo "::error::Set the CRABBOX_COORDINATOR variable on the image-publisher environment."
+            exit 1
+          fi
+          if [[ -z "$CRABBOX_COORDINATOR_ADMIN_TOKEN" ]]; then
+            echo "::error::Set the CRABBOX_COORDINATOR_ADMIN_TOKEN secret on the image-publisher environment."
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build trusted Crabbox CLI
+        run: go build -trimpath -o bin/crabbox ./cmd/crabbox
+
+      - name: Publish and prove image
+        shell: bash
+        env:
+          CRABBOX_IMAGE_LOG_DIR: ${{ runner.temp }}/devtools-image-proof/aws
+          CRABBOX_MACOS_ARTIFACT_DIR: ${{ runner.temp }}/devtools-image-proof/macos
+        run: |
+          set -euo pipefail
+          proof_dir="$RUNNER_TEMP/devtools-image-proof"
+          mkdir -p "$proof_dir"
+          case "$TARGET" in
+            linux)
+              command=(
+                env CRABBOX_OS="$LINUX_OS"
+                scripts/mint-aws-devtools-image.sh
+                --target linux
+                --region "$REGION"
+                --class standard
+                --type "$LINUX_TYPE"
+                --run
+              )
+              if [[ -n "$LINUX_ROOT_GB" ]]; then
+                command+=(--stock-source --root-gb "$LINUX_ROOT_GB")
+              fi
+              if [[ "$MEASURED" == true ]]; then
+                command+=(--measured --max-p95-runner-total-ms "$MAX_P95_RUNNER_TOTAL_MS")
+              fi
+              ;;
+            windows)
+              command=(
+                scripts/mint-aws-devtools-image.sh
+                --target windows
+                --region "$REGION"
+                --class standard
+                --type "$WINDOWS_TYPE"
+                --windows-mode normal
+                --run
+              )
+              if [[ "$WINDOWS_OS" == windows-server:2025 ]]; then
+                command=(env CRABBOX_OS="$WINDOWS_OS" "${command[@]}" --stock-source)
+              fi
+              ;;
+            macos)
+              command=(
+                scripts/mint-macos-devtools-image.sh
+                --region "$REGION"
+                --type "$MACOS_TYPE"
+                "--$MACOS_HOST"
+              )
+              ;;
+          esac
+          if [[ "$MEASURED" == true ]]; then
+            umask 077
+            private_dir="$(mktemp -d "$RUNNER_TEMP/devtools-image-private.XXXXXX")"
+            export CRABBOX_IMAGE_LOG_DIR="$private_dir"
+            export CRABBOX_IMAGE_PUBLIC_OUTCOME="$proof_dir/manifest.json"
+            status=0
+            "${command[@]}" >"$private_dir/publish.log" 2>&1 || status=$?
+            proof_status=0
+            node scripts/devtools-image-proof.mjs validate \
+              "$CRABBOX_IMAGE_PUBLIC_OUTCOME" >/dev/null || proof_status=$?
+            if [[ "$status" != 0 ]]; then
+              echo "::error::Measured publication failed (exit $status)."
+              exit "$status"
+            fi
+            if [[ "$proof_status" != 0 ]]; then
+              echo "::error::Measured publication outcome validation failed (exit $proof_status)."
+              exit "$proof_status"
+            fi
+          else
+            printf 'Publishing from protected commit %s\n' "$GITHUB_SHA"
+            printf 'Command:'
+            printf ' %q' "${command[@]}"
+            printf '\n'
+            "${command[@]}" 2>&1 | tee "$proof_dir/publish.log"
+          fi
+
+      - name: Summarize publication
+        if: always()
+        shell: bash
+        run: |
+          if [[ "$MEASURED" == true ]]; then
+            public_outcome="$RUNNER_TEMP/devtools-image-proof/manifest.json"
+            {
+              echo "## Measured developer image publication"
+              echo
+              if node scripts/devtools-image-proof.mjs validate \
+                "$public_outcome" >/dev/null 2>&1; then
+                jq -r '
+                  "- Status: `\(.status)`",
+                  "- Stage: `\(.stage)`",
+                  "- Source revision: `\(.sourceRevision)`",
+                  "- Baseline p95 runner total: `\(.comparison.baselineP95RunnerTotalMs // "unavailable")`",
+                  "- Candidate p95 runner total: `\(.comparison.candidateP95RunnerTotalMs // "unavailable")`",
+                  "- Promoted p95 runner total: `\(.comparison.promotedP95RunnerTotalMs // "unavailable")`",
+                  "- Rollback: `\(.rollbackStatus)`",
+                  "- Cleanup: `\(.cleanupStatus)`",
+                  "- Exit code: `\(.exitCode // "unavailable")`"
+                ' "$public_outcome"
+              else
+                echo '- Status: `outcome_unavailable`'
+              fi
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Developer image publication"
+            echo
+            echo "- Target: \`$TARGET\`"
+            echo "- Region: \`$REGION\`"
+            echo "- Source commit: \`$GITHUB_SHA\`"
+            if [[ -f "$RUNNER_TEMP/devtools-image-proof/publish.log" ]]; then
+              echo
+              echo "### Result"
+              grep -E 'candidate AMI smoke passed|promoted image selection proved|promoted (linux|windows) developer image passed|promoted macOS image lifecycle passed' \
+                "$RUNNER_TEMP/devtools-image-proof/publish.log" || true
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload publication diagnostics
+        if: always() && !inputs.measured
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: devtools-image-${{ inputs.target }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/devtools-image-proof
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload allowlisted measurement manifest
+        if: always() && inputs.measured
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: devtools-image-measurement-${{ github.run_id }}
+          path: ${{ runner.temp }}/devtools-image-proof/manifest.json
+          if-no-files-found: error
+          retention-days: 30

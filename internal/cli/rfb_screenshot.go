@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
+	"crypto/des"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
@@ -13,53 +13,78 @@ import (
 	"image/png"
 	"io"
 	"math/big"
+	"math/bits"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	rfbSecurityNone = 1
-	rfbSecurityARD  = 30
-	rfbEncodingRaw  = 0
+	rfbSecurityNone  = 1
+	rfbSecurityVNC   = 2
+	rfbSecurityARD   = 30
+	rfbEncodingRaw   = 0
+	rfbKeyEventDelay = 5 * time.Millisecond
+	// rfbKeyReleaseTimeout bounds the key-up and its confirming framebuffer
+	// read after typing is cancelled between a key's down and up events.
+	rfbKeyReleaseTimeout = 2 * time.Second
+	// rfbKeyReleaseTunnelGrace keeps the SSH tunnel up after cancellation
+	// until that release has had its full timeout.
+	rfbKeyReleaseTunnelGrace = rfbKeyReleaseTimeout + 500*time.Millisecond
+
+	// defaultRFBInputReadySettle is a documented delay, not a protocol
+	// handshake. RFB 3.8 and Apple ARD type 30 finish ServerInit and can
+	// emit a framebuffer before Screen Sharing has attached input control
+	// to the console session. Tight/QEMU fence and continuous-update
+	// messages are not advertised. The same-session helper that landed a
+	// full nonce waited ~2s after the first frame (Spotlight 500ms +
+	// launch 1200ms + key I/O) before the first text that actually
+	// appeared. Tests may shorten rfbInputReadySettle; do not treat the
+	// wait, the drain frame, or the byte count as glyph proof.
+	defaultRFBInputReadySettle = 2 * time.Second
 )
+
+var rfbInputReadySettle = defaultRFBInputReadySettle
 
 type rfbCredentials struct {
 	Username string
 	Password string
 }
 
+type rfbClientProtocol struct {
+	legacySecurityType      bool
+	securityResultAfterNone bool
+}
+
 func captureRemoteMacVNCScreenshot(ctx context.Context, cfg Config, target SSHTarget, outputPath string) error {
-	localPort := availableLocalVNCPort()
-	tunnel, err := startVNCForegroundTunnel(ctx, target, localPort, "127.0.0.1", managedVNCPort)
+	tunnel, localPort, err := startVNCForegroundTunnelOnReservedPort(ctx, target, "", "127.0.0.1", managedVNCPort)
 	if err != nil {
 		return err
 	}
 	defer stopProcess(tunnel)
 
-	creds, credentialsAvailable := providerDesktopCredentials(cfg, target)
-	if !credentialsAvailable {
-		password := ""
-		if out, err := runSSHOutput(ctx, target, vncPasswordCommand(target)); err == nil {
-			password = strings.TrimSpace(out)
-		}
-		creds = rfbCredentials{
-			Username: strings.TrimSpace(target.User),
-			Password: password,
-		}
-	}
-	img, err := captureRFBFrame(ctx, "127.0.0.1:"+localPort, creds)
+	creds, authMode, err := resolveMacOSRFBAuthentication(ctx, cfg, target)
 	if err != nil {
-		return exit(5, "capture macOS VNC screenshot: %v", err)
+		return err
+	}
+	conn, err := dialVNCForegroundTunnel(ctx, tunnel, localPort)
+	if err != nil {
+		return fmt.Errorf("connect to verified macOS VNC tunnel: %w", err)
+	}
+	defer conn.Close()
+	img, err := captureRFBFrameFromConn(ctx, conn, creds, authMode)
+	if err != nil {
+		return Exit(5, "capture macOS VNC screenshot: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		return exit(2, "create screenshot directory: %v", err)
+		return Exit(2, "create screenshot directory: %v", err)
 	}
 	file, err := os.Create(outputPath)
 	if err != nil {
-		return exit(2, "create screenshot %s: %v", outputPath, err)
+		return Exit(2, "create screenshot %s: %v", outputPath, err)
 	}
 	ok := false
 	defer func() {
@@ -69,28 +94,147 @@ func captureRemoteMacVNCScreenshot(ctx context.Context, cfg Config, target SSHTa
 		}
 	}()
 	if err := png.Encode(file, img); err != nil {
-		return exit(5, "write screenshot PNG: %v", err)
+		return Exit(5, "write screenshot PNG: %v", err)
 	}
 	ok = true
 	return nil
 }
 
-func providerDesktopCredentials(cfg Config, target SSHTarget) (rfbCredentials, bool) {
+func clickRemoteMacVNC(ctx context.Context, cfg Config, target SSHTarget, x, y int) error {
+	tunnel, localPort, err := startVNCForegroundTunnelOnReservedPort(ctx, target, "", "127.0.0.1", managedVNCPort)
+	if err != nil {
+		return err
+	}
+	defer stopProcess(tunnel)
+
+	creds, authMode, err := resolveMacOSRFBAuthentication(ctx, cfg, target)
+	if err != nil {
+		return err
+	}
+	conn, err := dialVNCForegroundTunnel(ctx, tunnel, localPort)
+	if err != nil {
+		return fmt.Errorf("connect to verified macOS VNC tunnel: %w", err)
+	}
+	defer conn.Close()
+	if err := clickRFBPointerFromConn(ctx, conn, creds, authMode, x, y); err != nil {
+		return fmt.Errorf("click macOS VNC pointer: %w", err)
+	}
+	return nil
+}
+
+func applyRFBConnDeadline(ctx context.Context, conn net.Conn) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+		return nil
+	}
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	return nil
+}
+
+func waitRFBKeyEventDelay(ctx context.Context) error {
+	return waitRFBDuration(ctx, rfbKeyEventDelay)
+}
+
+func waitRFBDuration(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func waitRFBInputReady(ctx context.Context) error {
+	if err := waitRFBDuration(ctx, rfbInputReadySettle); err != nil {
+		return fmt.Errorf("wait for RFB input ready: %w", err)
+	}
+	return nil
+}
+
+func typeRemoteMacVNC(ctx context.Context, cfg Config, target SSHTarget, text string) error {
+	tunnelCtx, stopTunnel := rfbKeyReleaseTunnelContext(ctx, rfbKeyReleaseTunnelGrace)
+	defer stopTunnel()
+	tunnel, localPort, err := startVNCForegroundTunnelOnReservedPort(tunnelCtx, target, "", "127.0.0.1", managedVNCPort)
+	if err != nil {
+		return err
+	}
+	defer stopProcess(tunnel)
+
+	creds, authMode, err := resolveMacOSRFBAuthentication(ctx, cfg, target)
+	if err != nil {
+		return err
+	}
+	conn, err := dialVNCForegroundTunnel(ctx, tunnel, localPort)
+	if err != nil {
+		return fmt.Errorf("connect to verified macOS VNC tunnel: %w", err)
+	}
+	defer conn.Close()
+	if err := typeRFBTextFromConn(ctx, conn, creds, authMode, text); err != nil {
+		return fmt.Errorf("type macOS VNC text: %w", err)
+	}
+	return nil
+}
+
+// rfbKeyReleaseTunnelContext follows ctx, but its cancellation lags ctx by
+// grace. The SSH tunnel dies with its context, and a key pressed when ctx ends
+// can only be released while the tunnel is still up.
+func rfbKeyReleaseTunnelContext(ctx context.Context, grace time.Duration) (context.Context, context.CancelFunc) {
+	tunnelCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	stopAfter := context.AfterFunc(ctx, func() {
+		time.AfterFunc(grace, func() { cancel(context.Cause(ctx)) })
+	})
+	return tunnelCtx, func() {
+		stopAfter()
+		cancel(context.Canceled)
+	}
+}
+
+func resolveMacOSRFBAuthentication(ctx context.Context, cfg Config, target SSHTarget) (rfbCredentials, localWebVNCAuthenticationMode, error) {
+	credentials, authMode, err := resolveMacOSWebVNCCredentials(ctx, cfg, target, runVNCPasswordSSH)
+	if err != nil {
+		return rfbCredentials{}, localWebVNCAuthAuto, err
+	}
+	if err := requireMacOSWebVNCCredentials(credentials, authMode); err != nil {
+		return rfbCredentials{}, localWebVNCAuthAuto, err
+	}
+	return credentials, authMode, nil
+}
+
+func providerDesktopCredentials(cfg Config, target SSHTarget) (rfbCredentials, bool, error) {
 	provider, err := ProviderFor(cfg.Provider)
 	if err != nil {
-		return rfbCredentials{}, false
+		return rfbCredentials{}, false, nil
 	}
 	return desktopCredentialsFromProvider(provider, cfg, target)
 }
 
-func desktopCredentialsFromProvider(provider Provider, cfg Config, target SSHTarget) (rfbCredentials, bool) {
-	credentialProvider, ok := provider.(DesktopCredentialProvider)
-	if !ok {
-		return rfbCredentials{}, false
+func desktopCredentialsFromProvider(provider Provider, cfg Config, target SSHTarget) (rfbCredentials, bool, error) {
+	var credentials DesktopCredentials
+	var ok bool
+	if resolver, supported := provider.(DesktopCredentialResolver); supported {
+		var err error
+		credentials, ok, err = resolver.ResolveDesktopCredentials(cfg, target)
+		if err != nil {
+			return rfbCredentials{}, false, err
+		}
+	} else if credentialProvider, supported := provider.(DesktopCredentialProvider); supported {
+		credentials, ok = credentialProvider.DesktopCredentials(cfg, target)
+	} else {
+		return rfbCredentials{}, false, nil
 	}
-	credentials, ok := credentialProvider.DesktopCredentials(cfg, target)
 	if !ok {
-		return rfbCredentials{}, false
+		return rfbCredentials{}, false, nil
 	}
 	username := strings.TrimSpace(credentials.Username)
 	if username == "" {
@@ -99,81 +243,344 @@ func desktopCredentialsFromProvider(provider Provider, cfg Config, target SSHTar
 	return rfbCredentials{
 		Username: username,
 		Password: credentials.Password,
-	}, true
+	}, true, nil
 }
 
-func captureRFBFrame(ctx context.Context, address string, creds rfbCredentials) (image.Image, error) {
-	dialer := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", address)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	return captureRFBFrameFromConn(ctx, conn, creds)
-}
-
-func captureRFBFrameFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials) (image.Image, error) {
+func preflightRFBAuthenticationFromConnWithMode(ctx context.Context, conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	}
 
-	version := make([]byte, 12)
-	if _, err := io.ReadFull(conn, version); err != nil {
-		return nil, fmt.Errorf("read RFB version: %w", err)
-	}
-	if !bytes.HasPrefix(version, []byte("RFB ")) {
-		return nil, fmt.Errorf("unexpected RFB version %q", string(version))
-	}
-	if _, err := conn.Write([]byte("RFB 003.008\n")); err != nil {
-		return nil, fmt.Errorf("write RFB version: %w", err)
-	}
-
-	securityType, err := negotiateRFBSecurityType(conn)
+	protocol, err := negotiateRFBClientProtocol(conn)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	securityType, err := negotiateRFBClientSecurityType(conn, creds, authMode, protocol)
+	if err != nil {
+		return err
+	}
+	return preflightRFBAuthenticationForSecurityType(conn, creds, securityType)
+}
+
+func preflightRFBAuthenticationForSecurityType(conn net.Conn, creds rfbCredentials, securityType byte) error {
 	switch securityType {
 	case rfbSecurityNone:
+		return fmt.Errorf("RFB server did not require credential authentication")
+	case rfbSecurityVNC:
+		if err := negotiateRFBVNCAuth(conn, creds); err != nil {
+			return err
+		}
 	case rfbSecurityARD:
 		if err := negotiateRFBARDAuth(conn, creds); err != nil {
-			return nil, err
+			return err
 		}
 	default:
-		return nil, fmt.Errorf("unsupported RFB security type %d", securityType)
+		return fmt.Errorf("unsupported RFB security type %d", securityType)
 	}
-	if err := readRFBSecurityResult(conn); err != nil {
+	return readRFBSecurityResult(conn)
+}
+
+func typeRFBTextFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode, text string) (resultErr error) {
+	if !utf8.ValidString(text) {
+		return fmt.Errorf("RFB text is not valid UTF-8")
+	}
+	if err := applyRFBConnDeadline(ctx, conn); err != nil {
+		return err
+	}
+	width, height, err := initializeRFBConnection(conn, creds, authMode, true)
+	if err != nil {
+		return err
+	}
+	if err := prepareRFBFramebufferClient(conn); err != nil {
+		return err
+	}
+	// Apple Screen Sharing can emit the first framebuffer immediately after
+	// ServerInit. If that data is unread, a single-threaded server blocks on
+	// the write and never consumes later KeyEvents. Closing the SSH tunnel
+	// after a short sleep then drops those unread events, which is the
+	// first-character-only delivery failure.
+	if _, err := requestAndReadRFBFramebuffer(conn, width, height); err != nil {
+		return fmt.Errorf("wait for RFB session ready: %w", err)
+	}
+	// A readable framebuffer is not input-control readiness. Apple grants
+	// session control asynchronously after ClientInit; keys sent in that
+	// window are accepted on the socket and discarded by the console.
+	if err := waitRFBInputReady(ctx); err != nil {
+		return err
+	}
+	var key uint32
+	var downWritten, upWritten int
+	defer func() {
+		// This connection has one writer. Only a complete key-down can press
+		// a key; resume a partial key-up without replaying its sent prefix.
+		if resultErr != nil && downWritten == 8 {
+			resultErr = releaseRFBKeyAfterError(conn, key, upWritten, width, height, resultErr)
+		}
+	}()
+	for _, r := range text {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		nextKey, err := rfbKeysymForRune(r)
+		if err != nil {
+			return err
+		}
+		key, upWritten = nextKey, 0
+		downWritten, err = writeRFBKeyEvent(conn, true, key)
+		if err != nil {
+			return err
+		}
+		if err := waitRFBKeyEventDelay(ctx); err != nil {
+			return err
+		}
+		upWritten, err = writeRFBKeyEvent(conn, false, key)
+		if err != nil {
+			return err
+		}
+		if err := waitRFBKeyEventDelay(ctx); err != nil {
+			return err
+		}
+	}
+	// All key-ups are complete. The normal drain owns confirmation now;
+	// retrying its request after a partial write could corrupt the stream.
+	downWritten = 0
+	if _, err := requestAndReadRFBFramebuffer(conn, width, height); err != nil {
+		return fmt.Errorf("drain RFB session after typing: %w", err)
+	}
+	return nil
+}
+
+// releaseRFBKeyAfterError sends a best-effort key-up for a key whose key-down
+// was already written; macOS Screen Sharing keeps the key held even after the
+// client disconnects. The connection deadline follows the caller context and
+// may already have passed, so the release gets its own. The server handles
+// messages in order, so a framebuffer reply confirms the key-up arrived before
+// the caller closes the tunnel. A broken transport cannot deliver it.
+func releaseRFBKeyAfterError(conn net.Conn, key uint32, upWritten int, width, height uint16, cause error) error {
+	if err := conn.SetDeadline(time.Now().Add(rfbKeyReleaseTimeout)); err != nil {
+		return fmt.Errorf("%w; release RFB key: %w", cause, err)
+	}
+	message := rfbKeyEventMessage(false, key)
+	if upWritten < len(message) {
+		n, err := conn.Write(message[upWritten:])
+		if err == nil && n != len(message)-upWritten {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			return fmt.Errorf("%w; release RFB key: %w", cause, err)
+		}
+	}
+	if _, err := requestAndReadRFBFramebuffer(conn, width, height); err != nil {
+		return fmt.Errorf("%w; confirm RFB key release: %w", cause, err)
+	}
+	return cause
+}
+
+func rfbKeysymForRune(r rune) (uint32, error) {
+	switch r {
+	case '\n', '\r':
+		return 0xff0d, nil // XK_Return
+	case '\t':
+		return 0xff09, nil // XK_Tab
+	case '\b':
+		return 0xff08, nil // XK_BackSpace
+	}
+	if r < 0x20 || r == 0x7f {
+		return 0, fmt.Errorf("RFB typing does not support control character U+%04X", r)
+	}
+	if r <= 0xff {
+		return uint32(r), nil
+	}
+	return 0x01000000 | uint32(r), nil
+}
+
+func clickRFBPointerFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode, x, y int) error {
+	if err := applyRFBConnDeadline(ctx, conn); err != nil {
+		return err
+	}
+
+	width, height, err := initializeRFBConnection(conn, creds, authMode, false)
+	if err != nil {
+		return err
+	}
+	if x < 0 || y < 0 || x >= int(width) || y >= int(height) {
+		return fmt.Errorf("pointer coordinates %d,%d exceed framebuffer %dx%d", x, y, width, height)
+	}
+	if err := writeRFBPointerEvent(conn, 0, x, y); err != nil {
+		return err
+	}
+	if err := writeRFBPointerEvent(conn, 1, x, y); err != nil {
+		return err
+	}
+	time.Sleep(80 * time.Millisecond)
+	return writeRFBPointerEvent(conn, 0, x, y)
+}
+
+func captureRFBFrameFromConn(ctx context.Context, conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode) (image.Image, error) {
+	if err := applyRFBConnDeadline(ctx, conn); err != nil {
 		return nil, err
 	}
 
-	if _, err := conn.Write([]byte{1}); err != nil {
-		return nil, fmt.Errorf("write RFB client init: %w", err)
-	}
-	width, height, err := readRFBServerInit(conn)
+	width, height, err := initializeRFBConnection(conn, creds, authMode, false)
 	if err != nil {
 		return nil, err
 	}
-	if width == 0 || height == 0 {
-		return nil, fmt.Errorf("server reported empty framebuffer %dx%d", width, height)
+	if err := prepareRFBFramebufferClient(conn); err != nil {
+		return nil, err
 	}
-	if int(width)*int(height) > 16_000_000 {
-		return nil, fmt.Errorf("framebuffer %dx%d is too large", width, height)
-	}
+	return requestAndReadRFBFramebuffer(conn, width, height)
+}
 
+func prepareRFBFramebufferClient(conn net.Conn) error {
 	if err := writeRFBPixelFormat(conn); err != nil {
-		return nil, err
+		return err
 	}
-	if err := writeRFBSetEncodings(conn); err != nil {
-		return nil, err
-	}
+	return writeRFBSetEncodings(conn)
+}
+
+func requestAndReadRFBFramebuffer(conn net.Conn, width, height uint16) (image.Image, error) {
 	if err := writeRFBFramebufferUpdateRequest(conn, width, height); err != nil {
 		return nil, err
 	}
 	return readRFBFramebufferUpdate(conn, int(width), int(height))
 }
 
-func negotiateRFBSecurityType(conn net.Conn) (byte, error) {
+func initializeRFBConnection(conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode, requireAuth bool) (uint16, uint16, error) {
+	protocol, err := negotiateRFBClientProtocol(conn)
+	if err != nil {
+		return 0, 0, err
+	}
+	securityType, err := negotiateRFBClientSecurityType(conn, creds, authMode, protocol)
+	if err != nil {
+		return 0, 0, err
+	}
+	switch securityType {
+	case rfbSecurityNone:
+		if requireAuth {
+			return 0, 0, fmt.Errorf("RFB server did not require credential authentication")
+		}
+	case rfbSecurityVNC:
+		if err := negotiateRFBVNCAuth(conn, creds); err != nil {
+			return 0, 0, err
+		}
+	case rfbSecurityARD:
+		if err := negotiateRFBARDAuth(conn, creds); err != nil {
+			return 0, 0, err
+		}
+	default:
+		return 0, 0, fmt.Errorf("unsupported RFB security type %d", securityType)
+	}
+	if securityType != rfbSecurityNone || protocol.securityResultAfterNone {
+		if err := readRFBSecurityResult(conn); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	if _, err := conn.Write([]byte{1}); err != nil {
+		return 0, 0, fmt.Errorf("write RFB client init: %w", err)
+	}
+	width, height, err := readRFBServerInit(conn)
+	if err != nil {
+		return 0, 0, err
+	}
+	if width == 0 || height == 0 {
+		return 0, 0, fmt.Errorf("server reported empty framebuffer %dx%d", width, height)
+	}
+	if int(width)*int(height) > 16_000_000 {
+		return 0, 0, fmt.Errorf("framebuffer %dx%d is too large", width, height)
+	}
+	return width, height, nil
+}
+
+func negotiateRFBClientProtocol(conn net.Conn) (rfbClientProtocol, error) {
+	version := make([]byte, 12)
+	if _, err := io.ReadFull(conn, version); err != nil {
+		return rfbClientProtocol{}, fmt.Errorf("read RFB version: %w", err)
+	}
+	clientVersion, err := rfbClientVersionForServer(version)
+	if err != nil {
+		return rfbClientProtocol{}, fmt.Errorf("unexpected RFB version %q", string(version))
+	}
+
+	protocol := rfbClientProtocol{securityResultAfterNone: true}
+	switch string(clientVersion) {
+	case "RFB 003.003\n":
+		protocol.legacySecurityType = true
+		protocol.securityResultAfterNone = false
+	case "RFB 003.007\n":
+		protocol.securityResultAfterNone = false
+	}
+	if _, err := conn.Write(clientVersion); err != nil {
+		return rfbClientProtocol{}, fmt.Errorf("write RFB version: %w", err)
+	}
+	return protocol, nil
+}
+
+func negotiateRFBClientSecurityType(conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode, protocol rfbClientProtocol) (byte, error) {
+	if !protocol.legacySecurityType {
+		return negotiateRFBSecurityTypeForMode(conn, creds, authMode)
+	}
+
+	security := make([]byte, 4)
+	if _, err := io.ReadFull(conn, security); err != nil {
+		return 0, fmt.Errorf("read RFB 3.3 security type: %w", err)
+	}
+	selected := binary.BigEndian.Uint32(security)
+	if selected == 0 {
+		reason, err := readRFBReason(conn)
+		if err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("RFB server rejected security negotiation: %s", reason)
+	}
+	if selected > 255 {
+		return 0, fmt.Errorf("unsupported RFB 3.3 security type %d", selected)
+	}
+	securityType := byte(selected)
+	if expected := rfbSecurityTypeForAuthenticationMode(authMode); expected != 0 && securityType != expected {
+		return 0, fmt.Errorf("RFB server selected security type %d, want %d", securityType, expected)
+	}
+	return securityType, nil
+}
+
+func writeRFBPointerEvent(conn net.Conn, buttonMask byte, x, y int) error {
+	if x < 0 || y < 0 || x > 0xffff || y > 0xffff {
+		return fmt.Errorf("RFB pointer coordinates %d,%d are outside the uint16 protocol range", x, y)
+	}
+	message := []byte{5, buttonMask, 0, 0, 0, 0}
+	binary.BigEndian.PutUint16(message[2:4], uint16(x))
+	binary.BigEndian.PutUint16(message[4:6], uint16(y))
+	if _, err := conn.Write(message); err != nil {
+		return fmt.Errorf("write RFB pointer event: %w", err)
+	}
+	return nil
+}
+
+func rfbKeyEventMessage(down bool, key uint32) [8]byte {
+	var message [8]byte
+	message[0] = 4
+	if down {
+		message[1] = 1
+	}
+	binary.BigEndian.PutUint32(message[4:8], key)
+	return message
+}
+
+func writeRFBKeyEvent(conn net.Conn, down bool, key uint32) (int, error) {
+	message := rfbKeyEventMessage(down, key)
+	n, err := conn.Write(message[:])
+	if err == nil && n != len(message) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return n, fmt.Errorf("write RFB key event: %w", err)
+	}
+	return n, nil
+}
+
+func negotiateRFBSecurityTypeForMode(conn net.Conn, creds rfbCredentials, authMode localWebVNCAuthenticationMode) (byte, error) {
 	count := []byte{0}
 	if _, err := io.ReadFull(conn, count); err != nil {
 		return 0, fmt.Errorf("read RFB security type count: %w", err)
@@ -189,16 +596,68 @@ func negotiateRFBSecurityType(conn net.Conn) (byte, error) {
 	if _, err := io.ReadFull(conn, types); err != nil {
 		return 0, fmt.Errorf("read RFB security types: %w", err)
 	}
-	for _, preferred := range types {
-		switch preferred {
-		case rfbSecurityARD, rfbSecurityNone:
-			if _, err := conn.Write([]byte{preferred}); err != nil {
+	preferences := []byte{rfbSecurityARD, rfbSecurityVNC, rfbSecurityNone}
+	if creds.Username == "" {
+		preferences = []byte{rfbSecurityVNC, rfbSecurityARD, rfbSecurityNone}
+	}
+	if creds.Password == "" {
+		preferences = []byte{rfbSecurityNone, rfbSecurityARD, rfbSecurityVNC}
+	}
+	if required := rfbSecurityTypeForAuthenticationMode(authMode); required != 0 {
+		preferences = []byte{required}
+	}
+	for _, preferred := range preferences {
+		for _, offered := range types {
+			if offered != preferred {
+				continue
+			}
+			if _, err := conn.Write([]byte{offered}); err != nil {
 				return 0, fmt.Errorf("write RFB security type: %w", err)
 			}
-			return preferred, nil
+			return offered, nil
 		}
 	}
 	return 0, fmt.Errorf("unsupported RFB security types %v", types)
+}
+
+func rfbSecurityTypeForAuthenticationMode(authMode localWebVNCAuthenticationMode) byte {
+	switch authMode {
+	case localWebVNCAuthVNC:
+		return rfbSecurityVNC
+	case localWebVNCAuthARD:
+		return rfbSecurityARD
+	default:
+		return 0
+	}
+}
+
+func negotiateRFBVNCAuth(conn net.Conn, creds rfbCredentials) error {
+	if creds.Password == "" {
+		return fmt.Errorf("VNC password is required")
+	}
+	challenge := make([]byte, 16)
+	if _, err := io.ReadFull(conn, challenge); err != nil {
+		return fmt.Errorf("read VNC auth challenge: %w", err)
+	}
+	var key [8]byte
+	copy(key[:], []byte(creds.Password))
+	for i := range key {
+		key[i] = bits.Reverse8(key[i])
+	}
+	cipher, err := des.NewCipher(key[:])
+	if err != nil {
+		return fmt.Errorf("create VNC auth cipher: %w", err)
+	}
+	response := make([]byte, len(challenge))
+	for offset := 0; offset < len(challenge); offset += cipher.BlockSize() {
+		// RFB VNC Authentication mandates DES for protocol compatibility; it is
+		// not used here to protect application data or stored credentials.
+		cipher.Encrypt(response[offset:offset+cipher.BlockSize()], challenge[offset:offset+cipher.BlockSize()]) // lgtm[go/weak-cryptographic-algorithm]
+	}
+	if _, err := conn.Write(response); err != nil {
+		return fmt.Errorf("write VNC auth response: %w", err)
+	}
+	return nil
 }
 
 func negotiateRFBARDAuth(conn net.Conn, creds rfbCredentials) error {

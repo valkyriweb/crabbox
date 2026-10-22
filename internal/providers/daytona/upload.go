@@ -11,8 +11,9 @@ import (
 	"path"
 	"strings"
 
-	apidaytona "github.com/daytonaio/daytona/libs/api-client-go"
-	sdkdaytona "github.com/daytonaio/daytona/libs/sdk-go/pkg/daytona"
+	apidaytona "github.com/daytona/clients/api-client-go"
+	sdkdaytona "github.com/daytona/clients/sdk-go/pkg/daytona"
+	core "github.com/openclaw/crabbox/internal/cli"
 )
 
 func (b *daytonaLeaseBackend) uploadDaytonaArchive(ctx context.Context, sandboxID, archivePath string, archive *os.File) error {
@@ -54,7 +55,7 @@ func daytonaToolboxUploadURL(sandbox *apidaytona.Sandbox, sandboxID, remotePath 
 	return u.String(), nil
 }
 
-func daytonaToolboxHeaders(cfg Config) (map[string]string, error) {
+func daytonaToolboxHeaders(cfg core.Config) (map[string]string, error) {
 	auth, err := daytonaAuthConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -72,8 +73,15 @@ func daytonaToolboxHeaders(cfg Config) (map[string]string, error) {
 }
 
 func uploadDaytonaFileStream(ctx context.Context, client *http.Client, endpoint string, headers map[string]string, file io.Reader, filename string) error {
-	if client == nil {
-		client = http.DefaultClient
+	// The query contains the destination file, not a different trusted origin.
+	origin, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid Daytona upload endpoint")
+	}
+	origin.RawQuery = ""
+	client, err = daytonaHTTPClient(client, origin.String())
+	if err != nil {
+		return err
 	}
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
@@ -98,11 +106,12 @@ func uploadDaytonaFileStream(ctx context.Context, client *http.Client, endpoint 
 		return fmt.Errorf("daytona upload archive: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		_ = pr.CloseWithError(fmt.Errorf("daytona upload archive: %s", resp.Status))
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if len(body) > 0 {
-			return fmt.Errorf("daytona upload archive: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+			message := strings.TrimSpace(redactDaytonaSecrets(string(body), daytonaHeaderSecrets(headers)...))
+			return fmt.Errorf("daytona upload archive: %s: %s", resp.Status, message)
 		}
 		return fmt.Errorf("daytona upload archive: %s", resp.Status)
 	}
@@ -127,4 +136,22 @@ func writeMultipartFile(pipe *io.PipeWriter, writer *multipart.Writer, file io.R
 		return err
 	}
 	return pipe.Close()
+}
+
+func daytonaHeaderSecrets(headers map[string]string) []string {
+	var secrets []string
+	for key, value := range headers {
+		if !strings.EqualFold(key, "Authorization") {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		secrets = append(secrets, value)
+		if strings.HasPrefix(strings.ToLower(value), "bearer ") {
+			secrets = append(secrets, strings.TrimSpace(value[len("bearer "):]))
+		}
+	}
+	return secrets
 }

@@ -11,16 +11,17 @@ func init() { core.RegisterProvider(Provider{}) }
 
 type Provider struct{}
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return []string{"execution-container"} }
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "sandbox",
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetWindows, WindowsMode: core.WindowsModeNormal}},
-		Features:    core.FeatureSet{},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"execution-container"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationLocalContext),
+		Name:             providerName,
+		Family:           "sandbox",
+		Kind:             core.ProviderKindDelegatedRun,
+		Targets:          []core.TargetSpec{{OS: core.TargetWindows, WindowsMode: core.WindowsModeNormal}},
+		Features:         core.FeatureSet{},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
@@ -42,11 +43,4 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	}
 	cfg.MXC.Containment = containment
 	return newBackend(p.Spec(), cfg, rt), nil
-}
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	return backend.(core.DoctorBackend), nil
 }

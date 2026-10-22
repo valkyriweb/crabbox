@@ -1,0 +1,1293 @@
+package blaxel
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+
+	"github.com/openclaw/crabbox/internal/providers/shared"
+	"github.com/openclaw/crabbox/internal/testutil"
+)
+
+type blaxelResponseBody struct {
+	*strings.Reader
+	readErr error
+	close   func() error
+}
+
+func (b *blaxelResponseBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if err == io.EOF && b.readErr != nil {
+		return n, b.readErr
+	}
+	return n, err
+}
+
+func (b *blaxelResponseBody) Close() error { return b.close() }
+
+func TestBlaxelBufferedResponseContract(t *testing.T) {
+	t.Setenv("CRABBOX_BLAXEL_API_KEY", "synthetic-first-key")
+	t.Setenv("BL_API_KEY", "synthetic-second-key")
+	readErr := errors.New("synthetic read failure")
+	for _, path := range []string{"json", "multipart"} {
+		t.Run(path, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, body, kind, wantValue, wantErrorBody string
+				status                                     int
+				nilOutput, failRead                        bool
+			}{
+				{name: "empty", status: 200, wantValue: "initial"},
+				{name: "no-content", status: 204, wantValue: "initial"},
+				{name: "whitespace", status: 200, body: " \t\n", wantValue: "initial"},
+				{name: "nil-output-non-json", status: 200, body: "ordinary text", nilOutput: true, wantValue: "initial"},
+				{name: "raw-json", status: 200, body: " {\"value\":\"ok\"}\n", wantValue: "ok"},
+				{name: "null", status: 200, body: "null", wantValue: "initial"},
+				{name: "syntax", status: 200, body: "{", kind: "syntax", wantValue: "initial"},
+				{name: "trailing-data", status: 200, body: "{} {}", kind: "syntax", wantValue: "initial"},
+				{name: "type", status: 200, body: "{\"value\":3}", kind: "type", wantValue: "initial"},
+				{name: "read", status: 200, body: "partial", failRead: true, kind: "read", wantValue: "initial"},
+				{name: "read-before-status", status: 503, body: "partial", failRead: true, nilOutput: true, kind: "read", wantValue: "initial"},
+				{name: "status", status: 503, body: " unavailable \n", kind: "status", wantErrorBody: " unavailable \n", wantValue: "initial"},
+				{name: "status-nil-output", status: 503, body: " unavailable \n", nilOutput: true, kind: "status", wantErrorBody: " unavailable \n", wantValue: "initial"},
+				{name: "status-redaction", status: 503, body: " synthetic-first-key/synthetic-second-key \n", kind: "status", wantErrorBody: " <redacted>/<redacted> \n", wantValue: "initial"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					out := struct {
+						Value string `json:"value"`
+					}{Value: "initial"}
+					closes, calls := 0, 0
+					body := &blaxelResponseBody{Reader: strings.NewReader(tc.body)}
+					if tc.failRead {
+						body.readErr = readErr
+					}
+					body.close = func() error {
+						closes++
+						if body.Len() != 0 || out.Value != tc.wantValue {
+							t.Errorf("close before consumption/decode: remaining=%d value=%q", body.Len(), out.Value)
+						}
+						return errors.New("ignored synthetic close failure")
+					}
+					httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+						calls++
+						return &http.Response{StatusCode: tc.status, Body: body, Header: make(http.Header)}, nil
+					})}
+					client := &restClient{http: httpClient, dataHTTP: httpClient}
+					var target any = &out
+					if tc.nilOutput {
+						target = nil
+					}
+					var data []byte
+					var err error
+					if path == "json" {
+						data, err = client.doAt(context.Background(), httpClient, "https://example.test", http.MethodGet, "/fixture", nil, nil, target)
+					} else {
+						data, err = client.doMultipartAt(context.Background(), "https://example.test", http.MethodPut, "/fixture", nil, "application/octet-stream", strings.NewReader("fixture"), target)
+					}
+					switch tc.kind {
+					case "":
+						if err != nil || data == nil || string(data) != tc.body {
+							t.Fatalf("data=%q nil=%v error=%v", data, data == nil, err)
+						}
+					case "read":
+						if err != readErr {
+							t.Fatalf("error=%v, want exact read error", err)
+						}
+					case "syntax":
+						if _, ok := err.(*json.SyntaxError); !ok {
+							t.Fatalf("error=%T %v, want unwrapped syntax error", err, err)
+						}
+					case "type":
+						if _, ok := err.(*json.UnmarshalTypeError); !ok {
+							t.Fatalf("error=%T %v, want unwrapped type error", err, err)
+						}
+					case "status":
+						got, ok := err.(apiError)
+						if !ok || got.StatusCode != tc.status || got.Body != tc.wantErrorBody {
+							t.Fatalf("error=%T %#v", err, err)
+						}
+					}
+					if tc.kind != "" && data != nil {
+						t.Fatalf("error returned bytes %q", data)
+					}
+					if calls != 1 || closes != 1 || out.Value != tc.wantValue {
+						t.Fatalf("calls=%d closes=%d value=%q", calls, closes, out.Value)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRedactErrorPreservesCauseAndSafeFormatting(t *testing.T) {
+	if err := redactError(nil); err != nil {
+		t.Fatalf("redactError(nil)=%v", err)
+	}
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded, errors.New("fixture failure")} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			t.Setenv("CRABBOX_BLAXEL_API_KEY", "synthetic-first-key")
+			t.Setenv("BL_API_KEY", "synthetic-second-key")
+			original := &url.Error{Op: "Get", URL: "https://example.test/synthetic-first-key/synthetic-second-key", Err: cause}
+			want := redactString(original.Error())
+			err := redactError(original)
+			t.Setenv("CRABBOX_BLAXEL_API_KEY", "")
+			t.Setenv("BL_API_KEY", "")
+			if !errors.Is(err, cause) {
+				t.Errorf("redacted error lost cause %v", cause)
+			}
+			var urlErr *url.Error
+			if !errors.As(err, &urlErr) || urlErr != original {
+				t.Error("redacted error lost typed transport cause")
+			}
+			var exitErr core.ExitError
+			if errors.As(err, &exitErr) {
+				t.Error("client error invented a CLI exit code")
+			}
+			for _, text := range []string{err.Error(), fmt.Sprint(err), fmt.Sprintf("%+v", err), fmt.Sprintf("%s", err)} {
+				if text != want {
+					t.Errorf("display=%q, want frozen redacted message %q", text, want)
+				}
+			}
+			if got := fmt.Errorf("outer: %w", err).Error(); got != "outer: "+want {
+				t.Errorf("wrapped display=%q", got)
+			}
+		})
+	}
+}
+
+func TestRedactedNativeHTTPRequestPreservesCancellation(t *testing.T) {
+	for _, multipart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("multipart=%t", multipart), func(t *testing.T) {
+			t.Setenv("CRABBOX_BLAXEL_API_KEY", "synthetic-query-key")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				cancel()
+				select {
+				case <-r.Context().Done():
+				case <-time.After(5 * time.Second):
+					t.Error("canceled HTTP request did not close")
+				}
+			}))
+			defer server.Close()
+			client := &restClient{http: server.Client(), dataHTTP: server.Client()}
+			values := url.Values{"fixture": {"synthetic-query-key"}}
+			var err error
+			if multipart {
+				_, err = client.doMultipartAt(ctx, server.URL, http.MethodPut, "/fixture", values, "application/octet-stream", strings.NewReader("fixture"), nil)
+			} else {
+				_, err = client.doAt(ctx, client.http, server.URL, http.MethodGet, "/fixture", values, nil, nil)
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("native HTTP error %v lost cancellation", err)
+			}
+			if err == nil || strings.Contains(fmt.Sprintf("%+v", err), "synthetic-query-key") || !strings.Contains(err.Error(), "<redacted>") {
+				t.Errorf("native error was not safely redacted: %v", err)
+			}
+		})
+	}
+}
+
+func TestWaitProcessStopsAfterNativeHTTPCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stops atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-owned":
+			_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{
+				"name": "sbx-owned", "url": serverURL(r) + "/sandbox/sbx-owned",
+			}, "status": "DEPLOYED"})
+		case r.Method == http.MethodGet && r.URL.Path == "/sandbox/sbx-owned/process/proc-owned":
+			cancel()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+				t.Error("canceled process request did not close")
+			}
+		case r.Method == http.MethodDelete && r.URL.Path == "/sandbox/sbx-owned/process/proc-owned":
+			stops.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{APIURL: server.URL, APIKey: "synthetic-key"}}, core.Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &backend{}
+	_, err = b.waitProcess(ctx, client, "sbx-owned", Process{ID: "proc-owned", Status: "running"})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("waitProcess error %v lost cancellation", err)
+	}
+	if got := stops.Load(); got != 1 {
+		t.Errorf("process stops=%d, want exactly the original process stopped", got)
+	}
+}
+
+func TestUploadFileRewindsArchiveAfterNativeMultipartFailure(t *testing.T) {
+	var attempts atomic.Int32
+	parts := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-owned":
+			_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "sbx-owned", "url": serverURL(r) + "/sandbox/sbx-owned"}, "status": "DEPLOYED"})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/filesystem-multipart/initiate/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"uploadId": fmt.Sprintf("upload-%d", attempts.Add(1))})
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/part"):
+			if err := r.ParseMultipartForm(1024); err != nil {
+				t.Error(err)
+				w.WriteHeader(500)
+				return
+			}
+			defer r.MultipartForm.RemoveAll()
+			file, _, err := r.FormFile("file")
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(500)
+				return
+			}
+			defer file.Close()
+			data, err := io.ReadAll(file)
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(500)
+				return
+			}
+			select {
+			case parts <- string(data):
+			default:
+				t.Error("unexpected extra multipart attempt")
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if strings.Contains(r.URL.Path, "upload-1/") {
+				http.Error(w, "WORKLOAD_UNAVAILABLE", http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"etag": "synthetic-etag", "partNumber": 1, "size": len(data)})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{APIURL: server.URL, APIKey: "synthetic-key"}}, core.Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "archive.tgz")
+	want := "archive-bytes\x00with-tail"
+	if err := os.WriteFile(archive, []byte(want), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := client.UploadFile(ctx, "sbx-owned", "/tmp/archive.tgz", file); err != nil {
+		t.Fatal(err)
+	}
+	if attempts.Load() != 2 || len(parts) != 2 {
+		t.Fatalf("attempts=%d parts=%d", attempts.Load(), len(parts))
+	}
+	for i := 0; i < 2; i++ {
+		if got := <-parts; got != want {
+			t.Fatalf("attempt %d body=%q want complete archive", i+1, got)
+		}
+	}
+}
+
+func TestBlaxelFallbackBoundsControlAndPreservesUpload(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const controlTimeout = 30 * time.Millisecond
+		server := testutil.NewPipeHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes":
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `[{"metadata":`)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-1":
+				_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{
+					"name": "sbx-1",
+					"url":  serverURL(r) + "/sandbox/sbx-1",
+				}})
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/filesystem-multipart/initiate/"):
+				_ = json.NewEncoder(w).Encode(map[string]any{"uploadId": "upload-1"})
+			case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/filesystem-multipart/upload-1/part"):
+				if err := r.ParseMultipartForm(1024); err != nil {
+					t.Error(err)
+				}
+				time.Sleep(3 * controlTimeout)
+				_ = json.NewEncoder(w).Encode(map[string]any{"etag": "etag-1", "partNumber": 1})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/filesystem-multipart/upload-1/complete"):
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		control, data := shared.ControlAndDataHTTPClients(nil, controlTimeout)
+		control.Transport, data.Transport = server.Client().Transport, server.Client().Transport
+		client := &restClient{
+			base:     server.URL,
+			apiKey:   "test-key",
+			version:  defaultAPIVersion,
+			http:     secureHTTPClient(control),
+			dataHTTP: secureHTTPClient(data),
+		}
+		started := time.Now()
+		err := client.Probe(context.Background())
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Probe error=%v, want whole-request deadline", err)
+		}
+		controlElapsed := time.Since(started)
+		if controlElapsed >= time.Second {
+			t.Fatalf("stalled control response bounded after %s, want under 1s", controlElapsed)
+		}
+
+		started = time.Now()
+		if err := client.UploadFile(context.Background(), "sbx-1", "/tmp/archive.tgz", strings.NewReader("archive")); err != nil {
+			t.Fatal(err)
+		}
+		dataElapsed := time.Since(started)
+		if dataElapsed <= controlTimeout {
+			t.Fatalf("upload completed in %s, want beyond %s", dataElapsed, controlTimeout)
+		}
+		t.Logf("Blaxel control body bounded in %s; multipart upload completed in %s beyond %s control deadline", controlElapsed.Round(time.Millisecond), dataElapsed.Round(time.Millisecond), controlTimeout)
+	})
+}
+
+func TestBlaxelInjectedHTTPSettingsArePreservedForBothPlanes(t *testing.T) {
+	transport := &http.Transport{DisableKeepAlives: true}
+	injected := &http.Client{Transport: transport, Timeout: 17 * time.Second}
+	api, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{APIKey: "test-key"}}, core.Runtime{HTTP: injected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := api.(*restClient)
+	if client.http.Transport != transport || client.dataHTTP.Transport != transport || client.http.Timeout != injected.Timeout || client.dataHTTP.Timeout != injected.Timeout {
+		t.Fatalf("settings=control:(%T,%s) data:(%T,%s)", client.http.Transport, client.http.Timeout, client.dataHTTP.Transport, client.dataHTTP.Timeout)
+	}
+	if injected.CheckRedirect != nil {
+		t.Fatal("constructor mutated injected redirect policy")
+	}
+}
+
+func TestBlaxelControlRedirectDoesNotLeakCredentials(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetRequests.Add(1)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization=%q", got)
+		}
+		http.Redirect(w, r, target.URL+"/capture", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+	api, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{APIURL: origin.URL, APIKey: "test-key"}}, core.Runtime{HTTP: origin.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.Probe(context.Background()); err == nil || !strings.Contains(err.Error(), "refused cross-origin redirect") {
+		t.Fatalf("Probe error=%v, want redirect rejection", err)
+	}
+	if targetRequests.Load() != 0 {
+		t.Fatalf("redirect target requests=%d, want 0", targetRequests.Load())
+	}
+}
+
+func TestValidateAPIURLCanonicalizesAndRejectsUnsafe(t *testing.T) {
+	got, err := ValidateAPIURL("https://API.BLAXEL.AI:443/v1/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://api.blaxel.ai" {
+		t.Fatalf("ValidateAPIURL canonical=%q", got)
+	}
+	if got, err := ValidateAPIURL("http://localhost:8080/v1"); err != nil || got != "http://localhost:8080" {
+		t.Fatalf("loopback ValidateAPIURL=%q err=%v", got, err)
+	}
+	for _, raw := range []string{
+		"https://user:pass@api.blaxel.ai",
+		"https://api.blaxel.ai?api_key=secret",
+		"https://api.blaxel.ai#secret",
+		"http://api.blaxel.ai",
+	} {
+		if _, err := ValidateAPIURL(raw); err == nil {
+			t.Fatalf("ValidateAPIURL(%q) succeeded", raw)
+		}
+	}
+}
+
+func TestValidateSandboxEndpointRestrictsBearerTokenDestinations(t *testing.T) {
+	got, err := validateSandboxEndpoint("https://SBX-ONE-WORKSPACE.us-pdx-1.BL.RUN:443/api/", "https://api.blaxel.ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://sbx-one-workspace.us-pdx-1.bl.run/api" {
+		t.Fatalf("endpoint=%q", got)
+	}
+	if got, err := validateSandboxEndpoint("http://127.0.0.1:8080/sandbox/sbx-1", "http://localhost:9999"); err != nil || got != "http://127.0.0.1:8080/sandbox/sbx-1" {
+		t.Fatalf("loopback endpoint=%q err=%v", got, err)
+	}
+	for _, tc := range []struct {
+		name       string
+		endpoint   string
+		management string
+	}{
+		{name: "userinfo", endpoint: "https://user:pass@sbx-one.us-pdx-1.bl.run", management: "https://api.blaxel.ai"},
+		{name: "query", endpoint: "https://sbx-one.us-pdx-1.bl.run?token=secret", management: "https://api.blaxel.ai"},
+		{name: "fragment", endpoint: "https://sbx-one.us-pdx-1.bl.run#secret", management: "https://api.blaxel.ai"},
+		{name: "http remote", endpoint: "http://sbx-one.us-pdx-1.bl.run", management: "https://api.blaxel.ai"},
+		{name: "untrusted host", endpoint: "https://evil.example/sandbox", management: "https://api.blaxel.ai"},
+		{name: "loopback with remote management", endpoint: "http://127.0.0.1:8080/sandbox", management: "https://api.blaxel.ai"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := validateSandboxEndpoint(tc.endpoint, tc.management); err == nil {
+				t.Fatalf("validateSandboxEndpoint(%q, %q) succeeded", tc.endpoint, tc.management)
+			}
+		})
+	}
+}
+
+func TestClientHeadersAndListShapes(t *testing.T) {
+	var sawWorkspace, sawVersion, sawAuth bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v0/sandboxes" {
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+		sawWorkspace = r.Header.Get("X-Blaxel-Workspace") == "workspace-test"
+		sawVersion = r.Header.Get("Blaxel-Version") == defaultAPIVersion
+		sawAuth = r.Header.Get("Authorization") == "Bearer test-key"
+		if r.URL.Query().Get("limit") != "2" {
+			t.Fatalf("query=%s", r.URL.RawQuery)
+		}
+		if r.URL.Query().Get("q") != "workspace-token" {
+			t.Fatalf("query=%s", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{
+				"metadata": map[string]any{
+					"name":   "sbx-1",
+					"url":    serverURL(r) + "/sandbox/sbx-1",
+					"labels": map[string]string{"env": "dev"},
+				},
+				"spec":   map[string]any{"region": "us-pdx-1", "runtime": map[string]any{"image": "ubuntu:24.04"}},
+				"status": "DEPLOYED",
+			}},
+			"meta": map[string]any{"nextCursor": "cursor-2"},
+		})
+	}))
+	defer server.Close()
+
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{
+		APIURL:    server.URL,
+		APIKey:    "test-key",
+		Workspace: "workspace-test",
+	}}, core.Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.ListSandboxes(context.Background(), ListSandboxesRequest{
+		Limit:  2,
+		Labels: map[string]string{"crabbox.blaxel.scope": "workspace-token"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawWorkspace || !sawVersion || !sawAuth {
+		t.Fatalf("headers workspace=%t version=%t auth=%t", sawWorkspace, sawVersion, sawAuth)
+	}
+	if len(result.Sandboxes) != 1 ||
+		result.Sandboxes[0].ID != "sbx-1" ||
+		result.Sandboxes[0].Endpoint == "" ||
+		result.Sandboxes[0].Labels["env"] != "dev" ||
+		result.Next != "cursor-2" {
+		t.Fatalf("result=%#v", result)
+	}
+
+	bare, err := parseSandboxList([]byte(`[{"metadata":{"name":"sbx-2","url":"https://sbx.example","labels":{"team":"core"}},"state":"RUNNING"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bare.Sandboxes) != 1 || bare.Sandboxes[0].ID != "sbx-2" || bare.Sandboxes[0].Status != "RUNNING" {
+		t.Fatalf("bare=%#v", bare)
+	}
+}
+
+func TestClientUsesManagementShapeAndSandboxDataPlane(t *testing.T) {
+	var sawPutLabels bool
+	var sawProcess bool
+	var sawUpload bool
+	var sawComplete bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{
+					"name": "sbx-1",
+					"url":  "http://" + r.Host + "/sandbox/sbx-1",
+				},
+				"spec":   map[string]any{"region": "us-pdx-1", "runtime": map[string]any{"image": "ubuntu:24.04"}},
+				"status": "DEPLOYED",
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/v0/sandboxes/sbx-1":
+			sawPutLabels = true
+			var body struct {
+				Metadata struct {
+					Labels map[string]string `json:"labels"`
+				} `json:"metadata"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Metadata.Labels["crabbox.lease"] != "blx_sbx-1" {
+				t.Fatalf("put labels=%#v", body.Metadata.Labels)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "sbx-1", "url": "http://" + r.Host + "/sandbox/sbx-1", "labels": body.Metadata.Labels},
+				"status":   "DEPLOYED",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox/sbx-1/process":
+			sawProcess = true
+			var body struct {
+				Command           string `json:"command"`
+				WaitForCompletion bool   `json:"waitForCompletion"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Command != "'go' 'test' './...'" || body.WaitForCompletion {
+				t.Fatalf("process body=%#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"pid": "1234", "status": "running"})
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox/sbx-1/filesystem-multipart/initiate//tmp/archive.tgz":
+			_ = json.NewEncoder(w).Encode(map[string]any{"uploadId": "upload-1", "path": "/tmp/archive.tgz"})
+		case r.Method == http.MethodPut && r.URL.Path == "/sandbox/sbx-1/filesystem-multipart/upload-1/part":
+			sawUpload = true
+			if r.Header.Get("Blaxel-Version") != defaultAPIVersion || r.Header.Get("X-Blaxel-Workspace") != "workspace-test" {
+				t.Fatalf("multipart headers version=%q workspace=%q", r.Header.Get("Blaxel-Version"), r.Header.Get("X-Blaxel-Workspace"))
+			}
+			if r.URL.Query().Get("partNumber") != "1" {
+				t.Fatalf("query=%s", r.URL.RawQuery)
+			}
+			if err := r.ParseMultipartForm(1024); err != nil {
+				t.Fatal(err)
+			}
+			file, _, err := r.FormFile("file")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			data, err := io.ReadAll(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != "\x00\x01archive" {
+				t.Fatalf("multipart upload=%q", data)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"etag": "etag-1", "partNumber": 1, "size": len(data)})
+		case r.Method == http.MethodPost && r.URL.Path == "/sandbox/sbx-1/filesystem-multipart/upload-1/complete":
+			sawComplete = true
+			var body struct {
+				Parts []multipartUploadPart `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Parts) != 1 || body.Parts[0].ETag != "etag-1" {
+				t.Fatalf("complete body=%#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "ok"})
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{
+		APIURL:    server.URL,
+		APIKey:    "test-key",
+		Workspace: "workspace-test",
+	}}, core.Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UpdateSandboxLabels(context.Background(), "sbx-1", map[string]string{"crabbox.lease": "blx_sbx-1"}); err != nil {
+		t.Fatal(err)
+	}
+	process, err := client.ExecuteProcess(context.Background(), "sbx-1", ExecuteProcessRequest{
+		Command: "go",
+		Args:    []string{"test", "./..."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if process.ID != "1234" || process.Status != "running" {
+		t.Fatalf("process=%#v", process)
+	}
+	if err := client.UploadFile(context.Background(), "sbx-1", "/tmp/archive.tgz", strings.NewReader("\x00\x01archive")); err != nil {
+		t.Fatal(err)
+	}
+	if !sawPutLabels || !sawProcess || !sawUpload || !sawComplete {
+		t.Fatalf("sawPutLabels=%t sawProcess=%t sawUpload=%t sawComplete=%t", sawPutLabels, sawProcess, sawUpload, sawComplete)
+	}
+}
+
+func TestClientRejectsUnsafeSandboxEndpointBeforeDataPlaneAuth(t *testing.T) {
+	var dataPlaneRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{
+					"name": "sbx-1",
+					"url":  "https://evil.example/sandbox/sbx-1",
+				},
+				"status": "DEPLOYED",
+			})
+		default:
+			dataPlaneRequests++
+			t.Fatalf("unexpected data-plane request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{
+		APIURL: server.URL,
+		APIKey: "test-key",
+	}}, core.Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ExecuteProcess(context.Background(), "sbx-1", ExecuteProcessRequest{Command: "true"})
+	if err == nil || !strings.Contains(err.Error(), "not a trusted Blaxel data-plane origin") {
+		t.Fatalf("ExecuteProcess err=%v", err)
+	}
+	if dataPlaneRequests != 0 {
+		t.Fatalf("dataPlaneRequests=%d", dataPlaneRequests)
+	}
+}
+
+func serverURL(r *http.Request) string {
+	return "http://" + r.Host
+}
+
+func TestClientRedactsAPIKeyFromErrors(t *testing.T) {
+	t.Setenv("CRABBOX_BLAXEL_API_KEY", "secret-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad secret-key", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{
+		APIURL: server.URL,
+		APIKey: "secret-key",
+	}}, core.Runtime{HTTP: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ListSandboxes(context.Background(), ListSandboxesRequest{})
+	if err == nil {
+		t.Fatal("ListSandboxes succeeded")
+	}
+	if strings.Contains(err.Error(), "secret-key") || !strings.Contains(err.Error(), "<redacted>") {
+		t.Fatalf("error not redacted: %v", err)
+	}
+}
+
+func TestSecureHTTPClientRedirectPolicy(t *testing.T) {
+	client := secureHTTPClient(&http.Client{})
+	req := &http.Request{URL: mustParseURL(t, "https://api.blaxel.ai/next")}
+	var via []*http.Request
+	for i := 0; i < 10; i++ {
+		via = append(via, &http.Request{URL: mustParseURL(t, "https://api.blaxel.ai/loop")})
+	}
+	if err := client.CheckRedirect(req, via); err == nil || !strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("redirect cap err=%v", err)
+	}
+	crossOriginVia := []*http.Request{{URL: mustParseURL(t, "https://api.blaxel.ai/start")}}
+	crossOriginReq := &http.Request{URL: mustParseURL(t, "https://evil.example/next")}
+	if err := client.CheckRedirect(crossOriginReq, crossOriginVia); err == nil || !strings.Contains(err.Error(), "refused cross-origin redirect") {
+		t.Fatalf("cross-origin err=%v", err)
+	}
+	originalErr := errors.New("original policy")
+	withOriginal := secureHTTPClient(&http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return originalErr
+	}})
+	if err := withOriginal.CheckRedirect(req, crossOriginVia); !errors.Is(err, originalErr) {
+		t.Fatalf("original policy err=%v", err)
+	}
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+func TestAPICreateSandboxRequestMapsLifecyclePolicies(t *testing.T) {
+	t.Parallel()
+
+	got := apiCreateSandboxRequest(CreateSandboxRequest{
+		Name:     "sbx-test",
+		Image:    "blaxel/base-image:latest",
+		Region:   "us-was-1",
+		MemoryMB: 2048,
+		TTL:      "20m",
+		IdleTTL:  "10m",
+	})
+
+	if got.Spec.Runtime.TTL != "20m" {
+		t.Fatalf("runtime.ttl=%q", got.Spec.Runtime.TTL)
+	}
+	if got.Spec.Lifecycle.TerminatedRetention != defaultTerminatedRetention {
+		t.Fatalf("terminatedRetention=%q", got.Spec.Lifecycle.TerminatedRetention)
+	}
+	if len(got.Spec.Lifecycle.ExpirationPolicies) != 2 {
+		t.Fatalf("policies=%#v", got.Spec.Lifecycle.ExpirationPolicies)
+	}
+	if got.Spec.Lifecycle.ExpirationPolicies[0] != (blaxelExpirationPolicy{Action: "delete", Type: "ttl-max-age", Value: "20m"}) {
+		t.Fatalf("max-age policy=%#v", got.Spec.Lifecycle.ExpirationPolicies[0])
+	}
+	if got.Spec.Lifecycle.ExpirationPolicies[1] != (blaxelExpirationPolicy{Action: "delete", Type: "ttl-idle", Value: "10m"}) {
+		t.Fatalf("idle policy=%#v", got.Spec.Lifecycle.ExpirationPolicies[1])
+	}
+
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	for _, want := range []string{
+		`"expirationPolicies"`,
+		`"ttl-max-age"`,
+		`"ttl-idle"`,
+		`"terminatedRetention":"5m"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("create body missing %s: %s", want, body)
+		}
+	}
+}
+
+func TestAPICreateSandboxRequestDefaultsLifecycleWhenTTLUnset(t *testing.T) {
+	t.Parallel()
+
+	got := apiCreateSandboxRequest(CreateSandboxRequest{
+		Name:  "sbx-default",
+		Image: "blaxel/base-image:latest",
+	})
+	if len(got.Spec.Lifecycle.ExpirationPolicies) != 1 {
+		t.Fatalf("policies=%#v", got.Spec.Lifecycle.ExpirationPolicies)
+	}
+	if got.Spec.Lifecycle.ExpirationPolicies[0].Type != "ttl-max-age" || got.Spec.Lifecycle.ExpirationPolicies[0].Value != defaultSandboxMaxAgeTTL {
+		t.Fatalf("default policy=%#v", got.Spec.Lifecycle.ExpirationPolicies[0])
+	}
+	if got.Spec.Lifecycle.TerminatedRetention != defaultTerminatedRetention {
+		t.Fatalf("terminatedRetention=%q", got.Spec.Lifecycle.TerminatedRetention)
+	}
+	if got.Spec.Runtime.TTL != defaultSandboxMaxAgeTTL {
+		t.Fatalf("runtime.ttl=%q", got.Spec.Runtime.TTL)
+	}
+}
+
+func TestAPICreateSandboxRequestHonorsExplicitTerminatedRetention(t *testing.T) {
+	t.Parallel()
+
+	got := apiCreateSandboxRequest(CreateSandboxRequest{
+		Name:                "sbx-ret",
+		IdleTTL:             "3m",
+		TerminatedRetention: "15m",
+	})
+	if got.Spec.Lifecycle.TerminatedRetention != "15m" {
+		t.Fatalf("terminatedRetention=%q", got.Spec.Lifecycle.TerminatedRetention)
+	}
+	if len(got.Spec.Lifecycle.ExpirationPolicies) != 1 || got.Spec.Lifecycle.ExpirationPolicies[0].Type != "ttl-idle" {
+		t.Fatalf("policies=%#v", got.Spec.Lifecycle.ExpirationPolicies)
+	}
+}
+
+func TestUpdateSandboxLabelsRoundTripsFullDocument(t *testing.T) {
+	// Blaxel PUT is a full replace: the update body must carry the current
+	// spec (runtime + lifecycle) or the sandbox gets DEACTIVATED.
+	var putBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v0/sandboxes/sbx-1" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "sbx-1", "labels": map[string]string{"old": "1"}},
+				"spec": map[string]any{
+					"region":  "us-pdx-1",
+					"runtime": map[string]any{"image": "img", "memory": 4096},
+					"lifecycle": map[string]any{
+						"expirationPolicies":  []map[string]string{{"type": "ttl-max-age", "value": "10m", "action": "delete"}},
+						"terminatedRetention": "1m",
+					},
+				},
+				"status": "DEPLOYED",
+			})
+			return
+		}
+		if r.Method == http.MethodPut && r.URL.Path == "/v0/sandboxes/sbx-1" {
+			buf := new(strings.Builder)
+			_, _ = io.Copy(buf, r.Body)
+			putBody = buf.String()
+			_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "sbx-1"}, "status": "DEPLOYED"})
+			return
+		}
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{
+		APIURL:    srv.URL,
+		APIKey:    "test-key",
+		Workspace: "workspace-test",
+	}}, core.Runtime{HTTP: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.UpdateSandboxLabels(context.Background(), "sbx-1", map[string]string{"crabbox.lease": "blx_sbx-1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"crabbox.lease":"blx_sbx-1"`, `"lifecycle"`, `"ttl-max-age"`, `"terminatedRetention":"1m"`, `"runtime"`, `"region"`} {
+		if !strings.Contains(putBody, want) {
+			t.Fatalf("PUT body missing %s: %s", want, putBody)
+		}
+	}
+	if strings.Contains(putBody, `"old":"1"`) {
+		t.Fatalf("PUT body should replace labels, got %s", putBody)
+	}
+}
+
+func TestDoSandboxRetryRecoversFromWorkloadUnavailable(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Management-plane sandbox lookup for sandboxBaseURL.
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v0/sandboxes/") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "sbx", "url": "http://" + r.Host + "/sandbox/sbx"},
+				"status":   "DEPLOYED",
+			})
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/process") {
+			calls++
+			if calls < 3 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"code":"WORKLOAD_UNAVAILABLE","status":404}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"pid":"123","status":"running"}`))
+			return
+		}
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{
+		APIURL:    srv.URL,
+		APIKey:    "test-key",
+		Workspace: "workspace-test",
+	}}, core.Runtime{HTTP: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, ok := client.(*restClient)
+	if !ok {
+		t.Fatalf("unexpected client type %T", client)
+	}
+
+	oldDelays := blaxelWorkloadRetryDelays
+	blaxelWorkloadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { blaxelWorkloadRetryDelays = oldDelays })
+
+	var out blaxelAPIProcess
+	_, err = rc.doSandboxRetry(context.Background(), "sbx", http.MethodPost, "/process", nil, map[string]any{}, &out)
+	if err != nil {
+		t.Fatalf("doSandboxRetry: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls, got %d", calls)
+	}
+	if out.PID != "123" {
+		t.Fatalf("unexpected pid %s", out.PID)
+	}
+}
+
+func TestDoSandboxRetryDoesNotRetryOtherErrors(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v0/sandboxes/") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "sbx", "url": "http://" + r.Host + "/sandbox/sbx"},
+				"status":   "DEPLOYED",
+			})
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/process") {
+			calls++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"bad request"}`))
+			return
+		}
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := newBlaxelClient(core.Config{Blaxel: core.BlaxelConfig{
+		APIURL:    srv.URL,
+		APIKey:    "test-key",
+		Workspace: "workspace-test",
+	}}, core.Runtime{HTTP: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, ok := client.(*restClient)
+	if !ok {
+		t.Fatalf("unexpected client type %T", client)
+	}
+
+	oldDelays := blaxelWorkloadRetryDelays
+	blaxelWorkloadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { blaxelWorkloadRetryDelays = oldDelays })
+
+	var out blaxelAPIProcess
+	_, err = rc.doSandboxRetry(context.Background(), "sbx", http.MethodPost, "/process", nil, map[string]any{}, &out)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call for non-retryable error, got %d", calls)
+	}
+}
+
+// A finite local archive with an observable in-flight Read. The test releases
+// that Read itself; it does not require cancellation to interrupt arbitrary I/O.
+type multipartLifetimeReadSeeker struct {
+	file             *os.File
+	entered          chan struct{}
+	release          chan struct{}
+	pauseOnce        sync.Once
+	releaseOnce      sync.Once
+	reading          atomic.Bool
+	seekWhileReading atomic.Bool
+	closeCalls       atomic.Int32
+	readErr          error
+}
+
+func (r *multipartLifetimeReadSeeker) Read(p []byte) (int, error) {
+	r.reading.Store(true)
+	defer r.reading.Store(false)
+	r.pauseOnce.Do(func() { close(r.entered); <-r.release })
+	if r.readErr != nil {
+		return 0, r.readErr
+	}
+	return r.file.Read(p)
+}
+
+func (r *multipartLifetimeReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	if r.reading.Load() {
+		r.seekWhileReading.Store(true)
+		return 0, errors.New("archive reader still borrowed by multipart producer")
+	}
+	return r.file.Seek(offset, whence)
+}
+
+func (r *multipartLifetimeReadSeeker) Close() error { r.closeCalls.Add(1); return r.file.Close() }
+
+func (r *multipartLifetimeReadSeeker) resume() { r.releaseOnce.Do(func() { close(r.release) }) }
+
+func TestUploadFileDoesNotRewindWhilePreviousMultipartReadIsActive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		archive := filepath.Join(t.TempDir(), "archive.tgz")
+		if err := os.WriteFile(archive, []byte("finite archive payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.Open(archive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		source := &multipartLifetimeReadSeeker{file: file, entered: make(chan struct{}), release: make(chan struct{})}
+		defer source.resume()
+		producerTransportDone := make(chan error, 1)
+		var parts atomic.Int32
+		retriedBytes := make(chan string, 1)
+		response := func(code int, body string) *http.Response {
+			return &http.Response{StatusCode: code, Status: fmt.Sprintf("%d %s", code, http.StatusText(code)), Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+		}
+		httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPut && req.Body != nil {
+				_, _ = io.Copy(io.Discard, req.Body)
+				_ = req.Body.Close()
+			}
+			switch {
+			case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/sandboxes/sbx-owned"):
+				return response(200, `{"metadata":{"name":"sbx-owned","url":"http://127.0.0.1:9443/sandbox/sbx-owned"},"status":"DEPLOYED"}`), nil
+			case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/filesystem-multipart/initiate/"):
+				return response(200, `{"uploadId":"owned-upload"}`), nil
+			case req.Method == http.MethodPut && strings.HasSuffix(req.URL.Path, "/part"):
+				if parts.Add(1) == 1 {
+					// RoundTripper may return response headers before request-body completion
+					// and close the body asynchronously. Its body owner is explicitly joined.
+					go func() {
+						_, copyErr := io.Copy(io.Discard, req.Body)
+						_ = req.Body.Close()
+						producerTransportDone <- copyErr
+					}()
+					<-source.entered
+					return response(503, "WORKLOAD_UNAVAILABLE"), nil
+				}
+				multipartBody, parseErr := req.MultipartReader()
+				if parseErr != nil {
+					_ = req.Body.Close()
+					return nil, parseErr
+				}
+				filePart, parseErr := multipartBody.NextPart()
+				if parseErr != nil {
+					_ = req.Body.Close()
+					return nil, parseErr
+				}
+				payload, copyErr := io.ReadAll(filePart)
+				if copyErr == nil {
+					_, copyErr = multipartBody.NextPart()
+					if copyErr == io.EOF {
+						copyErr = nil
+					}
+				}
+				_ = req.Body.Close()
+				if copyErr != nil {
+					return nil, copyErr
+				}
+				retriedBytes <- string(payload)
+				return response(200, `{"etag":"synthetic-etag","partNumber":1}`), nil
+			case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/complete"):
+				return response(204, ""), nil
+			default:
+				return nil, fmt.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+			}
+		})}
+		client := &restClient{base: "http://127.0.0.1:9443", http: httpClient, dataHTTP: httpClient}
+		result := make(chan error, 1)
+		go func() { result <- client.UploadFile(t.Context(), "sbx-owned", "/tmp/archive.tgz", source) }()
+		select {
+		case <-source.entered:
+		case early := <-result:
+			t.Fatalf("upload ended before controlled producer read: %v", early)
+		}
+		synctest.Wait()
+		overlappingSeek := source.seekWhileReading.Load()
+		source.resume()
+		uploadErr := <-result
+		<-producerTransportDone
+		synctest.Wait()
+		if uploadErr != nil {
+			var apiErr apiError
+			if !errors.As(uploadErr, &apiErr) || apiErr.StatusCode != 503 || !strings.Contains(apiErr.Body, "WORKLOAD_UNAVAILABLE") {
+				t.Fatalf("HTTP failure precedence changed: %v", uploadErr)
+			}
+		}
+		if overlappingSeek {
+			t.Fatalf("retry attempted Seek while the previous multipart producer still owned an active Read; original HTTP 503 preserved: %v", uploadErr)
+		}
+		if uploadErr != nil {
+			t.Fatalf("completed producer should permit the existing retry: %v", uploadErr)
+		}
+		if parts.Load() != 2 {
+			t.Fatalf("part attempts=%d, want existing retry", parts.Load())
+		}
+		if got := <-retriedBytes; got != "finite archive payload" {
+			t.Fatalf("retry payload=%q", got)
+		}
+		if source.closeCalls.Load() != 0 {
+			t.Fatal("borrowed source was closed")
+		}
+		if _, err := source.Seek(0, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := io.ReadAll(source); err != nil || string(got) != "finite archive payload" {
+			t.Fatalf("caller lost source ownership: %q %v", got, err)
+		}
+	})
+}
+
+func TestMultipartAttemptRetainsBorrowedSourceUntilCompletion(t *testing.T) {
+	t.Setenv("CRABBOX_BLAXEL_API_KEY", "synthetic-source-secret")
+	for _, tc := range []struct {
+		name, response, want                                     string
+		status                                                   int
+		sourceFailure, cancel, transportFailure, responseFailure bool
+	}{
+		{name: "early success finishes upload", status: 200, response: `{"etag":"ok"}`},
+		{name: "producer error after success", status: 200, response: `{"etag":"ok"}`, sourceFailure: true, want: "source"},
+		{name: "HTTP error remains primary", status: 400, response: "rejected", sourceFailure: true, want: "http"},
+		{name: "retryable HTTP error remains primary", status: 503, response: "WORKLOAD_UNAVAILABLE", sourceFailure: true, want: "http"},
+		{name: "decode error remains primary", status: 200, response: "{", sourceFailure: true, want: "decode"},
+		{name: "missing etag remains primary", status: 200, response: "{}", sourceFailure: true, want: "etag"},
+		{name: "transport failure remains primary", transportFailure: true, sourceFailure: true, want: "transport"},
+		{name: "response read failure remains primary", status: 200, response: `{"etag":"ok"}`, responseFailure: true, sourceFailure: true, want: "read"},
+		{name: "cancellation awaits borrowed read", status: 200, response: `{"etag":"ok"}`, cancel: true, want: "cancel"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				archive := filepath.Join(t.TempDir(), "archive")
+				if err := os.WriteFile(archive, []byte("payload"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				file, err := os.Open(archive)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				sourceErr := errors.New("synthetic source read failure: synthetic-source-secret")
+				transportErr := errors.New("synthetic transport failure")
+				responseErr := errors.New("synthetic response read failure")
+				source := &multipartLifetimeReadSeeker{file: file, entered: make(chan struct{}), release: make(chan struct{})}
+				if tc.sourceFailure {
+					source.readErr = sourceErr
+				}
+				defer source.resume()
+				bodyDone := make(chan struct{}, 1)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				httpClient := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method == http.MethodGet {
+						return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"metadata":{"name":"sbx-owned","url":"http://127.0.0.1:9443/sandbox/sbx-owned"}}`)), Header: make(http.Header)}, nil
+					}
+					go func() { _, _ = io.Copy(io.Discard, req.Body); _ = req.Body.Close(); bodyDone <- struct{}{} }()
+					<-source.entered
+					if tc.transportFailure {
+						return nil, transportErr
+					}
+					var body io.ReadCloser = io.NopCloser(strings.NewReader(tc.response))
+					if tc.responseFailure {
+						body = &blaxelResponseBody{Reader: strings.NewReader(tc.response), readErr: responseErr, close: func() error { return nil }}
+					}
+					return &http.Response{StatusCode: tc.status, Body: body, Header: make(http.Header)}, nil
+				})}
+				client := &restClient{base: "http://127.0.0.1:9443", http: httpClient, dataHTTP: httpClient}
+				result := make(chan error, 1)
+				go func() {
+					_, err := client.uploadMultipartPart(ctx, "sbx-owned", "upload", 1, "archive", source)
+					result <- err
+				}()
+				select {
+				case <-source.entered:
+				case err := <-result:
+					t.Fatalf("returned before controlled read: %v", err)
+				}
+				synctest.Wait()
+				if tc.cancel {
+					cancel()
+					synctest.Wait()
+				}
+				returnedEarly := false
+				var uploadErr error
+				select {
+				case uploadErr = <-result:
+					returnedEarly = true
+				default:
+				}
+				bodyStopped := false
+				select {
+				case <-bodyDone:
+					bodyStopped = true
+				default:
+				}
+				wantAbort := tc.want == "http" || tc.want == "decode" || tc.want == "etag" || tc.want == "transport" || tc.want == "read" || tc.cancel
+				if bodyStopped != wantAbort {
+					t.Errorf("pipe stopped=%v want=%v while Read paused", bodyStopped, wantAbort)
+				}
+				source.resume()
+				if !returnedEarly {
+					uploadErr = <-result
+				}
+				if !bodyStopped {
+					<-bodyDone
+				}
+				synctest.Wait()
+				if returnedEarly {
+					t.Errorf("attempt returned before borrowed Read completed: %v", uploadErr)
+				}
+				if source.closeCalls.Load() != 0 {
+					t.Error("attempt closed borrowed source")
+				}
+				if _, err := file.Seek(0, io.SeekStart); err != nil {
+					t.Fatal(err)
+				}
+				if data, err := io.ReadAll(file); err != nil || string(data) != "payload" {
+					t.Fatalf("caller ownership lost: %q %v", data, err)
+				}
+				switch tc.want {
+				case "":
+					if uploadErr != nil {
+						t.Fatal(uploadErr)
+					}
+				case "source":
+					if uploadErr != nil && strings.Contains(uploadErr.Error(), "synthetic-source-secret") {
+						t.Fatal("producer error bypassed existing redaction")
+					}
+					if !errors.Is(uploadErr, sourceErr) {
+						t.Fatalf("error=%v want source failure", uploadErr)
+					}
+				case "http":
+					var apiErr apiError
+					if !errors.As(uploadErr, &apiErr) || apiErr.StatusCode != tc.status || apiErr.Body != tc.response {
+						t.Fatalf("HTTP precedence: %v", uploadErr)
+					}
+				case "decode":
+					var syntaxErr *json.SyntaxError
+					if !errors.As(uploadErr, &syntaxErr) {
+						t.Fatalf("decode precedence: %v", uploadErr)
+					}
+				case "etag":
+					if uploadErr == nil || uploadErr.Error() != "blaxel multipart upload response omitted etag" {
+						t.Fatalf("ETag precedence: %v", uploadErr)
+					}
+				case "transport":
+					if !errors.Is(uploadErr, transportErr) {
+						t.Fatalf("transport precedence: %v", uploadErr)
+					}
+				case "read":
+					if !errors.Is(uploadErr, responseErr) {
+						t.Fatalf("response-read precedence: %v", uploadErr)
+					}
+				case "cancel":
+					if !errors.Is(uploadErr, context.Canceled) {
+						t.Fatalf("cancellation error=%v", uploadErr)
+					}
+				}
+			})
+		})
+	}
+}

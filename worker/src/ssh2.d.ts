@@ -12,6 +12,7 @@ declare module "ssh2" {
     off(event: "close" | "drain", listener: () => void): this;
     once(event: "close", listener: () => void): this;
     once(event: "drain", listener: () => void): this;
+    once(event: "exit", listener: (code?: number) => void): this;
   }
 
   export class Client {
@@ -46,21 +47,24 @@ declare module "ssh2" {
       },
       callback: (error: Error | undefined, channel: ClientChannel) => void,
     ): this;
+    exec(
+      command: string,
+      callback: (error: Error | undefined, channel: ClientChannel) => void,
+    ): this;
+    forwardOut(
+      sourceIP: string,
+      sourcePort: number,
+      destinationIP: string,
+      destinationPort: number,
+      callback: (error: Error | undefined, channel: ClientChannel) => void,
+    ): this;
     end(): void;
     once(event: "ready" | "close", listener: () => void): this;
     once(event: "error", listener: (error: Error) => void): this;
   }
 
-  export const utils: {
-    generateKeyPairSync(
-      keyType: "ed25519",
-      options?: { comment?: string },
-    ): { private: string; public: string };
-  };
-
   const ssh2: {
     Client: typeof Client;
-    utils: typeof utils;
   };
   export default ssh2;
 }

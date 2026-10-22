@@ -15,10 +15,10 @@ provider lifecycle ownership or the local SSH key.
 
 ```sh
 # Share with a specific user (defaults to role "use")
-crabbox share --id swift-crab --user alice@example.com
+crabbox share --id swift-crab --user github:12345
 
 # Grant manage access
-crabbox share --id swift-crab --user alice@example.com --role manage
+crabbox share --id swift-crab --user github:12345 --role manage
 
 # Share with everyone in the lease's org
 crabbox share --id swift-crab --org
@@ -35,6 +35,10 @@ The lease can be addressed by its canonical id (`cbx_…`) or its slug, either v
 When you pass neither `--user` nor `--org` (or pass `--list`), the command prints
 the current sharing instead of changing it.
 
+Only the lease owner, an admin, or a user with `manage` access can list or change
+sharing. A user with `use` access can see the lease but cannot enumerate its
+sharing roster.
+
 ## Roles
 
 ```text
@@ -47,8 +51,10 @@ A role applies to every `--user` and to `--org` named in the same invocation.
 
 ## Targets
 
-- `--user <email>` is repeatable. Addresses are stored normalized to lowercase
-  and trimmed; an empty value is rejected.
+- `--user <owner>` is repeatable. Use the immutable `github:<numeric-id>` owner
+  shown by `crabbox whoami` for a GitHub user. Shared-token automation may use
+  its configured stable owner instead. Values are stored normalized to
+  lowercase and trimmed; an empty value is rejected.
 - `--org` shares with authenticated users whose org matches the lease's org.
 
 ## Output
@@ -57,7 +63,7 @@ Without `--json`, the resulting share state prints one line per scope:
 
 ```text
 org=use
-user=alice@example.com role=use
+user=github:12345 role=use
 ```
 
 `org` is `off` when no org sharing is set, and `users=none` when no users are
@@ -67,7 +73,7 @@ shared. With `--json`, the share record is emitted under a `share` key.
 
 ```text
 --id <lease-id-or-slug>   lease to share (or first positional arg)
---user <email>            user email to share with; repeatable
+--user <owner>            owner identity to share with; repeatable
 --org                     share with the lease org
 --role use|manage         role to grant (default: use)
 --list                    print current sharing without changing it

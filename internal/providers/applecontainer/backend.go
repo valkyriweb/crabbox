@@ -2,7 +2,7 @@ package applecontainer
 
 import (
 	"context"
-	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/netip"
@@ -14,26 +14,19 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type backend struct {
-	spec core.ProviderSpec
-	cfg  core.Config
-	rt   core.Runtime
+	spec       core.ProviderSpec
+	cfg        core.Config
+	rt         core.Runtime
+	waitForSSH func(context.Context, *core.SSHTarget, io.Writer, string, time.Duration) error
 }
 
 func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	applyDefaults(&cfg)
-	return &backend{spec: spec, cfg: cfg, rt: rt}
-}
-
-func isAppleContainerProvider(name string) bool {
-	switch name {
-	case providerName, "apple", "applecontainer":
-		return true
-	default:
-		return false
-	}
+	return &backend{spec: spec, cfg: cfg, rt: rt, waitForSSH: core.WaitForSSHReady}
 }
 
 func applyDefaults(cfg *core.Config) {
@@ -74,9 +67,10 @@ func isDefaultWorkRoot(value string) bool {
 
 func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
+func (b *backend) SupportsRequestedLeaseID() bool { return true }
+
 func (b *backend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID string) error {
-	core.UseStoredTestboxKey(&target.SSH, leaseID)
-	return nil
+	return core.UseStoredTestboxKey(&target.SSH, leaseID)
 }
 
 func (b *backend) configForRun() core.Config {
@@ -100,6 +94,9 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	cfg := b.configForRun()
 	if err := requireMacOS(); err != nil {
 		return core.LeaseTarget{}, err
+	}
+	if strings.TrimSpace(req.RequestedLeaseID) != "" {
+		return b.acquireFixed(ctx, req, cfg)
 	}
 	leaseID := core.NewLeaseID()
 	containers, err := b.listContainers(ctx)
@@ -129,6 +126,10 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 	fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s image=%s keep=%v\n", providerName, leaseID, slug, cfg.AppleContainer.Image, req.Keep)
 	containerID, err := b.createContainer(ctx, cfg, name, leaseID, slug, publicKey, req.Keep)
 	if err != nil {
+		var retained *retainedImageContainerError
+		if errors.As(err, &retained) {
+			cleanupKey = false
+		}
 		return core.LeaseTarget{}, err
 	}
 	if req.Keep {
@@ -161,6 +162,12 @@ func (b *backend) Acquire(ctx context.Context, req core.AcquireRequest) (core.Le
 		}
 		return core.LeaseTarget{}, err
 	}
+	if err := core.UpdateLeaseClaimEndpoint(leaseID, lease.Server, lease.SSH); err != nil {
+		if !req.Keep {
+			_ = b.removeContainer(context.Background(), containerID)
+		}
+		return core.LeaseTarget{}, err
+	}
 	cleanupKey = false
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s container=%s state=ready\n", leaseID, c.id())
 	return lease, nil
@@ -175,6 +182,17 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
+	readOnlyStatus := req.StatusOnly && !req.ReleaseOnly
+	if strings.TrimSpace(leaseID) == "" && (!readOnlyStatus || req.Reclaim) {
+		return core.LeaseTarget{}, appleContainerOwnershipError(leaseID, c.id())
+	}
+	owned, conflict, err := appleContainerClaimStatus(leaseID, c.id())
+	if err != nil {
+		return core.LeaseTarget{}, err
+	}
+	if (conflict && (!readOnlyStatus || req.Reclaim)) || (!owned && !readOnlyStatus && (req.ReleaseOnly || !req.Reclaim)) {
+		return core.LeaseTarget{}, appleContainerOwnershipError(leaseID, c.id())
+	}
 	if req.ReleaseOnly {
 		return core.LeaseTarget{Server: b.serverFromContainer(c, cfg), LeaseID: leaseID}, nil
 	}
@@ -182,8 +200,8 @@ func (b *backend) Resolve(ctx context.Context, req core.ResolveRequest) (core.Le
 	if err != nil {
 		return core.LeaseTarget{}, err
 	}
-	if req.Repo.Root != "" {
-		if err := core.ClaimLeaseForRepoProviderScopePond(leaseID, slug, providerName, "", cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim); err != nil {
+	if req.Repo.Root != "" && (!readOnlyStatus || req.Reclaim) {
+		if err := core.ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, providerName, "", cfg.Pond, req.Repo.Root, cfg.IdleTimeout, req.Reclaim, lease.Server, lease.SSH); err != nil {
 			return core.LeaseTarget{}, err
 		}
 	}
@@ -215,7 +233,7 @@ func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.Doctor
 	// running. We use it as the readiness probe before listing.
 	statusResult, statusErr := b.container(ctx, []string{"system", "status"}, nil, nil)
 	if statusErr != nil {
-		return core.DoctorResult{}, exit(2, "%s system status failed (is the container CLI installed and started with `container system start`?): %s", providerName, commandDetail(statusResult, statusErr))
+		return core.DoctorResult{}, core.Exit(2, "%s system status failed (is the container CLI installed and started with `container system start`?): %s", providerName, commandDetail(statusResult, statusErr))
 	}
 	// The lease path shells out to `container run` with detached mode, `--user`,
 	// `--label`, and `--dns`. Probe that surface here so doctor fails fast on a
@@ -250,23 +268,86 @@ func (b *backend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest
 		}
 	}
 	if id == "" {
-		return exit(2, "provider=%s release requires a container id", providerName)
+		return core.Exit(2, "provider=%s release requires a container id", providerName)
 	}
-	if err := b.removeContainer(ctx, id); err != nil {
+	claim, err := readExactAppleContainerClaim(lease.LeaseID, id)
+	if err != nil {
 		return err
 	}
-	core.RemoveLeaseClaim(lease.LeaseID)
-	core.RemoveStoredTestboxKey(lease.LeaseID)
-	return nil
+	if strings.TrimSpace(lease.Server.Labels["fixed_intent_sha256"]) != "" && !fixedAppleContainerLeaseKind.IsFixedClaim(claim) {
+		return core.Exit(4, "lease_id_conflict: refusing to release fixed apple-container lease %s without its durable create intent", lease.LeaseID)
+	}
+	return fixedAppleContainerLeaseKind.FinalizeAfterCleanup(claim, func() error {
+		if err := b.removeClaimedContainer(ctx, id, claim); err != nil {
+			return err
+		}
+		core.RemoveStoredTestboxKey(lease.LeaseID)
+		return nil
+	})
+}
+
+func appleContainerClaimStatus(leaseID, containerID string) (owned, conflict bool, err error) {
+	claim, ok, err := exactAppleContainerClaim(leaseID)
+	if err != nil {
+		return false, false, err
+	}
+	if !ok {
+		return false, false, nil
+	}
+	boundID := strings.TrimSpace(claim.CloudID)
+	if boundID == "" {
+		return false, false, nil
+	}
+	if boundID != strings.TrimSpace(containerID) {
+		return false, true, nil
+	}
+	return true, false, nil
+}
+
+func appleContainerOwnershipError(leaseID, containerID string) error {
+	return core.Exit(4, "apple-container lease %q has no exact local claim bound to container %q; adopt it with an explicit --reclaim reuse before stop", strings.TrimSpace(leaseID), strings.TrimSpace(containerID))
+}
+
+func exactAppleContainerClaim(leaseID string) (core.LeaseClaim, bool, error) {
+	leaseID = strings.TrimSpace(leaseID)
+	claim, ok, exact, err := core.ResolveLeaseClaimForProviderWithExact(leaseID, providerName)
+	if err != nil || !ok || !exact || claim.LeaseID != leaseID {
+		return core.LeaseClaim{}, false, err
+	}
+	return claim, true, nil
+}
+
+func readExactAppleContainerClaim(leaseID, containerID string) (core.LeaseClaim, error) {
+	claim, ok, err := exactAppleContainerClaim(leaseID)
+	if err != nil {
+		return core.LeaseClaim{}, err
+	}
+	if !ok || strings.TrimSpace(claim.CloudID) != strings.TrimSpace(containerID) {
+		return core.LeaseClaim{}, appleContainerOwnershipError(leaseID, containerID)
+	}
+	return claim, nil
+}
+
+func requireExactAppleContainerClaim(leaseID, containerID string) error {
+	_, err := readExactAppleContainerClaim(leaseID, containerID)
+	return err
 }
 
 func (b *backend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
-	return fmt.Sprintf("released lease=%s container=%s", lease.LeaseID, blank(lease.Server.CloudID, lease.Server.Labels["container_id"]))
+	return fmt.Sprintf("released lease=%s container=%s", lease.LeaseID, core.Blank(lease.Server.CloudID, lease.Server.Labels["container_id"]))
 }
 
 func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	cfg := b.configForRun()
 	if err := requireMacOS(); err != nil {
+		return err
+	}
+	// Snapshot orphan-candidate claims before listing containers so a claim
+	// registered by a concurrent Acquire cannot be compared against an older
+	// container view and misclassified as a "missing container" orphan. Only
+	// claims that predate our container view can be genuine orphans.
+	orphanCandidates, err := core.ListLeaseClaims()
+	if err != nil {
 		return err
 	}
 	containers, err := b.listContainers(ctx)
@@ -299,34 +380,69 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 			continue
 		}
 		if req.DryRun {
-			fmt.Fprintf(b.rt.Stdout, "would remove container id=%s name=%s lease=%s reason=%s\n", server.DisplayID(), server.Name, blank(leaseID, "-"), reason)
+			fmt.Fprintf(b.rt.Stdout, "would remove container id=%s name=%s lease=%s reason=%s\n", server.DisplayID(), server.Name, core.Blank(leaseID, "-"), reason)
 			continue
 		}
-		fmt.Fprintf(b.rt.Stdout, "remove container id=%s name=%s lease=%s reason=%s\n", server.DisplayID(), server.Name, blank(leaseID, "-"), reason)
-		if err := b.removeContainer(ctx, c.id()); err != nil {
-			return err
+		fmt.Fprintf(b.rt.Stdout, "remove container id=%s name=%s lease=%s reason=%s\n", server.DisplayID(), server.Name, core.Blank(leaseID, "-"), reason)
+		remove := func() error {
+			if err := b.removeClaimedContainer(ctx, c.id(), claim); err != nil {
+				return err
+			}
+			if leaseID != "" {
+				core.RemoveStoredTestboxKey(leaseID)
+			}
+			return nil
 		}
-		if leaseID != "" {
-			core.RemoveLeaseClaim(leaseID)
-			core.RemoveStoredTestboxKey(leaseID)
+		if claim, ok := claimsByLease[leaseID]; ok {
+			if err := fixedAppleContainerLeaseKind.FinalizeAfterCleanup(claim, remove); err != nil {
+				return err
+			}
+		} else if err := remove(); err != nil {
+			return err
 		}
 		removed++
 	}
 	claimsRemoved := 0
-	for leaseID := range claimsByLease {
-		if leaseID == "" {
+	for _, claim := range orphanCandidates {
+		if claim.Provider != providerName || claim.LeaseID == "" {
 			continue
 		}
-		if _, ok := liveLeases[leaseID]; ok {
+		if isReleasedFixedAppleContainerClaim(claim) {
+			continue
+		}
+		if fixedAppleContainerLeaseKind.IsFixedClaim(claim) && claim.FixedCreateIntent.State != "acquired" {
+			// A native create can finish after the inventory snapshot without
+			// updating its pending claim when startup fails. Keep its recovery path.
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s reason=pending-fixed-acquisition\n", claim.LeaseID)
+			continue
+		}
+		if _, ok := liveLeases[claim.LeaseID]; ok {
 			continue
 		}
 		if req.DryRun {
-			fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s reason=missing container\n", leaseID)
+			if err := core.VerifyLeaseClaimUnchanged(claim.LeaseID, claim); err != nil {
+				fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s reason=changed-during-cleanup err=%v\n", claim.LeaseID, err)
+				continue
+			}
+			fmt.Fprintf(b.rt.Stdout, "would remove claim lease=%s reason=missing container\n", claim.LeaseID)
 			continue
 		}
-		fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s reason=missing container\n", leaseID)
-		core.RemoveLeaseClaim(leaseID)
-		core.RemoveStoredTestboxKey(leaseID)
+		// Remove only if the claim is unchanged since our pre-container snapshot;
+		// a concurrent Acquire/Touch that (re)bound this lease makes it no longer
+		// an orphan, so RemoveLeaseClaimIfUnchanged declines and the live lease
+		// survives. Intentionally retain the stored testbox key: Acquire creates or
+		// reuses it before publishing its claim, outside this claim CAS. Until keys
+		// have their own generation/ownership fence, deleting one here can break the
+		// concurrent live lease; fail closed by retaining inert local key material.
+		var confirmAbsent func() error
+		if fixedAppleContainerLeaseKind.IsFixedClaim(claim) {
+			confirmAbsent = func() error { return b.confirmFixedContainerAbsent(ctx, claim) }
+		}
+		if err := fixedAppleContainerLeaseKind.FinalizeAfterCleanup(claim, confirmAbsent); err != nil {
+			fmt.Fprintf(b.rt.Stderr, "skip claim lease=%s reason=changed-during-cleanup err=%v\n", claim.LeaseID, err)
+			continue
+		}
+		fmt.Fprintf(b.rt.Stdout, "remove claim lease=%s reason=missing container\n", claim.LeaseID)
 		claimsRemoved++
 	}
 	if !req.DryRun {
@@ -337,22 +453,37 @@ func (b *backend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 
 func (b *backend) Touch(_ context.Context, req core.TouchRequest) (core.Server, error) {
 	server := req.Lease.Server
-	if server.Labels == nil {
-		server.Labels = map[string]string{}
-	}
-	original := server.Labels
-	server.Labels = core.TouchDirectLeaseLabels(original, b.configForRun(), req.State, time.Now().UTC())
-	for _, key := range []string{"container_id", "image", "ssh_user", "ssh_port", "work_root"} {
-		if value := strings.TrimSpace(original[key]); value != "" {
-			server.Labels[key] = value
-		}
-	}
+	server.Labels = core.TouchDirectLeaseLabels(server.Labels, b.configForRun(), req.State, time.Now().UTC())
 	return server, nil
 }
 
 func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey string, keep bool) (string, error) {
+	return b.createContainerWithFixedIntent(ctx, cfg, name, leaseID, slug, publicKey, keep, "")
+}
+
+func (b *backend) createContainerWithFixedIntent(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey string, keep bool, fingerprint string) (string, error) {
+	return b.createContainerWithFixedIntentLockState(ctx, cfg, name, leaseID, slug, publicKey, keep, fingerprint, false)
+}
+
+// createContainerWithFixedIntentUnderLeaseLock is only for callers that already
+// hold leaseID's durable claim lock for the entire create/verify/start sequence.
+func (b *backend) createContainerWithFixedIntentUnderLeaseLock(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey string, keep bool, fingerprint string) (string, error) {
+	return b.createContainerWithFixedIntentLockState(ctx, cfg, name, leaseID, slug, publicKey, keep, fingerprint, true)
+}
+
+func (b *backend) createContainerWithFixedIntentLockState(ctx context.Context, cfg core.Config, name, leaseID, slug, publicKey string, keep bool, fingerprint string, leaseLockHeld bool) (string, error) {
+	digest, reviewedDefault := core.DefaultContainerImageDigest(cfg.AppleContainer.Image)
+	if reviewedDefault && digest == "" {
+		return "", core.Exit(2, "compiled container image is missing its reviewed digest")
+	}
 	labels := core.DirectLeaseLabels(cfg, leaseID, slug, providerName, "", keep, time.Now().UTC())
+	if fingerprint = strings.TrimSpace(fingerprint); fingerprint != "" {
+		labels["fixed_intent_sha256"] = fingerprint
+	}
 	labels["image"] = cfg.AppleContainer.Image
+	if reviewedDefault {
+		labels["image_digest"] = digest
+	}
 	labels["ssh_user"] = cfg.AppleContainer.User
 	labels["ssh_port"] = sshPort
 	labels["work_root"] = cfg.AppleContainer.WorkRoot
@@ -379,6 +510,9 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 		"-e", "CRABBOX_WORK_ROOT=" + cfg.AppleContainer.WorkRoot,
 		"-e", "CRABBOX_SSH_PORT=" + sshPort,
 	}
+	if core.IsArchitectureExplicit(cfg) {
+		args = append(args, "--arch", cfg.Architecture)
+	}
 	for i, volume := range cfg.Cache.Volumes {
 		args = append(args, "-e", fmt.Sprintf("CRABBOX_CACHE_VOLUME_PATH_%d=%s", i, strings.TrimSpace(volume.Path)))
 	}
@@ -400,10 +534,16 @@ func (b *backend) createContainer(ctx context.Context, cfg core.Config, name, le
 	}
 	args = append(args, cfg.AppleContainer.ExtraRunArgs...)
 	args = append(args, cfg.AppleContainer.Image, "/bin/sh", "-lc", bootstrapScript)
+	if reviewedDefault {
+		if leaseLockHeld {
+			return b.createPinnedContainerUnderLeaseLock(ctx, cfg, append([]string{"create"}, args[2:]...), name, leaseID, slug, digest)
+		}
+		return b.createPinnedContainer(ctx, cfg, append([]string{"create"}, args[2:]...), name, leaseID, slug, digest)
+	}
 
 	result, err := b.container(ctx, args, nil, b.rt.Stderr)
 	if err != nil {
-		return "", commandError("container run", result, err)
+		return "", shared.LocalCommandError("container run", result, err)
 	}
 	id := strings.TrimSpace(result.Stdout)
 	if id == "" {
@@ -427,23 +567,23 @@ func appleContainerCacheVolumeMounts(volumes []core.CacheVolumeConfig) ([]string
 		key := strings.TrimSpace(volume.Key)
 		path := strings.TrimSpace(volume.Path)
 		if key == "" {
-			return nil, exit(2, "cache volume key is required")
+			return nil, core.Exit(2, "cache volume key is required")
 		}
 		if strings.Contains(key, ":") {
-			return nil, exit(2, "cache volume key %q must not contain ':'", key)
+			return nil, core.Exit(2, "cache volume key %q must not contain ':'", key)
 		}
 		if path == "" {
-			return nil, exit(2, "cache volume path is required")
+			return nil, core.Exit(2, "cache volume path is required")
 		}
 		if !strings.HasPrefix(path, "/") {
-			return nil, exit(2, "cache volume path %q must be absolute", path)
+			return nil, core.Exit(2, "cache volume path %q must be absolute", path)
 		}
-		hostPath := filepath.Join(root, appleContainerCacheVolumeName(key))
+		hostPath := filepath.Join(root, shared.CacheVolumeName(key))
 		if err := os.MkdirAll(hostPath, 0o777); err != nil {
-			return nil, exit(2, "create apple-container cache volume %s: %v", hostPath, err)
+			return nil, core.Exit(2, "create apple-container cache volume %s: %v", hostPath, err)
 		}
 		if err := os.Chmod(hostPath, 0o777); err != nil {
-			return nil, exit(2, "make apple-container cache volume writable %s: %v", hostPath, err)
+			return nil, core.Exit(2, "make apple-container cache volume writable %s: %v", hostPath, err)
 		}
 		mounts = append(mounts, hostPath+":"+path)
 	}
@@ -453,47 +593,19 @@ func appleContainerCacheVolumeMounts(volumes []core.CacheVolumeConfig) ([]string
 func appleContainerCacheRoot() (string, error) {
 	dir, err := os.UserCacheDir()
 	if err != nil {
-		return "", exit(2, "user cache directory is unavailable")
+		return "", core.Exit(2, "user cache directory is unavailable")
 	}
 	return filepath.Join(dir, "crabbox", "apple-container-cache"), nil
-}
-
-func appleContainerCacheVolumeName(key string) string {
-	key = strings.TrimSpace(key)
-	sum := sha256.Sum256([]byte(key))
-	var safe strings.Builder
-	for _, r := range key {
-		switch {
-		case r >= 'a' && r <= 'z':
-			safe.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			safe.WriteRune(r + ('a' - 'A'))
-		case r >= '0' && r <= '9':
-			safe.WriteRune(r)
-		case r == '.' || r == '_' || r == '-':
-			safe.WriteRune(r)
-		default:
-			safe.WriteByte('-')
-		}
-		if safe.Len() >= 80 {
-			break
-		}
-	}
-	name := strings.Trim(safe.String(), ".-_")
-	if name == "" {
-		name = "volume"
-	}
-	return fmt.Sprintf("crabbox-cache-%s-%x", name, sum[:6])
 }
 
 func (b *backend) listContainers(ctx context.Context) ([]inspectContainer, error) {
 	result, err := b.container(ctx, []string{"ls", "--all", "--format", "json"}, nil, nil)
 	if err != nil {
-		return nil, commandError("container ls", result, err)
+		return nil, shared.LocalCommandError("container ls", result, err)
 	}
 	all, err := decodeInspect([]byte(result.Stdout))
 	if err != nil {
-		return nil, exit(2, "parse container ls: %v", err)
+		return nil, core.Exit(2, "parse container ls: %v", err)
 	}
 	out := make([]inspectContainer, 0, len(all))
 	for _, c := range all {
@@ -508,14 +620,14 @@ func (b *backend) listContainers(ctx context.Context) ([]inspectContainer, error
 func (b *backend) inspectContainer(ctx context.Context, id string) (inspectContainer, error) {
 	result, err := b.container(ctx, []string{"inspect", id}, nil, nil)
 	if err != nil {
-		return inspectContainer{}, commandError("container inspect", result, err)
+		return inspectContainer{}, shared.LocalCommandError("container inspect", result, err)
 	}
 	containers, err := decodeInspect([]byte(result.Stdout))
 	if err != nil {
-		return inspectContainer{}, exit(2, "parse container inspect for %s: %v", id, err)
+		return inspectContainer{}, core.Exit(2, "parse container inspect for %s: %v", id, err)
 	}
 	if len(containers) == 0 {
-		return inspectContainer{}, exit(4, "container not found: %s", id)
+		return inspectContainer{}, core.Exit(4, "container not found: %s", id)
 	}
 	return containers[0], nil
 }
@@ -525,7 +637,7 @@ func (b *backend) waitForNetworkAddress(ctx context.Context, id string, c inspec
 		return c, nil
 	}
 	if appleContainerTerminalStatus(c.status()) {
-		return inspectContainer{}, exit(5, "apple-container %s stopped before a network address was assigned", id)
+		return inspectContainer{}, core.Exit(5, "apple-container %s stopped before a network address was assigned", id)
 	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -534,25 +646,41 @@ func (b *backend) waitForNetworkAddress(ctx context.Context, id string, c inspec
 	defer deadline.Stop()
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return inspectContainer{}, ctx.Err()
-		case <-deadline.C:
-			return inspectContainer{}, exit(5, "apple-container %s has no network address yet", id)
-		case <-tick.C:
-			next, err := b.inspectContainer(ctx, id)
-			if err != nil {
-				return inspectContainer{}, err
+	initial := true
+	result, err := shared.Poll(context.WithoutCancel(ctx), 0, 500*time.Millisecond,
+		func(context.Context, time.Duration) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline.C:
+				return core.Exit(5, "apple-container %s has no network address yet", id)
+			case <-tick.C:
+				return nil
+			}
+		},
+		func(context.Context) (inspectContainer, error) {
+			if initial {
+				initial = false
+				return c, nil
+			}
+			return b.inspectContainer(ctx, id)
+		},
+		func(_ context.Context, next inspectContainer, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
 			}
 			if next.ip() != "" {
-				return next, nil
+				return true, nil
 			}
 			if appleContainerTerminalStatus(next.status()) {
-				return inspectContainer{}, exit(5, "apple-container %s stopped before a network address was assigned", id)
+				return false, core.Exit(5, "apple-container %s stopped before a network address was assigned", id)
 			}
-		}
+			return false, nil
+		}, nil)
+	if err != nil {
+		return inspectContainer{}, err
 	}
+	return result.Value, nil
 }
 
 func appleContainerTerminalStatus(status string) bool {
@@ -567,12 +695,14 @@ func appleContainerTerminalStatus(status string) bool {
 func (b *backend) resolveContainer(ctx context.Context, identifier string) (inspectContainer, string, string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
-		return inspectContainer{}, "", "", exit(2, "provider=%s requires --id <lease-id-or-slug-or-container>", providerName)
+		return inspectContainer{}, "", "", core.Exit(2, "provider=%s requires --id <lease-id-or-slug-or-container>", providerName)
 	}
+	var resolvedClaim core.LeaseClaim
 	var wantLease, wantSlug string
 	if claim, ok, err := core.ResolveLeaseClaimForProvider(identifier, providerName); err != nil {
 		return inspectContainer{}, "", "", err
 	} else if ok {
+		resolvedClaim = claim
 		wantLease = claim.LeaseID
 		wantSlug = claim.Slug
 	}
@@ -580,16 +710,37 @@ func (b *backend) resolveContainer(ctx context.Context, identifier string) (insp
 	if err != nil {
 		return inspectContainer{}, "", "", err
 	}
+	if boundID := strings.TrimSpace(resolvedClaim.CloudID); boundID != "" {
+		for _, c := range containers {
+			if c.id() == boundID {
+				labels := c.labels()
+				return c, shared.FirstNonBlank(resolvedClaim.LeaseID, labels["lease"]), shared.FirstNonBlank(resolvedClaim.Slug, labels["slug"]), nil
+			}
+		}
+		return inspectContainer{}, "", "", core.Exit(4, "apple-container lease not found: %s", identifier)
+	}
 	normalized := core.NormalizeLeaseSlug(identifier)
+	var matched *inspectContainer
+	var matchedLease, matchedSlug string
 	for _, c := range containers {
 		labels := c.labels()
 		leaseID := labels["lease"]
 		slug := labels["slug"]
 		if wantLease != "" && leaseID == wantLease {
-			return c, leaseID, slug, nil
+			if matched != nil {
+				return inspectContainer{}, "", "", core.Exit(2, "apple-container lease %s matches multiple containers; use an exact claimed container id", wantLease)
+			}
+			candidate := c
+			matched, matchedLease, matchedSlug = &candidate, leaseID, slug
+			continue
 		}
 		if wantSlug != "" && core.NormalizeLeaseSlug(slug) == core.NormalizeLeaseSlug(wantSlug) {
-			return c, leaseID, slug, nil
+			if matched != nil {
+				return inspectContainer{}, "", "", core.Exit(2, "apple-container slug %s matches multiple containers; use a lease id", wantSlug)
+			}
+			candidate := c
+			matched, matchedLease, matchedSlug = &candidate, leaseID, slug
+			continue
 		}
 		if wantLease != "" || wantSlug != "" {
 			continue
@@ -598,14 +749,17 @@ func (b *backend) resolveContainer(ctx context.Context, identifier string) (insp
 			return c, leaseID, slug, nil
 		}
 	}
-	return inspectContainer{}, "", "", exit(4, "apple-container lease not found: %s", identifier)
+	if matched != nil {
+		return *matched, matchedLease, matchedSlug, nil
+	}
+	return inspectContainer{}, "", "", core.Exit(4, "apple-container lease not found: %s", identifier)
 }
 
 func (b *backend) removeContainer(ctx context.Context, id string) error {
 	// `container delete --force <id>` removes a running or stopped container.
 	result, err := b.container(ctx, []string{"delete", "--force", id}, nil, b.rt.Stderr)
 	if err != nil {
-		return commandError("container delete", result, err)
+		return shared.LocalCommandError("container delete", result, err)
 	}
 	return nil
 }
@@ -622,13 +776,15 @@ func (b *backend) prepareLease(ctx context.Context, cfg core.Config, c inspectCo
 	}
 	host := c.ip()
 	if host == "" {
-		return core.LeaseTarget{}, exit(5, "apple-container %s has no network address yet", c.id())
+		return core.LeaseTarget{}, core.Exit(5, "apple-container %s has no network address yet", c.id())
 	}
-	keyPath, err := core.TestboxKeyPath(leaseID)
+	keyPath, err := core.OptionalStoredTestboxKeyPath(leaseID)
 	if err == nil {
 		if _, statErr := os.Stat(keyPath); statErr == nil {
 			cfg.SSHKey = keyPath
 		}
+	} else if !os.IsNotExist(err) {
+		return core.LeaseTarget{}, err
 	}
 	target := core.SSHTargetFromConfig(cfg, host)
 	target.Port = sshPort
@@ -648,7 +804,7 @@ func (b *backend) waitForSSHReady(ctx context.Context, id string, target *core.S
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- core.WaitForSSHReady(waitCtx, target, b.rt.Stderr, "apple container ssh", timeout)
+		done <- b.waitForSSH(waitCtx, target, b.rt.Stderr, "apple container ssh", timeout)
 	}()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -678,9 +834,9 @@ func (b *backend) exitedDuringBootstrapError(ctx context.Context, id, status str
 		hint = "; DNS failed during package bootstrap, retry with --apple-container-extra-run-args '--dns <resolver>' or configure appleContainer.extraRunArgs"
 	}
 	if strings.TrimSpace(logs) == "" {
-		return exit(5, "apple-container %s stopped during SSH bootstrap status=%s%s", id, blank(status, "unknown"), hint)
+		return core.Exit(5, "apple-container %s stopped during SSH bootstrap status=%s%s", id, core.Blank(status, "unknown"), hint)
 	}
-	return exit(5, "apple-container %s stopped during SSH bootstrap status=%s%s\ncontainer logs:\n%s", id, blank(status, "unknown"), hint, logs)
+	return core.Exit(5, "apple-container %s stopped during SSH bootstrap status=%s%s\ncontainer logs:\n%s", id, core.Blank(status, "unknown"), hint, logs)
 }
 
 func (b *backend) containerLogTail(ctx context.Context, id string, limit int) string {
@@ -721,50 +877,37 @@ func (b *backend) hostDNSServers(ctx context.Context) []string {
 }
 
 func (b *backend) serverFromContainer(c inspectContainer, cfg core.Config) core.Server {
-	labels := map[string]string{}
-	for key, value := range c.labels() {
-		labels[key] = value
-	}
+	labels := shared.LabelsWithDefaults(c.labels(), map[string]string{
+		"provider":    providerName,
+		"server_type": shared.FirstNonBlank(c.image(), cfg.AppleContainer.Image),
+		"state":       c.status(),
+	})
 	labels["container_id"] = c.id()
-	if labels["provider"] == "" {
-		labels["provider"] = providerName
-	}
-	if labels["server_type"] == "" {
-		labels["server_type"] = firstNonBlank(c.image(), cfg.AppleContainer.Image)
-	}
-	if labels["state"] == "" {
-		labels["state"] = c.status()
-	}
 	labels["ssh_port"] = sshPort
-	status := c.status()
-	if c.running() && labels["state"] == "ready" {
-		status = "ready"
-	}
-	server := core.Server{
-		CloudID:  c.id(),
-		Provider: providerName,
-		Name:     c.id(),
-		Status:   status,
-		Labels:   labels,
-	}
+	server := shared.LocalInstanceServer(providerName, c.id(), c.status(), c.running(), labels)
 	server.PublicNet.IPv4.IP = c.ip()
-	server.ServerType.Name = firstNonBlank(labels["server_type"], cfg.AppleContainer.Image)
+	server.ServerType.Name = shared.FirstNonBlank(labels["server_type"], cfg.AppleContainer.Image)
 	return server
 }
 
 // checkRunSurface verifies the `container run` subcommand exists and advertises
-// the options the lease path depends on (`--user`, `--label`, `--dns`). It uses
+// the options the lease path depends on (`--user`, `--label`, `--dns`, and
+// `--arch` when architecture was explicit). It uses
 // `run --help`, which has no side effects, so doctor can detect an incompatible
 // CLI before any lease is attempted.
 func (b *backend) checkRunSurface(ctx context.Context) error {
 	result, err := b.container(ctx, []string{"run", "--help"}, nil, nil)
 	if err != nil {
-		return exit(2, "%s `container run` subcommand unavailable (incompatible container CLI?): %s", providerName, commandDetail(result, err))
+		return core.Exit(2, "%s `container run` subcommand unavailable (incompatible container CLI?): %s", providerName, commandDetail(result, err))
 	}
 	help := result.Stdout + result.Stderr
-	for _, opt := range []string{"--user", "--label", "--dns"} {
+	required := []string{"--user", "--label", "--dns"}
+	if core.IsArchitectureExplicit(b.configForRun()) {
+		required = append(required, "--arch")
+	}
+	for _, opt := range required {
 		if !strings.Contains(help, opt) {
-			return exit(2, "%s `container run` is missing the required %s option; upgrade Apple's container CLI", providerName, opt)
+			return core.Exit(2, "%s `container run` is missing the required %s option; upgrade Apple's container CLI", providerName, opt)
 		}
 	}
 	return nil
@@ -772,7 +915,7 @@ func (b *backend) checkRunSurface(ctx context.Context) error {
 
 func requireMacOS() error {
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
-		return exit(2, "provider=%s requires macOS on Apple silicon; current host is %s/%s", providerName, runtime.GOOS, runtime.GOARCH)
+		return core.Exit(2, "provider=%s requires macOS on Apple silicon; current host is %s/%s", providerName, runtime.GOOS, runtime.GOARCH)
 	}
 	return nil
 }
@@ -785,24 +928,18 @@ func shouldCleanup(server core.Server, claim core.LeaseClaim, hasClaim bool, now
 	if strings.EqualFold(labels["keep"], "true") {
 		return false, "keep=true"
 	}
+	if !hasClaim {
+		return false, "missing claim"
+	}
+	leaseID := strings.TrimSpace(labels["lease"])
+	containerID := strings.TrimSpace(server.CloudID)
+	if claim.Provider != providerName || claim.LeaseID != leaseID || leaseID == "" || strings.TrimSpace(claim.CloudID) != containerID || containerID == "" {
+		return false, "claim mismatch"
+	}
 	if !strings.EqualFold(server.Status, "running") && server.Status != "ready" {
-		return true, "container state=" + blank(server.Status, "unknown")
+		return true, "container state=" + core.Blank(server.Status, "unknown")
 	}
-	if hasClaim {
-		lastUsed, err := time.Parse(time.RFC3339, claim.LastUsedAt)
-		if err != nil || lastUsed.IsZero() {
-			return false, "claim active"
-		}
-		idle := time.Duration(claim.IdleTimeoutSeconds) * time.Second
-		if idle <= 0 {
-			return false, "claim active"
-		}
-		if now.After(lastUsed.Add(idle).Add(12 * time.Hour)) {
-			return true, "claim expired"
-		}
-		return false, "claim active"
-	}
-	return false, "missing claim"
+	return shared.ClaimIdleExpiredAfterGrace(claim, now, 12*time.Hour)
 }
 
 func readyCheck(cfg core.Config) string {
@@ -817,14 +954,6 @@ func readyCheck(cfg core.Config) string {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
-}
-
-func commandError(action string, result core.LocalCommandResult, err error) error {
-	code := result.ExitCode
-	if code == 0 {
-		code = 1
-	}
-	return exit(code, "%s failed: %s", action, commandDetail(result, err))
 }
 
 func commandDetail(result core.LocalCommandResult, err error) string {
@@ -895,15 +1024,6 @@ func uniqueAppleContainerDNSServers(servers []string, limit int) []string {
 		}
 	}
 	return unique
-}
-
-func firstNonBlank(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 // bootstrapScript provisions sshd, the Crabbox SSH user and work root inside a

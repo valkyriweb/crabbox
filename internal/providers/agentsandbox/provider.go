@@ -15,17 +15,19 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
+func (Provider) BackendCapabilities() core.Backend { return &backend{} }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "agent-sandbox",
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureArchiveSync, core.FeatureCleanup},
-		Coordinator: core.CoordinatorNever,
+		Authentication:             core.DirectProviderAuthentication(core.ProviderAuthenticationNativeConfig),
+		SyncGuardrailFullCandidate: true,
+		Name:                       providerName,
+		Family:                     "agent-sandbox",
+		Kind:                       core.ProviderKindDelegatedRun,
+		Targets:                    []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:                   core.FeatureSet{core.FeatureArchiveSync, core.FeatureCleanup, core.FeatureRunSession, core.FeatureFixedCurrentRepoStop},
+		Coordinator:                core.CoordinatorNever,
+		ClassDisposition:           core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -56,18 +58,6 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 		rt:        rt,
 		newClient: newKubernetesClient,
 	}, nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
-	}
-	return doctor, nil
 }
 
 func validateConfig(cfg core.Config) error {
@@ -117,4 +107,20 @@ func validateConfig(cfg core.Config) error {
 		return core.Exit(2, "agent-sandbox execTimeoutSecs must be non-negative")
 	}
 	return nil
+}
+
+// Controller scope describes trusted local routing; live authority is pinned at acquisition.
+func (p Provider) ControllerProviderScope(cfg core.Config) (string, error) {
+	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
+		return "", core.Exit(2, "provider=%s supports target=linux only", providerName)
+	}
+	if err := p.ValidateConfig(cfg); err != nil {
+		return "", err
+	}
+	return claimScope(cfg), nil
+}
+
+func (p Provider) SupportsControllerFixedLeaseID(cfg core.Config) bool {
+	_, err := p.ControllerProviderScope(cfg)
+	return err == nil && cfg.TTL > 0
 }

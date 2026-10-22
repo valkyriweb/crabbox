@@ -10,7 +10,11 @@ import (
 )
 
 func (a App) history(ctx context.Context, args []string) error {
+	if len(args) > 0 && (args[0] == "prune" || args[0] == "delete") {
+		return a.localHistoryMaintenance(args)
+	}
 	fs := newFlagSet("history", a.Stderr)
+	source := fs.String("source", "", "record source: local, coordinator, or all")
 	leaseID := fs.String("lease", "", "filter by lease id")
 	owner := fs.String("owner", "", "filter by owner")
 	org := fs.String("org", "", "filter by org")
@@ -20,16 +24,19 @@ func (a App) history(ctx context.Context, args []string) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	coord, err := configuredCoordinator()
-	if err != nil {
+	sourceName, coord, err := resolveHistorySource(*source)
+	if err != nil && sourceName != "all" {
 		return err
+	}
+	if sourceName != "" {
+		return a.historyFromSources(ctx, sourceName, coord, localHistoryFilter{LeaseID: *leaseID, State: *state, Limit: *limit}, *owner, *org, *jsonOut, err)
 	}
 	runs, err := coord.Runs(ctx, *leaseID, *owner, *org, *state, *limit)
 	if err != nil {
 		return err
 	}
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(runs)
+		return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(runs))
 	}
 	for _, run := range runs {
 		telemetry := runTelemetryStatusSummary(run.Telemetry)
@@ -45,6 +52,7 @@ func (a App) history(ctx context.Context, args []string) error {
 func (a App) logs(ctx context.Context, args []string) error {
 	args, jsonAnywhere := extractBoolFlag(args, "json")
 	fs := newFlagSet("logs", a.Stderr)
+	source := fs.String("source", "", "record source: local, coordinator, or all")
 	runIDValue, args := popLeadingRunID(args)
 	runID := fs.String("id", runIDValue, "run id")
 	tail := fs.Int("tail", 0, "print only the last N log lines")
@@ -56,17 +64,20 @@ func (a App) logs(ctx context.Context, args []string) error {
 		*runID = fs.Arg(0)
 	}
 	if *runID == "" {
-		return exit(2, "usage: crabbox logs <run-id>")
+		return Exit(2, "usage: crabbox logs <run-id>")
 	}
 	if jsonAnywhere {
 		*jsonOut = true
 	}
 	if *tail < 0 {
-		return exit(2, "tail must be >= 0")
+		return Exit(2, "tail must be >= 0")
 	}
-	coord, err := configuredCoordinator()
-	if err != nil {
+	sourceName, coord, err := resolveHistorySource(*source)
+	if err != nil && sourceName != "all" {
 		return err
+	}
+	if sourceName != "" {
+		return a.localHistoryRead(ctx, sourceName, coord, *runID, "logs", *tail, false, *jsonOut, err)
 	}
 	logText, err := coord.RunLogs(ctx, *runID)
 	if err != nil {
@@ -103,20 +114,46 @@ func (a App) events(ctx context.Context, args []string) error {
 		*runID = fs.Arg(0)
 	}
 	if *runID == "" {
-		return exit(2, "usage: crabbox events <run-id>")
+		return Exit(2, "usage: crabbox events <run-id>")
 	}
 	if jsonAnywhere {
 		*jsonOut = true
 	}
 	if *after < 0 {
-		return exit(2, "after must be >= 0")
+		return Exit(2, "after must be >= 0")
 	}
 	if *limit <= 0 {
-		return exit(2, "limit must be positive")
+		return Exit(2, "limit must be positive")
 	}
 	coord, err := configuredCoordinator()
 	if err != nil {
 		return err
+	}
+	if strings.HasPrefix(*runID, "cbx_") {
+		if *after != 0 || *limit != 500 || *eventType != "" || *phase != "" {
+			return Exit(2, "lease creation events do not support run filters or pagination")
+		}
+		var response struct {
+			Events []CreationEvent `json:"events"`
+		}
+		if err := coord.do(ctx, "GET", "/v1/leases/"+*runID+"/events", nil, &response); err != nil {
+			return err
+		}
+		if *jsonOut {
+			return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(response.Events))
+		}
+		for _, event := range response.Events {
+			fmt.Fprintf(a.Stdout, "%s %s source=%s", event.At, event.Phase, event.Source)
+			if event.Step != "" && event.DurationMs != nil {
+				var errors int64
+				if event.Errors != nil {
+					errors = *event.Errors
+				}
+				fmt.Fprintf(a.Stdout, " step=%s durationMs=%g count=%d errors=%d", event.Step, *event.DurationMs, event.Count, errors)
+			}
+			fmt.Fprintln(a.Stdout)
+		}
+		return nil
 	}
 	eventTypeFilter := strings.TrimSpace(*eventType)
 	phaseFilter := strings.TrimSpace(*phase)
@@ -125,7 +162,7 @@ func (a App) events(ctx context.Context, args []string) error {
 		return err
 	}
 	if *jsonOut {
-		return json.NewEncoder(a.Stdout).Encode(events)
+		return json.NewEncoder(a.Stdout).Encode(nonNullJSONCollection(events))
 	}
 	for _, event := range events {
 		text := event.Message
@@ -151,13 +188,13 @@ func (a App) attach(ctx context.Context, args []string) error {
 		*runID = fs.Arg(0)
 	}
 	if *runID == "" {
-		return exit(2, "usage: crabbox attach <run-id>")
+		return Exit(2, "usage: crabbox attach <run-id>")
 	}
 	if *after < 0 {
-		return exit(2, "after must be >= 0")
+		return Exit(2, "after must be >= 0")
 	}
 	if *poll <= 0 {
-		return exit(2, "poll must be positive")
+		return Exit(2, "poll must be positive")
 	}
 	coord, err := configuredCoordinator()
 	if err != nil {

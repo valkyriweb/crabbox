@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -18,11 +19,15 @@ import (
 	"github.com/islo-labs/go-sdk/client"
 	"github.com/islo-labs/go-sdk/customauth"
 	"github.com/islo-labs/go-sdk/option"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type isloAPI interface {
-	CreateSandbox(context.Context, *gosdk.SandboxCreate) (*gosdk.SandboxResponse, error)
+	CreateSandbox(context.Context, *gosdk.CreateSandboxRequest) (*gosdk.SandboxResponse, error)
 	GetSandbox(context.Context, string) (*gosdk.SandboxResponse, error)
+	GetSandboxByID(context.Context, string) (*gosdk.SandboxResponse, error)
 	PauseSandbox(context.Context, string) (*gosdk.SandboxResponse, error)
 	ResumeSandbox(context.Context, string) (*gosdk.SandboxResponse, error)
 	ListSandboxes(context.Context) ([]*gosdk.SandboxResponse, error)
@@ -46,25 +51,39 @@ type IsloShare struct {
 }
 
 type isloSDKClient struct {
-	sdk        *client.Client
-	auth       *customauth.Provider
-	baseURL    string
-	httpClient *http.Client
+	sdk              *client.Client
+	auth             *customauth.Provider
+	baseURL          string
+	httpClient       *http.Client
+	createHTTPClient *http.Client
 }
 
 const isloDefaultResponseHeaderTimeout = 30 * time.Second
+const isloCreateTimeout = 5 * time.Minute
+
+// isloDefaultBaseURL is the Islo control-plane host. It is the default endpoint
+// the SDK client and the claim scope are both built from.
+const isloDefaultBaseURL = "https://api.islo.dev"
 
 var isloCleanupTimeout = 15 * time.Second
 
-var newIsloClient = func(cfg Config, rt Runtime) (isloAPI, error) {
+var newIsloClient = func(cfg core.Config, rt core.Runtime) (isloAPI, error) {
 	apiKey := strings.TrimSpace(cfg.Islo.APIKey)
 	if apiKey == "" {
-		return nil, exit(2, "provider=islo requires ISLO_API_KEY")
+		return nil, core.Exit(2, "provider=islo requires ISLO_API_KEY")
 	}
-	baseURL := strings.TrimRight(blank(cfg.Islo.BaseURL, "https://api.islo.dev"), "/")
+	baseURL := strings.TrimRight(core.Blank(cfg.Islo.BaseURL, isloDefaultBaseURL), "/")
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = defaultIsloHTTPClient()
+		var err error
+		httpClient, err = defaultIsloHTTPClient()
+		if err != nil {
+			return nil, fmt.Errorf("%s HTTP client setup: %w", isloProvider, err)
+		}
+	}
+	httpClient, err := isloHTTPClientWithRedirectGuard(baseURL, httpClient)
+	if err != nil {
+		return nil, err
 	}
 	auth := customauth.NewProvider(baseURL, apiKey, 0, httpClient)
 	var baseTransport http.RoundTripper
@@ -74,37 +93,163 @@ var newIsloClient = func(cfg Config, rt Runtime) (isloAPI, error) {
 		timeout = httpClient.Timeout
 	}
 	sdkHTTPClient := &http.Client{
-		Transport: customauth.NewTransport(baseTransport, auth),
-		Timeout:   timeout,
+		Transport:     customauth.NewTransport(baseTransport, auth),
+		Timeout:       timeout,
+		CheckRedirect: isloSameOriginRedirectGuard(baseURL, nil),
+	}
+	var createHTTPClient *http.Client
+	if rt.HTTP == nil {
+		// Provisioning can outlast ordinary API headers. Only our private create
+		// transport delegates that wait to the bounded operation context.
+		transport := httpClient.Transport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = 0
+		createClient := *sdkHTTPClient
+		createClient.Transport = customauth.NewTransport(transport, auth)
+		createHTTPClient = &createClient
 	}
 	sdk := client.NewClient(option.WithBaseURL(baseURL), option.WithHTTPClient(sdkHTTPClient))
-	return &isloSDKClient{sdk: sdk, auth: auth, baseURL: baseURL, httpClient: httpClient}, nil
+	return &isloSDKClient{sdk: sdk, auth: auth, baseURL: baseURL, httpClient: httpClient, createHTTPClient: createHTTPClient}, nil
 }
 
 func isloCleanupContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), isloCleanupTimeout)
 }
 
-func defaultIsloHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+func defaultIsloHTTPClient() (*http.Client, error) {
+	transport, err := core.CloneDefaultTransport()
+	if err != nil {
+		return nil, err
+	}
 	transport.ResponseHeaderTimeout = isloDefaultResponseHeaderTimeout
-	return &http.Client{Transport: transport}
+	return &http.Client{Transport: transport}, nil
 }
 
-func (c *isloSDKClient) CreateSandbox(ctx context.Context, req *gosdk.SandboxCreate) (*gosdk.SandboxResponse, error) {
-	return c.sdk.Sandboxes.CreateSandbox(ctx, req)
+func isloHTTPClientWithRedirectGuard(baseURL string, source *http.Client) (*http.Client, error) {
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("islo base URL: %w", err)
+	}
+	if base.Scheme == "" || base.Host == "" {
+		return nil, fmt.Errorf("islo base URL must include scheme and host")
+	}
+	if source == nil {
+		source = http.DefaultClient
+	}
+	client := *source
+	client.CheckRedirect = isloSameOriginRedirectGuard(baseURL, source.CheckRedirect)
+	return &client, nil
+}
+
+func isloSameOriginRedirectGuard(baseURL string, next func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	base, _ := url.Parse(baseURL)
+	baseOrigin := isloURLEffectiveOrigin(base)
+	return func(req *http.Request, via []*http.Request) error {
+		if isloURLEffectiveOrigin(req.URL) != baseOrigin {
+			return &isloRedirectError{from: baseOrigin, to: isloURLEffectiveOrigin(req.URL)}
+		}
+		if len(via) >= 10 {
+			return &isloRedirectLimitError{}
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		return nil
+	}
+}
+
+type isloRedirectError struct {
+	from string
+	to   string
+}
+
+type isloRedirectLimitError struct{}
+
+func (*isloRedirectLimitError) Error() string {
+	return "islo redirect stopped after 10 redirects"
+}
+
+func (e *isloRedirectError) Error() string {
+	return fmt.Sprintf("refusing islo redirect from %s to %s", e.from, e.to)
+}
+
+func isloSanitizeRedirectError(err error) error {
+	var redirectErr *isloRedirectError
+	// net/http wraps CheckRedirect failures in *url.Error, whose text includes
+	// the rejected URL. Return our origin-only error so Location secrets stay out.
+	if errors.As(err, &redirectErr) {
+		return redirectErr
+	}
+	var limitErr *isloRedirectLimitError
+	if errors.As(err, &limitErr) {
+		return limitErr
+	}
+	return err
+}
+
+func isloURLEffectiveOrigin(value *url.URL) string {
+	if value == nil {
+		return ""
+	}
+	port := value.Port()
+	if port == "" {
+		switch strings.ToLower(value.Scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return strings.ToLower(value.Scheme) + "://" + strings.ToLower(value.Hostname()) + ":" + port
+}
+
+func (c *isloSDKClient) CreateSandbox(ctx context.Context, req *gosdk.CreateSandboxRequest) (*gosdk.SandboxResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, isloCreateTimeout)
+	defer cancel()
+	var opts []option.RequestOption
+	if c.createHTTPClient != nil {
+		opts = append(opts, option.WithHTTPClient(c.createHTTPClient))
+	}
+	sandbox, err := c.sdk.Sandboxes.CreateSandbox(ctx, req, opts...)
+	if err != nil {
+		return nil, isloSanitizeRedirectError(err)
+	}
+	return sandbox, nil
 }
 
 func (c *isloSDKClient) GetSandbox(ctx context.Context, name string) (*gosdk.SandboxResponse, error) {
-	return c.sdk.Sandboxes.GetSandbox(ctx, &gosdk.GetSandboxRequest{SandboxName: name})
+	sandbox, err := c.sdk.Sandboxes.GetSandbox(ctx, &gosdk.GetSandboxRequest{SandboxName: name})
+	if err != nil {
+		return nil, isloSanitizeRedirectError(err)
+	}
+	return sandbox, nil
+}
+
+// GetSandboxByID resolves a sandbox through `GET /sandboxes/-/by-id/{id}`.
+// Unlike the by-name lookup it keeps answering 200 after a delete, returning
+// status "deleted" with deleted_at set, so it is the only authoritative
+// tombstone the API offers for a specific resource generation.
+func (c *isloSDKClient) GetSandboxByID(ctx context.Context, id string) (*gosdk.SandboxResponse, error) {
+	sandbox, err := c.sdk.Sandboxes.GetSandboxByID(ctx, &gosdk.GetSandboxByIDRequest{ID: id})
+	if err != nil {
+		return nil, isloSanitizeRedirectError(err)
+	}
+	return sandbox, nil
 }
 
 func (c *isloSDKClient) PauseSandbox(ctx context.Context, name string) (*gosdk.SandboxResponse, error) {
-	return c.sdk.Sandboxes.PauseSandbox(ctx, &gosdk.PauseSandboxRequest{SandboxName: name})
+	sandbox, err := c.sdk.Sandboxes.PauseSandbox(ctx, &gosdk.PauseSandboxRequest{SandboxName: name})
+	if err != nil {
+		return nil, isloSanitizeRedirectError(err)
+	}
+	return sandbox, nil
 }
 
 func (c *isloSDKClient) ResumeSandbox(ctx context.Context, name string) (*gosdk.SandboxResponse, error) {
-	return c.sdk.Sandboxes.ResumeSandbox(ctx, &gosdk.ResumeSandboxRequest{SandboxName: name})
+	sandbox, err := c.sdk.Sandboxes.ResumeSandbox(ctx, &gosdk.ResumeSandboxRequest{SandboxName: name})
+	if err != nil {
+		return nil, isloSanitizeRedirectError(err)
+	}
+	return sandbox, nil
 }
 
 func (c *isloSDKClient) ListSandboxes(ctx context.Context) ([]*gosdk.SandboxResponse, error) {
@@ -113,7 +258,7 @@ func (c *isloSDKClient) ListSandboxes(ctx context.Context) ([]*gosdk.SandboxResp
 	for offset := 0; ; offset += limit {
 		page, err := c.sdk.Sandboxes.ListSandboxes(ctx, &gosdk.ListSandboxesRequest{Limit: &limit, Offset: &offset})
 		if err != nil {
-			return nil, err
+			return nil, isloSanitizeRedirectError(err)
 		}
 		if page == nil {
 			return all, nil
@@ -142,17 +287,18 @@ func (c *isloSDKClient) DeleteSandbox(ctx context.Context, name string) error {
 	if err := c.authorize(ctx, httpReq); err != nil {
 		return err
 	}
+	token := strings.TrimPrefix(httpReq.Header.Get("Authorization"), "Bearer ")
 	httpReq.Header.Set("Accept", "application/json")
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return err
+		return isloSanitizeRedirectError(err)
 	}
 	defer resp.Body.Close()
 	// Mirror the >=400 failure convention used by the other raw endpoints, with
 	// 404 carved out so an already-gone sandbox is an idempotent success.
 	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotFound {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("islo delete sandbox %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return fmt.Errorf("islo delete sandbox %s: %s", resp.Status, shared.RedactErrorSecrets(strings.TrimSpace(string(snippet)), token))
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
@@ -173,19 +319,19 @@ func (c *isloSDKClient) UploadArchive(ctx context.Context, name, targetPath stri
 	}
 	token, err := c.auth.Token(ctx)
 	if err != nil {
-		return fmt.Errorf("islo auth: %w", err)
+		return fmt.Errorf("islo auth: %w", isloSanitizeRedirectError(err))
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", contentType)
 	httpReq.Header.Set("Accept", "application/json")
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("islo upload archive: %w", err)
+		return fmt.Errorf("islo upload archive: %w", isloSanitizeRedirectError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("islo upload archive %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return fmt.Errorf("islo upload archive %s: %s", resp.Status, shared.RedactErrorSecrets(strings.TrimSpace(string(snippet)), token))
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
@@ -243,16 +389,17 @@ func (c *isloSDKClient) CreateShare(ctx context.Context, name string, port int, 
 	if err := c.authorize(ctx, httpReq); err != nil {
 		return IsloShare{}, err
 	}
+	token := strings.TrimPrefix(httpReq.Header.Get("Authorization"), "Bearer ")
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return IsloShare{}, fmt.Errorf("islo create share: %w", err)
+		return IsloShare{}, fmt.Errorf("islo create share: %w", isloSanitizeRedirectError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return IsloShare{}, fmt.Errorf("islo create share %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return IsloShare{}, fmt.Errorf("islo create share %s: %s", resp.Status, shared.RedactErrorSecrets(strings.TrimSpace(string(snippet)), token))
 	}
 	var raw isloShareResponse
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
@@ -269,10 +416,11 @@ func (c *isloSDKClient) ListShares(ctx context.Context, name string) ([]IsloShar
 	if err := c.authorize(ctx, httpReq); err != nil {
 		return nil, err
 	}
+	token := strings.TrimPrefix(httpReq.Header.Get("Authorization"), "Bearer ")
 	httpReq.Header.Set("Accept", "application/json")
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("islo list shares: %w", err)
+		return nil, fmt.Errorf("islo list shares: %w", isloSanitizeRedirectError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
@@ -280,7 +428,7 @@ func (c *isloSDKClient) ListShares(ctx context.Context, name string) ([]IsloShar
 	}
 	if resp.StatusCode >= 400 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("islo list shares %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return nil, fmt.Errorf("islo list shares %s: %s", resp.Status, shared.RedactErrorSecrets(strings.TrimSpace(string(snippet)), token))
 	}
 	var raw []isloShareResponse
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
@@ -296,7 +444,7 @@ func (c *isloSDKClient) ListShares(ctx context.Context, name string) ([]IsloShar
 func (c *isloSDKClient) authorize(ctx context.Context, req *http.Request) error {
 	token, err := c.auth.Token(ctx)
 	if err != nil {
-		return fmt.Errorf("islo auth: %w", err)
+		return fmt.Errorf("islo auth: %w", isloSanitizeRedirectError(err))
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	return nil
@@ -331,24 +479,24 @@ func (c *isloSDKClient) ExecStream(ctx context.Context, name string, req *gosdk.
 	}
 	token, err := c.auth.Token(ctx)
 	if err != nil {
-		return 1, fmt.Errorf("islo auth: %w", err)
+		return 1, fmt.Errorf("islo auth: %w", isloSanitizeRedirectError(err))
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return 1, err
+		return 1, isloSanitizeRedirectError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return 1, fmt.Errorf("islo exec stream %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return 1, fmt.Errorf("islo exec stream %s: %s", resp.Status, shared.RedactErrorSecrets(strings.TrimSpace(string(snippet)), token))
 	}
-	return parseIsloSSE(resp.Body, stdout, stderr)
+	return parseIsloSSE(resp.Body, stdout, stderr, token)
 }
 
-func parseIsloSSE(r io.Reader, stdout, stderr io.Writer) (int, error) {
+func parseIsloSSE(r io.Reader, stdout, stderr io.Writer, secrets ...string) (int, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	exitCode := 0
@@ -363,9 +511,13 @@ func parseIsloSSE(r io.Reader, stdout, stderr io.Writer) (int, error) {
 		payload := strings.Join(data, "\n")
 		switch event {
 		case "stdout":
-			_, _ = stdout.Write([]byte(payload))
+			if _, err := stdout.Write([]byte(payload)); err != nil {
+				return err
+			}
 		case "stderr":
-			_, _ = stderr.Write([]byte(payload))
+			if _, err := stderr.Write([]byte(payload)); err != nil {
+				return err
+			}
 		case "exit":
 			n, err := strconv.Atoi(strings.TrimSpace(payload))
 			if err != nil {
@@ -418,7 +570,7 @@ func parseIsloSSE(r io.Reader, stdout, stderr io.Writer) (int, error) {
 	}
 	if !seenExit {
 		if streamErr != "" {
-			return 1, fmt.Errorf("islo exec stream error: %s", streamErr)
+			return 1, fmt.Errorf("islo exec stream error: %s", shared.RedactErrorSecrets(streamErr, secrets...))
 		}
 		return 1, fmt.Errorf("islo exec stream ended without exit event")
 	}

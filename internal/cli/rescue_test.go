@@ -13,6 +13,8 @@ func TestClassifyDesktopFailure(t *testing.T) {
 	}{
 		{output: "missing xdotool; warm a new --desktop lease", want: rescueInputStackDead},
 		{output: "missing clipboard tool; install xclip or xsel", want: rescueClipboardUnavailable},
+		{output: "clipboard helper failed while serving paste (status=124)", want: rescueClipboardDeliveryFailed},
+		{output: "desktop command exited during launch (status=1)", want: rescueDesktopCommandNotLaunched},
 		{output: "browser process not found", want: rescueBrowserNotLaunched},
 		{output: "Error: Can't open display: :99", want: rescueDesktopSessionMissing},
 		{output: "capture failed screenshot repair=restart desktop services", want: rescueScreenshotCaptureBroken},
@@ -96,6 +98,70 @@ func TestRescueCommandsCarryResolvedStaticTargetFallback(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("static rescue command missing resolved target %q: %s", want, got)
 		}
+	}
+}
+
+func TestRescueCommandsCarryExternalPrivateRouting(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const leaseID = "cbx_abcdef123456"
+	stored := ExternalConfig{Command: "provider-command", WorkRoot: "/work/crabbox"}
+	stored.Connection.Desktop = ExternalDesktopConfig{Username: "screen-user", PasswordEnv: "SCREEN_SHARING_PASSWORD"}
+	routingPath, err := PersistExternalRouting(leaseID, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedRouting, err := LoadExternalRouting(routingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := rescueContext{
+		Cfg: Config{
+			Provider: "external",
+			TargetOS: targetMacOS,
+			External: ExternalConfig{Connection: ExternalConnectionConfig{Desktop: ExternalDesktopConfig{
+				Username:    "screen-user",
+				PasswordEnv: "SCREEN_SHARING_PASSWORD",
+			}}},
+		},
+		Target:  SSHTarget{TargetOS: targetMacOS},
+		LeaseID: leaseID,
+	}
+	for name, got := range map[string]string{
+		"doctor": desktopDoctorCommand(ctx),
+		"status": webVNCStatusRescueCommand(ctx),
+		"reset":  webVNCResetRescueCommand(ctx),
+		"daemon": webVNCDaemonStartRescueCommand(ctx),
+		"retry":  desktopLaunchRetryCommand(ctx, []string{"open", "https://example.test"}),
+	} {
+		for _, want := range []string{
+			"--provider external",
+			"--target macos",
+			"--external-routing-file " + routingPath,
+			"--external-routing-digest " + ExternalRoutingDigest(loadedRouting),
+			"--external-desktop-username screen-user",
+			"--external-desktop-password-env SCREEN_SHARING_PASSWORD",
+			"--id " + leaseID,
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("%s command missing %q: %s", name, want, got)
+			}
+		}
+	}
+}
+
+func TestExternalLeaseCommandRoutingArgsDoNotPromoteRepositoryDesktopCredentials(t *testing.T) {
+	cfg := Config{Provider: "external"}
+	cfg.External.Command = "/usr/local/bin/provider"
+	cfg.External.WorkRoot = "/work/crabbox"
+	cfg.External.Connection.Desktop.Username = "repository-user"
+	cfg.External.Connection.Desktop.PasswordEnv = "GH_TOKEN"
+	cfg.credentialProvenance.externalDesktopUser = credentialSourceRepository
+	cfg.credentialProvenance.externalDesktopEnv = credentialSourceRepository
+
+	got := AppendExternalDesktopRoutingArgs(nil, cfg)
+	joined := strings.Join(got, " ")
+	if strings.Contains(joined, "--external-desktop-username") || strings.Contains(joined, "--external-desktop-password-env") {
+		t.Fatalf("repository desktop routing was promoted to trusted flags: %#v", got)
 	}
 }
 

@@ -132,7 +132,7 @@ stop_and_confirm() {
 }
 
 remote_sandbox_present() {
-  if ! remote_inventory_output="$(sandbox list "${sandbox_scope_args[@]}" --all --name-prefix "$sandbox_name" --sort-by name --limit 50 2>&1)"; then
+  if ! remote_inventory_output="$(sandbox list ${sandbox_scope_args[@]+"${sandbox_scope_args[@]}"} --all --name-prefix "$sandbox_name" --sort-by name --limit 50 2>&1)"; then
     return 2
   fi
   if awk -v name="$sandbox_name" 'NR > 1 && $1 == name { found = 1 } END { exit found ? 0 : 1 }' <<<"$remote_inventory_output"; then
@@ -244,6 +244,8 @@ export CRABBOX_VERCEL_SANDBOX_SMOKE_VALUE="forwarded-ok"
 mkdir -p "$smoke_repo"
 cd "$smoke_repo"
 git init -q
+# Do not leave background Git maintenance racing this disposable repo's cleanup.
+git config --local maintenance.auto false
 git config user.email smoke@example.com
 git config user.name "Crabbox Vercel Sandbox Smoke"
 cat >.crabbox.yaml <<EOF
@@ -316,7 +318,7 @@ if [[ -n "${CRABBOX_VERCEL_SANDBOX_TEAM_ID:-}" ]]; then
 elif [[ -n "${CRABBOX_VERCEL_SANDBOX_SCOPE:-}" ]]; then
   sandbox_scope_args+=(--scope "$CRABBOX_VERCEL_SANDBOX_SCOPE")
 fi
-sandbox_stop_args=(stop "${sandbox_scope_args[@]}")
+sandbox_stop_args=(stop ${sandbox_scope_args[@]+"${sandbox_scope_args[@]}"})
 sandbox_stop_args+=("$sandbox_name")
 trap - ERR
 if sandbox_stop_output="$(sandbox "${sandbox_stop_args[@]}" 2>&1)"; then
@@ -410,11 +412,11 @@ else
 fi
 trap 'unexpected_failure "$LINENO"' ERR
 if [[ $remote_cleanup_status -eq 2 ]]; then
-  sandbox rm "${sandbox_scope_args[@]}" "$sandbox_name" >/dev/null 2>&1 || true
+  sandbox rm ${sandbox_scope_args[@]+"${sandbox_scope_args[@]}"} "$sandbox_name" >/dev/null 2>&1 || true
   classify_failure "$remote_inventory_output" "remote_inventory_failed"
 fi
 if [[ $remote_cleanup_status -ne 0 ]]; then
-  sandbox rm "${sandbox_scope_args[@]}" "$sandbox_name" >/dev/null 2>&1 || true
+  sandbox rm ${sandbox_scope_args[@]+"${sandbox_scope_args[@]}"} "$sandbox_name" >/dev/null 2>&1 || true
   classify_and_exit diagnostic_only "remote_sandbox_cleanup_unconfirmed"
 fi
 cleanup_needed=0

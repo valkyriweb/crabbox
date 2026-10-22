@@ -17,7 +17,7 @@ desktop and exposes one right now".
 
 ```text
 --desktop  visible desktop with a loopback VNC server (XFCE, Wayland, or GNOME)
---browser  Chrome/Chromium installed and exported via $BROWSER and $CHROME_BIN
+--browser  Supported browser installed and exported via $BROWSER and $CHROME_BIN
 --code     code-server bound to a loopback port for the portal code bridge
 ```
 
@@ -54,18 +54,21 @@ Capability flags follow a two-step validation, both in
 
 Label enforcement is skipped for static SSH targets, because Crabbox does not
 own the host. There the capability is detected probe-by-probe instead (see
-[Static targets](#static-targets)). A macOS lease is treated as
-desktop-capable without a `desktop=true` label, because Screen Sharing is the
-desktop.
+[Static targets](#static-targets)). A coordinator-backed macOS lease is treated
+as desktop-capable without a `desktop=true` label, because Screen Sharing is
+the desktop. An exact-claim Crabbox Parallels macOS clone is treated the same
+so already-configured Screen Sharing can be used without rewriting lease
+metadata; source and unowned VMs remain rejected, and RFB/SSH still prove the
+desktop after GUI setup.
 
 ## Desktop
 
 When a managed Linux lease is created with `--desktop` (default `xfce`),
 bootstrap (`internal/cli/bootstrap.go`) installs and enables systemd units for:
 
-- Xvfb on display `:99`;
+- resize-capable TigerVNC on display `:99`;
 - an XFCE4 session (`xfce4-session`, panel, terminal, settings, theme);
-- x11vnc bound to `127.0.0.1:5900` with `-localhost`;
+- VNC bound to `127.0.0.1:5900` with `-localhost yes`;
 - a randomized VNC password at `/var/lib/crabbox/vnc.password`;
 - screenshot and capture tooling: `scrot`, `ffmpeg`, plus input helpers
   (`xdotool`, `wmctrl`, `xclip`, `xsel`).
@@ -120,6 +123,13 @@ On managed Linux, bootstrap installs:
 - a managed Chrome policy and a launcher wrapper, whose path is written to
   `/var/lib/crabbox/browser.env` as `BROWSER` and `CHROME_BIN`.
 
+Restored images retain their installed desktop and browser prerequisite packages.
+When a package-installed Chrome or Chromium passes `--version`, bootstrap reuses
+it without downloading signing keys, refreshing browser repositories, or upgrading
+the browser. Missing packages and absent or unusable browsers take the normal
+installation path. Per-lease policies, wrappers, environment files, services, and
+readiness checks still run. Update browsers when maintaining or rebaking the image.
+
 On static and macOS/Windows targets, Crabbox probes for an existing browser
 (`probeBrowserEnv`) and aborts before the command runs if none is found:
 
@@ -137,8 +147,11 @@ CHROME_BIN=/path/to/browser
 CRABBOX_BROWSER=1
 ```
 
-Test runners that read `BROWSER` or `CHROME_BIN` (Vitest, Playwright, etc.)
-work without extra plumbing.
+The [local-container provider](../providers/local-container.md) also supports
+Firefox and Firefox ESR, including native Firefox from Mozilla's signed APT
+repository on Ubuntu. Its exported paths can therefore select Firefox;
+`BROWSER` and `CHROME_BIN` do not promise Chromium or CDP compatibility. Select
+an image with the browser engine required by your test runner.
 
 For browser QA where the remote service is sensitive to source IP (login
 flows, regional CDN behavior), pair `--browser` with
@@ -153,12 +166,15 @@ passes that proxy to Chrome.
 - installs the binary at `/usr/local/bin/code-server` (standalone install,
   `--prefix=/usr/local`);
 - binds it to a loopback port (default `8080`);
-- relies on coordinator state for the access token.
+- starts with code-server auth disabled on that loopback listener; coordinator
+  authentication and the ticketed CLI bridge control browser access.
 
 `crabbox code --id ...` and the portal open a code-server tab through the
 authenticated portal bridge at `/portal/leases/{id-or-slug}/code/`. The bridge
-proxies HTTP and WebSocket traffic to the loopback port and injects the auth
-token, so you never handle it directly. There is no public code-server port.
+proxies HTTP and WebSocket traffic through the local CLI's SSH tunnel to the
+loopback port. Keep the CLI bridge running while using the editor. The
+coordinator must have an isolated `CRABBOX_CODE_ORIGIN_TEMPLATE` configured;
+see [Portal](portal.md). There is no public code-server port.
 
 Code is managed-Linux-only because the bridge depends on the lease shape and
 the cloud-init that installs the binary. Windows, macOS, and static SSH are
@@ -205,8 +221,8 @@ For static SSH hosts, capability validation degrades to probe-based detection,
 because Crabbox does not install software on operator-owned machines:
 
 - `--desktop`: probe loopback VNC at `127.0.0.1:5900` over SSH (X11 checks for
-  Xvfb/x11vnc; Wayland/GNOME checks for the compositor and WayVNC). Fail with a
-  clear error if the desktop is not running.
+  Xtigervnc or legacy Xvfb/x11vnc; Wayland/GNOME checks for the compositor and
+  WayVNC). Fail with a clear error if the desktop is not running.
 - `--browser`: probe for a browser binary using the OS-specific search list;
   fail if none is found.
 - `--code` is rejected (managed Linux only).

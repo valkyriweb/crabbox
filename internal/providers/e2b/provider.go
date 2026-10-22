@@ -12,17 +12,22 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return e2bProvider }
-func (Provider) Aliases() []string { return nil }
+func (Provider) ServerTypeForConfig(cfg core.Config) string {
+	return core.Blank(cfg.E2B.Template, core.E2BConfigDefaultTemplate)
+}
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        e2bProvider,
-		Family:      "e2b",
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureURLBridge},
-		Coordinator: core.CoordinatorNever,
+		ClaimExpiryBound:           e2bMaxSandboxTimeout,
+		Authentication:             core.DirectProviderAuthentication(core.ProviderAuthenticationAPIKey),
+		SyncGuardrailFullCandidate: true,
+		Name:                       e2bProvider,
+		Family:                     "e2b",
+		Kind:                       core.ProviderKindDelegatedRun,
+		Targets:                    []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:                   core.FeatureSet{core.FeatureURLBridge, core.FeatureRunSession},
+		Coordinator:                core.CoordinatorNever,
+		ClassDisposition:           core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -36,16 +41,4 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewE2BBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "e2b doctor backend unavailable")
-	}
-	return doctor, nil
 }

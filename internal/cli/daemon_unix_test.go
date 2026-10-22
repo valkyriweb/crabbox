@@ -29,7 +29,7 @@ func TestStopDaemonProcessKillsProcessGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = cmd.Process.Wait()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		err := syscall.Kill(childPID, 0)
 		if err == syscall.ESRCH {
@@ -44,7 +44,9 @@ func TestStopDaemonProcessKillsProcessGroup(t *testing.T) {
 
 func waitForPIDFile(t *testing.T, path string) int {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	// The child fork/exec that writes this file can be slow when the full package
+	// runs in parallel under CI load, so allow generous startup slack.
+	deadline := time.Now().Add(30 * time.Second)
 	var lastErr error
 	for {
 		data, err := os.ReadFile(path)

@@ -1,189 +1,137 @@
-# 🦀 Crabbox Docs
+# Crabbox
 
-**Warm a box, sync the diff, run the suite.**
+**On-demand computers for agents.**
 
-## What Crabbox is
+## What Crabbox Is
 
-Crabbox is a generic remote software testing and execution control plane. It
-keeps the local developer story unchanged — edit, save, run — while moving the
-actual compute, tests, and review evidence onto owned or provider-backed remote
-capacity. A maintainer or an AI agent issues one command; Crabbox leases a box,
-ships the working tree, runs the command, streams the output back, and cleans
-up.
+Crabbox gives coding agents and humans on-demand computers for tests and builds.
+Keep editing locally while a remote box runs your working tree, including
+uncommitted changes. Crabbox streams output, returns the command’s exit code,
+and cleans up the lease according to the provider’s contract.
 
-A `crabbox run` leases a brokered cloud machine, reuses a static SSH host, or
-delegates to a sandbox provider; syncs your tracked, non-ignored local files;
-executes the command remotely; streams stdout and stderr back; and then
-releases or unclaims the target. An optional coordinator owns cloud provider
-credentials, lease state, cleanup, usage accounting, and cost guardrails so
-individual machines and CLIs never hold those. The coordinator runs either on
-Cloudflare Workers with a Durable Object or on Node.js with PostgreSQL.
-
-## How it fits together
-
-```text
-your laptop                 coordinator runtime              cloud provider
--------------               -------------------              --------------
-crabbox CLI    -- HTTPS --> Cloudflare + Durable Object  --> Hetzner / AWS / Azure / GCP
-   |                      or Node.js + PostgreSQL              |
-   |                                                           |
-   +------------- SSH + rsync to leased runner <---------------+
-```
-
-The CLI is a Go binary (`cmd/crabbox`, `internal/cli`). Shared coordinator
-behavior lives in `worker/src`; Cloudflare and Node/PostgreSQL provide runtime
-adapters. Lease lifecycle calls go through the coordinator over HTTPS, but the
-data plane — SSH, rsync, and command execution — goes **directly from the CLI to
-the runner host**. Runners hold no coordinator credentials; they are leaf nodes.
-
-Crabbox selects one of three execution modes per provider:
-
-- **Brokered** — for `aws`, `azure`, `gcp`, and `hetzner` when a broker URL is
-  configured (`CRABBOX_COORDINATOR`). The coordinator provisions and tracks
-  leases; the CLI still drives sync and command execution over SSH.
-- **Direct SSH** — the same SSH-lease providers without a broker, plus static
-  hosts (`provider: ssh`) and self-hosted/local providers. The CLI talks to the
-  cloud or host API itself.
-- **Delegated** — sandbox/proof runners (for example dynamic-session and
-  Firecracker providers) that own sync and run end to end; there is no SSH lease.
-
-Brokered Linux runners are vanilla Ubuntu boxes prepared by cloud-init with SSH,
-Git, rsync, and `/work/crabbox`. AWS and Azure can also broker Windows
-(normal and WSL2) and, on AWS, EC2 Mac desktop targets. Project runtimes come
-from Actions hydration or repo-owned setup.
-
-## A run, end to end
-
-1. The CLI loads config from flags, env, repo, user, and defaults.
-2. The CLI mints a per-lease SSH key and slug, then `POST /v1/leases` on the
-   broker (brokered mode) or provisions directly (direct mode).
-3. The coordinator checks active-lease and monthly spend caps, reserves
-   worst-case TTL cost, provisions a server with region/market fallback, and
-   returns host / port / user / workdir / expiry / slug.
-4. The CLI waits for the `crabbox-ready` marker, seeds remote Git when possible,
-   rsyncs the Git file-list manifest, runs sync guardrails, and hydrates the
-   configured base ref.
-5. The CLI runs the command over SSH, streams output, records run events, and
-   sends heartbeats.
-6. The CLI releases the lease unless `--keep` is set. Kept leases still
-   auto-release after the idle timeout, and the broker frees reserved cost when
-   the lease closes.
-
-See [How Crabbox Works](how-it-works.md) for the full picture, including
-warm-box reuse and the brokered-vs-direct paths. See the
-[Source Map](source-map.md) to trace any documented behavior back to code.
-
-## Install
+With a provider configured, run the test command your repository already uses:
 
 ```sh
-brew install openclaw/tap/crabbox
-```
-
-Verify with `crabbox --version`.
-
-## Quick start
-
-```sh
-# log in once per machine — stores a broker token in user config
-crabbox login --url https://broker.example.com
-
-# one-shot run on a fresh leased box
 crabbox run -- pnpm test
-
-# keep a warm box around for repeated runs; output includes an id and a slug
-crabbox warmup
-crabbox run --id swift-crab -- pnpm test:changed
-crabbox ssh --id swift-crab
-crabbox stop swift-crab
 ```
 
-Each lease has a canonical id (`cbx_<12 hex>`) and a friendly slug
-(`<adjective>-<noun>`); most commands accept either via `--id`. Run
-`crabbox doctor` to validate local config, broker/provider reachability, and SSH
-key availability before a long workflow, and `crabbox usage` to summarize recent
-spend by user, org, provider, and server type.
+## One Loop, Many Kinds of Box
 
-## Where to read next
+The standard remote execution loop:
 
-Pick whichever matches your intent:
+1. **Edit locally** in your existing checkout.
+2. **Lease a box** or reuse warm capacity.
+3. **Sync** the working tree, including uncommitted changes.
+4. **Run** your command on the box.
+5. **Stream output and return the exit code** to the caller.
+6. **Clean up** owned capacity, or keep it warm for the next run.
 
-- **Start here:** [Getting started](getting-started.md),
-  [How Crabbox Works](how-it-works.md),
-  [Concepts and glossary](concepts.md).
-- **Get the mental model:** [Vision](vision.md),
-  [Architecture](architecture.md), [Orchestrator](orchestrator.md),
-  [Runtime adapter stack](features/runtime-adapter-stack.md),
-  [Broker auth and routing](features/broker-auth-routing.md),
-  [Coordinator](features/coordinator.md),
-  [Bring your own infrastructure](features/bring-your-own-infrastructure.md).
-- **Deploy the coordinator:** [Infrastructure](infrastructure.md),
-  [Portable coordinator](features/portable-coordinator.md),
-  [Operations](operations.md), [Security](security.md).
-- **Use the CLI:** [CLI overview](cli.md),
-  [Command reference](commands/README.md),
-  [Feature reference](features/README.md),
-  [Configuration](features/configuration.md), [Jobs](features/jobs.md),
-  [Pond](features/pond.md),
-  [Actions hydration](features/actions-hydration.md),
-  [Capsules](features/capsules.md), [Checkpoints](features/checkpoints.md),
-  [Browser portal](features/portal.md),
-  [Runtime adapter stack](features/runtime-adapter-stack.md),
-  [Capabilities](features/capabilities.md),
-  [Interactive desktop and VNC](features/interactive-desktop-vnc.md),
-  [Telemetry](features/telemetry.md), [Sync](features/sync.md).
-- **Pick or add a target:** [Provider reference](providers/README.md),
-  [Providers feature overview](features/providers.md),
-  [Provider authoring](features/provider-authoring.md),
-  [Provider backends](provider-backends.md),
-  [Capacity fallback](features/capacity-fallback.md),
-  [Network](features/network.md), [Tailscale](features/tailscale.md).
-  Per-provider: [AWS](providers/aws.md), [Azure](providers/azure.md),
-  [Azure Dynamic Sessions](providers/azure-dynamic-sessions.md),
-  [Google Cloud](providers/gcp.md), [Hetzner](providers/hetzner.md),
-  [DigitalOcean](providers/digitalocean.md), [Linode](providers/linode.md),
-  [Proxmox](providers/proxmox.md), [XCP-ng](providers/xcp-ng.md),
-  [Incus](providers/incus.md), [Parallels](providers/parallels.md),
-  [Local Container](providers/local-container.md),
-  [Multipass](providers/multipass.md),
-  [Static SSH](providers/ssh.md), [Railway](providers/railway.md),
-  [RunPod](providers/runpod.md),
-  [Blacksmith Testbox](providers/blacksmith-testbox.md),
-  [KubeVirt](providers/kubevirt.md), [External](providers/external.md),
-  [Namespace Devbox](providers/namespace-devbox.md),
-  [Namespace Compute Instance](providers/namespace-instance.md),
-  [Semaphore](providers/semaphore.md), [Sprites](providers/sprites.md),
-  [Tenki](providers/tenki.md),
-  [Daytona](providers/daytona.md), [Islo](providers/islo.md),
-  [E2B](providers/e2b.md), [Modal](providers/modal.md),
-  [Agent Sandbox](providers/agent-sandbox.md),
-  [OpenComputer](providers/opencomputer.md),
-  [Freestyle](providers/freestyle.md),
-  [Anthropic Sandbox Runtime](providers/anthropic-sandbox-runtime.md),
-  [Tensorlake](providers/tensorlake.md), [Upstash Box](providers/upstash-box.md),
-  [Weights & Biases](providers/wandb.md), [Cloudflare](providers/cloudflare.md).
-- **Operate it:** [Operations](operations.md),
-  [Observability](observability.md), [Troubleshooting](troubleshooting.md),
-  [Performance](performance.md), [Cost and usage](features/cost-usage.md),
-  [Lifecycle and cleanup](features/lifecycle-cleanup.md).
-- **Set it up or audit it:** [Infrastructure](infrastructure.md),
-  [Portable coordinator](features/portable-coordinator.md),
-  [Security](security.md), [Auth and admin](features/auth-admin.md),
-  [Repository onboarding](features/repository-onboarding.md),
-  [SSH keys](features/ssh-keys.md), [Source Map](source-map.md).
+Delegated providers can own the execution and sync path. Reuse, evidence, and
+cleanup follow the selected provider’s capabilities and the run policy.
 
-## About these docs
+The execution substrate can change without turning the workflow into a
+provider-specific script. Start with [Use Cases](use-cases.md) when you know the
+job but not the provider, or browse the [Provider Reference](providers/README.md)
+when you already know where the work should run.
 
-Markdown in this directory is the user-facing documentation source.
-Implementation truth stays in code; the [Source Map](source-map.md) lists the
-files behind each documented behavior. The GitHub Pages site at
-<https://openclaw.github.io/crabbox/> is generated from these Markdown files by
-`scripts/build-docs-site.mjs` and deployed by `.github/workflows/pages.yml`.
-Pages must be enabled on the repository or organization for the workflow to
-publish.
+## More Agents, Less Waiting
 
-Build and check the docs site locally:
+- **Agents in parallel:** put tests and builds on separate boxes instead of
+  competing for one laptop’s CPU, RAM, and ports.
+- **Warm boxes:** reuse prepared environments to keep the edit-run loop short.
+- **Cross-platform tests:** target Linux, macOS, native Windows, or WSL2 from
+  the same local checkout. Availability depends on the provider.
+- **See and drive the box:** use [VNC or WebVNC](features/interactive-desktop-vnc.md)
+  on supported desktops, request a browser, or use VS Code in the browser with
+  `--code` on managed Linux. The authenticated [portal](features/portal.md)
+  shows leases and run logs; WebVNC supports watching or taking control while
+  the local bridge runs.
+- **Shared team capacity:** an optional coordinator owns cloud credentials,
+  shares leases, and enforces expiry and configured spend caps for brokered
+  providers.
+
+The [provider catalog](providers/README.md) covers clouds, local VMs, SSH hosts,
+and delegated sandboxes. The [external plugin contract](providers/external.md)
+lets you connect your own backend. The website generates its provider wall and
+category counts from the catalog metadata.
+
+## Start Here
+
+- [Getting Started](getting-started.md) — install the CLI and complete a first
+  remote run.
+- [Use Cases](use-cases.md) — choose a workflow such as fast feedback, agent
+  execution, cross-platform validation, browser QA, fan-out, or GPU work.
+- [Pricing and Costs](pricing.md) — understand the current open-source,
+  bring-your-own-compute cost model and its guardrails.
+- [How Crabbox Works](how-it-works.md) — follow a run across the CLI,
+  coordinator, and runner.
+- [Crabbox Vision](../VISION.md) — understand product scope, non-goals, and
+  lifecycle safety rules.
+
+## Pick an Operating Model
+
+| Path | Best For | Ownership |
+| --- | --- | --- |
+| Local runtime | Fast, credential-free development checks | Your workstation and local runtime |
+| Direct cloud or SSH | Personal cloud accounts, private hosts, and self-hosted virtualization | Your provider account or infrastructure |
+| Team coordinator | Shared credentials, leases, cleanup, usage, and spend caps | Your Cloudflare or Node.js/PostgreSQL deployment |
+| Delegated execution | Provider-shaped agent, CI, browser, or GPU runs | The selected provider or self-hosted runtime operator |
+
+Crabbox software is MIT-licensed. It does not currently publish a hosted
+control-plane plan; provider compute and any coordinator infrastructure are
+billed by their respective operators. See [Pricing and Costs](pricing.md) for
+the exact boundary.
+
+## Trust Boundary
+
+Run trusted repositories with trusted teammates. Crabbox is a developer
+execution tool; isolation depends on the selected runtime. Reuse and destructive
+cleanup require verified ownership of the exact resource and claim. Ambiguous
+ownership fails closed.
+
+Use [Provider Selection](features/provider-selection.md) to route a workload,
+then read that provider’s documentation and the [security model](security.md).
+The recommendation command is workflow guidance, not a security certification.
+
+## Go Deeper
+
+- **CLI and configuration:** [CLI](cli.md),
+  [Command Reference](commands/README.md),
+  [Configuration](features/configuration.md), and
+  [Repository Onboarding](features/repository-onboarding.md).
+- **Fleet and operations:** [Architecture](architecture.md),
+  [Infrastructure](infrastructure.md), [Operations](operations.md),
+  [Observability](observability.md), [Read-Only Device Pairing](features/device-pairing.md),
+  and [Security](security.md).
+- **Runs and evidence:** [Jobs](features/jobs.md),
+  [Actions Hydration](features/actions-hydration.md),
+  [Artifacts](features/artifacts.md), [Checkpoints](features/checkpoints.md),
+  and [Interactive Desktop and VNC](features/interactive-desktop-vnc.md).
+- **Platform boundaries:** [Nested Execution](features/nested-execution.md)
+  distinguishes WSL2, container engines, prepared KVM hosts, and local
+  sandboxes.
+- **Extensibility:** [Integration Catalog](integrations/README.md),
+  [Provider Authoring](features/provider-authoring.md), and
+  [Source Map](source-map.md).
+
+## About These Docs
+
+The Markdown in `docs/` is the user-facing source for
+[crabbox.sh](https://crabbox.sh/). Implementation truth stays in code; the
+[Source Map](source-map.md) traces documented behavior back to its owner.
+
+Build and validate the site locally:
 
 ```sh
 scripts/check-docs.sh
 open dist/docs-site/index.html
 ```
+
+When editing `docs/`, use the site's supported level 1–4 headings and
+triple-backtick code fences. Site-target heading links are checked against the
+same heading identities the renderer emits; examples and comments do not reserve
+anchors. Keep published heading IDs stable. Repository-only Markdown targets
+retain the checker's separate existing GitHub-oriented anchor rules, not a claim
+of complete GitHub Markdown support.
+
+See [Translating the Documentation](translations.md) to add or refresh a language.

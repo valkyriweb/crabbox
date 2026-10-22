@@ -1,0 +1,151 @@
+{
+  "schema": "crabbox-bootstrap-fragments/v1",
+  "fragments": [
+    {
+      "name": "xfceSessionEnvironment",
+      "file": "xfceSessionEnvironment.sh",
+      "literal": true,
+      "parameters": {}
+    },
+    {
+      "name": "xfceDesktopTheme",
+      "file": "xfceDesktopTheme.sh",
+      "parameters": {
+        "cssStyle": "sh-string"
+      }
+    },
+    {
+      "name": "xfceDesktopSession",
+      "file": "xfceDesktopSession.sh",
+      "literal": true,
+      "parameters": {}
+    },
+    {
+      "name": "gnomeDesktopTheme",
+      "file": "gnomeDesktopTheme.sh",
+      "literal": true,
+      "parameters": {}
+    },
+    {
+      "name": "linuxBootstrapActivate",
+      "file": "linuxBootstrapActivate.sh",
+      "parameters": {}
+    },
+    {
+      "name": "linuxBootstrapPrelude",
+      "file": "linuxBootstrapPrelude.sh",
+      "parameters": {}
+    },
+    {
+      "name": "linuxBootstrapStart",
+      "file": "linuxBootstrapStart.sh",
+      "literal": true,
+      "parameters": {}
+    },
+    {
+      "name": "linuxSSHRestart",
+      "file": "linuxSSHRestart.sh",
+      "parameters": {}
+    },
+    {
+      "name": "linuxOptionalPackages",
+      "file": "linuxOptionalPackages.sh",
+      "literal": true,
+      "parameters": {}
+    },
+    {
+      "name": "windowsHeader",
+      "file": "windowsHeader.ps1",
+      "parameters": {
+        "user": "ps-string",
+        "publicKey": "ps-string",
+        "workRoot": "ps-string",
+        "ports": "ps-strings"
+      }
+    },
+    {
+      "name": "windowsRuntime",
+      "file": "windowsRuntime.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "windowsRuntimeGate",
+      "file": "windowsRuntimeGate.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "windowsNodeInstall",
+      "file": "windowsNodeInstall.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "windowsCore",
+      "file": "windowsCore.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "windowsDesktopPrelude",
+      "file": "windowsDesktopPrelude.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "windowsNativePrelude",
+      "file": "windowsNativePrelude.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "windowsFinalize",
+      "file": "windowsFinalize.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "windowsDesktop",
+      "file": "windowsDesktop.ps1",
+      "parameters": {}
+    },
+    {
+      "name": "macOSSSHSession",
+      "file": "macOSSSHSession.sh",
+      "parameters": {}
+    },
+    {
+      "name": "macOSNodeInstall",
+      "file": "macOSNodeInstall.sh",
+      "parameters": {}
+    },
+    {
+      "name": "macOS",
+      "file": "macOS.sh",
+      "parameters": {
+        "user": "sh-string",
+        "publicKey": "sh-string",
+        "workRoot": "sh-string",
+        "ports": "sh-strings"
+      }
+    },
+    {
+      "name": "codeServerInstall",
+      "file": "codeServerInstall.sh",
+      "parameters": {}
+    },
+    {
+      "name": "tailscalePinnedInstall",
+      "file": "tailscalePinnedInstall.sh",
+      "parameters": {
+        "version": "sh-string",
+        "amd64SHA": "sh-string",
+        "arm64SHA": "sh-string"
+      }
+    },
+    {
+      "name": "tailscalePackageInstall",
+      "file": "tailscalePackageInstall.sh",
+      "parameters": {}
+    },
+    {
+      "name": "wslTruffleHogInstall",
+      "file": "wslTruffleHogInstall.sh",
+      "parameters": {}
+    }
+  ]
+}

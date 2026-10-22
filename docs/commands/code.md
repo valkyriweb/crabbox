@@ -5,7 +5,8 @@ authenticated coordinator [portal](../features/portal.md), so you can edit the
 synced checkout in a browser VS Code without exposing the runner directly.
 
 ```sh
-crabbox warmup --code
+crabbox warmup --code --slug swift-crab
+crabbox run --id swift-crab --sync-only
 crabbox code --id swift-crab
 crabbox code --id swift-crab --open
 ```
@@ -14,6 +15,9 @@ crabbox code --id swift-crab --open
 
 - A configured coordinator login. The command refuses to run without one:
   `crabbox login --url broker.example.com` first.
+- A valid coordinator `CRABBOX_CODE_ORIGIN_TEMPLATE` backed by wildcard TLS and
+  WebSocket ingress. Browser Code fails closed when the template is absent or
+  invalid.
 - A lease created with the `code` capability (`crabbox warmup --code`). The
   Linux bootstrap installs `code-server` only for leases that request it, and
   reusing a lease checks for the matching `code=true` label.
@@ -27,6 +31,9 @@ crabbox code --id swift-crab --open
 runner's loopback interface (`127.0.0.1:8080`), opens an SSH tunnel to it, mints
 a short-lived bridge ticket from the coordinator, and registers a local bridge
 process. Keep the process running while you use the editor.
+
+`code` does not sync local files. Run `run --sync-only` first, or open an
+already synced or Actions-hydrated workspace.
 
 The data path is:
 
@@ -42,15 +49,24 @@ The coordinator authenticates the browser through portal auth and authenticates
 the local bridge with a one-use, short-lived ticket. The CLI sends the ticket as
 an `X-Crabbox-Bridge-Ticket` WebSocket upgrade header so it stays out of
 WebSocket URLs while leaving ordinary coordinator authentication intact. A
-bearer-header retry supports older coordinators, and the coordinator accepts
-query tickets only from older CLIs. Because the trusted boundary is the portal
-plus the bridge ticket, `code-server` runs with auth disabled on the runner side.
+bearer-header retry supports older coordinators. Current coordinators reject
+bridge tickets in URL query strings by default, so older CLIs that still send
+query-ticket bridges must be upgraded before they can connect. Operators who
+need a temporary legacy rollout window can set
+`CRABBOX_ALLOW_QUERY_BRIDGE_TICKETS=1`; remove that setting after affected
+clients upgrade. Because the trusted boundary is the portal plus the bridge
+ticket, `code-server` runs with auth disabled on the runner side.
 
 The portal URL is lease-scoped:
 
 ```text
 /portal/leases/<lease-id>/code/
 ```
+
+Displayed and opened portal URLs never include coordinator URL usernames,
+passwords, original query parameters, or fragments. Coordinator HTTP and bridge
+authentication retain their configured credentials; browsers authenticate
+through their existing portal session or normal browser authentication.
 
 If the browser opens before the local bridge connects, the Code portal renders a
 waiting state with the exact `crabbox code` command, copy/reload controls, and
@@ -62,7 +78,7 @@ The editor opens the synced workspace by default. If you run `crabbox code` from
 a subdirectory of the local checkout, Crabbox maps that relative path onto the
 remote workspace and opens the matching folder. [Actions-hydrated](../features/actions-hydration.md)
 leases open the hydration workspace instead of the default
-`/work/crabbox/<repo>` path.
+`/work/crabbox/<lease>/<repo>` path.
 
 ### Resilience
 
@@ -70,6 +86,10 @@ Managed `code-server` starts with `Default Dark Modern` as its theme. The bridge
 chunks large HTTP responses and websocket frames so VS Code assets and
 extension-host traffic stay under coordinator websocket frame limits, and it
 reconnects automatically on transient bridge errors.
+
+Ctrl+C interrupts both the code-server readiness wait and the reconnect delay;
+it does not wait for the next retry. The local bridge and SSH tunnel close,
+while the lease remains available for reuse.
 
 ## Flags
 

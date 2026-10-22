@@ -33,9 +33,15 @@ Bootstrap flow:
 
 - EC2Launch v2 runs the `enableOpenSsh` user-data task, opening the first OpenSSH
   foothold on port `22`.
-- Over that SSH connection, Crabbox runs the shared Windows desktop bootstrap as a
-  local `crabbox` administrator: it installs Git for Windows and TightVNC and
-  configures the visible console session.
+- Over that SSH connection as `Administrator`, Crabbox runs the shared Windows
+  bootstrap, which installs Git for Windows and configures the requested SSH
+  ports and the local `crabbox` administrator. Desktop mode also installs TightVNC
+  and configures the visible console session.
+- Fresh brokered leases may use the advertised port `22` for this initial setup
+  even when `ssh.port: "2222"` explicitly pins the workload to `2222`. Final
+  readiness and workload delivery honor that pin without port fallback. The
+  initial route must be advertised by the coordinator; Crabbox does not invent
+  port `22` when it is omitted. This applies to both native Windows and WSL2.
 - Windows auto-logon (`AutoAdminLogon`) starts a visible console session for the
   `crabbox` user.
 - TightVNC runs inside that logged-in user session through the `CrabboxUserVNC`
@@ -63,7 +69,9 @@ Bootstrap flow:
   Custom Script Extension copies `C:\AzureData\CustomData.bin` to
   `C:\AzureData\crabbox-bootstrap.ps1` and runs it.
 - The script installs OpenSSH, Git for Windows, and TightVNC, creates the `crabbox`
-  administrator, and configures auto-logon.
+  administrator, and configures auto-logon. Every downloaded installer/archive
+  is pinned to a release URL and verified with SHA-256 before extraction or
+  execution; a mismatch deletes the download and stops bootstrap.
 - In desktop mode the bootstrap reboots once to land the auto-logon console
   session, then Crabbox waits for SSH and VNC readiness.
 - VNC listens on port `5900` and is reachable only through the SSH tunnel.
@@ -107,7 +115,8 @@ Linux tooling on Windows-capable nested-virtualization VM families.
 
 The bootstrap enables the `Microsoft-Windows-Subsystem-Linux`,
 `VirtualMachinePlatform`, and `HypervisorPlatform` features, updates the WSL kernel,
-and imports a `Crabbox` distribution from an Ubuntu rootfs. Enabling the features
+and imports a `Crabbox` distribution from a versioned Ubuntu rootfs whose
+SHA-256 is verified before import. Enabling the features
 and updating the kernel each trigger a reboot, so the first WSL2 warmup takes longer
 than a native Windows warmup.
 
@@ -142,9 +151,11 @@ such as `/home/alice/crabbox`.
 
 ## Troubleshooting
 
-**Tunnel command uses port `22`.** Expected for AWS Windows. EC2Launch enables
-OpenSSH on port `22`, and Crabbox records the working SSH port after probing the
-configured fallbacks.
+**Tunnel command uses port `22`.** AWS Windows initially enables OpenSSH on
+port `22`. With automatic port selection, Crabbox can record that working
+fallback. An explicit SSH port setting pins subsequent workload and tunnel
+connections to that advertised port; using `22` for initial bootstrap does not
+change an explicit `2222` selection.
 
 **Screenshot is black from raw SSH.** Use `crabbox screenshot`. It runs a scheduled
 task inside the logged-in console session; an ad hoc non-interactive SSH PowerShell

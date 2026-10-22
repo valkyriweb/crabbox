@@ -1,0 +1,285 @@
+package daytona
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	daytona "github.com/daytona/clients/api-client-go"
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+const daytonaActivityRequestTimeout = 10 * time.Second
+
+func validateDaytonaCreateConfig(cfg core.Config) error {
+	if strings.TrimSpace(cfg.Daytona.Snapshot) == "" && !classSnapshotRequested(cfg) {
+		return core.Exit(2, "provider=daytona requires --daytona-snapshot or daytona.snapshot")
+	}
+	if cfg.TTL <= 0 || cfg.IdleTimeout <= 0 || core.DurationMinutesCeil(cfg.TTL) > math.MaxInt32 || core.DurationMinutesCeil(cfg.IdleTimeout) > math.MaxInt32 {
+		return core.Exit(2, "provider=daytona requires positive TTL and idle timeout within Daytona's minute range")
+	}
+	return nil
+}
+
+func daytonaCreateBody(cfg core.Config, leaseID, slug string, keep bool, now time.Time) *daytona.CreateSandbox {
+	cfg.WorkRoot, cfg.SSHUser = daytonaWorkRoot(cfg), daytonaUser(cfg)
+	labels := core.DirectLeaseLabels(cfg, leaseID, slug, daytonaProvider, "", keep, now)
+	// A selected snapshot owns its sizing. Only retain a class that acquisition
+	// actually used to select or validate that snapshot, never an inherited default.
+	if !classSnapshotRequested(cfg) {
+		delete(labels, "class")
+	}
+	labels["lease_name"], labels["work_root"] = core.LeaseProviderName(leaseID, slug), cfg.WorkRoot
+	body := daytona.NewCreateSandbox()
+	body.SetName(labels["lease_name"])
+	body.SetSnapshot(strings.TrimSpace(cfg.Daytona.Snapshot))
+	body.SetUser(cfg.SSHUser)
+	body.SetLabels(labels)
+	body.SetPublic(false)
+	body.SetAutoStopInterval(int32(core.DurationMinutesCeil(cfg.IdleTimeout)))
+	body.SetAutoDeleteInterval(-1)
+	body.SetTtlMinutes(int32(core.DurationMinutesCeil(cfg.TTL)))
+	if target := strings.TrimSpace(cfg.Daytona.Target); target != "" {
+		body.SetTarget(target)
+	}
+	return body
+}
+
+func (b *daytonaLeaseBackend) createDaytonaSandbox(ctx context.Context, repo core.Repo, keep, reclaim bool, requestedSlug string, sources ...*core.NativeCheckpointForkRecord) (sandbox *daytona.Sandbox, leaseID, slug string, err error) {
+	if err := validateDaytonaCreateConfig(b.cfg); err != nil {
+		return nil, "", "", err
+	}
+	client, err := newDaytonaClient(b.cfg, b.rt)
+	if err != nil {
+		return nil, "", "", err
+	}
+	cfg := b.cfg
+	snapshot, err := selectClassSnapshot(ctx, client, cfg)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if len(sources) != 0 && sources[0] != nil {
+		if snapshot == nil {
+			snapshot, err = client.GetSnapshot(ctx, strings.TrimSpace(cfg.Daytona.Snapshot))
+			if err != nil {
+				return nil, "", "", err
+			}
+		}
+		if err := validateDaytonaForkSnapshot(snapshot, sources[0]); err != nil {
+			return nil, "", "", err
+		}
+	}
+	scope, organization, err := daytonaAccountContext(ctx, client)
+	if err != nil {
+		return nil, "", "", err
+	}
+	existing, err := client.ListCrabboxSandboxes(ctx)
+	if err != nil {
+		return nil, "", "", daytonaError("list sandboxes", err)
+	}
+	leaseID = core.NewLeaseID()
+	slug, err = core.AllocateDirectLeaseSlug(leaseID, requestedSlug, daytonaSandboxesToServers(existing))
+	if err != nil {
+		return nil, "", "", err
+	}
+	cfg.ServerType, cfg.WorkRoot, cfg.SSHUser, cfg.SSHPort = (Provider{}).ServerTypeForConfig(cfg), daytonaWorkRoot(cfg), daytonaUser(cfg), "22"
+	if snapshot != nil {
+		cfg.ServerType = snapshot.GetId()
+	}
+	body := daytonaCreateBody(cfg, leaseID, slug, keep, time.Now().UTC())
+	if snapshot != nil {
+		// Resolve labels before changing Snapshot, which changes class precedence.
+		cfg.Daytona.Snapshot = snapshot.GetId()
+		body.SetSnapshot(cfg.Daytona.Snapshot)
+	}
+	labels := body.GetLabels()
+	fmt.Fprintf(b.rt.Stderr, "provisioning provider=daytona lease=%s slug=%s snapshot=%s target=%s keep=%v\n", leaseID, slug, cfg.Daytona.Snapshot, core.Blank(cfg.Daytona.Target, "-"), keep)
+	created, createErr := client.CreateSandbox(ctx, *body)
+	if createErr != nil || created == nil || created.GetId() == "" {
+		if createErr == nil {
+			createErr = errors.New("create response missing sandbox id")
+		}
+		// Even HTTP 400 can follow allocation when native startup fails.
+		// Never retry the POST; recover only this attempt before cleanup.
+		recoveryCtx, cancel := daytonaCleanupContext()
+		defer cancel()
+		var recoveryErr error
+		created, recoveryErr = recoverDaytonaAllocation(recoveryCtx, client, labels["lease_name"], leaseID)
+		if recoveryErr != nil {
+			return nil, leaseID, slug, fmt.Errorf("%w; cannot reconcile Daytona lease %s: %v", daytonaError("create sandbox", createErr), leaseID, recoveryErr)
+		}
+	}
+	resourceID := created.GetId()
+	accountMatches := created.GetOrganizationId() == organization
+	if !accountMatches {
+		// Retain cleanup custody, but never attest an inconsistent response.
+		scope = ""
+	}
+	defer func() {
+		if err != nil && accountMatches {
+			err = b.rollbackDaytonaSandbox(resourceID, leaseID, err)
+		}
+	}()
+	if _, err = core.ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurable(leaseID, slug, cfg, scope, core.Server{Provider: daytonaProvider, CloudID: resourceID, ImmutableID: resourceID, Labels: labels}, core.SSHTarget{}, repo.Root, cfg.IdleTimeout, reclaim, core.LeaseClaim{}, false); err != nil {
+		return nil, leaseID, slug, err
+	}
+	if !accountMatches {
+		return nil, leaseID, slug, core.Exit(4, "Daytona created sandbox organization differs from authenticated acquisition scope; claim and resource %s retained for manual recovery", resourceID)
+	}
+	if createErr != nil {
+		return nil, leaseID, slug, daytonaError("create sandbox", createErr)
+	}
+	sandbox, err = waitForDaytonaReady(ctx, client, resourceID, 5*time.Minute)
+	if err != nil {
+		return nil, leaseID, slug, err
+	}
+	if err = validateClassSandbox(sandbox, snapshot); err != nil {
+		return nil, leaseID, slug, err
+	}
+	labels["state"], labels["last_touched_at"] = "ready", core.LeaseLabelTime(time.Now().UTC())
+	sandbox, err = establishDaytonaSandboxOwnership(ctx, client, resourceID, leaseID, labels)
+	return sandbox, leaseID, slug, err
+}
+
+func recoverDaytonaAllocation(ctx context.Context, client daytonaAPI, name, leaseID string) (*daytona.Sandbox, error) {
+	for {
+		// Inventory is eventually consistent. Resolve the unique name, but never
+		// treat a matching name alone as proof that this attempt owns the resource.
+		sandbox, err := client.GetSandbox(ctx, name)
+		if err == nil && sandbox != nil && sandbox.GetId() != "" {
+			if id, owned := daytonaSandboxOwnership(sandbox); !owned || id != leaseID || sandbox.GetName() != name {
+				return nil, fmt.Errorf("sandbox named %s does not match ownership of lease %s; refusing recovery", name, leaseID)
+			}
+			return sandbox, nil
+		}
+		if waitErr := shared.SleepContext(ctx, time.Second); waitErr != nil {
+			return nil, fmt.Errorf("allocation unconfirmed for sandbox name=%s: %w; inspect provider inventory before retrying", name, waitErr)
+		}
+	}
+}
+
+func (b *daytonaLeaseBackend) rollbackDaytonaSandbox(resourceID, leaseID string, cause error) error {
+	ctx, cancel := daytonaCleanupContext()
+	defer cancel()
+	client, err := newDaytonaClient(b.cfg, b.rt)
+	if err == nil {
+		err = deleteOwnedDaytonaSandbox(ctx, client, resourceID, leaseID)
+	}
+	if err != nil {
+		return fmt.Errorf("%w; cleanup failed for Daytona lease=%s sandbox=%s: %v; retry crabbox stop --provider daytona %s", cause, leaseID, resourceID, err, leaseID)
+	}
+	core.RemoveLeaseClaim(leaseID)
+	return cause
+}
+
+func deleteOwnedDaytonaSandbox(ctx context.Context, client daytonaAPI, resourceID, leaseID string) error {
+	sandbox, err := client.GetSandbox(ctx, resourceID)
+	if daytonaIsNotFoundError(err) {
+		return nil
+	}
+	if err != nil {
+		return daytonaError("verify sandbox before deletion", err)
+	}
+	if id, owned := daytonaSandboxOwnership(sandbox); !owned || id != leaseID || sandbox.GetId() != resourceID {
+		return core.Exit(4, "refusing to delete Daytona sandbox %s: ownership does not match lease %s", resourceID, leaseID)
+	}
+	if daytonaStateDeleted(daytonaSandboxState(sandbox)) {
+		return nil
+	}
+	// A retry should wait for an accepted deletion, not submit another DELETE
+	// that Daytona rejects with a conflict while destruction is in progress.
+	state := daytonaSandboxState(sandbox)
+	if state != "destroying" && state != "deleting" {
+		if err := client.DeleteSandbox(ctx, resourceID); err != nil && !daytonaIsNotFoundError(err) {
+			return daytonaError("delete sandbox", err)
+		}
+	}
+	for {
+		sandbox, err = client.GetSandbox(ctx, resourceID)
+		if daytonaIsNotFoundError(err) || err == nil && daytonaStateDeleted(daytonaSandboxState(sandbox)) {
+			return nil
+		}
+		if err != nil {
+			return daytonaError("confirm sandbox deletion", err)
+		}
+		if err := shared.SleepContext(ctx, time.Second); err != nil {
+			return err
+		}
+	}
+}
+
+func daytonaStateDeleted(state string) bool {
+	return state == "destroyed" || state == "deleted"
+}
+
+func daytonaActivityInterval(idle time.Duration) time.Duration {
+	interval := idle / 3
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval
+}
+
+func (b *daytonaLeaseBackend) BeginSSHRunActivity(ctx context.Context, lease core.LeaseTarget) (func(), error) {
+	client, err := newDaytonaClient(b.cfg, b.rt)
+	if err != nil {
+		return nil, err
+	}
+	sandbox, err := client.GetSandbox(ctx, lease.Server.CloudID)
+	if err != nil {
+		return nil, daytonaError("get sandbox before SSH run", err)
+	}
+	return b.startDaytonaActivity(ctx, sandbox)
+}
+
+func (b *daytonaLeaseBackend) startDaytonaActivity(ctx context.Context, sandbox *daytona.Sandbox) (func(), error) {
+	client, err := newDaytonaClient(b.cfg, b.rt)
+	if err != nil {
+		return nil, err
+	}
+	refresh := func(callCtx context.Context) error {
+		callCtx, cancel := context.WithTimeout(callCtx, daytonaActivityRequestTimeout)
+		defer cancel()
+		return client.UpdateLastActivity(callCtx, sandbox.GetId())
+	}
+	if err := refresh(ctx); err != nil {
+		return nil, daytonaError("refresh activity", err)
+	}
+	idle := time.Duration(sandbox.GetAutoStopInterval()) * time.Minute
+	if idle <= 0 {
+		idle = b.cfg.IdleTimeout
+	}
+	activityCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(daytonaActivityInterval(idle))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-activityCtx.Done():
+				return
+			case <-ticker.C:
+				if err := refresh(activityCtx); err != nil && activityCtx.Err() == nil {
+					fmt.Fprintf(b.rt.Stderr, "warning: daytona activity refresh failed: %v\n", daytonaError("refresh activity", err))
+				}
+			}
+		}
+	}()
+	return func() { cancel(); <-done }, nil
+}
+
+func daytonaTouchedLabels(labels map[string]string, cfg core.Config, req core.TouchRequest) map[string]string {
+	if req.IdleTimeoutOverride != nil {
+		rounded := time.Duration(core.DurationMinutesCeil(*req.IdleTimeoutOverride)) * time.Minute
+		req.IdleTimeoutOverride = &rounded
+	}
+	return core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(labels, cfg, req.State, time.Now().UTC(), req.IdleTimeoutOverride)
+}

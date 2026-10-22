@@ -23,6 +23,8 @@ const (
 	repoBuildReplayClass    = "repo-build-replay"
 	repoBuildReplayVersion  = "0.1.0"
 	capsuleManifestFileName = "capsule.yaml"
+	privateCapsuleDirMode   = 0o700
+	privateCapsuleFileMode  = 0o600
 
 	capsuleOutcomePass           = "pass"
 	capsuleOutcomeFailReproduced = "fail_reproduced"
@@ -202,40 +204,48 @@ func (a App) capsuleFromActions(ctx context.Context, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return exit(2, "usage: crabbox capsule from-actions <run-url> --replay '<command>'")
+		return Exit(2, "usage: crabbox capsule from-actions <run-url> --replay '<command>'")
 	}
 	if strings.TrimSpace(*replayCommand) == "" {
-		return exit(2, "capsule from-actions requires --replay")
+		return Exit(2, "capsule from-actions requires --replay")
 	}
 	if *maxLogBytes <= 0 {
-		return exit(2, "--max-log-bytes must be greater than 0")
+		return Exit(2, "--max-log-bytes must be greater than 0")
 	}
 	runRef, err := parseActionsRunRef(fs.Arg(0), *repoFlag)
 	if err != nil {
 		return err
 	}
-	view, err := fetchActionsRunView(ctx, runRef)
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if err := ValidateProviderCredentialDestination(cfg); err != nil {
+		return err
+	}
+	childEnvDenylist := externalDesktopChildEnvDenylist(cfg, cfg.TargetOS)
+	view, err := fetchActionsRunView(ctx, runRef, childEnvDenylist)
 	if err != nil {
 		return err
 	}
 	runRef.Attempt = firstNonZero(runRef.Attempt, view.Attempt)
-	workflowPath, err := fetchActionsWorkflowPath(ctx, runRef)
+	workflowPath, err := fetchActionsWorkflowPath(ctx, runRef, childEnvDenylist)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "warning: workflow path unavailable: %v\n", err)
 	}
-	artifacts, err := fetchActionsArtifacts(ctx, runRef)
+	artifacts, err := fetchActionsArtifacts(ctx, runRef, childEnvDenylist)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "warning: artifact metadata unavailable: %v\n", err)
 	}
 	job, step, jobMatched := selectCapsuleFailure(view.Jobs, *jobName)
 	if !jobMatched {
-		return exit(2, "capsule from-actions --job %q did not match any job in the run", *jobName)
+		return Exit(2, "capsule from-actions --job %q did not match any job in the run", *jobName)
 	}
 	if !isFailureConclusion(job.Conclusion) {
 		if job.Name != "" {
-			return exit(2, "capsule from-actions selected job %q but its conclusion is %q, not a failure", job.Name, blank(job.Conclusion, "-"))
+			return Exit(2, "capsule from-actions selected job %q but its conclusion is %q, not a failure", job.Name, blank(job.Conclusion, "-"))
 		}
-		return exit(2, "capsule from-actions requires a failed GitHub Actions job")
+		return Exit(2, "capsule from-actions requires a failed GitHub Actions job")
 	}
 	if *scenario == "" {
 		*scenario = defaultCapsuleScenario(view, job, step)
@@ -244,18 +254,21 @@ func (a App) capsuleFromActions(ctx context.Context, args []string) error {
 	if dir == "" {
 		dir = filepath.Join("capsules", defaultCapsuleOutputName(runRef, job, step, *jobName != "" || capsuleRunHasMultipleFailures(view.Jobs)))
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0o755); err != nil {
+	if err := ensurePrivateCapsuleDir(dir); err != nil {
+		return err
+	}
+	if err := ensurePrivateCapsuleDir(filepath.Join(dir, "logs")); err != nil {
 		return err
 	}
 	logRef, failureSignature := capsuleArtifactRef{}, ""
 	if !*noLogs {
-		logText, logErr := fetchActionsFailedLog(ctx, runRef)
+		logText, logErr := fetchActionsFailedLog(ctx, runRef, childEnvDenylist)
 		if logErr != nil {
 			fmt.Fprintf(a.Stderr, "warning: failed log unavailable: %v\n", logErr)
 		} else if logText != "" {
 			logText = boundString(logText, *maxLogBytes)
 			logPath := filepath.Join(dir, "logs", "failed.log")
-			if err := os.WriteFile(logPath, []byte(logText), 0o644); err != nil {
+			if err := writePrivateCapsuleFile(logPath, []byte(logText)); err != nil {
 				return err
 			}
 			logDigest := sha256String(logText)
@@ -289,7 +302,7 @@ func (a App) capsuleReplay(ctx context.Context, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return exit(2, "usage: crabbox capsule replay <capsule.yaml> [--keep]")
+		return Exit(2, "usage: crabbox capsule replay <capsule.yaml> [--keep]")
 	}
 	path := capsuleManifestPath(fs.Arg(0))
 	manifest, err := readCapsuleManifest(path)
@@ -297,7 +310,7 @@ func (a App) capsuleReplay(ctx context.Context, args []string) error {
 		return err
 	}
 	if strings.TrimSpace(manifest.Replay.Command) == "" {
-		return exit(2, "capsule %s has no replay.command", path)
+		return Exit(2, "capsule %s has no replay.command", path)
 	}
 	runArgs := []string{"--shell"}
 	if *leaseID != "" {
@@ -337,7 +350,7 @@ func (a App) capsuleReplay(ctx context.Context, args []string) error {
 		record.Note = "replay command exited 0; original failure was not reproduced"
 		manifest.Replays = append(manifest.Replays, record)
 		_ = writeCapsuleManifest(path, manifest)
-		return exit(1, "capsule replay did not reproduce the failure; command exited 0 after %s", time.Since(started).Round(time.Millisecond))
+		return Exit(1, "capsule replay did not reproduce the failure; command exited 0 after %s", time.Since(started).Round(time.Millisecond))
 	}
 	if code, ok := remoteReplayExitCode(err); ok {
 		record.DurationMs = time.Since(started).Milliseconds()
@@ -350,7 +363,7 @@ func (a App) capsuleReplay(ctx context.Context, args []string) error {
 			return writeErr
 		}
 		if !reproduced {
-			return exit(1, "capsule replay found a new failure; exit=%d did not contain failure_signature %q in the last %d bytes of replay output", code, strings.TrimSpace(manifest.Oracle.FailureSignature), capsuleReplayOutputMaxBytes)
+			return Exit(1, "capsule replay found a new failure; exit=%d did not contain failure_signature %q in the last %d bytes of replay output", code, strings.TrimSpace(manifest.Oracle.FailureSignature), capsuleReplayOutputMaxBytes)
 		}
 		fmt.Fprintf(a.Stdout, "capsule replay outcome=%s exit=%d quality=%s total=%s\n", record.Outcome, code, record.ReplayQuality, time.Since(started).Round(time.Millisecond))
 		if *keep {
@@ -376,7 +389,7 @@ func (a App) capsuleInspect(ctx context.Context, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return exit(2, "usage: crabbox capsule inspect <capsule.yaml>")
+		return Exit(2, "usage: crabbox capsule inspect <capsule.yaml>")
 	}
 	if jsonAnywhere {
 		*jsonOut = true
@@ -411,10 +424,10 @@ func (a App) capsulePromote(ctx context.Context, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return exit(2, "usage: crabbox capsule promote <capsule.yaml> --regression")
+		return Exit(2, "usage: crabbox capsule promote <capsule.yaml> --regression")
 	}
 	if !*regression {
-		return exit(2, "capsule promote currently requires --regression")
+		return Exit(2, "capsule promote currently requires --regression")
 	}
 	path := capsuleManifestPath(fs.Arg(0))
 	manifest, err := readCapsuleManifest(path)
@@ -442,14 +455,14 @@ type actionsRunRef struct {
 func parseActionsRunRef(value, repoOverride string) (actionsRunRef, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return actionsRunRef{}, exit(2, "empty GitHub Actions run URL")
+		return actionsRunRef{}, Exit(2, "empty GitHub Actions run URL")
 	}
 	if _, err := strconv.ParseInt(value, 10, 64); err == nil || strings.HasPrefix(value, "-") || strings.HasPrefix(value, "+") {
 		if _, err := parsePositiveActionsInt(value, "run id"); err != nil {
 			return actionsRunRef{}, err
 		}
 		if repoOverride == "" {
-			return actionsRunRef{}, exit(2, "run id requires --repo owner/name")
+			return actionsRunRef{}, Exit(2, "run id requires --repo owner/name")
 		}
 		repo, err := parseGitHubRepo(repoOverride)
 		if err != nil {
@@ -459,11 +472,11 @@ func parseActionsRunRef(value, repoOverride string) (actionsRunRef, error) {
 	}
 	u, err := url.Parse(value)
 	if err != nil || !strings.EqualFold(u.Host, "github.com") {
-		return actionsRunRef{}, exit(2, "expected GitHub Actions run URL or numeric run id with --repo")
+		return actionsRunRef{}, Exit(2, "expected GitHub Actions run URL or numeric run id with --repo")
 	}
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 	if len(parts) < 5 || parts[2] != "actions" || parts[3] != "runs" {
-		return actionsRunRef{}, exit(2, "expected GitHub Actions run URL like https://github.com/owner/repo/actions/runs/123")
+		return actionsRunRef{}, Exit(2, "expected GitHub Actions run URL like https://github.com/owner/repo/actions/runs/123")
 	}
 	repo, err := cleanGitHubRepo(parts[0], parts[1])
 	if err != nil {
@@ -475,7 +488,7 @@ func parseActionsRunRef(value, repoOverride string) (actionsRunRef, error) {
 	ref := actionsRunRef{Repo: repo, RunID: parts[4]}
 	if len(parts) >= 6 && parts[5] == "attempts" {
 		if len(parts) < 7 {
-			return actionsRunRef{}, exit(2, "expected GitHub Actions attempt URL like https://github.com/owner/repo/actions/runs/123/attempts/2")
+			return actionsRunRef{}, Exit(2, "expected GitHub Actions attempt URL like https://github.com/owner/repo/actions/runs/123/attempts/2")
 		}
 		attempt, err := parsePositiveActionsInt(parts[6], "attempt")
 		if err != nil {
@@ -496,17 +509,17 @@ func parseActionsRunRef(value, repoOverride string) (actionsRunRef, error) {
 func parsePositiveActionsInt(value, label string) (int, error) {
 	n, err := strconv.Atoi(value)
 	if err != nil || n <= 0 {
-		return 0, exit(2, "invalid GitHub Actions %s %q", label, value)
+		return 0, Exit(2, "invalid GitHub Actions %s %q", label, value)
 	}
 	return n, nil
 }
 
-func fetchActionsRunView(ctx context.Context, ref actionsRunRef) (capsuleRunView, error) {
+func fetchActionsRunView(ctx context.Context, ref actionsRunRef, childEnvDenylist []string) (capsuleRunView, error) {
 	args := []string{"run", "view", ref.RunID, "--repo", ref.Repo.Slug(), "--json", "attempt,conclusion,createdAt,displayTitle,event,headBranch,headSha,jobs,name,startedAt,status,updatedAt,url,workflowName"}
 	if ref.Attempt > 0 {
 		args = append(args, "--attempt", strconv.Itoa(ref.Attempt))
 	}
-	out, err := ghOutput(ctx, "", args...)
+	out, err := ghOutputWithChildEnvironment(ctx, "", childEnvDenylist, args...)
 	if err != nil {
 		return capsuleRunView{}, err
 	}
@@ -517,8 +530,8 @@ func fetchActionsRunView(ctx context.Context, ref actionsRunRef) (capsuleRunView
 	return view, nil
 }
 
-func fetchActionsWorkflowPath(ctx context.Context, ref actionsRunRef) (string, error) {
-	out, err := ghOutput(ctx, "", "api", "repos/"+ref.Repo.Slug()+"/actions/runs/"+ref.RunID)
+func fetchActionsWorkflowPath(ctx context.Context, ref actionsRunRef, childEnvDenylist []string) (string, error) {
+	out, err := ghOutputWithChildEnvironment(ctx, "", childEnvDenylist, "api", "repos/"+ref.Repo.Slug()+"/actions/runs/"+ref.RunID)
 	if err != nil {
 		return "", err
 	}
@@ -529,13 +542,13 @@ func fetchActionsWorkflowPath(ctx context.Context, ref actionsRunRef) (string, e
 	return res.Path, nil
 }
 
-func fetchActionsArtifacts(ctx context.Context, ref actionsRunRef) ([]capsuleArtifactRef, error) {
+func fetchActionsArtifacts(ctx context.Context, ref actionsRunRef, childEnvDenylist []string) ([]capsuleArtifactRef, error) {
 	const pageSize = 100
 	artifacts := []capsuleArtifactRef{}
 	seen := 0
 	for page := 1; ; page++ {
 		endpoint := fmt.Sprintf("repos/%s/actions/runs/%s/artifacts?per_page=%d&page=%d", ref.Repo.Slug(), ref.RunID, pageSize, page)
-		out, err := ghOutput(ctx, "", "api", endpoint)
+		out, err := ghOutputWithChildEnvironment(ctx, "", childEnvDenylist, "api", endpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -566,24 +579,24 @@ func appendActionsArtifactRefs(dst []capsuleArtifactRef, src []actionsArtifact) 
 	return dst
 }
 
-func fetchActionsFailedLog(ctx context.Context, ref actionsRunRef) (string, error) {
+func fetchActionsFailedLog(ctx context.Context, ref actionsRunRef, childEnvDenylist []string) (string, error) {
 	args := []string{"run", "view", ref.RunID, "--repo", ref.Repo.Slug(), "--log-failed"}
 	if ref.Attempt > 0 {
 		args = append(args, "--attempt", strconv.Itoa(ref.Attempt))
 	}
-	return ghOutputAllowError(ctx, "", args...)
+	return ghOutputAllowErrorWithChildEnvironment(ctx, "", childEnvDenylist, args...)
 }
 
-func ghOutputAllowError(ctx context.Context, dir string, args ...string) (string, error) {
+func ghOutputAllowErrorWithChildEnvironment(ctx context.Context, dir string, childEnvDenylist []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "gh", args...)
+	if len(childEnvDenylist) > 0 {
+		cmd.Env = childEnvironmentWithout(os.Environ(), childEnvDenylist...)
+	}
 	if dir != "" {
 		cmd.Dir = dir
 	}
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), err
-	}
-	return string(out), nil
+	return string(out), err
 }
 
 func selectCapsuleFailure(jobs []capsuleJobView, preferredJob string) (capsuleJobView, capsuleStepView, bool) {
@@ -897,14 +910,41 @@ func boundString(value string, maxBytes int) string {
 }
 
 func writeCapsuleManifest(path string, manifest capsuleManifest) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := yaml.Marshal(manifest)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writePrivateCapsuleFile(path, data)
+}
+
+func ensurePrivateCapsuleDir(path string) error {
+	if err := os.MkdirAll(path, privateCapsuleDirMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, privateCapsuleDirMode)
+}
+
+func writePrivateCapsuleFile(path string, data []byte) error {
+	// Create missing capsule parents privately without changing permissions on
+	// an existing repository, shared directory, or the current working directory.
+	if err := os.MkdirAll(filepath.Dir(path), privateCapsuleDirMode); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, privateCapsuleFileMode)
+	if err != nil {
+		return err
+	}
+	// OpenFile preserves an existing file's mode. Tighten it before writing so
+	// reused capsule paths never expose newly captured logs through old modes.
+	if err := file.Chmod(privateCapsuleFileMode); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func readCapsuleManifest(path string) (capsuleManifest, error) {
@@ -918,10 +958,10 @@ func readCapsuleManifest(path string) (capsuleManifest, error) {
 		return capsuleManifest{}, err
 	}
 	if manifest.CapsuleVersion != capsuleVersion {
-		return capsuleManifest{}, exit(2, "unsupported capsule_version=%d in %s", manifest.CapsuleVersion, path)
+		return capsuleManifest{}, Exit(2, "unsupported capsule_version=%d in %s", manifest.CapsuleVersion, path)
 	}
 	if manifest.Class == "" {
-		return capsuleManifest{}, exit(2, "capsule %s is missing class", path)
+		return capsuleManifest{}, Exit(2, "capsule %s is missing class", path)
 	}
 	return manifest, nil
 }
@@ -972,26 +1012,7 @@ func capsuleReplayFailureOutcome(failureSignature, replayOutput string, code int
 }
 
 func safePathComponent(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	var b strings.Builder
-	lastDash := false
-	for _, r := range value {
-		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
-		if ok {
-			b.WriteRune(r)
-			lastDash = false
-			continue
-		}
-		if !lastDash {
-			b.WriteByte('-')
-			lastDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		return "capsule"
-	}
-	return out
+	return blank(NormalizeLeaseSlug(value), "capsule")
 }
 
 func sha256String(value string) string {

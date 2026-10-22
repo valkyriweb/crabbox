@@ -2,13 +2,491 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+func TestCanonicalInputCoverageBoundary(t *testing.T) {
+	clearConfigEnv(t)
+	path := isolatedConfigPath(t)
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, owner := range canonicalConfigInputOwners {
+		if got := providerConfigurationFor(cfg, owner); got.State != "defaults_only" || !got.ProviderInput.Complete || !got.GenericInput.Complete {
+			t.Fatalf("canonical owner %s: %#v", owner, got)
+		}
+	}
+	if got := providerConfigurationFor(cfg, "future-untracked-provider"); got.State != "unknown" || got.ProviderInput.Complete {
+		t.Fatal("unlisted provider was certified from registration/defaults alone")
+	}
+	if got := providerConfigurationFor(baseConfig(), "machine0"); got.State != "unknown" {
+		t.Fatal("base defaults acquired a complete input history")
+	}
+	partial := baseConfig()
+	if err := applyFileConfig(&partial, fileConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := providerConfigurationFor(partial, "machine0"); got.State != "unknown" {
+		t.Fatal("one partial overlay certified the entire history")
+	}
+	original := cfg
+	markSynthesizedFlagInputs(&cfg, true)
+	completeCanonicalConfigInputs(&cfg)
+	if providerConfigurationFor(cfg, "machine0").State != "unknown" || providerConfigurationFor(original, "machine0").State != "defaults_only" {
+		t.Fatal("derived qualification lost copy isolation or reacquired completeness")
+	}
+	if err := os.WriteFile(path, []byte("provider: nonexistent-provider-for-input-test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := loadConfig()
+	if err == nil || failed.inputProvenance != nil {
+		t.Fatal("failed canonical load retained a completeness certificate")
+	}
+}
+
+func TestProviderConfigurationStatusStates(t *testing.T) {
+	const owner configInputOwner = "machine0"
+	complete := configInputLedger(nil).withCoverage(owner, true).withCoverage(configInputGeneric, true)
+	for _, tc := range []struct {
+		name, want string
+		ledger     configInputLedger
+	}{
+		{"untracked", "unknown", nil},
+		{"provider incomplete", "unknown", configInputLedger(nil).withCoverage(configInputGeneric, true)},
+		{"generic incomplete", "unknown", configInputLedger(nil).withCoverage(owner, true)},
+		{"defaults", "defaults_only", complete},
+		{"generic only", "generic_inputs_present", complete.withInput(configInputGeneric, configInputRepo, configInputValue)},
+		{"direct", "explicit", complete.withInput(owner, configInputUser, configInputValue)},
+		{"intent only", "explicit", complete.withInput(owner, configInputEnvironment, configInputIntent)},
+		{"known partial input", "explicit", configInputLedger(nil).withInput(owner, configInputFlag, configInputValue)},
+		{"unknown provider with generic input", "unknown", configInputLedger(nil).withInput(configInputGeneric, configInputUser, configInputValue)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{inputProvenance: tc.ledger}
+			got := providerConfigurationFor(cfg, owner)
+			if got.State != tc.want {
+				t.Fatalf("state=%s, want %s", got.State, tc.want)
+			}
+			cfg.Machine0.CLIPath = "not-installed"
+			cfg.Machine0.Image = "different-from-default"
+			if !reflect.DeepEqual(got, providerConfigurationFor(cfg, owner)) {
+				t.Fatal("values or executable names were used to infer source state")
+			}
+			if got.ProviderInput.Sources == nil || got.GenericInput.Sources == nil {
+				t.Fatal("source arrays must not be JSON null")
+			}
+		})
+	}
+}
+
+func TestProviderStatusSelectionAndOfflineContract(t *testing.T) {
+	view := providerConfigStatus(Config{})
+	if view.SchemaVersion != 1 || view.Kind != "offline" || len(view.Providers) != len(RegisteredProviderNames()) {
+		t.Fatal("incorrect offline registry projection")
+	}
+	for name, entry := range view.Providers {
+		if !entry.Supported || entry.Selection.Selected || entry.Selection.Source != nil || entry.Configuration.State != "unknown" || entry.Authentication.Status != "unchecked" || entry.Readiness != "unchecked" {
+			t.Fatalf("untracked provider %s acquired a false status: %#v", name, entry)
+		}
+	}
+	for _, provider := range registeredProviders() {
+		for _, alias := range append([]string{provider.Spec().Name}, provider.Spec().Aliases...) {
+			cfg := Config{Provider: alias, providerSelectionSource: providerSelectionFlag}
+			selected := providerConfigStatus(cfg)
+			for name, entry := range selected.Providers {
+				want := name == provider.Spec().Name
+				if entry.Selection.Selected != want || (entry.Selection.Source != nil) != want {
+					t.Fatalf("alias %s selection incorrectly attributed to %s", alias, name)
+				}
+				if want && *entry.Selection.Source != providerSelectionFlag {
+					t.Fatal("selection source changed")
+				}
+			}
+		}
+	}
+	data, err := json.Marshal(view)
+	if err != nil || !bytes.Contains(data, []byte(`"source":null`)) {
+		t.Fatal("unselected source must be explicit JSON null")
+	}
+	var text bytes.Buffer
+	writeProviderConfigStatus(&text, view)
+	if !strings.Contains(text.String(), "inspection=offline") || !strings.Contains(text.String(), "auth_status=unchecked readiness=unchecked") || strings.Contains(text.String(), "configuration=defaults_only") {
+		t.Fatal("text output claimed checked or complete configuration")
+	}
+}
+
+func TestLocalContainerOrdinaryFileRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, wantYAML string
+		present, enabled      bool
+	}{
+		{"omitted", "{}", "localContainer: {}\n", false, true},
+		{"null", "{dockerSocket: null, noHostname: null}", "localContainer: {}\n", false, true},
+		{"false", "{dockerSocket: false, noHostname: false}", "localContainer:\n    dockerSocket: false\n    noHostname: false\n", true, false},
+		{"true", "{dockerSocket: true, noHostname: true}", "localContainer:\n    dockerSocket: true\n    noHostname: true\n", true, true},
+		{"zero values", "{runtime: '', image: '', user: '', workRoot: '', cpus: 0, memory: '', network: ''}", "localContainer: {}\n", false, true},
+		{"nine values", "{runtime: custom, image: example:tag, user: runner, workRoot: '~/literal', cpus: 3, memory: 4g, network: custom, dockerSocket: false, noHostname: false}", "localContainer:\n    runtime: custom\n    image: example:tag\n    user: runner\n    workRoot: ~/literal\n    cpus: 3\n    memory: 4g\n    network: custom\n    dockerSocket: false\n    noHostname: false\n", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolatedConfigPath(t)
+			if err := os.WriteFile(path, []byte("localContainer: "+tc.input+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := readFileConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if file.LocalContainer == nil || (file.LocalContainer.DockerSocket != nil) != tc.present || (file.LocalContainer.NoHostname != nil) != tc.present {
+				t.Fatal("reader lost pointer boolean presence")
+			}
+			cfg := baseConfig()
+			cfg.Provider = "unselected-config-test"
+			cfg.LocalContainer.DockerSocket, cfg.LocalContainer.NoHostname = !tc.enabled, !tc.enabled
+			if !tc.present {
+				cfg.LocalContainer.DockerSocket, cfg.LocalContainer.NoHostname = true, true
+			}
+			if err := applyFileConfig(&cfg, file); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.LocalContainer.DockerSocket != tc.enabled || cfg.LocalContainer.NoHostname != tc.enabled {
+				t.Fatal("file boolean layering changed")
+			}
+			written, err := writeUserFileConfig(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if written != path {
+				t.Fatalf("write path=%q, want %q", written, path)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != tc.wantYAML {
+				t.Fatalf("written YAML=%q, want %q", data, tc.wantYAML)
+			}
+			again, err := readFileConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(again, file) {
+				t.Fatal("file values changed on round trip")
+			}
+		})
+	}
+}
+
+type configArchitectureTestProvider struct {
+	architectureCapabilityTestProvider
+}
+
+func (p configArchitectureTestProvider) Spec() ProviderSpec {
+	spec := p.architectureCapabilityTestProvider.Spec()
+	spec.Name = "config-architecture-test"
+	return spec
+}
+func (configArchitectureTestProvider) DescribeImplicitArchitecture(Config) string {
+	return "native"
+}
+
+func isolatedConfigPath(t *testing.T) string {
+	t.Helper()
+	clearConfigEnv(t)
+	home := t.TempDir()
+	configPath := filepath.Join(home, "config.yaml")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	return configPath
+}
+
+func TestConfigShowUsesProviderImplicitArchitecture(t *testing.T) {
+	provider := configArchitectureTestProvider{}
+	RegisterProvider(provider)
+	t.Cleanup(func() { delete(providerRegistry, provider.Spec().Name) })
+	for _, tc := range []struct {
+		name, provider, architecture, want string
+		explicit                           bool
+	}{
+		{"implicit", provider.Spec().Name, ArchitectureAMD64, "native", false},
+		{"explicit amd64", provider.Spec().Name, ArchitectureAMD64, ArchitectureAMD64, true},
+		{"explicit arm64", provider.Spec().Name, ArchitectureARM64, ArchitectureARM64, true},
+		{"no descriptor", "unknown-config-provider", ArchitectureAMD64, ArchitectureAMD64, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Provider, cfg.Architecture, cfg.architectureExplicit = tc.provider, tc.architecture, tc.explicit
+			if got := configShowView(cfg)["architecture"]; got != tc.want {
+				t.Fatalf("JSON architecture=%q want %q", got, tc.want)
+			}
+			if got := configShowView(cfg)["architectureExplicit"]; got != tc.explicit {
+				t.Fatalf("JSON architectureExplicit=%v want %t", got, tc.explicit)
+			}
+			var text bytes.Buffer
+			writeConfigShowText(&text, cfg)
+			if !strings.Contains(text.String(), " arch="+tc.want+" ") {
+				t.Fatalf("text architecture missing %q", tc.want)
+			}
+			if !strings.Contains(text.String(), fmt.Sprintf(" architecture_explicit=%t ", tc.explicit)) {
+				t.Fatalf("text explicit-architecture marker changed: %s", text.String())
+			}
+			if got := effectiveArchitectureForConfig(cfg); got != tc.architecture {
+				t.Fatalf("diagnostics changed execution architecture=%q", got)
+			}
+		})
+	}
+}
+
+func TestConfigShowEffectiveLeaseDurations(t *testing.T) {
+	for _, tc := range []struct {
+		name, userYAML, repoYAML, envTTL, envIdleTimeout string
+		wantTTL, wantIdleTimeout, wantProvider           string
+	}{
+		{
+			name: "compiled defaults", wantTTL: "30m0s", wantIdleTimeout: "30m0s",
+		},
+		{
+			name: "top-level YAML", userYAML: "ttl: 125m\nidleTimeout: 75s\n",
+			wantTTL: "2h5m0s", wantIdleTimeout: "1m15s",
+		},
+		{
+			name:     "nested lease overrides top-level",
+			userYAML: "ttl: 125m\nidleTimeout: 75s\nlease:\n  ttl: 150m\n  idleTimeout: 45m\n",
+			wantTTL:  "2h30m0s", wantIdleTimeout: "45m0s",
+		},
+		{
+			name:     "environment overrides file",
+			userYAML: "ttl: 125m\nidleTimeout: 75s\nlease:\n  ttl: 150m\n  idleTimeout: 45m\n",
+			envTTL:   "195m", envIdleTimeout: "90.5s",
+			wantTTL: "3h15m0s", wantIdleTimeout: "1m30.5s",
+		},
+		{
+			name:     "repo overrides user and preserves omitted values",
+			userYAML: "lease:\n  ttl: 150m\n  idleTimeout: 45m\n",
+			repoYAML: "ttl: 240m\n",
+			wantTTL:  "4h0m0s", wantIdleTimeout: "45m0s",
+		},
+		{
+			name: "AWS with distinct provider and job durations",
+			userYAML: `provider: aws
+blaxel:
+  ttl: 11m
+  idleTTL: 2m
+githubCodespaces:
+  idleTimeout: 13m
+jobs:
+  test:
+    ttl: 17m
+    idleTimeout: 3m
+`,
+			wantTTL: "30m0s", wantIdleTimeout: "30m0s", wantProvider: "aws",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Chdir(t.TempDir())
+			// clearConfigEnv does not clear these generic selection/duration inputs.
+			for _, key := range []string{"CRABBOX_CONFIG", "CRABBOX_PROVIDER", "CRABBOX_PROFILE", "CRABBOX_TARGET", "CRABBOX_OS", "CRABBOX_ARCH", "CRABBOX_TTL", "CRABBOX_IDLE_TIMEOUT"} {
+				t.Setenv(key, "")
+			}
+			for path, content := range map[string]string{userConfigPath(): tc.userYAML, "crabbox.yaml": tc.repoYAML} {
+				if content == "" {
+					continue
+				}
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("CRABBOX_TTL", tc.envTTL)
+			t.Setenv("CRABBOX_IDLE_TIMEOUT", tc.envIdleTimeout)
+			for _, format := range []string{"json", "text"} {
+				t.Run(format, func(t *testing.T) {
+					var stdout, stderr bytes.Buffer
+					var args []string
+					if format == "json" {
+						args = []string{"--json"}
+					}
+					if err := (App{Stdout: &stdout, Stderr: &stderr}).configShow(args); err != nil {
+						t.Fatalf("config show: %v", err)
+					}
+					output := stdout.String()
+					if format == "json" {
+						var view map[string]any
+						if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+							t.Fatal(err)
+						}
+						for key, want := range map[string]string{"ttl": tc.wantTTL, "idleTimeout": tc.wantIdleTimeout, "provider": tc.wantProvider} {
+							if got := view[key]; got != want {
+								t.Errorf("top-level %s=%v, want string %q", key, got, want)
+							}
+						}
+						if tc.wantProvider == "aws" {
+							blaxel := view["blaxel"].(map[string]any)
+							codespaces := view["githubCodespaces"].(map[string]any)
+							job := view["jobs"].(map[string]any)["test"].(map[string]any)
+							if blaxel["ttl"] != "11m" || blaxel["idleTTL"] != "2m" || codespaces["idleTimeout"] != "13m0s" || job["ttl"] != "17m0s" || job["idleTimeout"] != "3m0s" {
+								t.Error("provider/job durations were not retained separately")
+							}
+						}
+						return
+					}
+					wantLine := fmt.Sprintf("lease ttl=%s idle_timeout=%s\n", tc.wantTTL, tc.wantIdleTimeout)
+					if !strings.Contains(output, "\n"+wantLine) || strings.Count(output, "\nlease ") != 1 {
+						t.Errorf("want one complete generic lease line %q", wantLine)
+					}
+					lines := strings.Split(output, "\n")
+					if len(lines) < 4 || !strings.HasPrefix(lines[1], "provider="+tc.wantProvider+" ") || lines[2]+"\n" != wantLine || !strings.HasPrefix(lines[3], "broker=") {
+						t.Error("generic lease line must appear immediately between provider and broker summaries")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestConfigShowWarmupKeep(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		cfg := baseConfig()
+		cfg.WarmupKeep = keep
+		var output bytes.Buffer
+		if err := writeConfigShowText(&output, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if line := fmt.Sprintf("\nwarmup keep=%t\n", keep); !strings.Contains(output.String(), line) || strings.Count(output.String(), "\nwarmup ") != 1 {
+			t.Fatalf("missing unique warmup summary %q", line)
+		}
+		if got := configShowView(cfg)["warmup"].(map[string]any)["keep"]; got != keep {
+			t.Fatalf("JSON warmup.keep=%v, want %t", got, keep)
+		}
+	}
+}
+
+func TestConfigCommandsReportSelectedPath(t *testing.T) {
+	for _, name := range []string{"default", "absolute", "relative", "missing", "symlink"} {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Chdir(t.TempDir())
+			t.Setenv("CRABBOX_CONFIG", "")
+			path := userConfigPath()
+			if name != "default" {
+				path = filepath.Join(t.TempDir(), "selected config.yaml")
+				if name == "relative" {
+					path = "selected config.yaml"
+				}
+				t.Setenv("CRABBOX_CONFIG", path)
+			}
+			profile := "selected-path-proof"
+			if name == "missing" {
+				profile = "default"
+			} else {
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("profile: "+profile+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if name == "symlink" {
+					link := filepath.Join(filepath.Dir(path), "selected link.yaml")
+					if err := os.Symlink(path, link); err != nil {
+						t.Skipf("symlink unavailable: %v", err)
+					}
+					path = link
+					t.Setenv("CRABBOX_CONFIG", path)
+				}
+			}
+			var stdout, stderr bytes.Buffer
+			app := App{Stdout: &stdout, Stderr: &stderr}
+			if err := app.Run(context.Background(), []string{"config", "path"}); err != nil {
+				t.Fatal(err)
+			}
+			if got := stdout.String(); got != path+"\n" {
+				t.Fatalf("config path=%q want %q", got, path)
+			}
+			stdout.Reset()
+			if err := app.Run(context.Background(), []string{"config", "show"}); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(stdout.String(), "config="+path+"\n") || !strings.Contains(stdout.String(), " profile="+profile+"\n") {
+				t.Fatalf("config show path/profile mismatch: %s", stdout.String())
+			}
+			if name == "missing" {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("diagnostics created missing config: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigShowReportsProviderSelectionSource(t *testing.T) {
+	t.Run("compiled default text", func(t *testing.T) {
+		isolateDoctorProviderSelectionTest(t)
+		var stdout, stderr bytes.Buffer
+		if err := (App{Stdout: &stdout, Stderr: &stderr}).configShow(nil); err != nil {
+			t.Fatalf("config show error=%v stderr=%q", err, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "provider= provider_selected=false provider_source=compiled_default") {
+			t.Fatalf("config show missing compiled-default provenance:\n%s", stdout.String())
+		}
+		if !strings.Contains(stdout.String(), " class=beast type= profile=default") {
+			t.Fatalf("config show exposed a provider-specific effective machine type:\n%s", stdout.String())
+		}
+		if strings.Contains(stdout.String(), "provider=hetzner") {
+			t.Fatalf("config show presented compiled metadata as selected:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("compiled default json", func(t *testing.T) {
+		isolateDoctorProviderSelectionTest(t)
+		var stdout, stderr bytes.Buffer
+		if err := (App{Stdout: &stdout, Stderr: &stderr}).configShow([]string{"--json"}); err != nil {
+			t.Fatalf("config show error=%v stderr=%q", err, stderr.String())
+		}
+		var view map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+			t.Fatalf("config show JSON invalid: %v\n%s", err, stdout.String())
+		}
+		if view["provider"] != "" || view["providerSource"] != "compiled_default" || view["providerSelected"] != false || view["serverType"] != "" {
+			t.Fatalf("config show provider selection=%#v", view)
+		}
+	})
+
+	t.Run("command override json", func(t *testing.T) {
+		isolateDoctorProviderSelectionTest(t)
+		var stdout, stderr bytes.Buffer
+		if err := (App{Stdout: &stdout, Stderr: &stderr}).configShow([]string{"--provider", "hetzner", "--json"}); err != nil {
+			t.Fatalf("config show error=%v stderr=%q", err, stderr.String())
+		}
+		var view map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+			t.Fatalf("config show JSON invalid: %v\n%s", err, stdout.String())
+		}
+		if view["provider"] != "hetzner" || view["providerSource"] != "flag" || view["providerSelected"] != true || view["serverType"] == "" {
+			t.Fatalf("config show provider provenance=%#v", view)
+		}
+	})
+}
 
 func TestNamespaceInstanceConfigShowRedactsEndpointCredentials(t *testing.T) {
 	cfg := baseConfig()
@@ -29,56 +507,407 @@ func TestNamespaceInstanceConfigShowRedactsEndpointCredentials(t *testing.T) {
 	}
 }
 
-func TestConfigShowIncludesAgentSandboxRoute(t *testing.T) {
+func TestConfigShowIncludesCubeSandboxWithoutSecret(t *testing.T) {
+	const secret = "cubesandbox-secret"
+	const password = "cube-fixture-passphrase"
 	cfg := baseConfig()
-	cfg.AgentSandbox.Kubectl = "/opt/bin/kubectl"
-	cfg.AgentSandbox.Kubeconfig = "/tmp/agent-kubeconfig"
-	cfg.AgentSandbox.Context = "agent-context"
-	cfg.AgentSandbox.Namespace = "sandboxes"
-	cfg.AgentSandbox.WarmPool = "linux-pool"
-	cfg.AgentSandbox.Container = "worker"
-	cfg.AgentSandbox.Workdir = "/workspace/my-app"
-	cfg.AgentSandbox.SandboxReadyTimeout = 2 * time.Minute
-	cfg.AgentSandbox.PodReadyTimeout = 45 * time.Second
-	cfg.AgentSandbox.ExecTimeoutSecs = 42
-	cfg.AgentSandbox.DeleteOnRelease = false
-	cfg.AgentSandbox.ForgetMissing = true
-
+	cfg.CubeSandbox = CubeSandboxConfig{
+		APIKey:        secret,
+		APIURL:        "https://user:" + password + "@cube-api.example.test/v1?token=hidden",
+		Domain:        "sandboxes.example.test",
+		Template:      "tpl-linux",
+		Workdir:       "/workspace/repo",
+		User:          "ubuntu",
+		ProxyNodeIP:   "cubeproxy.example.test",
+		ProxyPortHTTP: 443,
+		ProxyScheme:   "https",
+	}
 	view := configShowView(cfg)
-	agent, ok := view["agentSandbox"].(map[string]any)
-	if !ok || agent["kubeconfig"] != "/tmp/agent-kubeconfig" || agent["warmPool"] != "linux-pool" ||
-		agent["sandboxReadyTimeout"] != "2m0s" || agent["deleteOnRelease"] != false || agent["forgetMissing"] != true {
-		t.Fatalf("agentSandbox view=%#v", agent)
+	cube, ok := view["cubeSandbox"].(map[string]any)
+	if !ok || cube["domain"] != "sandboxes.example.test" || cube["proxyPortHttp"] != 443 || cube["proxyScheme"] != "https" {
+		t.Fatalf("cubeSandbox view=%#v", cube)
+	}
+	jsonData, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
 	}
 	var text bytes.Buffer
 	writeConfigShowText(&text, cfg)
-	for _, want := range []string{
-		"agent_sandbox kubectl=/opt/bin/kubectl",
-		"kubeconfig=/tmp/agent-kubeconfig",
-		"context=agent-context",
-		"namespace=sandboxes",
-		"warm_pool=linux-pool",
-		"container=worker",
-		"workdir=/workspace/my-app",
-		"sandbox_ready_timeout=2m0s",
-		"pod_ready_timeout=45s",
-		"exec_timeout_secs=42",
-		"delete_on_release=false",
-		"forget_missing=true",
-	} {
-		if !strings.Contains(text.String(), want) {
-			t.Fatalf("config show missing %q: %q", want, text.String())
+	for name, output := range map[string]string{"json": string(jsonData), "text": text.String()} {
+		if strings.Contains(output, secret) || strings.Contains(output, password) || strings.Contains(output, "hidden") {
+			t.Fatalf("%s config show leaked CubeSandbox secret: %s", name, output)
+		}
+		for _, want := range []string{"cube-api.example.test/v1", "sandboxes.example.test", "tpl-linux", "cubeproxy.example.test", "https"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("%s config show missing %q: %s", name, want, output)
+			}
 		}
 	}
 }
 
+func TestConfigShowIncludesPhalaConfig(t *testing.T) {
+	for _, state := range []string{"default", "true", "false"} {
+		t.Run(state, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Phala = PhalaConfig{CLIPath: "/opt/phala", InstanceType: "tdx.small", WorkRoot: "/work/phala", NodeID: "example-node", Compose: "/tmp/example.yaml"}
+			var wantAttest any
+			if state != "default" {
+				value := state == "true"
+				cfg.Phala.Attest = &value
+				wantAttest = value
+			}
+			before := cfg.Phala
+			encoded, err := json.Marshal(configShowView(cfg))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var view map[string]any
+			if err := json.Unmarshal(encoded, &view); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]any{"cli": "/opt/phala", "instanceType": "tdx.small", "workRoot": "/work/phala", "nodeId": "example-node", "compose": "/tmp/example.yaml", "attest": wantAttest}
+			if !reflect.DeepEqual(view["phala"], want) {
+				t.Fatalf("phala view = %#v, want %#v", view["phala"], want)
+			}
+			var text bytes.Buffer
+			writeConfigShowText(&text, cfg)
+			wantLine := "phala cli=/opt/phala instance_type=tdx.small work_root=/work/phala node_id=example-node compose=/tmp/example.yaml attest=" + state + "\n"
+			if !strings.Contains(text.String(), wantLine) {
+				t.Fatalf("missing Phala settings line %q", wantLine)
+			}
+			if cfg.Phala != before {
+				t.Fatal("config inspection changed Phala configuration")
+			}
+		})
+	}
+}
+
+func TestFirecrackerConfigDefaultsPreserveConfiguredValues(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "firecracker"
+	cfg.Firecracker.Binary = "/opt/bin/firecracker"
+	cfg.Firecracker.Jailer = "/opt/bin/jailer"
+	cfg.Firecracker.Kernel = "/var/lib/firecracker/vmlinux"
+	cfg.Firecracker.RootFS = "/var/lib/firecracker/rootfs.ext4"
+	cfg.Firecracker.User = "runner"
+	cfg.Firecracker.WorkRoot = "/workspace/firecracker"
+	cfg.Firecracker.CPUs = 6
+	cfg.Firecracker.MemoryMiB = 12288
+	cfg.Firecracker.DiskMiB = 32768
+	cfg.Firecracker.Network = "cni"
+	cfg.Firecracker.CNINetwork = "lab-firecracker"
+	cfg.Firecracker.CNIConfDir = "/etc/cni/lab"
+	cfg.Firecracker.CNIBinDir = "/opt/cni/lab"
+	cfg.Firecracker.LaunchTimeout = 3 * time.Minute
+	cfg.Firecracker.DeleteOnRelease = false
+	before := cfg.Firecracker
+	if err := applyProviderConfigDefaults(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Firecracker != before {
+		t.Fatalf("defaults changed explicitly configured Firecracker values: got %#v, want %#v", cfg.Firecracker, before)
+	}
+}
+
+func TestAppleVMOrdinaryFileRoundTrip(t *testing.T) {
+	full := "  helperPath: ' ~/helper '\n  image: ' ~/image '\n  imageSHA256: ' checksum '\n  user: ' user '\n  workRoot: ' ~/work '\n  cpus: 0\n  memoryMiB: -2\n  diskGiB: 0\n"
+	zeros := "  cpus: 0\n  memoryMiB: 0\n  diskGiB: 0\n"
+	for _, tc := range []struct {
+		name, document, serialized string
+	}{
+		{"current-all-fields", "appleVM:\n" + full, "appleVM:\n" + full},
+		{"legacy-retained", "appleVZ:\n" + full, "appleVZ:\n" + full},
+		{"both-retained", "appleVM:\n" + full + "appleVZ:\n" + zeros, "appleVM:\n" + full + "appleVZ:\n" + zeros},
+		{"empty-current-retained", "appleVM: {}\nappleVZ:\n" + full, "appleVM: {}\nappleVZ:\n" + full},
+		{"null-current-omitted", "appleVM: null\nappleVZ:\n" + full, "appleVZ:\n" + full},
+		{"value-strings-omitted-zero-pointers-retained", "appleVM:\n  helperPath: ''\n  image: ''\n  imageSHA256: ''\n  user: ''\n  workRoot: ''\n" + zeros, "appleVM:\n" + zeros},
+		{"null-numeric-pointers-omitted", "appleVM:\n  cpus: null\n  memoryMiB: null\n  diskGiB: null\n", "appleVM: {}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolatedConfigPath(t)
+			if err := os.WriteFile(path, []byte(tc.document), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := readFileConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var original fileConfig
+			if err := yaml.Unmarshal([]byte(tc.document), &original); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(file, original) {
+				t.Fatalf("read file=%+v, want %+v", file, original)
+			}
+			// Runtime alias selection must not normalize the persistent document.
+			cfg := Config{}
+			if err := applyFileConfig(&cfg, file); err != nil {
+				t.Fatal(err)
+			}
+			writtenPath, err := writeUserFileConfig(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if writtenPath != path {
+				t.Fatalf("writer path=%q, want %q", writtenPath, path)
+			}
+			if !reflect.DeepEqual(file, original) {
+				t.Fatal("apply/write mutated the input file config")
+			}
+			reread, err := readFileConfig(writtenPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(reread, original) {
+				t.Fatalf("round-trip file=%+v, want %+v", reread, original)
+			}
+			data, err := os.ReadFile(writtenPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotMap, wantMap map[string]any
+			if err := yaml.Unmarshal(data, &gotMap); err != nil {
+				t.Fatal(err)
+			}
+			if err := yaml.Unmarshal([]byte(tc.serialized), &wantMap); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotMap, wantMap) {
+				t.Fatalf("serialized config=%s, want semantic YAML %s", data, tc.serialized)
+			}
+			if strings.Contains(tc.serialized, "appleVM:") && strings.Contains(tc.serialized, "appleVZ:") && strings.Index(string(data), "appleVM:") > strings.Index(string(data), "appleVZ:") {
+				t.Fatal("current section should precede legacy section")
+			}
+		})
+	}
+}
+
+func TestSealosConfigWriter(t *testing.T) {
+	for _, value := range []string{"null", "{}", "{kubectl: '', kubeconfig: '', context: '', namespace: '', image: '', templateID: '', cpu: '', memory: '', storageLimit: '', network: '', sshGatewayHost: '', sshGatewayPort: '', sshUser: '', workRoot: '', nodeHost: '', deleteOnRelease: false}"} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte("sealosDevbox: "+value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{}
+		if value != "null" {
+			want["sealosDevbox"] = map[string]any{}
+		}
+		if strings.Contains(value, "false") {
+			want["sealosDevbox"] = map[string]any{"deleteOnRelease": false}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer=%#v want %#v", got, want)
+		}
+	}
+}
+
+func TestKubeVirtConfigWriter(t *testing.T) {
+	for _, input := range []string{"null", "{}", "{kubectl: '', virtctl: '', kubeconfig: '', context: '', namespace: '', template: '', sshUser: '', sshKey: '', sshPublicKey: '', sshPort: '', workRoot: '', deleteOnRelease: false}", "{context: '  ', workRoot: '/workspace/~/guest', deleteOnRelease: true}"} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte("kubevirt: "+input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := baseConfig()
+		if err := applyFileConfig(&cfg, file); err != nil {
+			t.Fatal(err)
+		}
+		after, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("overlay mutated writer input")
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{}
+		if input != "null" {
+			want["kubevirt"] = map[string]any{}
+		}
+		if strings.Contains(input, "false") {
+			want["kubevirt"] = map[string]any{"deleteOnRelease": false}
+		}
+		if strings.Contains(input, "true") {
+			want["kubevirt"] = map[string]any{"context": "  ", "workRoot": "/workspace/~/guest", "deleteOnRelease": true}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer=%#v want %#v", got, want)
+		}
+	}
+}
+
+func TestAppleContainerConfigWriterAndJSON(t *testing.T) {
+	if reflect.TypeOf(fileAppleContainerConfig{}).Name() != "fileAppleContainerConfig" {
+		t.Fatal("file decoder destination name changed")
+	}
+	for _, tc := range []struct{ input, want string }{{"null", "{}"}, {"{}", "appleContainer: {}"}, {"{cliPath: '', image: '', user: '', workRoot: '', cpus: 0, memory: '', extraRunArgs: []}", "appleContainer: {}"}, {"{cliPath: '~/literal', image: '  ', cpus: -2, extraRunArgs: [' a ', a, a]}", "appleContainer: {cliPath: '~/literal', image: '  ', cpus: -2, extraRunArgs: [' a ', a, a]}"}} {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte("appleContainer: "+tc.input), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := baseConfig()
+		if err := applyFileConfig(&cfg, file); err != nil {
+			t.Fatal(err)
+		}
+		after, err := yaml.Marshal(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("overlay mutated writer input")
+		}
+		if _, err := writeUserFileConfig(file); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got, want map[string]any
+		if err := yaml.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal([]byte(tc.want), &want); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("writer=%#v want %#v", got, want)
+		}
+	}
+	cfg := baseConfig()
+	cfg.AppleContainer = AppleContainerConfig{CLIPath: "tool", Image: "image-example", User: "user-example", WorkRoot: "/workspace/example", CPUs: 3, Memory: "6g"}
+	data, err := json.Marshal(cfg.AppleContainer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	wantJSON := map[string]any{"CLIPath": "tool", "Image": "image-example", "User": "user-example", "WorkRoot": "/workspace/example", "CPUs": float64(3), "Memory": "6g", "ExtraRunArgs": nil}
+	if !reflect.DeepEqual(got, wantJSON) {
+		t.Fatalf("runtime JSON=%#v", got)
+	}
+}
+
+func TestGeneratedFileStorageWriter(t *testing.T) {
+	for _, tc := range []struct{ name, input, want string }{
+		{"missing", "{}", "{}"},
+		{"null sections", "vultr: null\ntensorlake: null\ntencentcloud: null\nrunpod: null\nlinode: null", "{}"},
+		{"empty sections", "vultr: {}\ntensorlake: {}\ntencentcloud: {}\nrunpod: {}\nlinode: {}", "vultr: {}\ntensorlake: {}\ntencentcloud: {}\nrunpod: {}\nlinode: {}"},
+		{"null values", "vultr: {region: null, vpcIds: null}\ntensorlake: {cpus: null, memoryMB: null}\ntencentcloud: {rootGB: null}\nrunpod: {diskGB: null}\nlinode: {region: null, image: null, type: null, firewall: null, sshCIDRs: null}", "vultr: {}\ntensorlake: {}\ntencentcloud: {}\nrunpod: {}\nlinode: {}"},
+		{"historical zero omission", "vultr: {region: '', vpcIds: [], sshCIDRs: []}\ntensorlake: {cpus: 0, memoryMB: 0}\ntencentcloud: {rootGB: 0}\nrunpod: {diskGB: 0}\nlinode: {region: '', image: '', type: '', firewall: '', sshCIDRs: []}", "vultr: {}\ntensorlake: {}\ntencentcloud: {}\nrunpod: {}\nlinode: {}"},
+		{"raw nonzero storage", "vultr: {region: '  ', vpcIds: [' a ', a, a]}\ntensorlake: {cpus: -0.5, memoryMB: -2}\ntencentcloud: {rootGB: 4294967296}\nrunpod: {diskGB: -3}\nlinode: {region: '  ', image: image-example, type: type-example, firewall: firewall-example, sshCIDRs: [' 192.0.2.0/24 ', 192.0.2.0/24, 192.0.2.0/24]}", "vultr: {region: '  ', vpcIds: [' a ', a, a]}\ntensorlake: {cpus: -0.5, memoryMB: -2}\ntencentcloud: {rootGB: 4294967296}\nrunpod: {diskGB: -3}\nlinode: {region: '  ', image: image-example, type: type-example, firewall: firewall-example, sshCIDRs: [' 192.0.2.0/24 ', 192.0.2.0/24, 192.0.2.0/24]}"},
+		{"negative int64 retained", "tencentcloud: {rootGB: -4}", "tencentcloud: {rootGB: -4}"},
+		{"intentional presence and clear", "blaxel: {execTimeoutSecs: 0, forgetMissing: false}\nanthropicSandboxRuntime: {settings: '', debug: false}\nmodal: {secrets: []}", "blaxel: {execTimeoutSecs: 0, forgetMissing: false}\nanthropicSandboxRuntime: {settings: '', debug: false}\nmodal: {secrets: []}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := isolatedConfigPath(t)
+			if err := os.WriteFile(path, []byte(tc.input), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := readFileConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writeUserFileConfig(file); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got, want map[string]any
+			if err := yaml.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if err := yaml.Unmarshal([]byte(tc.want), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("stored config = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestGeneratedFileStorageSetBroker(t *testing.T) {
+	path := isolatedConfigPath(t)
+	if err := os.WriteFile(path, []byte("vultr: {region: '', vpcIds: []}\nlinode: {region: '', image: '', type: '', firewall: '', sshCIDRs: []}\nmodal: {secrets: []}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
+	if err := app.configSetBroker([]string{"--url", "https://broker.example.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got["vultr"], map[string]any{}) {
+		t.Errorf("vultr storage = %#v, want empty mapping", got["vultr"])
+	}
+	if !reflect.DeepEqual(got["linode"], map[string]any{}) {
+		t.Errorf("linode storage = %#v, want empty mapping", got["linode"])
+	}
+	if !reflect.DeepEqual(got["modal"], map[string]any{"secrets": []any{}}) {
+		t.Errorf("modal clear lost: %#v", got["modal"])
+	}
+	file, err := readFileConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Broker == nil || file.Broker.URL != "https://broker.example.invalid" {
+		t.Fatalf("broker update missing")
+	}
+}
+
 func TestConfigSetBrokerRegisteredMode(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_PROVIDER", "")
 
 	var stdout bytes.Buffer
@@ -104,12 +933,7 @@ func TestConfigSetBrokerRegisteredMode(t *testing.T) {
 }
 
 func TestConfigSetBrokerRegisteredModeAcceptsDirectProvider(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_PROVIDER", "")
 
 	app := App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
@@ -130,12 +954,7 @@ func TestConfigSetBrokerRegisteredModeAcceptsDirectProvider(t *testing.T) {
 }
 
 func TestConfigSetBrokerRegisteredModeRejectsUnknownProvider(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_PROVIDER", "")
 
 	app := App{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}}
@@ -153,12 +972,7 @@ func TestConfigSetBrokerRegisteredModeRejectsUnknownProvider(t *testing.T) {
 }
 
 func TestConfigSetBrokerUsesPersistedRegisteredModeForProviderValidation(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_PROVIDER", "")
 	if err := os.WriteFile(configPath, []byte("broker:\n  url: https://old.example.test\n  mode: Registered\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -181,12 +995,7 @@ func TestConfigSetBrokerUsesPersistedRegisteredModeForProviderValidation(t *test
 }
 
 func TestConfigSetBrokerRejectsPersistedDirectProviderWhenSwitchingToManaged(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_PROVIDER", "")
 	original := "provider: xcp-ng\nbroker:\n  url: https://old.example.test\n  mode: registered\n  provider: xcp-ng\n"
 	if err := os.WriteFile(configPath, []byte(original), 0o600); err != nil {
@@ -211,12 +1020,7 @@ func TestConfigSetBrokerRejectsPersistedDirectProviderWhenSwitchingToManaged(t *
 }
 
 func TestConfigSetBrokerDoesNotPromoteTopLevelProviderWhenOmitted(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_PROVIDER", "")
 	if err := os.WriteFile(configPath, []byte("provider: xcp-ng\nbroker:\n  url: https://old.example.test\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -236,12 +1040,7 @@ func TestConfigSetBrokerDoesNotPromoteTopLevelProviderWhenOmitted(t *testing.T) 
 }
 
 func TestConfigShowIncludesRunPreflightTools(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	if err := os.WriteFile(configPath, []byte("run:\n  preflightTools: [node, bun]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -272,14 +1071,32 @@ func TestConfigShowIncludesRunPreflightTools(t *testing.T) {
 	}
 }
 
+func TestConfigShowReportsWebVNCAgentBaseURLSupport(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("CRABBOX_WEBVNC_AGENT_BASE_URL", "https://agent.example.test")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		WebVNCAgentBaseURL string `json:"webvncAgentBaseUrl"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.WebVNCAgentBaseURL != "https://agent.example.test" {
+		t.Fatalf("webvncAgentBaseUrl=%q", got.WebVNCAgentBaseURL)
+	}
+}
+
 func TestConfigShowExportsControllerProviderContract(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
-	config := "provider: external\nbroker:\n  url: https://broker.example.test/root/\n  mode: registered\nexternal:\n  command: provider-a\n  capabilities:\n    idempotentLeaseId: true\n"
+	configPath := isolatedConfigPath(t)
+	config := "provider: external\nbroker:\n  url: https://broker-user:broker-pass@broker.example.test/root/?token=query-secret#fragment-secret\n  mode: registered\nexternal:\n  command: provider-a\n  capabilities:\n    idempotentLeaseId: true\n"
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -297,18 +1114,43 @@ func TestConfigShowExportsControllerProviderContract(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Provider != "external" || got.ProviderScope != "test-external:provider-a" || !got.IdempotentLeaseID || got.CoordinatorRegistrationURL != "https://broker.example.test/root" {
+	if got.Provider != "external" || got.ProviderScope != "test-external:provider-a" || !got.IdempotentLeaseID || got.CoordinatorRegistrationURL != "https://<redacted>@broker.example.test/root" {
 		t.Fatalf("controller provider contract=%#v", got)
+	}
+	for _, secret := range []string{"broker-user", "broker-pass", "query-secret", "fragment-secret"} {
+		if strings.Contains(stdout.String(), secret) {
+			t.Fatalf("config show json leaked coordinator registration secret %q: %q", secret, stdout.String())
+		}
+	}
+}
+
+func TestConfigShowExportsRawControllerProviderIdentityContract(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	config := "provider: external\nbroker:\n  url: https://broker-user:broker-pass@broker.example.test/root/?token=query-secret#fragment-secret\n  mode: registered\nexternal:\n  command: provider-a\n  capabilities:\n    idempotentLeaseId: true\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow([]string{"--json", "--controller-provider-identity", "--provider", "external"}); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 || got["provider"] != "external" || got["providerScope"] != "test-external:provider-a" || got["idempotentLeaseId"] != true || got["coordinatorRegistrationUrl"] != "https://broker-user:broker-pass@broker.example.test/root?token=query-secret#fragment-secret" {
+		t.Fatalf("controller provider identity contract=%#v", got)
+	}
+	stdout.Reset()
+	if err := app.configShow([]string{"--controller-provider-identity", "--provider", "external"}); err == nil || !strings.Contains(err.Error(), "requires --json") {
+		t.Fatalf("controller provider identity without JSON error=%v", err)
 	}
 }
 
 func TestConfigShowRedactsCloudflareDynamicWorkers(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	if err := os.WriteFile(configPath, []byte(`provider: aws
 cloudflareDynamicWorkers:
   loaderUrl: https://user:pass@loader.example.test?token=query-secret#fragment-secret
@@ -358,32 +1200,8 @@ cloudflareDynamicWorkers:
 	}
 }
 
-func TestRedactedConfigURLWithoutQueryStripsQueryAndFragmentWithoutUserinfo(t *testing.T) {
-	got := redactedConfigURLWithoutQuery("https://loader.example.test/v1?token=query-secret#fragment-secret")
-	if got != "https://loader.example.test/v1" {
-		t.Fatalf("redacted URL=%q", got)
-	}
-}
-
-func TestRedactedConfigURLWithoutQueryFailsClosedForMalformedURL(t *testing.T) {
-	for _, raw := range []string{
-		"https://loader.example.test/%zz?token=@query-secret",
-		"https://api-token:443#pass@host/%zz",
-	} {
-		got := redactedConfigURLWithoutQuery(raw)
-		if got != "<redacted>" || strings.Contains(got, "query-secret") || strings.Contains(got, "api-token") {
-			t.Fatalf("redacted URL for %q=%q", raw, got)
-		}
-	}
-}
-
 func TestConfigSetBrokerRejectsDirectOnlyProvider(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 
 	var stdout bytes.Buffer
 	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
@@ -397,12 +1215,7 @@ func TestConfigSetBrokerRejectsDirectOnlyProvider(t *testing.T) {
 }
 
 func TestConfigShowIncludesJobHydrateGitHubRunner(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	if err := os.WriteFile(configPath, []byte("jobs:\n  smoke:\n    architecture: arm64\n    label: nightly smoke\n    artifactGlobs:\n      - reports/**\n    requiredArtifacts:\n      - reports/summary.json\n    hydrate:\n      actions: true\n      githubRunner: true\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -437,13 +1250,62 @@ func TestConfigShowIncludesJobHydrateGitHubRunner(t *testing.T) {
 	}
 }
 
+func TestConfigShowRedactsCloudflareSandbox(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	if err := os.WriteFile(configPath, []byte(`provider: aws
+cloudflareSandbox:
+  url: https://user:pass@bridge.example.test?token=query-secret#fragment-secret
+  token: secret-token
+  workdir: /workspace/test
+  execTimeoutSecs: 90
+  forgetMissing: true
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	for _, secret := range []string{"secret-token", "user:pass", "query-secret", "fragment-secret"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("config show leaked %q: %q", secret, text)
+		}
+	}
+	if !strings.Contains(text, "cloudflare_sandbox url=https://<redacted>@bridge.example.test workdir=/workspace/test exec_timeout_secs=90 forget_missing=true auth=configured") {
+		t.Fatalf("config show missing cloudflare-sandbox summary: %q", text)
+	}
+
+	stdout.Reset()
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		CloudflareSandbox struct {
+			URL             string `json:"url"`
+			Auth            string `json:"auth"`
+			Workdir         string `json:"workdir"`
+			ExecTimeoutSecs int    `json:"execTimeoutSecs"`
+			ForgetMissing   bool   `json:"forgetMissing"`
+		} `json:"cloudflareSandbox"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.CloudflareSandbox.URL != "https://<redacted>@bridge.example.test" || got.CloudflareSandbox.Auth != "configured" || got.CloudflareSandbox.Workdir != "/workspace/test" || got.CloudflareSandbox.ExecTimeoutSecs != 90 || !got.CloudflareSandbox.ForgetMissing {
+		t.Fatalf("json cloudflare-sandbox=%#v", got.CloudflareSandbox)
+	}
+	for _, secret := range []string{"secret-token", "user:pass", "query-secret", "fragment-secret"} {
+		if strings.Contains(stdout.String(), secret) {
+			t.Fatalf("config show json leaked %q: %q", secret, stdout.String())
+		}
+	}
+}
+
 func TestConfigShowIncludesCloudflareWithoutSecret(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_CLOUDFLARE_RUNNER_TOKEN", "cloudflare-secret-token")
 	if err := os.WriteFile(configPath, []byte("cloudflare:\n  apiUrl: https://cloudflare.example.test\n  workdir: /workspace/test\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -484,13 +1346,165 @@ func TestConfigShowIncludesCloudflareWithoutSecret(t *testing.T) {
 	}
 }
 
+func TestConfigShowIncludesBlaxelWithoutSecret(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("CRABBOX_BLAXEL_API_KEY", "blaxel-secret-token")
+	t.Setenv("CRABBOX_BLAXEL_API_URL", "https://api.blaxel.example.test")
+	if err := os.WriteFile(configPath, []byte(strings.Join([]string{
+		"provider: blaxel",
+		"blaxel:",
+		"  workspace: workspace-test",
+		"  region: us-pdx-1",
+		"  image: ubuntu:24.04",
+		"  memoryMB: 2048",
+		"  ttl: 30m",
+		"  idleTTL: 5m",
+		"  workdir: /workspace/test",
+		"  execTimeoutSecs: 120",
+		"  forgetMissing: true",
+	}, "\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "blaxel api_url=https://api.blaxel.example.test workspace=workspace-test region=us-pdx-1 image=ubuntu:24.04 memory_mb=2048 ttl=30m idle_ttl=5m workdir=/workspace/test exec_timeout_secs=120 forget_missing=true auth=configured") {
+		t.Fatalf("config show missing blaxel summary: %q", text)
+	}
+	if strings.Contains(text, "blaxel-secret-token") {
+		t.Fatalf("config show leaked Blaxel token: %q", text)
+	}
+
+	stdout.Reset()
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Blaxel struct {
+			APIURL          string `json:"apiUrl"`
+			Auth            string `json:"auth"`
+			Workspace       string `json:"workspace"`
+			Region          string `json:"region"`
+			Image           string `json:"image"`
+			MemoryMB        int    `json:"memoryMB"`
+			TTL             string `json:"ttl"`
+			IdleTTL         string `json:"idleTTL"`
+			Workdir         string `json:"workdir"`
+			ExecTimeoutSecs int    `json:"execTimeoutSecs"`
+			ForgetMissing   bool   `json:"forgetMissing"`
+		} `json:"blaxel"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Blaxel.APIURL != "https://api.blaxel.example.test" ||
+		got.Blaxel.Auth != "configured" ||
+		got.Blaxel.Workspace != "workspace-test" ||
+		got.Blaxel.Region != "us-pdx-1" ||
+		got.Blaxel.Image != "ubuntu:24.04" ||
+		got.Blaxel.MemoryMB != 2048 ||
+		got.Blaxel.TTL != "30m" ||
+		got.Blaxel.IdleTTL != "5m" ||
+		got.Blaxel.Workdir != "/workspace/test" ||
+		got.Blaxel.ExecTimeoutSecs != 120 ||
+		!got.Blaxel.ForgetMissing {
+		t.Fatalf("unexpected blaxel json: %#v", got.Blaxel)
+	}
+	if strings.Contains(stdout.String(), "blaxel-secret-token") {
+		t.Fatalf("config show json leaked Blaxel token: %q", stdout.String())
+	}
+}
+
+func TestConfigShowIncludesNomadWithoutSecret(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("NOMAD_TOKEN", "nomad-secret-token")
+	t.Setenv("CRABBOX_NOMAD_DATACENTERS", "dc1,dc2")
+	if err := os.WriteFile(configPath, []byte(strings.Join([]string{
+		"nomad:",
+		"  address: https://user:pass@nomad.example.test:4646",
+		"  region: global",
+		"  namespace: team-a",
+		"  task: test-task",
+		"  driver: docker",
+		"  image: ubuntu:24.04",
+		"  workdir: /workspace/test",
+		"  nodePool: pool-a",
+		"  datacenters: [dc1, dc2]",
+		"  cpu: 500",
+		"  memoryMB: 1024",
+		"  diskMB: 2048",
+		"  allocReadyTimeout: 2m",
+		"  evalTimeout: 3m",
+		"  execTimeoutSecs: 45",
+	}, "\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "nomad address=https://<redacted>@nomad.example.test:4646 region=global namespace=team-a auth_env=default auth=env") {
+		t.Fatalf("config show missing nomad summary: %q", text)
+	}
+	for _, secret := range []string{"nomad-secret-token", "user:pass"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("config show leaked Nomad secret %q: %q", secret, text)
+		}
+	}
+
+	stdout.Reset()
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Nomad struct {
+			Address           string   `json:"address"`
+			Auth              string   `json:"auth"`
+			TokenEnv          string   `json:"tokenEnv"`
+			Region            string   `json:"region"`
+			Namespace         string   `json:"namespace"`
+			Datacenters       []string `json:"datacenters"`
+			CPU               int      `json:"cpu"`
+			MemoryMB          int      `json:"memoryMB"`
+			DiskMB            int      `json:"diskMB"`
+			AllocReadyTimeout string   `json:"allocReadyTimeout"`
+			EvalTimeout       string   `json:"evalTimeout"`
+			ExecTimeoutSecs   int      `json:"execTimeoutSecs"`
+		} `json:"nomad"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Nomad.Address != "https://<redacted>@nomad.example.test:4646" ||
+		got.Nomad.Auth != "env" ||
+		got.Nomad.TokenEnv != "NOMAD_TOKEN" ||
+		got.Nomad.Region != "global" ||
+		got.Nomad.Namespace != "team-a" ||
+		strings.Join(got.Nomad.Datacenters, ",") != "dc1,dc2" ||
+		got.Nomad.CPU != 500 ||
+		got.Nomad.MemoryMB != 1024 ||
+		got.Nomad.DiskMB != 2048 ||
+		got.Nomad.AllocReadyTimeout != "2m0s" ||
+		got.Nomad.EvalTimeout != "3m0s" ||
+		got.Nomad.ExecTimeoutSecs != 45 {
+		t.Fatalf("unexpected nomad json: %#v", got.Nomad)
+	}
+	for _, secret := range []string{"nomad-secret-token", "user:pass"} {
+		if strings.Contains(stdout.String(), secret) {
+			t.Fatalf("config show json leaked Nomad secret %q: %q", secret, stdout.String())
+		}
+	}
+}
+
 func TestConfigShowIncludesSuperserveWithoutSecret(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_SUPERSERVE_API_KEY", "superserve-secret-token")
 	if err := os.WriteFile(configPath, []byte("superserve:\n  baseUrl: https://user:base-url-secret@superserve.example.test\n  template: superserve/custom\n  workdir: /workspace/test\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -533,19 +1547,32 @@ func TestConfigShowIncludesSuperserveWithoutSecret(t *testing.T) {
 }
 
 func TestConfigShowIncludesDigitalOceanProviderConfig(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	if err := os.WriteFile(configPath, []byte("provider: digitalocean\ndigitalocean:\n  region: sfo3\n  image: ubuntu-24-04-x64\n  vpc: vpc-123\n  sshCIDRs: [203.0.113.0/24, 2001:db8::/64]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
 	var stdout bytes.Buffer
-	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
-	if err := app.configShow(nil); err != nil {
+	runShow := func(args []string) error {
+		cmd := exec.CommandContext(t.Context(), binary, append([]string{"config", "show"}, args...)...)
+		cmd.Dir = home
+		cmd.Env = []string{"HOME=" + home, "USERPROFILE=" + home, "APPDATA=" + home, "XDG_CONFIG_HOME=" + home, "XDG_STATE_HOME=" + home, "CRABBOX_CONFIG=" + configPath, "PATH=" + t.TempDir()}
+		var stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("config show: %w: %s", err, &stderr)
+		}
+		if stderr.Len() != 0 {
+			return fmt.Errorf("config show stderr: %s", &stderr)
+		}
+		return nil
+	}
+	if err := runShow(nil); err != nil {
 		t.Fatal(err)
 	}
 	text := stdout.String()
@@ -557,7 +1584,7 @@ func TestConfigShowIncludesDigitalOceanProviderConfig(t *testing.T) {
 	}
 
 	stdout.Reset()
-	if err := app.configShow([]string{"--json"}); err != nil {
+	if err := runShow([]string{"--json"}); err != nil {
 		t.Fatal(err)
 	}
 	var got struct {
@@ -585,13 +1612,173 @@ func TestConfigShowIncludesDigitalOceanProviderConfig(t *testing.T) {
 	}
 }
 
-func TestConfigShowIncludesHostingerWithoutSecret(t *testing.T) {
-	clearConfigEnv(t)
+func TestConfigShowIncludesVultrProviderConfigWithoutSecret(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("VULTR_API_KEY", "vultr-secret-token")
+	if err := os.WriteFile(configPath, []byte("provider: vultr\nvultr:\n  region: sjc\n  os: \"2284\"\n  image: image-123\n  snapshot: snapshot-123\n  firewallGroup: fw-123\n  vpcIds: [vpc-a, vpc-b]\n  sshCIDRs: [203.0.113.0/24, 2001:db8::/64]\n  userScheme: limited\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
 	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	var stdout bytes.Buffer
+	runShow := func(args []string) error {
+		cmd := exec.CommandContext(t.Context(), binary, append([]string{"config", "show"}, args...)...)
+		cmd.Dir = home
+		cmd.Env = []string{"HOME=" + home, "USERPROFILE=" + home, "APPDATA=" + home, "XDG_CONFIG_HOME=" + home, "XDG_STATE_HOME=" + home, "CRABBOX_CONFIG=" + configPath, "PATH=" + t.TempDir(), "VULTR_API_KEY=" + os.Getenv("VULTR_API_KEY")}
+		var stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("config show: %w: %s", err, &stderr)
+		}
+		if stderr.Len() != 0 {
+			return fmt.Errorf("config show stderr: %s", &stderr)
+		}
+		return nil
+	}
+	if err := runShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "vultr region=sjc os=2284 image=image-123 snapshot=snapshot-123 firewall_group=fw-123 vpc_ids=vpc-a,vpc-b ssh_cidrs=203.0.113.0/24,2001:db8::/64 user_scheme=limited") {
+		t.Fatalf("config show missing vultr summary: %q", text)
+	}
+	if !strings.Contains(text, "ssh=root@<host>:22 fallback_ports=-") {
+		t.Fatalf("config show missing effective vultr ssh defaults: %q", text)
+	}
+	if strings.Contains(text, "vultr-secret-token") || strings.Contains(text, "auth=configured") {
+		t.Fatalf("config show leaked or reported Vultr API key: %q", text)
+	}
+
+	stdout.Reset()
+	if err := runShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		SSHUser          string   `json:"sshUser"`
+		SSHPort          string   `json:"sshPort"`
+		SSHFallbackPorts []string `json:"sshFallbackPorts"`
+		Vultr            struct {
+			Region        string   `json:"region"`
+			OS            string   `json:"os"`
+			Image         string   `json:"image"`
+			Snapshot      string   `json:"snapshot"`
+			FirewallGroup string   `json:"firewallGroup"`
+			VPCIDs        []string `json:"vpcIds"`
+			SSHCIDRs      []string `json:"sshCIDRs"`
+			UserScheme    string   `json:"userScheme"`
+		} `json:"vultr"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Vultr.Region != "sjc" ||
+		got.Vultr.OS != "2284" ||
+		got.Vultr.Image != "image-123" ||
+		got.Vultr.Snapshot != "snapshot-123" ||
+		got.Vultr.FirewallGroup != "fw-123" ||
+		strings.Join(got.Vultr.VPCIDs, ",") != "vpc-a,vpc-b" ||
+		strings.Join(got.Vultr.SSHCIDRs, ",") != "203.0.113.0/24,2001:db8::/64" ||
+		got.Vultr.UserScheme != "limited" {
+		t.Fatalf("unexpected vultr json: %#v", got.Vultr)
+	}
+	if got.SSHUser != "root" || got.SSHPort != "22" || len(got.SSHFallbackPorts) != 0 {
+		t.Fatalf("unexpected vultr ssh json: %#v", got)
+	}
+	if strings.Contains(stdout.String(), "vultr-secret-token") {
+		t.Fatalf("config show json leaked Vultr API key: %q", stdout.String())
+	}
+}
+
+func TestConfigShowIncludesScalewayProviderConfigWithoutSecrets(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("SCW_ACCESS_KEY", "redaction-fixture-access")
+	t.Setenv("SCW_SECRET_KEY", "redaction-fixture-private")
+	if err := os.WriteFile(configPath, []byte("provider: scaleway\nscaleway:\n  region: fr-par\n  zone: fr-par-1\n  image: ubuntu_noble\n  type: DEV1-S\n  projectId: project-123\n  organizationId: org-123\n  securityGroup: sg-123\n  sshCIDRs: [203.0.113.0/24, 2001:db8::/64]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "scaleway region=fr-par zone=fr-par-1 image=ubuntu_noble type=DEV1-S project_id=project-123 organization_id=org-123 security_group=sg-123 ssh_cidrs=203.0.113.0/24,2001:db8::/64 auth=configured") {
+		t.Fatalf("config show missing scaleway summary: %q", text)
+	}
+	if !strings.Contains(text, "ssh=root@<host>:22 fallback_ports=-") {
+		t.Fatalf("config show missing effective scaleway ssh defaults: %q", text)
+	}
+	for _, secret := range []string{"redaction-fixture-access", "redaction-fixture-private"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("config show leaked Scaleway secret %q: %q", secret, text)
+		}
+	}
+
+	stdout.Reset()
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		SSHUser  string `json:"sshUser"`
+		SSHPort  string `json:"sshPort"`
+		Scaleway struct {
+			Region         string   `json:"region"`
+			Zone           string   `json:"zone"`
+			Image          string   `json:"image"`
+			Type           string   `json:"type"`
+			ProjectID      string   `json:"projectId"`
+			OrganizationID string   `json:"organizationId"`
+			SecurityGroup  string   `json:"securityGroup"`
+			SSHCIDRs       []string `json:"sshCIDRs"`
+			Auth           string   `json:"auth"`
+		} `json:"scaleway"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Scaleway.Region != "fr-par" ||
+		got.Scaleway.Zone != "fr-par-1" ||
+		got.Scaleway.Image != "ubuntu_noble" ||
+		got.Scaleway.Type != "DEV1-S" ||
+		got.Scaleway.ProjectID != "project-123" ||
+		got.Scaleway.OrganizationID != "org-123" ||
+		got.Scaleway.SecurityGroup != "sg-123" ||
+		got.Scaleway.Auth != "configured" ||
+		strings.Join(got.Scaleway.SSHCIDRs, ",") != "203.0.113.0/24,2001:db8::/64" {
+		t.Fatalf("unexpected scaleway json: %#v", got.Scaleway)
+	}
+	if got.SSHUser != "root" || got.SSHPort != "22" {
+		t.Fatalf("unexpected scaleway ssh json: %#v", got)
+	}
+	rendered := stdout.String()
+	for _, secret := range []string{"redaction-fixture-access", "redaction-fixture-private"} {
+		if strings.Contains(rendered, secret) {
+			t.Fatalf("config show json leaked Scaleway secret %q: %q", secret, rendered)
+		}
+	}
+}
+
+func TestConfigShowScalewayPartialAuth(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("SCW_ACCESS_KEY", "redaction-fixture-access")
+	cfg := Config{Provider: "scaleway"}
+	view := configShowView(cfg)["scaleway"].(map[string]any)
+	if got := view["auth"]; got != "partial" {
+		t.Fatalf("auth=%v, want partial", got)
+	}
+	rendered := fmt.Sprint(view)
+	if strings.Contains(rendered, "redaction-fixture-access") {
+		t.Fatalf("config show leaked Scaleway access key: %s", rendered)
+	}
+}
+
+func TestConfigShowIncludesHostingerWithoutSecret(t *testing.T) {
+	configPath := isolatedConfigPath(t)
 	t.Setenv("HOSTINGER_API_TOKEN", "hostinger-secret-token")
 	if err := os.WriteFile(configPath, []byte(`hostinger:
   apiUrl: https://hostinger.example.test
@@ -661,13 +1848,86 @@ func TestConfigShowIncludesHostingerWithoutSecret(t *testing.T) {
 	}
 }
 
+func TestConfigShowIncludesLambdaWithoutSecret(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("LAMBDA_API_KEY", "lambda-secret-token")
+	if err := os.WriteFile(configPath, []byte(`provider: lambda
+lambda:
+  region: us-east-1
+  type: gpu_1x_h100_sxm5
+  imageFamily: lambda-stack-24-04
+  firewallRuleset: crabbox
+  sshCIDRs: [203.0.113.0/24]
+  filesystemNames: [cache]
+  filesystemMounts:
+    - name: cache
+      mountPath: /mnt/cache
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "lambda region=us-east-1 type=gpu_1x_h100_sxm5 image=- image_family=lambda-stack-24-04 firewall_ruleset=crabbox ssh_cidrs=203.0.113.0/24 filesystems=cache mounts=1 auth=env") {
+		t.Fatalf("config show missing lambda summary: %q", text)
+	}
+	if !strings.Contains(text, "ssh=ubuntu@<host>:22 fallback_ports=-") {
+		t.Fatalf("config show missing effective lambda ssh defaults: %q", text)
+	}
+	if strings.Contains(text, "lambda-secret-token") || strings.Contains(text, "LAMBDA_API_KEY") {
+		t.Fatalf("config show text leaked lambda credential: %q", text)
+	}
+
+	stdout.Reset()
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String(), "lambda-secret-token") || strings.Contains(stdout.String(), "LAMBDA_API_KEY") {
+		t.Fatalf("config show json leaked lambda credential: %q", stdout.String())
+	}
+	var got struct {
+		SSHUser          string   `json:"sshUser"`
+		SSHPort          string   `json:"sshPort"`
+		SSHFallbackPorts []string `json:"sshFallbackPorts"`
+		Lambda           struct {
+			Region           string                  `json:"region"`
+			Type             string                  `json:"type"`
+			ImageFamily      string                  `json:"imageFamily"`
+			FirewallRuleset  string                  `json:"firewallRuleset"`
+			SSHCIDRs         []string                `json:"sshCIDRs"`
+			FilesystemNames  []string                `json:"filesystemNames"`
+			FilesystemMounts []LambdaFilesystemMount `json:"filesystemMounts"`
+			Auth             string                  `json:"auth"`
+		} `json:"lambda"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Lambda.Region != "us-east-1" || got.Lambda.Type != "gpu_1x_h100_sxm5" || got.Lambda.ImageFamily != "lambda-stack-24-04" || got.Lambda.FirewallRuleset != "crabbox" || got.Lambda.Auth != "env" {
+		t.Fatalf("unexpected lambda json: %#v", got.Lambda)
+	}
+	if got.SSHUser != "ubuntu" || got.SSHPort != "22" || len(got.SSHFallbackPorts) != 0 {
+		t.Fatalf("unexpected lambda ssh json: %#v", got)
+	}
+}
+
+func configShowTextSection(t *testing.T, text, name string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, name+" ") {
+			return line
+		}
+	}
+	t.Fatalf("config show missing %s section", name)
+	return ""
+}
+
 func TestConfigShowIncludesNvidiaBrevWithoutSecretSurface(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_NVIDIA_BREV_TOKEN", "ignored-brev-secret")
 	if err := os.WriteFile(configPath, []byte(`nvidiaBrev:
   cli: /usr/local/bin/brev
@@ -692,13 +1952,18 @@ func TestConfigShowIncludesNvidiaBrevWithoutSecretSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := stdout.String()
-	want := "nvidia_brev cli=/usr/local/bin/brev org=example-org type=gpu gpu_name=L40S provider=aws mode=vm launchable=pytorch startup_script=setup.sh release_action=stop target=host user=ubuntu work_root=/work/brev auth=cli"
+	want := "nvidia_brev cli=/usr/local/bin/brev org=example-org type=gpu gpu_name=L40S provider=aws mode=vm launchable=pytorch startup_script=setup.sh release_action=stop target=host user=ubuntu work_root=/work/brev auth_mode=cli auth_status=unchecked readiness=unchecked"
 	if !strings.Contains(text, want) {
 		t.Fatalf("config show missing nvidia-brev summary: %q", text)
 	}
-	for _, secretFragment := range []string{"ignored-brev-secret", "token", "api_key", "password", "private_key"} {
-		if strings.Contains(strings.ToLower(text), secretFragment) {
-			t.Fatalf("config show text exposed %q: %q", secretFragment, text)
+	if strings.Contains(strings.ToLower(text), "ignored-brev-secret") {
+		t.Fatalf("config show text exposed the synthetic secret: %q", text)
+	}
+	// Other providers may describe token-based authentication in their metadata.
+	section := configShowTextSection(t, text, "nvidia_brev")
+	for _, secretField := range []string{"token", "api_key", "password", "private_key"} {
+		if strings.Contains(strings.ToLower(section), secretField) {
+			t.Fatalf("nvidia-brev config text exposed %q: %q", secretField, section)
 		}
 	}
 
@@ -755,9 +2020,247 @@ func TestConfigShowIncludesNvidiaBrevWithoutSecretSurface(t *testing.T) {
 	}
 }
 
+func TestConfigShowIncludesVastWithoutSecretSurface(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("CRABBOX_VAST_API_KEY", "vast-redaction-fixture-secret")
+	if err := os.WriteFile(configPath, []byte(`provider: vast
+ssh:
+  user: ubuntu
+vast:
+  apiUrl: https://user:secret@vast.example.test/api/v0?token=hidden
+  instanceType: on-demand
+  gpuName: RTX 4090
+  gpuCount: 2
+  image: nvidia/cuda:vast
+  templateId: tpl-vast
+  runtype: ssh_direct
+  diskGB: 60
+  maxDphTotal: 3.5
+  minReliability: 0.9
+  order: reliability desc
+  user: root
+  workRoot: /work/vast
+  releaseAction: stop
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	for _, args := range [][]string{nil, {"--json"}} {
+		if err := app.configShow(args); err == nil || err.Error() != "vast.apiUrl must be an absolute URL without credentials" {
+			t.Fatalf("config show invalid URL error=%v", err)
+		}
+		if stdout.Len() != 0 {
+			t.Fatal("config show rendered invalid configuration")
+		}
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The command rejects this URL; exercise redaction at the rendering layer.
+	cfg = effectiveConfigForShow(cfg)
+	if err := writeConfigShowText(&stdout, cfg); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	if !strings.Contains(text, "vast api_url=https://<redacted>@vast.example.test/api/v0 instance_type=ondemand gpu_name=RTX 4090 gpu_count=2") ||
+		!strings.Contains(text, "work_root=/work/vast release_action=stop auth=configured") {
+		t.Fatalf("config show missing vast summary: %q", text)
+	}
+	if strings.Contains(text, "vast-redaction-fixture-secret") || strings.Contains(text, "user:secret") || strings.Contains(text, "hidden") {
+		t.Fatalf("config show text leaked Vast secret: %q", text)
+	}
+
+	stdout.Reset()
+	view := configShowView(cfg)
+	sections, err := collectProviderConfigShowSections(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := addProviderConfigShowSections(view, sections); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(&stdout).Encode(view); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		SSHUser string `json:"sshUser"`
+		SSHPort string `json:"sshPort"`
+		Vast    struct {
+			APIURL         string  `json:"apiUrl"`
+			Auth           string  `json:"auth"`
+			InstanceType   string  `json:"instanceType"`
+			GPUName        string  `json:"gpuName"`
+			GPUCount       int     `json:"gpuCount"`
+			Image          string  `json:"image"`
+			TemplateID     string  `json:"templateId"`
+			Runtype        string  `json:"runtype"`
+			DiskGB         int     `json:"diskGB"`
+			MaxDphTotal    float64 `json:"maxDphTotal"`
+			MinReliability float64 `json:"minReliability"`
+			Order          string  `json:"order"`
+			User           string  `json:"user"`
+			WorkRoot       string  `json:"workRoot"`
+			ReleaseAction  string  `json:"releaseAction"`
+		} `json:"vast"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Vast.APIURL != "https://<redacted>@vast.example.test/api/v0" ||
+		got.Vast.Auth != "configured" ||
+		got.Vast.InstanceType != "ondemand" ||
+		got.Vast.GPUName != "RTX 4090" ||
+		got.Vast.GPUCount != 2 ||
+		got.Vast.Image != "nvidia/cuda:vast" ||
+		got.Vast.TemplateID != "tpl-vast" ||
+		got.Vast.Runtype != "ssh_direct" ||
+		got.Vast.DiskGB != 60 ||
+		got.Vast.MaxDphTotal != 3.5 ||
+		got.Vast.MinReliability != 0.9 ||
+		got.Vast.Order != "reliability desc" ||
+		got.Vast.User != "root" ||
+		got.Vast.WorkRoot != "/work/vast" ||
+		got.Vast.ReleaseAction != "stop" {
+		t.Fatalf("unexpected vast json: %#v", got.Vast)
+	}
+	if got.SSHUser != "ubuntu" || got.SSHPort != "22" {
+		t.Fatalf("unexpected vast ssh json: %#v", got)
+	}
+	if strings.Contains(stdout.String(), "vast-redaction-fixture-secret") || strings.Contains(stdout.String(), "user:secret") || strings.Contains(stdout.String(), "hidden") {
+		t.Fatalf("config show json leaked Vast secret: %q", stdout.String())
+	}
+	t.Run("valid config command", func(t *testing.T) {
+		path := isolatedConfigPath(t)
+		if err := os.WriteFile(path, []byte("provider: vast\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		app := App{Stdout: &output, Stderr: &bytes.Buffer{}}
+		if err := app.configShow(nil); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(output.String(), "vast api_url=https://console.vast.ai/api/v0 instance_type=ondemand") {
+			t.Fatal("valid Vast configuration missing from command output")
+		}
+		output.Reset()
+		if err := app.configShow([]string{"--json"}); err != nil {
+			t.Fatal(err)
+		}
+		var view struct {
+			Provider string `json:"provider"`
+			Vast     struct {
+				InstanceType string `json:"instanceType"`
+			} `json:"vast"`
+		}
+		if err := json.Unmarshal(output.Bytes(), &view); err != nil {
+			t.Fatal(err)
+		}
+		if view.Provider != "vast" || view.Vast.InstanceType != "ondemand" {
+			t.Fatalf("unexpected valid Vast command view: %#v", view)
+		}
+	})
+
+}
+
+func TestConfigShowIncludesNebiusWithoutSecretSurface(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	t.Setenv("CRABBOX_NEBIUS_PROFILE", "env-profile")
+	if err := os.WriteFile(configPath, []byte(`provider: nebius
+nebius:
+  cli: /usr/local/bin/nebius
+  parentId: project-123
+  subnetId: subnet-123
+  platform: cpu-d3
+  preset: 4vcpu-16gb
+  imageFamily: ubuntu24.04-driverless
+  diskType: network_ssd
+  diskSizeGiB: 50
+  user: crabbox
+  publicIP: dynamic
+  securityGroupIds: [sg-1, sg-2]
+  serviceAccountId: sa-123
+  recoveryPolicy: fail
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := stdout.String()
+	want := "nebius cli=/usr/local/bin/nebius profile=env-profile parent_id=project-123 subnet_id=subnet-123 platform=cpu-d3 preset=4vcpu-16gb image_family=ubuntu24.04-driverless disk_type=network_ssd disk_size_gib=50 user=crabbox public_ip=dynamic security_group_ids=sg-1,sg-2 service_account_id=sa-123 recovery_policy=fail auth_mode=cli auth_status=unchecked readiness=unchecked"
+	if !strings.Contains(text, want) {
+		t.Fatalf("config show missing nebius summary: %q", text)
+	}
+	section := configShowTextSection(t, text, "nebius")
+	for _, secretField := range []string{"token", "api_key", "private_key", "password"} {
+		if strings.Contains(strings.ToLower(section), secretField) {
+			t.Fatalf("nebius config text exposed %q: %q", secretField, section)
+		}
+	}
+
+	stdout.Reset()
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Nebius struct {
+			CLI              string   `json:"cli"`
+			Auth             string   `json:"auth"`
+			Profile          string   `json:"profile"`
+			ParentID         string   `json:"parentId"`
+			SubnetID         string   `json:"subnetId"`
+			Platform         string   `json:"platform"`
+			Preset           string   `json:"preset"`
+			ImageFamily      string   `json:"imageFamily"`
+			DiskType         string   `json:"diskType"`
+			DiskSizeGiB      int      `json:"diskSizeGiB"`
+			User             string   `json:"user"`
+			PublicIP         string   `json:"publicIP"`
+			SecurityGroupIDs []string `json:"securityGroupIds"`
+			ServiceAccountID string   `json:"serviceAccountId"`
+			RecoveryPolicy   string   `json:"recoveryPolicy"`
+		} `json:"nebius"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Nebius.CLI != "/usr/local/bin/nebius" ||
+		got.Nebius.Auth != "cli" ||
+		got.Nebius.Profile != "env-profile" ||
+		got.Nebius.ParentID != "project-123" ||
+		got.Nebius.SubnetID != "subnet-123" ||
+		got.Nebius.Platform != "cpu-d3" ||
+		got.Nebius.Preset != "4vcpu-16gb" ||
+		got.Nebius.ImageFamily != "ubuntu24.04-driverless" ||
+		got.Nebius.DiskType != "network_ssd" ||
+		got.Nebius.DiskSizeGiB != 50 ||
+		got.Nebius.User != "crabbox" ||
+		got.Nebius.PublicIP != "dynamic" ||
+		strings.Join(got.Nebius.SecurityGroupIDs, ",") != "sg-1,sg-2" ||
+		got.Nebius.ServiceAccountID != "sa-123" ||
+		got.Nebius.RecoveryPolicy != "fail" {
+		t.Fatalf("unexpected nebius json: %#v", got.Nebius)
+	}
+	nebiusJSON, err := json.Marshal(got.Nebius)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secretFragment := range []string{"token", "apiKey", "privateKey", "password"} {
+		if strings.Contains(string(nebiusJSON), secretFragment) {
+			t.Fatalf("nebius config show json exposed %q: %s", secretFragment, nebiusJSON)
+		}
+	}
+}
+
 func TestConfigShowAppliesNvidiaBrevGenericWorkRoot(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Provider = "nvidia-brev"
+	setProviderSelection(&cfg, "nvidia-brev", providerSelectionFlag)
 	cfg.WorkRoot = "/srv/crabbox"
 	MarkWorkRootExplicit(&cfg)
 	got := effectiveConfigForShow(cfg)
@@ -767,20 +2270,33 @@ func TestConfigShowAppliesNvidiaBrevGenericWorkRoot(t *testing.T) {
 }
 
 func TestConfigShowAppliesHostingerPerUserWorkRootDefault(t *testing.T) {
+	provider, err := ProviderFor("hostinger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootFor := func(cfg Config) any {
+		for _, field := range provider.(ProviderConfigShowProjector).ConfigShowSection(cfg).Fields {
+			if field.JSONName == "workRoot" {
+				return field.JSONValue
+			}
+		}
+		t.Fatal("Hostinger section missing workRoot")
+		return nil
+	}
 	other := effectiveConfigForShow(baseConfig())
-	if other.Hostinger.WorkRoot != "/home/root/crabbox" ||
+	if rootFor(other) != "/home/root/crabbox" ||
 		other.WorkRoot != defaultPOSIXWorkRoot {
 		t.Fatalf("unexpected inactive Hostinger defaults: %#v", other)
 	}
 
 	explicit := baseConfig()
 	explicit.Hostinger.WorkRoot = " /home/root/crabbox "
-	if got := effectiveConfigForShow(explicit).Hostinger.WorkRoot; got != explicit.Hostinger.WorkRoot {
+	if got := rootFor(effectiveConfigForShow(explicit)); got != explicit.Hostinger.WorkRoot {
 		t.Fatalf("explicit Hostinger work root changed: %q", got)
 	}
 
 	cfg := baseConfig()
-	cfg.Provider = "hostinger"
+	setProviderSelection(&cfg, "hostinger", providerSelectionFlag)
 	cfg.Hostinger.User = "ubuntu"
 
 	got := effectiveConfigForShow(cfg)
@@ -791,13 +2307,208 @@ func TestConfigShowAppliesHostingerPerUserWorkRootDefault(t *testing.T) {
 	}
 }
 
-func TestConfigShowPreservesExplicitDigitalOceanSSHBaseValues(t *testing.T) {
+func TestConfigShowSSHDefaults(t *testing.T) {
 	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	type sshValues struct{ user, port string }
+	for _, tc := range []struct {
+		name, provider     string
+		user, port         string
+		marked             *sshValues
+		fallback           []string
+		fallbackExplicit   bool
+		wantUser, wantPort string
+		wantFallback       []string
+	}{
+		{
+			name: "digitalocean/empty", provider: "digitalocean",
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "digitalocean/compiled connection defaults", provider: "digitalocean",
+			user: "crabbox", port: "2222", fallback: []string{"22", "2201"}, fallbackExplicit: true,
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "linode/empty", provider: "linode", fallback: []string{},
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "linode/compiled connection defaults", provider: "linode",
+			user: "crabbox", port: "2222", fallback: []string{"22", "2201"},
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "vultr/empty", provider: "vultr", fallback: []string{"22", "2201"},
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "vultr/compiled connection defaults", provider: "vultr",
+			user: "crabbox", port: "2222", fallback: []string{}, fallbackExplicit: true,
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "lambda/empty with fallback backing data", provider: "lambda",
+			fallback: []string{"2201", "2202"}[:0], fallbackExplicit: true,
+			wantUser: "ubuntu", wantPort: "22",
+		},
+		{
+			name: "lambda/compiled connection defaults", provider: "lambda",
+			user: "crabbox", port: "2222", fallback: []string{"22", "2201"}, fallbackExplicit: true,
+			wantUser: "ubuntu", wantPort: "22",
+		},
+		{
+			name: "scaleway/empty with explicit nil fallback", provider: "scaleway", fallbackExplicit: true,
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "scaleway/compiled connection defaults", provider: "scaleway",
+			user: "crabbox", port: "2222", fallback: []string{"22", "2201"},
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "tencentcloud/empty", provider: "tencentcloud", fallback: []string{"22", "2201"},
+			wantUser: "ubuntu", wantPort: "22",
+		},
+		{
+			name: "tencentcloud/compiled connection defaults", provider: "tencentcloud",
+			user: "crabbox", port: "2222", fallback: []string{},
+			wantUser: "ubuntu", wantPort: "22",
+		},
+		{
+			name: "digitalocean/custom user with base port", provider: "digitalocean",
+			user: "operator", port: "2222", fallback: []string{"2201"},
+			wantUser: "operator", wantPort: "22",
+		},
+		{
+			name: "linode/base user with custom port", provider: "linode",
+			user: "crabbox", port: "2200", wantUser: "root", wantPort: "2200",
+		},
+		{
+			name: "lambda/padded base values", provider: "lambda",
+			user: " crabbox ", port: " 2222 ", fallback: []string{"2201"},
+			wantUser: " crabbox ", wantPort: " 2222 ",
+		},
+		{
+			name: "vultr/whitespace values", provider: "vultr",
+			user: " \t", port: " ", wantUser: " \t", wantPort: " ",
+		},
+		{
+			name: "scaleway/user marker only", provider: "scaleway",
+			user: "crabbox", port: "2222", marked: &sshValues{user: "crabbox"},
+			wantUser: "crabbox", wantPort: "22",
+		},
+		{
+			name: "tencentcloud/port marker only", provider: "tencentcloud",
+			user: "crabbox", port: "2222", marked: &sshValues{port: "2222"},
+			wantUser: "ubuntu", wantPort: "2222",
+		},
+		{
+			name: "linode/both marked then base values", provider: "linode",
+			user: "crabbox", port: "2222", marked: &sshValues{user: "saved-user", port: "2200"},
+			fallback: []string{"22", "2201"}, fallbackExplicit: true,
+			wantUser: "crabbox", wantPort: "2222",
+		},
+		{
+			name: "vultr/both marked then cleared", provider: "vultr",
+			marked: &sshValues{user: "saved-user", port: "2200"}, fallback: []string{"2201"},
+			wantUser: "", wantPort: "",
+		},
+		{
+			name: "lambda/both marked then changed", provider: "lambda",
+			user: "current-user", port: "2202", marked: &sshValues{user: "saved-user", port: "2200"},
+			fallback: []string{"2203"}, fallbackExplicit: true,
+			wantUser: "current-user", wantPort: "2202",
+		},
+		{
+			name: "digitalocean/empty snapshots are not explicit", provider: "digitalocean",
+			user: "crabbox", port: "2222", marked: &sshValues{},
+			wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "tencentcloud/whitespace snapshots are explicit", provider: "tencentcloud",
+			marked:   &sshValues{user: " ", port: "\t"},
+			wantUser: "", wantPort: "",
+		},
+		{
+			name: "scaleway/actionable selection", provider: "scaleway",
+			fallback: []string{"2201"}, wantUser: "root", wantPort: "22",
+		},
+		{
+			name: "outside cohort/hetzner", provider: "hetzner",
+			fallback: []string{"22", "2201"}, wantFallback: []string{"22", "2201"},
+			wantUser: "", wantPort: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				TargetOS: "windows", WindowsMode: "wsl", Class: "beast", WorkRoot: "/srv/config-show",
+				SSHFallbackPorts: tc.fallback, sshFallbackPortsExplicit: tc.fallbackExplicit,
+			}
+			setProviderSelection(&cfg, tc.provider, providerSelectionFlag)
+			// Keep the unrelated work-root preprojections stable for the full-config comparison.
+			cfg.Hostinger.WorkRoot = "/srv/hostinger"
+			cfg.Vast.WorkRoot = "/srv/vast"
+			cfg.NvidiaBrev.WorkRoot = "/srv/brev"
+			MarkWorkRootExplicit(&cfg)
+			if tc.marked != nil {
+				cfg.SSHUser, cfg.SSHPort = tc.marked.user, tc.marked.port
+				MarkSSHUserExplicit(&cfg)
+				MarkSSHPortExplicit(&cfg)
+			}
+			cfg.SSHUser, cfg.SSHPort = tc.user, tc.port
+			if tc.fallbackExplicit {
+				cfg.explicitSSHFallbackPorts = []string{"2205", "2206"}
+			}
+			before := cfg
+			before.SSHFallbackPorts = slices.Clone(cfg.SSHFallbackPorts)
+			before.explicitSSHFallbackPorts = slices.Clone(cfg.explicitSSHFallbackPorts)
+			fallbackBacking := cfg.SSHFallbackPorts[:cap(cfg.SSHFallbackPorts)]
+			beforeBacking := slices.Clone(fallbackBacking)
+			want := before
+			want.SSHUser, want.SSHPort, want.SSHFallbackPorts = tc.wantUser, tc.wantPort, tc.wantFallback
+
+			got := effectiveConfigForShow(cfg)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("display config differs from expected SSH-only projection: user=%q port=%q fallbacks=%#v; want user=%q port=%q fallbacks=%#v",
+					got.SSHUser, got.SSHPort, got.SSHFallbackPorts, tc.wantUser, tc.wantPort, tc.wantFallback)
+			}
+			if !reflect.DeepEqual(cfg, before) {
+				t.Error("display projection changed the input config or marker snapshots")
+			}
+			if !reflect.DeepEqual(fallbackBacking, beforeBacking) {
+				t.Errorf("display projection changed fallback backing data: got %#v, want %#v", fallbackBacking, beforeBacking)
+			}
+		})
+	}
+}
+
+func TestConfigShowSSHDefaultsUnselected(t *testing.T) {
+	clearConfigEnv(t)
+	for _, provider := range []string{"", "hetzner", "digitalocean", "linode", "vultr", "lambda", "scaleway", "tencentcloud", " digitalocean ", "do", "Lambda"} {
+		for _, source := range []providerSelectionSource{"", providerSelectionCompiledDefault} {
+			t.Run(provider+"/"+string(source), func(t *testing.T) {
+				cfg := Config{
+					Provider: provider, providerSelectionSource: source,
+					SSHUser: "crabbox", SSHPort: "2222", SSHFallbackPorts: []string{"2201"},
+				}
+				cfg.Hostinger.WorkRoot = "/srv/hostinger"
+				cfg.Vast.WorkRoot = "/srv/vast"
+				cfg.NvidiaBrev.WorkRoot = "/srv/brev"
+				before := cfg
+				before.SSHFallbackPorts = slices.Clone(cfg.SSHFallbackPorts)
+				if got := effectiveConfigForShow(cfg); !reflect.DeepEqual(got, before) {
+					t.Fatal("unselected provider changed display configuration")
+				}
+				if !reflect.DeepEqual(cfg, before) {
+					t.Fatal("unselected display projection changed the input configuration")
+				}
+			})
+		}
+	}
+}
+
+func TestConfigShowPreservesExplicitDigitalOceanSSHBaseValues(t *testing.T) {
+	configPath := isolatedConfigPath(t)
 	if err := os.WriteFile(configPath, []byte("provider: digitalocean\nssh:\n  user: crabbox\n  port: \"2222\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -820,12 +2531,7 @@ func TestConfigShowPreservesExplicitDigitalOceanSSHBaseValues(t *testing.T) {
 }
 
 func TestConfigShowIncludesMorphWithoutSecret(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("MORPH_API_KEY", "morph-secret-token")
 	if err := os.WriteFile(configPath, []byte("morph:\n  apiUrl: https://morph.example.test\n  snapshot: snapshot_123\n  sshGatewayHost: ssh.morph.example.test\n  workRoot: /tmp/morph\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -871,12 +2577,7 @@ func TestConfigShowIncludesMorphWithoutSecret(t *testing.T) {
 }
 
 func TestConfigShowSurfacesUnsupportedAzureDynamicSessionsPool(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	if err := os.WriteFile(configPath, []byte("azureDynamicSessions:\n  endpoint: https://pool.env.eastus.azurecontainerapps.io\n  pool: legacy-pool\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -908,12 +2609,7 @@ func TestConfigShowSurfacesUnsupportedAzureDynamicSessionsPool(t *testing.T) {
 }
 
 func TestConfigShowIncludesSyncInclude(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	if err := os.WriteFile(configPath, []byte("sync:\n  include:\n    - src\n    - scripts\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -945,12 +2641,7 @@ func TestConfigShowIncludesSyncInclude(t *testing.T) {
 }
 
 func TestConfigShowIncludesXCPNgWithoutSecret(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	config := []byte(`xcpNg:
   apiUrl: https://xcp-ng.example.test
   username: root
@@ -1017,14 +2708,9 @@ func TestConfigShowIncludesXCPNgWithoutSecret(t *testing.T) {
 }
 
 func TestConfigShowRedactsXCPNgAPIURLUserinfo(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	config := []byte(`xcpNg:
-  apiUrl: https://pool-user:pool-pass@xcp-ng.example.test/path?view=1
+  apiUrl: https://pool-user:pool-pass@xcp-ng.example.test/path?token=query-secret#fragment-secret
   username: root
   password: xcp-ng-secret
 `)
@@ -1038,11 +2724,11 @@ func TestConfigShowRedactsXCPNgAPIURLUserinfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := stdout.String()
-	wantURL := "https://<redacted>@xcp-ng.example.test/path?view=1"
+	wantURL := "https://<redacted>@xcp-ng.example.test/path"
 	if !strings.Contains(text, "xcp_ng api_url="+wantURL) {
 		t.Fatalf("config show text missing redacted XCP-ng API URL: %q", text)
 	}
-	for _, secret := range []string{"pool-user", "pool-pass", "pool-user:pool-pass", "xcp-ng-secret"} {
+	for _, secret := range []string{"pool-user", "pool-pass", "pool-user:pool-pass", "xcp-ng-secret", "query-secret", "fragment-secret"} {
 		if strings.Contains(text, secret) {
 			t.Fatalf("config show text leaked %q: %q", secret, text)
 		}
@@ -1064,7 +2750,56 @@ func TestConfigShowRedactsXCPNgAPIURLUserinfo(t *testing.T) {
 	if got.XCPNg.APIURL != wantURL || got.XCPNg.Auth != "configured" {
 		t.Fatalf("unexpected xcp-ng json: %#v", got.XCPNg)
 	}
-	for _, secret := range []string{"pool-user", "pool-pass", "pool-user:pool-pass", "xcp-ng-secret"} {
+	for _, secret := range []string{"pool-user", "pool-pass", "pool-user:pool-pass", "xcp-ng-secret", "query-secret", "fragment-secret"} {
+		if strings.Contains(stdout.String(), secret) {
+			t.Fatalf("config show json leaked %q: %q", secret, stdout.String())
+		}
+	}
+}
+
+func TestConfigShowRedactsProxmoxAPIURLUserinfo(t *testing.T) {
+	configPath := isolatedConfigPath(t)
+	config := []byte(`proxmox:
+  apiUrl: https://proxy-user:proxy-pass@pve.example.test:8006/api2/json?view=1
+  tokenId: crabbox@pve!ci
+  tokenSecret: proxmox-token-secret
+`)
+	if err := os.WriteFile(configPath, config, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
+	if err := app.configShow(nil); err != nil {
+		t.Fatal(err)
+	}
+	wantURL := "https://<redacted>@pve.example.test:8006/api2/json"
+	if !strings.Contains(stdout.String(), "proxmox api_url="+wantURL) {
+		t.Fatalf("config show text missing redacted Proxmox API URL: %q", stdout.String())
+	}
+	for _, secret := range []string{"proxy-user", "proxy-pass", "proxy-user:proxy-pass", "proxmox-token-secret"} {
+		if strings.Contains(stdout.String(), secret) {
+			t.Fatalf("config show text leaked %q: %q", secret, stdout.String())
+		}
+	}
+
+	stdout.Reset()
+	if err := app.configShow([]string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Proxmox struct {
+			APIURL string `json:"apiUrl"`
+			Auth   string `json:"auth"`
+		} `json:"proxmox"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Proxmox.APIURL != wantURL || got.Proxmox.Auth != "configured" {
+		t.Fatalf("unexpected Proxmox json: %#v", got.Proxmox)
+	}
+	for _, secret := range []string{"proxy-user", "proxy-pass", "proxy-user:proxy-pass", "proxmox-token-secret"} {
 		if strings.Contains(stdout.String(), secret) {
 			t.Fatalf("config show json leaked %q: %q", secret, stdout.String())
 		}
@@ -1072,12 +2807,7 @@ func TestConfigShowRedactsXCPNgAPIURLUserinfo(t *testing.T) {
 }
 
 func TestConfigShowRedactsSchemeLessXCPNgAPIURLUserinfo(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	config := []byte(`xcpNg:
   apiUrl: pool-user:pool-pass@xcp-ng.example.test/path?view=1
   username: root
@@ -1093,7 +2823,7 @@ func TestConfigShowRedactsSchemeLessXCPNgAPIURLUserinfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := stdout.String()
-	wantURL := "<redacted>@xcp-ng.example.test/path?view=1"
+	wantURL := "<redacted>@xcp-ng.example.test/path"
 	if !strings.Contains(text, "xcp_ng api_url="+wantURL) {
 		t.Fatalf("config show text missing redacted scheme-less XCP-ng API URL: %q", text)
 	}
@@ -1126,11 +2856,13 @@ func TestConfigShowRedactsSchemeLessXCPNgAPIURLUserinfo(t *testing.T) {
 	}
 }
 
-func TestRedactedConfigURLRedactsUserinfoOnMalformedURL(t *testing.T) {
+func TestRedactedConfigURLFailsClosedForMalformedURL(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		raw  string
 	}{
+		{"query secret in malformed path", "https://loader.example.test/%zz?token=@query-secret"},
+		{"fragment secret in malformed URL", "https://api-token:443#pass@host/%zz"},
 		{"full URL with bad escape in host", "https://pool-user:pool-pass@%zz"},
 		{"full URL with bad escape in path", "https://pool-user:pool-pass@xcp-ng.example.test/%zz"},
 		{"full URL with bad port", "https://pool-user:pool-pass@xcp-ng.example.test:abc"},
@@ -1144,12 +2876,223 @@ func TestRedactedConfigURLRedactsUserinfoOnMalformedURL(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := redactedConfigURL(tc.raw)
+			if got != "<redacted>" {
+				t.Fatalf("redacted URL for %q=%q, want <redacted>", tc.raw, got)
+			}
 			for _, secret := range []string{"pool-user", "pool-pass", "pool/pass", "pool?pass", "pool#pass", "pool@pass", "pool-user:pool-pass"} {
 				if strings.Contains(got, secret) {
 					t.Fatalf("redacted URL leaked %q for %q: %s", secret, tc.raw, got)
 				}
 			}
 		})
+	}
+}
+
+func TestRedactedConfigURLRemovesQueryAndFragment(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "absolute without userinfo",
+			raw:  "https://api.example.test/v1?token=query-secret#fragment-secret",
+			want: "https://api.example.test/v1",
+		},
+		{
+			name: "absolute with userinfo",
+			raw:  "https://user:password@api.example.test/v1?view=1#section",
+			want: "https://<redacted>@api.example.test/v1",
+		},
+		{
+			name: "scheme-less",
+			raw:  "api.example.test/v1?token=query-secret#fragment-secret",
+			want: "api.example.test/v1",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := redactedConfigURL(test.raw); got != test.want {
+				t.Fatalf("redactedConfigURL(%q)=%q, want %q", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestConfigShowIncusResolvedSettings(t *testing.T) {
+	for _, source := range []string{"defaults", "file", "environment"} {
+		t.Run(source, func(t *testing.T) {
+			clearConfigEnv(t)
+			for _, suffix := range strings.Fields(`REMOTE PROJECT ADDRESS SOCKET INSTANCE_TYPE IMAGE PROFILE USER WORK_ROOT
+DELETE_ON_RELEASE START_TIMEOUT LAUNCH_PORT PROXY_LISTEN_HOST PROXY_LISTEN_PORT PROXY_DEVICE TLS_SERVER_CERT INSECURE_TLS REMOTE_IMAGE_SERVER`) {
+				t.Setenv("CRABBOX_INCUS_"+suffix, "")
+			}
+			t.Setenv("CRABBOX_PROVIDER", "")
+			t.Chdir(t.TempDir())
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			t.Setenv("CRABBOX_CONFIG", configPath)
+			want := map[string]any{
+				"remote": "local", "project": "", "address": "", "socket": "",
+				"instanceType": "container", "image": "images:ubuntu/24.04/cloud", "profile": "",
+				"user": "crabbox", "workRoot": "/work/crabbox", "deleteOnRelease": true,
+				"startTimeout": "10m0s", "launchPort": "22", "proxyListenHost": "127.0.0.1",
+				"proxyListenPort": "", "proxyDevice": "crabbox-ssh", "tlsServerCert": "",
+				"insecureTLS": false, "remoteImageServer": "",
+			}
+			if source != "defaults" {
+				config := `provider: incus
+incus:
+  remote: lab
+  project: proof
+  address: https://incus.example.test:8443
+  socket: ~/incus.sock
+  instanceType: container
+  image: local:custom-image
+  profile: file-profile
+  user: alice
+  workRoot: /workspace
+  deleteOnRelease: false
+  startTimeout: 3m
+  launchPort: "2200"
+  proxyListenHost: 192.0.2.10
+  proxyDevice: proof-ssh
+  tlsServerCert: ~/server.crt
+  insecureTLS: true
+  remoteImageServer: https://images.example.test
+`
+				if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				want = map[string]any{
+					"remote": "lab", "project": "proof", "address": "https://incus.example.test:8443",
+					"socket":       filepath.Join(os.Getenv("HOME"), "incus.sock"),
+					"instanceType": "container", "image": "local:custom-image", "profile": "file-profile",
+					"user": "alice", "workRoot": "/workspace", "deleteOnRelease": false,
+					"startTimeout": "3m0s", "launchPort": "2200", "proxyListenHost": "192.0.2.10",
+					"proxyListenPort": "", "proxyDevice": "proof-ssh",
+					"tlsServerCert": filepath.Join(os.Getenv("HOME"), "server.crt"),
+					"insecureTLS":   true, "remoteImageServer": "https://images.example.test",
+				}
+			}
+			if source == "environment" {
+				t.Setenv("CRABBOX_PROVIDER", "incus")
+				t.Setenv("CRABBOX_INCUS_INSTANCE_TYPE", "vm")
+				t.Setenv("CRABBOX_INCUS_PROFILE", "proof-secureboot")
+				t.Setenv("CRABBOX_INCUS_SOCKET", "~/env-incus.sock")
+				want["instanceType"] = "vm"
+				want["profile"] = "proof-secureboot"
+				want["socket"] = filepath.Join(os.Getenv("HOME"), "env-incus.sock")
+			}
+			cfg, err := loadConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(configShowView(effectiveConfigForShow(cfg)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var view struct {
+				Incus map[string]any `json:"incus"`
+			}
+			if err := json.Unmarshal(data, &view); err != nil {
+				t.Fatal(err)
+			}
+			if len(view.Incus) != len(want) {
+				t.Fatalf("incus field count=%d, want %d", len(view.Incus), len(want))
+			}
+			for key, value := range want {
+				if view.Incus[key] != value {
+					t.Errorf("incus.%s=%#v, want %#v", key, view.Incus[key], value)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigShowIncusRedactsEndpoints(t *testing.T) {
+	const userinfo = "api-user:api-password@"
+	for _, tc := range []struct{ name, raw, want string }{
+		{"empty", "", ""},
+		{"https", "https://" + userinfo + "incus.example.test:8443/path?token=query-secret#fragment-secret", "https://<redacted>@incus.example.test:8443/path"},
+		{"scheme-less", userinfo + "incus.example.test:8443/path?token=query-secret#fragment-secret", "<redacted>@incus.example.test:8443/path"},
+		{"malformed", "https://" + userinfo + "incus.example.test/%zz?token=query-secret#fragment-secret", "<redacted>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Incus.Address, cfg.Incus.RemoteImageServer = tc.raw, tc.raw
+			cfg.Incus.CheckpointMetadata = map[string]string{"private": "checkpoint-secret"}
+			view, ok := configShowView(cfg)["incus"].(map[string]any)
+			if !ok {
+				t.Fatal("missing incus object")
+			}
+			for _, field := range []string{"address", "remoteImageServer"} {
+				if view[field] != tc.want {
+					t.Errorf("incus.%s=%q, want %q", field, view[field], tc.want)
+				}
+			}
+			data, err := json.Marshal(view)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, secret := range []string{"api-user", "api-password", "query-secret", "fragment-secret", "checkpoint-secret"} {
+				if strings.Contains(string(data), secret) {
+					t.Errorf("incus JSON leaked %q", secret)
+				}
+			}
+			if cfg.Incus.Address != tc.raw || cfg.Incus.RemoteImageServer != tc.raw {
+				t.Fatal("config show mutated Incus endpoints")
+			}
+		})
+	}
+}
+
+func TestConfigShowRedactsAllEndpointURLComponents(t *testing.T) {
+	const rawURL = "https://api-user:api-password@api.example.test/v1?token=query-secret#fragment-secret"
+	cfg := Config{Coordinator: rawURL}
+	cfg.NamespaceInstance.Endpoint = rawURL
+	cfg.Morph.APIURL = rawURL
+	cfg.E2B.APIURL = rawURL
+	cfg.UpstashBox.BaseURL = rawURL
+	cfg.Smolvm.BaseURL = rawURL
+	cfg.Blaxel.APIURL = rawURL
+	cfg.AsciiBox.BaseURL = rawURL
+	cfg.Superserve.BaseURL = rawURL
+	cfg.Cloudflare.APIURL = rawURL
+	cfg.FastAPICloud.APIURL = rawURL
+	cfg.CloudflareDynamicWorkers.LoaderURL = rawURL
+	cfg.CloudflareSandbox.BridgeURL = rawURL
+	cfg.CloudRunSandbox.GatewayURL = rawURL
+	cfg.Nomad.Address = rawURL
+	cfg.Vast.APIURL = rawURL
+	cfg.Hostinger.APIURL = rawURL
+	cfg.OVH.Endpoint = rawURL
+	cfg.TencentCloud.APIEndpoint = rawURL
+	cfg.AzureDynamicSessions.Endpoint = rawURL
+	cfg.Proxmox.APIURL = rawURL
+	cfg.XCPNg.APIURL = rawURL
+
+	var text bytes.Buffer
+	writeConfigShowText(&text, cfg)
+	view := configShowView(cfg)
+	sections, err := collectProviderConfigShowSections(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := addProviderConfigShowSections(view, sections); err != nil {
+		t.Fatal(err)
+	}
+	jsonData, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, output := range map[string]string{"text": text.String(), "json": string(jsonData)} {
+		if !strings.Contains(output, "api.example.test/v1") {
+			t.Fatalf("%s output omitted safe endpoint: %s", name, output)
+		}
+		for _, secret := range []string{"api-user", "api-password", "query-secret", "fragment-secret"} {
+			if strings.Contains(output, secret) {
+				t.Fatalf("%s output leaked %q: %s", name, secret, output)
+			}
+		}
 	}
 }
 
@@ -1175,13 +3118,12 @@ func TestRoutingSafeURLRedactsUserinfoOnMalformedURL(t *testing.T) {
 }
 
 func TestConfigShowIncludesDockerSandboxConfig(t *testing.T) {
-	clearConfigEnv(t)
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
 	home := t.TempDir()
 	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
-	t.Setenv("CRABBOX_PROVIDER", "")
 	if err := os.WriteFile(configPath, []byte(`provider: docker-sandbox
 dockerSandbox:
   cliPath: /opt/sbx
@@ -1194,13 +3136,29 @@ dockerSandbox:
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("CRABBOX_DOCKER_SANDBOX_EXTRA_WORKSPACES", "/tmp/extra")
-	t.Setenv("CRABBOX_DOCKER_SANDBOX_MCP", "context7,all")
-	t.Setenv("CRABBOX_DOCKER_SANDBOX_KIT", "example-org/base")
-
 	var stdout bytes.Buffer
-	app := App{Stdout: &stdout, Stderr: &bytes.Buffer{}}
-	if err := app.configShow(nil); err != nil {
+	runShow := func(args []string) error {
+		cmd := exec.CommandContext(t.Context(), binary, append([]string{"config", "show"}, args...)...)
+		cmd.Dir = home
+		cmd.Env = []string{
+			"HOME=" + home, "USERPROFILE=" + home, "APPDATA=" + home,
+			"XDG_CONFIG_HOME=" + home, "XDG_STATE_HOME=" + home,
+			"CRABBOX_CONFIG=" + configPath, "PATH=" + t.TempDir(),
+			"CRABBOX_DOCKER_SANDBOX_EXTRA_WORKSPACES=/tmp/extra",
+			"CRABBOX_DOCKER_SANDBOX_MCP=context7,all",
+			"CRABBOX_DOCKER_SANDBOX_KIT=example-org/base",
+		}
+		var stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("config show: %w: %s", err, &stderr)
+		}
+		if stderr.Len() != 0 {
+			return fmt.Errorf("config show stderr: %s", &stderr)
+		}
+		return nil
+	}
+	if err := runShow(nil); err != nil {
 		t.Fatal(err)
 	}
 	text := stdout.String()
@@ -1217,7 +3175,7 @@ dockerSandbox:
 	}
 
 	stdout.Reset()
-	if err := app.configShow([]string{"--json"}); err != nil {
+	if err := runShow([]string{"--json"}); err != nil {
 		t.Fatal(err)
 	}
 	var got struct {
@@ -1247,12 +3205,7 @@ dockerSandbox:
 }
 
 func TestConfigShowRejectsInvalidDockerSandboxCPUConfig(t *testing.T) {
-	clearConfigEnv(t)
-	home := t.TempDir()
-	configPath := filepath.Join(home, "config.yaml")
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("CRABBOX_CONFIG", configPath)
+	configPath := isolatedConfigPath(t)
 	t.Setenv("CRABBOX_PROVIDER", "docker-sandbox")
 	if err := os.WriteFile(configPath, []byte("profile: default\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1276,5 +3229,441 @@ func TestConfigShowRejectsInvalidDockerSandboxCPUConfig(t *testing.T) {
 	stdout.Reset()
 	if err := app.configShow([]string{"--json"}); err == nil || !strings.Contains(err.Error(), "docker-sandbox cpus must be a whole number") {
 		t.Fatalf("configShow --json err=%v, want docker-sandbox whole-number validation", err)
+	}
+}
+
+func TestMachine0ConfigWorkRootDisplay(t *testing.T) {
+	if got := machine0ConfigWorkRoot(""); got != "<dynamic:/home/<resolved-ssh-user>/crabbox>" {
+		t.Fatalf("dynamic work root display=%q", got)
+	}
+	if got := machine0ConfigWorkRoot("/srv/explicit"); got != "/srv/explicit" {
+		t.Fatalf("explicit work root display=%q", got)
+	}
+}
+
+func TestConfigShowArchitectureExplicitnessOffline(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml, env, arch string
+		explicit              bool
+	}{
+		{name: "default", arch: "amd64"},
+		{name: "empty yaml", yaml: "architecture: ''\n", arch: "amd64"},
+		{name: "yaml amd64", yaml: "architecture: amd64\n", arch: "amd64", explicit: true},
+		{name: "yaml arm64", yaml: "architecture: arm64\n", arch: "arm64", explicit: true},
+		{name: "environment overrides yaml", yaml: "architecture: arm64\n", env: "amd64", arch: "amd64", explicit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateDoctorProviderSelectionTest(t)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte("provider: ssh\ntarget: macos\nstatic:\n  host: offline.example.test\n"+tc.yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CRABBOX_CONFIG", path)
+			t.Setenv("CRABBOX_ARCH", tc.env)
+			// No executable can run. config show must not probe/admit the host.
+			t.Setenv("PATH", t.TempDir())
+			for _, jsonOutput := range []bool{false, true} {
+				var out, log bytes.Buffer
+				args := []string{}
+				if jsonOutput {
+					args = []string{"--json"}
+				}
+				if err := (App{Stdout: &out, Stderr: &log}).configShow(args); err != nil {
+					t.Fatal(err)
+				}
+				if jsonOutput {
+					var view map[string]any
+					if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+						t.Fatal(err)
+					}
+					if view["architecture"] != tc.arch || view["architectureExplicit"] != tc.explicit {
+						t.Fatalf("view=%v", view)
+					}
+				} else if !strings.Contains(out.String(), fmt.Sprintf("arch=%s architecture_explicit=%t", tc.arch, tc.explicit)) {
+					t.Fatalf("text=%s", &out)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigShowLocalContainerSettingsOffline(t *testing.T) {
+	binary, err := builtCLITestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const configured = `localContainer:
+  runtime: docker
+  image: debian:bookworm
+  user: test-runner
+  workRoot: /work/custom
+  cpus: 3
+  memory: 6g
+  network: none
+  dockerSocket: true
+`
+	for _, tc := range []struct {
+		name, yaml, root, arch string
+		env, args              []string
+		local                  map[string]any
+		socketDefault          bool
+	}{
+		{name: "defaults", yaml: "provider: local-container\n"},
+		{name: "issue reproduction", yaml: "provider: local-container\nprofile: local-container-config-proof\n" + configured, root: "/work/custom", local: map[string]any{
+			"image": "debian:bookworm", "user": "test-runner", "cpus": float64(3), "memory": "6g", "network": "none", "dockerSocket": true,
+		}},
+		{name: "environment overrides file", yaml: "provider: local-container\n" + configured, root: "/work/env", env: []string{
+			"CRABBOX_LOCAL_CONTAINER_RUNTIME=podman", "CRABBOX_LOCAL_CONTAINER_IMAGE=example-org/custom:latest",
+			"CRABBOX_LOCAL_CONTAINER_USER=env-runner", "CRABBOX_LOCAL_CONTAINER_WORK_ROOT=/work/env",
+			"CRABBOX_LOCAL_CONTAINER_CPUS=4", "CRABBOX_LOCAL_CONTAINER_MEMORY=8g", "CRABBOX_LOCAL_CONTAINER_NETWORK=bridge",
+			"CRABBOX_LOCAL_CONTAINER_DOCKER_SOCKET=false",
+		}, local: map[string]any{"runtime": "podman", "image": "example-org/custom:latest", "user": "env-runner", "cpus": float64(4), "memory": "8g"}},
+		{name: "environment zero false and empty", yaml: "provider: local-container\n" + configured, root: "/work/custom", env: []string{
+			"CRABBOX_LOCAL_CONTAINER_RUNTIME=", "CRABBOX_LOCAL_CONTAINER_IMAGE=", "CRABBOX_LOCAL_CONTAINER_USER=",
+			"CRABBOX_LOCAL_CONTAINER_WORK_ROOT=", "CRABBOX_LOCAL_CONTAINER_CPUS=0", "CRABBOX_LOCAL_CONTAINER_MEMORY=",
+			"CRABBOX_LOCAL_CONTAINER_NETWORK=", "CRABBOX_LOCAL_CONTAINER_DOCKER_SOCKET=false",
+		}, local: map[string]any{"image": "debian:bookworm", "user": "test-runner", "memory": "6g", "network": "none"}},
+		{name: "file zero false and empty", yaml: "provider: local-container\nlocalContainer:\n  cpus: 0\n  memory: ''\n  dockerSocket: false\n"},
+		{name: "generic file root", yaml: "provider: local-container\nworkRoot: /work/generic\n", root: "/work/generic"},
+		{name: "generic environment root", yaml: "provider: local-container\nworkRoot: /work/file\n", env: []string{"CRABBOX_WORK_ROOT=/work/env"}, root: "/work/env"},
+		{name: "provider file beats generic environment", yaml: "provider: local-container\nlocalContainer:\n  workRoot: /work/provider\n", env: []string{"CRABBOX_WORK_ROOT=/work/env"}, root: "/work/provider"},
+		{name: "provider environment beats file", yaml: "provider: local-container\nworkRoot: /work/generic\nlocalContainer:\n  workRoot: /work/file\n", env: []string{"CRABBOX_LOCAL_CONTAINER_WORK_ROOT=/work/provider"}, root: "/work/provider"},
+		{name: "socket default root", yaml: "provider: local-container\nlocalContainer:\n  dockerSocket: true\n", socketDefault: true, local: map[string]any{"dockerSocket": true}},
+		{name: "socket explicit generic default", yaml: "provider: local-container\nworkRoot: /work/crabbox\nlocalContainer:\n  dockerSocket: true\n", local: map[string]any{"dockerSocket": true}},
+		{name: "socket explicit provider default", yaml: "provider: local-container\nlocalContainer:\n  workRoot: /work/crabbox\n  dockerSocket: true\n", local: map[string]any{"dockerSocket": true}},
+		{name: "socket generic custom root", yaml: "provider: local-container\nworkRoot: /work/generic\nlocalContainer:\n  dockerSocket: true\n", root: "/work/generic", local: map[string]any{"dockerSocket": true}},
+		{name: "socket environment explicit default", yaml: "provider: local-container\nlocalContainer:\n  dockerSocket: true\n", env: []string{"CRABBOX_LOCAL_CONTAINER_WORK_ROOT=/work/crabbox"}, local: map[string]any{"dockerSocket": true}},
+		{name: "no provider selected", local: map[string]any{"workRoot": ""}, arch: "amd64"},
+		{name: "other provider selected", yaml: "provider: hetzner\nworkRoot: /work/other\nlocalContainer:\n  workRoot: /work/local\n  dockerSocket: true\n", root: "/work/other", arch: "amd64", local: map[string]any{"workRoot": "/work/local", "dockerSocket": true}},
+		{name: "provider flag override", yaml: "provider: hetzner\nlocalContainer:\n  workRoot: /work/local\n", args: []string{"--provider", "local-container"}, root: "/work/local"},
+		{name: "explicit amd64", yaml: "provider: local-container\narchitecture: amd64\n", arch: "amd64"},
+		{name: "explicit arm64", yaml: "provider: local-container\narchitecture: arm64\n", arch: "arm64"},
+		{name: "environment architecture", yaml: "provider: local-container\narchitecture: arm64\n", env: []string{"CRABBOX_ARCH=amd64"}, arch: "amd64"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			configPath := filepath.Join(root, "config.yaml")
+			if err := os.Mkdir(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(configPath, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			wantRoot := tc.root
+			if wantRoot == "" {
+				wantRoot = "/work/crabbox"
+			}
+			cache := filepath.Join(root, "cache")
+			if tc.socketDefault && runtime.GOOS != "windows" {
+				if runtime.GOOS == "darwin" {
+					cache = filepath.Join(home, "Library", "Caches")
+				}
+				wantRoot = filepath.Join(cache, "crabbox", "local-container-work")
+			}
+			want := map[string]any{
+				"runtime": "docker", "image": baseConfig().LocalContainer.Image, "user": "crabbox", "workRoot": wantRoot,
+				"cpus": float64(0), "memory": "", "network": "bridge", "dockerSocket": false,
+			}
+			for key, value := range tc.local {
+				want[key] = value
+			}
+			arch := tc.arch
+			if arch == "" {
+				arch = "native"
+			}
+			explicit := strings.Contains(tc.yaml, "architecture:")
+			var baseline [2]string
+			for _, tools := range []string{"unavailable", "podman", "docker and podman"} {
+				binDir := filepath.Join(root, tools)
+				if err := os.Mkdir(binDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				trap := filepath.Join(root, "runtime-executed")
+				if runtime.GOOS != "windows" && tools != "unavailable" {
+					for _, name := range strings.Fields(tools) {
+						if name == "and" {
+							continue
+						}
+						if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nprintf invoked > \"$RUNTIME_TRAP\"\nexit 97\n"), 0o700); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				for format := range 2 {
+					args := append([]string{"config", "show"}, tc.args...)
+					if format == 1 {
+						args = append(args, "--json")
+					}
+					cmd := exec.Command(binary, args...)
+					cmd.Dir = root
+					cmd.Env = append([]string{
+						"HOME=" + home, "USERPROFILE=" + home, "APPDATA=" + root, "LOCALAPPDATA=" + cache,
+						"XDG_CONFIG_HOME=" + root, "XDG_CACHE_HOME=" + cache, "XDG_STATE_HOME=" + root,
+						"CRABBOX_CONFIG=" + configPath, "PATH=" + binDir, "RUNTIME_TRAP=" + trap,
+					}, tc.env...)
+					var stderr bytes.Buffer
+					cmd.Stderr = &stderr
+					out, err := cmd.Output()
+					if err != nil || stderr.Len() != 0 {
+						t.Fatalf("config show format=%d tools=%s: %v stderr=%s", format, tools, err, &stderr)
+					}
+					if tools == "unavailable" {
+						baseline[format] = string(out)
+					} else if string(out) != baseline[format] {
+						t.Errorf("format=%d changed when %s became discoverable", format, tools)
+					}
+					if format == 1 {
+						var view map[string]any
+						if err := json.Unmarshal(out, &view); err != nil {
+							t.Fatal(err)
+						}
+						if !reflect.DeepEqual(view["localContainer"], want) {
+							t.Errorf("localContainer=%#v, want %#v", view["localContainer"], want)
+						}
+						if view["workRoot"] != wantRoot {
+							t.Errorf("workRoot=%v, want %s", view["workRoot"], wantRoot)
+						}
+						if view["architecture"] != arch || view["architectureExplicit"] != explicit {
+							t.Errorf("architecture=%v explicit=%v, want %s/%t", view["architecture"], view["architectureExplicit"], arch, explicit)
+						}
+					} else {
+						wantLine := fmt.Sprintf("local_container runtime=%s image=%s user=%s work_root=%s cpus=%g memory=%s network=%s docker_socket=%t\n",
+							want["runtime"], want["image"], want["user"], blank(want["workRoot"].(string), "-"), want["cpus"], blank(want["memory"].(string), "-"), want["network"], want["dockerSocket"])
+						if !strings.Contains(string(out), wantLine) {
+							t.Errorf("missing text line %q", wantLine)
+						}
+						if !strings.Contains(string(out), fmt.Sprintf("arch=%s architecture_explicit=%t", arch, explicit)) {
+							t.Errorf("missing architecture %s/%t", arch, explicit)
+						}
+					}
+				}
+				if _, err := os.Stat(trap); !os.IsNotExist(err) {
+					t.Fatalf("runtime trap executed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigShowCoordinatorEndpointAndTokenStatus(t *testing.T) {
+	cfg := baseConfig()
+	cfg.CoordToken = "synthetic-private-token"
+	cfg.Coordinator = "https://broker.example.test/api"
+	view := configShowView(cfg)
+	data, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text bytes.Buffer
+	writeConfigShowText(&text, cfg)
+	for name, output := range map[string]string{"json": string(data), "text": text.String()} {
+		if strings.Contains(output, "synthetic-private") {
+			t.Errorf("%s exposed internal fields or credentials", name)
+		}
+		if !strings.Contains(output, "broker.example.test/api") || !strings.Contains(output, "configured") {
+			t.Errorf("%s lost safe endpoint or token status", name)
+		}
+	}
+}
+
+func TestLambdaBindingFileRoundTrip(t *testing.T) {
+	path := isolatedConfigPath(t)
+	for _, tc := range []struct {
+		input, want string
+		nilLambda   bool
+	}{{"{}\n", "{}\n", true}, {"lambda: null\n", "{}\n", true}, {"lambda: {}\n", "lambda: {}\n", false}, {"lambda: {sshCIDRs: [], filesystemNames: [], filesystemMounts: []}\n", "lambda: {}\n", false}, {"lambda:\n  region: west\n  type: gpu\n  image: image\n  imageFamily: family\n  firewallRuleset: rule\n  sshCIDRs: [cidr]\n  filesystemNames: [data]\n  filesystemMounts:\n    - name: data\n      mountPath: /mnt/data\n    - {}\n", "lambda:\n    region: west\n    type: gpu\n    image: image\n    imageFamily: family\n    firewallRuleset: rule\n    sshCIDRs:\n        - cidr\n    filesystemNames:\n        - data\n    filesystemMounts:\n        - name: data\n          mountPath: /mnt/data\n        - {}\n", false}} {
+		if err := os.WriteFile(path, []byte(tc.input), 0600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (file.Lambda == nil) != tc.nilLambda {
+			t.Fatalf("decoded lambda=%#v", file.Lambda)
+		}
+		if tc.input == "lambda: {}\n" && !reflect.DeepEqual(*file.Lambda, fileLambdaConfig{}) {
+			t.Fatal("decoded file initialized runtime defaults")
+		}
+		written, err := writeUserFileConfig(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if written != path {
+			t.Fatalf("write path=%q", written)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != tc.want {
+			t.Fatalf("YAML got=%q want=%q", data, tc.want)
+		}
+		again, err := readFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.input != "lambda: {sshCIDRs: [], filesystemNames: [], filesystemMounts: []}\n" && !reflect.DeepEqual(again, file) {
+			t.Fatal("roundtrip fields changed")
+		}
+	}
+	for _, tc := range []struct{ input, detail string }{{"lambda: wrong\n", "line 1: cannot unmarshal !!str `wrong` into cli.fileLambdaConfig"}, {"lambda: [wrong]\n", "line 1: cannot unmarshal !!seq into cli.fileLambdaConfig"}} {
+		if err := os.WriteFile(path, []byte(tc.input), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readFileConfig(path)
+		want := "parse config " + path + ": yaml: unmarshal errors:\n  " + tc.detail
+		if err == nil || err.Error() != want {
+			t.Fatalf("diagnostic=%v want=%q", err, want)
+		}
+	}
+}
+
+func TestLambdaBindingJSON(t *testing.T) {
+	isolatedConfigPath(t)
+	cfg := baseConfig()
+	cfg.Lambda = LambdaConfig{Region: "west", Type: "gpu", Image: "image", ImageFamily: "family", FirewallRuleset: "rule", SSHCIDRs: []string{"cidr"}, FilesystemNames: []string{"data"}, FilesystemMounts: []LambdaFilesystemMount{{Name: "data", MountPath: "/mnt/data"}, {}}}
+	data, err := json.Marshal(cfg.Lambda)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"Region":"west","Type":"gpu","Image":"image","ImageFamily":"family","FirewallRuleset":"rule","SSHCIDRs":["cidr"],"FilesystemNames":["data"],"FilesystemMounts":[{"name":"data","mountPath":"/mnt/data"},{}]}`
+	if string(data) != want {
+		t.Fatalf("runtime JSON=%s", data)
+	}
+	data, err = json.Marshal(configShowView(cfg)["lambda"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = `{"auth":"missing","filesystemMounts":[{"name":"data","mountPath":"/mnt/data"},{}],"filesystemNames":["data"],"firewallRuleset":"rule","image":"image","imageFamily":"family","region":"west","sshCIDRs":["cidr"],"type":"gpu"}`
+	if string(data) != want {
+		t.Fatalf("config-show JSON=%s", data)
+	}
+}
+
+func TestProviderDisplayRootsAndSelection(t *testing.T) {
+	for _, name := range []string{"hostinger", "vast", "vast-ai", "vastai", "nvidia-brev", "brev", "nvidia"} {
+		provider, err := ProviderFor(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, selected := range []bool{false, true} {
+			for _, roots := range []string{"default", "generic", "provider", "explicit-default", "whitespace"} {
+				t.Run(name+"/"+strconv.FormatBool(selected)+"/"+roots, func(t *testing.T) {
+					cfg := baseConfig()
+					if selected {
+						setProviderSelection(&cfg, name, providerSelectionFlag)
+					}
+					cfg.SSHUser, cfg.SSHPort = "generic-user", "2209"
+					cfg.SSHFallbackPorts = []string{"2208"}
+					MarkSSHUserExplicit(&cfg)
+					MarkSSHPortExplicit(&cfg)
+					cfg.Hostinger.User, cfg.Vast.User = " raw-user ", " raw-user "
+					wantRoots := map[string]string{"hostinger": "/home/raw-user/crabbox", "vast": VastConfigDefaultWorkRoot, "nvidiaBrev": NvidiaBrevConfigDefaultWorkRoot}
+					if roots != "default" {
+						cfg.WorkRoot = "/generic/root"
+						MarkWorkRootExplicit(&cfg)
+						for key := range wantRoots {
+							wantRoots[key] = "/generic/root"
+						}
+					}
+					switch roots {
+					case "provider", "whitespace":
+						root := "/provider/root"
+						if roots == "whitespace" {
+							root = "  "
+						}
+						cfg.Hostinger.WorkRoot, cfg.Vast.WorkRoot, cfg.NvidiaBrev.WorkRoot = root, root, root
+						for key := range wantRoots {
+							wantRoots[key] = root
+						}
+					case "explicit-default":
+						cfg.Vast.WorkRoot, cfg.NvidiaBrev.WorkRoot = VastConfigDefaultWorkRoot, NvidiaBrevConfigDefaultWorkRoot
+						MarkVastWorkRootExplicit(&cfg)
+						MarkNvidiaBrevWorkRootExplicit(&cfg)
+						wantRoots["vast"], wantRoots["nvidiaBrev"] = VastConfigDefaultWorkRoot, NvidiaBrevConfigDefaultWorkRoot
+					}
+					before := cfg
+					before.SSHFallbackPorts = slices.Clone(cfg.SSHFallbackPorts)
+					got := effectiveConfigForShow(cfg)
+					if !reflect.DeepEqual(cfg, before) || !reflect.DeepEqual(got.inputProvenance, before.inputProvenance) {
+						t.Fatal("display changed input config or provenance")
+					}
+					sections, err := collectProviderConfigShowSections(got)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(cfg, before) {
+						t.Fatal("section projection mutated the original input")
+					}
+					for _, section := range sections {
+						want, check := wantRoots[section.JSONKey]
+						if !check {
+							continue
+						}
+						found := false
+						for _, field := range section.Fields {
+							if field.JSONName == "workRoot" {
+								found = true
+								if field.JSONValue != want || field.TextValue != want {
+									t.Fatalf("section=%s root=%v/%q want=%q", section.JSONKey, field.JSONValue, field.TextValue, want)
+								}
+							}
+						}
+						if !found {
+							t.Fatalf("section=%s missing workRoot", section.JSONKey)
+						}
+						delete(wantRoots, section.JSONKey)
+					}
+					if len(wantRoots) != 0 {
+						t.Fatalf("missing sections: %v", wantRoots)
+					}
+					if !selected {
+						if !reflect.DeepEqual(got, before) {
+							t.Fatal("inactive provider changed generic display configuration")
+						}
+						return
+					}
+					switch provider.Spec().Name {
+					case "hostinger":
+						if got.SSHUser != " raw-user " || got.SSHPort != "22" || got.SSHFallbackPorts != nil || got.WorkRoot != got.Hostinger.WorkRoot {
+							t.Fatal("Hostinger display connection projection changed")
+						}
+					case "vast":
+						if got.SSHUser != "generic-user" || got.SSHPort != "22" || got.SSHFallbackPorts != nil || got.WorkRoot != got.Vast.WorkRoot {
+							t.Fatal("Vast explicit user or fixed port projection changed")
+						}
+					case "nvidia-brev":
+						if got.SSHUser != before.SSHUser || got.SSHPort != before.SSHPort || !reflect.DeepEqual(got.SSHFallbackPorts, before.SSHFallbackPorts) || got.WorkRoot != got.NvidiaBrev.WorkRoot {
+							t.Fatal("Brev changed unrelated connection fields")
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestVastDisplayUsesProviderUserWithoutGenericProvenance(t *testing.T) {
+	cfg := baseConfig()
+	setProviderSelection(&cfg, "vast-ai", providerSelectionEnvironment)
+	cfg.SSHUser, cfg.SSHPort = "unmarked-user", "2209"
+	cfg.Vast.User = " raw-provider-user "
+	got := effectiveConfigForShow(cfg)
+	if got.SSHUser != cfg.Vast.User || got.SSHPort != "22" || got.SSHFallbackPorts != nil {
+		t.Fatalf("Vast display user/port/fallback=%q/%q/%v", got.SSHUser, got.SSHPort, got.SSHFallbackPorts)
+	}
+}
+
+func TestNomadDisplayVariableNameFallback(t *testing.T) {
+	for _, tc := range []struct{ raw, name, mode string }{{"", "NOMAD_TOKEN", "default"}, {"  ", "NOMAD_TOKEN", "default"}, {" NOMAD_TOKEN ", "NOMAD_TOKEN", "default"}, {" CUSTOM_NAME ", "CUSTOM_NAME", "custom"}} {
+		cfg := Config{Nomad: NomadConfig{TokenEnv: tc.raw}}
+		if got := nomadAuthEnv(cfg); got != tc.name {
+			t.Fatalf("display variable name=%q want=%q", got, tc.name)
+		}
+		if got := nomadTextAuthEnv(cfg); got != tc.mode {
+			t.Fatalf("display variable mode=%q want=%q", got, tc.mode)
+		}
 	}
 }

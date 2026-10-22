@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,74 +15,137 @@ func (a App) claimLeaseTargetForRepoAndRegister(
 	ctx context.Context,
 	leaseID, slug string,
 	cfg Config,
-	server Server,
+	server *Server,
 	target SSHTarget,
 	repoRoot string,
 	reclaim bool,
 ) error {
-	_, err := a.claimLeaseTargetForRepoAndRegisterMode(ctx, leaseID, slug, cfg, server, target, repoRoot, reclaim, false)
-	return err
+	return a.claimLeaseTargetForRepoAndRegisterMode(ctx, leaseID, slug, &cfg, server, target, repoRoot, reclaim, false, nil)
 }
 
 func (a App) claimResolvedLeaseTargetForRepoAndRegister(
 	ctx context.Context,
 	leaseID, slug string,
 	cfg Config,
-	server Server,
+	server *Server,
 	target SSHTarget,
 	repoRoot string,
 	reclaim bool,
 ) error {
-	_, err := a.claimLeaseTargetForRepoAndRegisterMode(ctx, leaseID, slug, cfg, server, target, repoRoot, reclaim, true)
-	return err
+	return a.claimLeaseTargetForRepoAndRegisterMode(ctx, leaseID, slug, &cfg, server, target, repoRoot, reclaim, true, nil)
+}
+
+func (a App) claimRunLeaseTargetForRepoAndRegister(
+	ctx context.Context,
+	leaseID, slug string,
+	cfg *Config,
+	server *Server,
+	target SSHTarget,
+	repoRoot string,
+	reclaim, resolved bool,
+	idleTimeoutOverride *time.Duration,
+) error {
+	return a.claimLeaseTargetForRepoAndRegisterMode(ctx, leaseID, slug, cfg, server, target, repoRoot, reclaim, resolved, idleTimeoutOverride)
+}
+
+// Initialized direct leases own their recorded idle policy. Managed leases instead
+// use the coordinator's projection; a registration URL alone does not make a
+// registered direct lease coordinator-managed.
+func applyClaimIdlePolicy(cfg *Config, server *Server, recorded LeaseClaim, exists bool, override *time.Duration) error {
+	if !exists {
+		return nil
+	}
+	policy := claimIdlePolicyForConfig(*cfg)
+	if policy == claimIdleCoordinatorProjection {
+		return nil
+	}
+	proposed := cfg.IdleTimeout
+	if override != nil {
+		policy, proposed = claimIdleReplaceExplicitly, *override
+	}
+	idle, normalize, err := selectClaimIdleTimeout(recorded.IdleTimeoutSeconds, proposed, policy)
+	if err != nil || !normalize {
+		return err
+	}
+	cfg.IdleTimeout = idle
+	server.Labels = claimLabelsWithIdleTimeout(server.Labels, idle)
+	return nil
+}
+
+func refreshRunLeaseClaimEndpoint(leaseID string, server *Server, target SSHTarget) {
+	if server == nil {
+		return
+	}
+	expected, exists, set := ServerLeaseClaimSnapshot(*server)
+	if !set || !exists {
+		return
+	}
+	updated, err := UpdateLeaseClaimEndpointIfUnchanged(leaseID, expected, *server, target)
+	if err == nil {
+		SetServerLeaseClaimSnapshot(server, updated, true)
+	}
 }
 
 func (a App) claimLeaseTargetForRepoAndRegisterMode(
 	ctx context.Context,
 	leaseID, slug string,
-	cfg Config,
-	server Server,
+	cfg *Config,
+	server *Server,
 	target SSHTarget,
 	repoRoot string,
 	reclaim, resolved bool,
-) (leaseClaim, error) {
+	idleTimeoutOverride *time.Duration,
+) error {
 	var expected leaseClaim
 	var expectedExists bool
 	var err error
 	if resolved {
-		expected, expectedExists, err = resolvedLeaseClaimSnapshot(leaseID, server)
+		expected, expectedExists, err = resolvedLeaseClaimSnapshot(leaseID, *server)
+	} else if server.claimSnapshotSet {
+		expected, expectedExists, err = resolvedLeaseClaimSnapshot(leaseID, *server)
 	} else {
-		expected, expectedExists, err = readLeaseClaimWithPresence(leaseID)
+		expected, expectedExists, err = ReadLeaseClaimWithPresence(leaseID)
 	}
 	if err != nil {
-		return leaseClaim{}, err
+		return err
 	}
-	claimed, err := claimLeaseTargetForRepoConfigIfUnchanged(
+	if err := applyClaimIdlePolicy(cfg, server, expected, expectedExists, idleTimeoutOverride); err != nil {
+		return err
+	}
+	idlePolicy := claimIdlePolicyForConfig(*cfg)
+	if idlePolicy == claimIdlePreserveRecorded && resolved && expectedExists && idleTimeoutOverride != nil {
+		idlePolicy = claimIdleReplaceExplicitly
+	}
+	provider, _ := claimProviderDetailsForConfig(*cfg)
+	claimed, err := claimLeaseTargetForRepoConfigScopeIfUnchangedMode(
 		leaseID,
 		slug,
-		cfg,
-		server,
+		*cfg,
+		providerClaimScope(provider, *cfg),
+		*server,
 		target,
 		repoRoot,
 		cfg.IdleTimeout,
 		reclaim,
 		expected,
 		expectedExists,
+		leaseClaimTargetOptions{idle: idlePolicy},
 	)
 	if err != nil {
-		return leaseClaim{}, err
+		return err
 	}
-	if err := a.registerCoordinatorLeaseBestEffort(ctx, cfg, LeaseTarget{
-		Server:  server,
+	SetServerLeaseClaimSnapshot(server, claimed, true)
+	lease := LeaseTarget{
+		Server:  *server,
 		SSH:     target,
 		LeaseID: leaseID,
-	}); err != nil {
-		return claimed, err
 	}
-	return claimed, nil
+	err = a.registerCoordinatorLeaseBestEffort(ctx, *cfg, &lease)
+	*server = lease.Server
+	return err
 }
 
-func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config, lease LeaseTarget) error {
+func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config, lease *LeaseTarget) error {
 	adapterID, workspaceID, adapterMode, bindingErr := adapterRuntimeRegistrationBinding()
 	if bindingErr != nil {
 		a.coordinatorRegistrationWarning(lease.LeaseID, bindingErr)
@@ -113,7 +175,7 @@ func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config,
 	provider := firstNonBlank(server.Provider, cfg.Provider)
 	targetOS := firstNonBlank(target.TargetOS, cfg.TargetOS)
 	registration := CoordinatorLeaseRegistration{
-		Slug:               firstNonBlank(serverSlug(server), lease.LeaseID),
+		Slug:               firstNonBlank(ServerSlug(server), lease.LeaseID),
 		Provider:           provider,
 		TargetOS:           targetOS,
 		WindowsMode:        firstNonBlank(target.WindowsMode, cfg.WindowsMode),
@@ -132,13 +194,13 @@ func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config,
 		WorkRoot:           cfg.WorkRoot,
 		Profile:            cfg.Profile,
 		Class:              cfg.Class,
-		Pond:               normalizePondName(cfg.Pond),
+		Pond:               NormalizePondName(cfg.Pond),
 		ExposedPorts:       append([]string(nil), cfg.ExposedPorts...),
 		TTLSeconds:         int(cfg.TTL.Seconds()),
 		IdleTimeoutSeconds: int(cfg.IdleTimeout.Seconds()),
 	}
 	if adapterMode {
-		registrationID, err := ensureRuntimeAdapterRegistrationID(lease.LeaseID)
+		registrationID, err := ensureRuntimeAdapterRegistrationID(lease.LeaseID, &lease.Server)
 		if err != nil {
 			a.coordinatorRegistrationWarning(lease.LeaseID, err)
 			return err
@@ -156,6 +218,7 @@ func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config,
 	if adapterMode && runtimeAdapterRegistrationReplay(err) {
 		registrationID, rotateErr := stageRuntimeAdapterRegistrationReplacement(
 			lease.LeaseID,
+			&lease.Server,
 			registration.RuntimeRegistrationID,
 		)
 		if rotateErr != nil {
@@ -169,6 +232,9 @@ func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config,
 		a.coordinatorRegistrationWarning(lease.LeaseID, err)
 		if adapterMode {
 			return fmt.Errorf("register adapter workspace with coordinator: %w", err)
+		}
+		if cfg.macOSPortalAuto {
+			return fmt.Errorf("register macOS portal lease with coordinator: %w", err)
 		}
 		return nil
 	}
@@ -190,13 +256,37 @@ func (a App) registerCoordinatorLeaseBestEffort(ctx context.Context, cfg Config,
 	if adapterMode {
 		if err := acknowledgeRuntimeAdapterRegistrationID(
 			lease.LeaseID,
+			&lease.Server,
 			registration.RuntimeRegistrationID,
 		); err != nil {
 			a.coordinatorRegistrationWarning(lease.LeaseID, err)
 			return err
 		}
 	}
+	if cfg.macOSPortalAuto {
+		if err := persistAutomaticCoordinatorRegistrationBinding(lease.LeaseID, &lease.Server, cfg, coord.BaseURL); err != nil {
+			callCtx, cancel := context.WithTimeout(context.Background(), coordinatorRegistrationTimeout)
+			_, releaseErr := coord.ReleaseLeaseForProvider(callCtx, lease.LeaseID, false, cfg.Provider)
+			cancel()
+			a.coordinatorRegistrationWarning(lease.LeaseID, errors.Join(err, releaseErr))
+			return err
+		}
+	}
 	return nil
+}
+
+func persistAutomaticCoordinatorRegistrationBinding(leaseID string, server *Server, cfg Config, actualURL string) error {
+	expectedURL := strings.TrimSpace(cfg.macOSPortalCoordinator)
+	if expectedURL == "" || actualURL != expectedURL {
+		return fmt.Errorf("automatic macOS portal coordinator binding changed before persistence")
+	}
+	return mutateCoordinatorRegistrationClaim(leaseID, server, func(claim *leaseClaim) error {
+		if bound := strings.TrimSpace(claim.CoordinatorRegistrationURL); bound != "" && bound != expectedURL {
+			return fmt.Errorf("automatic macOS portal coordinator conflicts with persisted binding")
+		}
+		claim.CoordinatorRegistrationURL = expectedURL
+		return nil
+	})
 }
 
 func coordinatorRegistrationSSHUser(target SSHTarget) string {
@@ -253,115 +343,107 @@ func adapterRuntimeRegistrationBinding() (adapterID, workspaceID string, require
 	return adapterID, workspaceID, true, nil
 }
 
-func ensureRuntimeAdapterRegistrationID(leaseID string) (string, error) {
-	var registrationID string
-	err := mutateLeaseClaimGuarded(
-		leaseID,
-		func(claim leaseClaim, exists bool) error {
-			if !exists || claim.LeaseID != leaseID {
-				return fmt.Errorf("adapter coordinator registration requires a persisted lease claim")
-			}
-			return nil
-		},
-		func(claim *leaseClaim) error {
-			current := strings.TrimSpace(claim.RuntimeAdapterRegistrationID)
-			pending := strings.TrimSpace(claim.RuntimeAdapterPendingRegistrationID)
-			if pending != "" {
-				if !validControllerWorkspaceID(pending) {
-					return fmt.Errorf("adapter coordinator registration has an invalid pending registration id")
-				}
-				registrationID = pending
-				return nil
-			}
-			registrationID = current
-			if current == "" {
-				generated, err := randomHex(16)
-				if err != nil {
-					return fmt.Errorf("generate runtime adapter registration id: %w", err)
-				}
-				registrationID = generated
-				claim.RuntimeAdapterRegistrationID = generated
-			}
-			if !validControllerWorkspaceID(registrationID) {
-				return fmt.Errorf("adapter coordinator registration has an invalid registration id")
-			}
-			return nil
-		},
-	)
-	return registrationID, err
+func mutateCoordinatorRegistrationClaim(leaseID string, server *Server, mutate func(*leaseClaim) error) error {
+	expected, exists, set := ServerLeaseClaimSnapshot(*server)
+	if !set || !exists || expected.LeaseID != leaseID {
+		return fmt.Errorf("coordinator registration requires an exact persisted lease claim")
+	}
+	var updated leaseClaim
+	err := mutateLeaseClaimGuarded(leaseID, unchangedLeaseClaimGuard(leaseID, expected, true), func(claim *leaseClaim) error {
+		if err := mutate(claim); err != nil {
+			return err
+		}
+		updated = cloneLeaseClaim(*claim)
+		return nil
+	})
+	if err == nil {
+		SetServerLeaseClaimSnapshot(server, updated, true)
+	}
+	return err
 }
 
-func stageRuntimeAdapterRegistrationReplacement(leaseID, rejectedID string) (string, error) {
+func ensureRuntimeAdapterRegistrationID(leaseID string, server *Server) (string, error) {
 	var registrationID string
-	err := mutateLeaseClaimGuarded(
-		leaseID,
-		func(claim leaseClaim, exists bool) error {
-			if !exists || claim.LeaseID != leaseID {
-				return fmt.Errorf("adapter coordinator registration requires a persisted lease claim")
-			}
-			return nil
-		},
-		func(claim *leaseClaim) error {
-			current := strings.TrimSpace(claim.RuntimeAdapterRegistrationID)
-			pending := strings.TrimSpace(claim.RuntimeAdapterPendingRegistrationID)
-			if pending != "" && !validControllerWorkspaceID(pending) {
+	err := mutateCoordinatorRegistrationClaim(leaseID, server, func(claim *leaseClaim) error {
+		current := strings.TrimSpace(claim.RuntimeAdapterRegistrationID)
+		pending := strings.TrimSpace(claim.RuntimeAdapterPendingRegistrationID)
+		if pending != "" {
+			if !validControllerWorkspaceID(pending) {
 				return fmt.Errorf("adapter coordinator registration has an invalid pending registration id")
 			}
-			if pending != "" && pending != rejectedID {
-				registrationID = pending
-				return nil
-			}
-			if pending == rejectedID {
-				claim.RuntimeAdapterRegistrationID = rejectedID
-				claim.RuntimeAdapterPendingRegistrationID = ""
-				current = rejectedID
-			}
-			if current != rejectedID {
-				if !validControllerWorkspaceID(current) {
-					return fmt.Errorf("adapter coordinator registration changed while rotating its generation")
-				}
-				registrationID = current
-				return nil
-			}
+			registrationID = pending
+			return nil
+		}
+		registrationID = current
+		if current == "" {
 			generated, err := randomHex(16)
 			if err != nil {
-				return fmt.Errorf("rotate runtime adapter registration id: %w", err)
+				return fmt.Errorf("generate runtime adapter registration id: %w", err)
 			}
 			registrationID = generated
-			claim.RuntimeAdapterPendingRegistrationID = generated
-			return nil
-		},
-	)
+			claim.RuntimeAdapterRegistrationID = generated
+		}
+		if !validControllerWorkspaceID(registrationID) {
+			return fmt.Errorf("adapter coordinator registration has an invalid registration id")
+		}
+		return nil
+	})
 	return registrationID, err
 }
 
-func acknowledgeRuntimeAdapterRegistrationID(leaseID, registrationID string) error {
-	return mutateLeaseClaimGuarded(
-		leaseID,
-		func(claim leaseClaim, exists bool) error {
-			if !exists || claim.LeaseID != leaseID {
-				return fmt.Errorf("adapter coordinator registration requires a persisted lease claim")
-			}
+func stageRuntimeAdapterRegistrationReplacement(leaseID string, server *Server, rejectedID string) (string, error) {
+	var registrationID string
+	err := mutateCoordinatorRegistrationClaim(leaseID, server, func(claim *leaseClaim) error {
+		current := strings.TrimSpace(claim.RuntimeAdapterRegistrationID)
+		pending := strings.TrimSpace(claim.RuntimeAdapterPendingRegistrationID)
+		if pending != "" && !validControllerWorkspaceID(pending) {
+			return fmt.Errorf("adapter coordinator registration has an invalid pending registration id")
+		}
+		if pending != "" && pending != rejectedID {
+			registrationID = pending
 			return nil
-		},
-		func(claim *leaseClaim) error {
-			current := strings.TrimSpace(claim.RuntimeAdapterRegistrationID)
-			pending := strings.TrimSpace(claim.RuntimeAdapterPendingRegistrationID)
-			switch {
-			case pending == registrationID:
-				claim.RuntimeAdapterRegistrationID = registrationID
-				claim.RuntimeAdapterPendingRegistrationID = ""
-			case current == registrationID:
-				// Another registration attempt may already have staged the next
-				// generation. Do not discard that independent pending transition.
-			case registrationID == "":
-				return fmt.Errorf("coordinator acknowledged an empty runtime adapter registration id")
-			default:
-				return fmt.Errorf("runtime adapter registration changed before acknowledgment")
+		}
+		if pending == rejectedID {
+			claim.RuntimeAdapterRegistrationID = rejectedID
+			claim.RuntimeAdapterPendingRegistrationID = ""
+			current = rejectedID
+		}
+		if current != rejectedID {
+			if !validControllerWorkspaceID(current) {
+				return fmt.Errorf("adapter coordinator registration changed while rotating its generation")
 			}
+			registrationID = current
 			return nil
-		},
-	)
+		}
+		generated, err := randomHex(16)
+		if err != nil {
+			return fmt.Errorf("rotate runtime adapter registration id: %w", err)
+		}
+		registrationID = generated
+		claim.RuntimeAdapterPendingRegistrationID = generated
+		return nil
+	})
+	return registrationID, err
+}
+
+func acknowledgeRuntimeAdapterRegistrationID(leaseID string, server *Server, registrationID string) error {
+	return mutateCoordinatorRegistrationClaim(leaseID, server, func(claim *leaseClaim) error {
+		current := strings.TrimSpace(claim.RuntimeAdapterRegistrationID)
+		pending := strings.TrimSpace(claim.RuntimeAdapterPendingRegistrationID)
+		switch {
+		case pending == registrationID:
+			claim.RuntimeAdapterRegistrationID = registrationID
+			claim.RuntimeAdapterPendingRegistrationID = ""
+		case current == registrationID:
+			// Another registration attempt may already have staged the next
+			// generation. Do not discard that independent pending transition.
+		case registrationID == "":
+			return fmt.Errorf("coordinator acknowledged an empty runtime adapter registration id")
+		default:
+			return fmt.Errorf("runtime adapter registration changed before acknowledgment")
+		}
+		return nil
+	})
 }
 
 func runtimeAdapterRegistrationReplay(err error) bool {
@@ -372,20 +454,6 @@ func runtimeAdapterDeleteCompletionMismatch(err error) bool {
 	return coordinatorResponseErrorCode(err, 409) == "runtime_adapter_delete_completion_mismatch"
 }
 
-func coordinatorResponseErrorCode(err error, status int) string {
-	var httpErr CoordinatorHTTPError
-	if !errors.As(err, &httpErr) || httpErr.StatusCode != status {
-		return ""
-	}
-	var body struct {
-		Error string `json:"error"`
-	}
-	if json.Unmarshal([]byte(httpErr.Message), &body) != nil {
-		return ""
-	}
-	return body.Error
-}
-
 func (a App) coordinatorRegistrationWarning(leaseID string, err error) {
 	if a.Stderr == nil {
 		return
@@ -393,13 +461,30 @@ func (a App) coordinatorRegistrationWarning(leaseID string, err error) {
 	fmt.Fprintf(a.Stderr, "warning: coordinator registration failed for %s: %v\n", firstNonBlank(leaseID, "unknown"), err)
 }
 
-func (a App) startRegisteredWebVNCDaemonBestEffort(cfg Config, target SSHTarget, leaseID string, keep bool) {
+func (a App) startRegisteredWebVNCDaemonBestEffort(ctx context.Context, cfg Config, target SSHTarget, leaseID string, keep bool) {
 	if !shouldStartRegisteredWebVNCDaemon(cfg, keep) {
 		return
 	}
-	if err := a.startWebVNCDaemon(webVNCBridgeArgs(cfg, target, leaseID, false, false), leaseID, false, ""); err != nil {
+	args := webVNCBridgeRouting(cfg, target, leaseID, false, false)
+	// Resolve the password before the daemon environment is scrubbed. The
+	// supervisor forwards this value to the bridge over its one-shot stdin gate.
+	credentialInput := registeredWebVNCDaemonCredentialInput(cfg, args.Args)
+	if err := a.startWebVNCDaemon(ctx, args, leaseID, false, "", credentialInput, target.ChildEnvDenylist...); err != nil {
 		fmt.Fprintf(a.Stderr, "warning: could not start registered WebVNC bridge for %s: %v\n", leaseID, err)
 	}
+}
+
+func registeredWebVNCDaemonCredentialInput(cfg Config, args []string) *string {
+	name := webVNCDaemonCredentialName(append([]string{"webvnc"}, args...))
+	if name == "" {
+		return nil
+	}
+	value, ok := LookupExternalDesktopPassword(cfg, name)
+	if !ok || strings.TrimSpace(value) == "" {
+		// Preserve startWebVNCDaemon's existing missing/empty diagnostic.
+		return nil
+	}
+	return &value
 }
 
 func shouldStartRegisteredWebVNCDaemon(cfg Config, keep bool) bool {
@@ -429,7 +514,7 @@ func (a App) releaseRegisteredCoordinatorLeaseAfterConfirmedAbsence(ctx context.
 	if adapterMode {
 		return a.completeRuntimeAdapterDeleteAfterConfirmedAbsence(ctx, cfg, leaseID, adapterID, workspaceID)
 	}
-	claim, exists, err := readLeaseClaimWithPresence(leaseID)
+	claim, exists, err := ReadLeaseClaimWithPresence(leaseID)
 	if err != nil {
 		return err
 	}
@@ -457,7 +542,7 @@ func (a App) completeRuntimeAdapterDeleteAfterConfirmedAbsence(ctx context.Conte
 		}
 		return err
 	}
-	claim, exists, err := readLeaseClaimWithPresence(leaseID)
+	claim, exists, err := ReadLeaseClaimWithPresence(leaseID)
 	if err != nil {
 		return err
 	}
@@ -470,6 +555,7 @@ func (a App) completeRuntimeAdapterDeleteAfterConfirmedAbsence(ctx context.Conte
 			ctx,
 			coord,
 			leaseID,
+			cfg.Provider,
 			adapterID,
 			workspaceID,
 		)
@@ -479,7 +565,7 @@ func (a App) completeRuntimeAdapterDeleteAfterConfirmedAbsence(ctx context.Conte
 			return fmt.Errorf("runtime adapter delete completion has an invalid persisted registration id")
 		}
 		callCtx, cancel := context.WithTimeout(ctx, coordinatorRegistrationTimeout)
-		_, err := coord.CompleteRuntimeAdapterDelete(callCtx, leaseID, adapterID, workspaceID, registrationID)
+		_, err := coord.CompleteRuntimeAdapterDeleteForProvider(callCtx, leaseID, cfg.Provider, adapterID, workspaceID, registrationID)
 		cancel()
 		if err == nil || isCoordinatorNotFound(err) {
 			return nil
@@ -493,6 +579,7 @@ func (a App) completeRuntimeAdapterDeleteAfterConfirmedAbsence(ctx context.Conte
 		ctx,
 		coord,
 		leaseID,
+		cfg.Provider,
 		adapterID,
 		workspaceID,
 	)
@@ -501,11 +588,11 @@ func (a App) completeRuntimeAdapterDeleteAfterConfirmedAbsence(ctx context.Conte
 func completeLegacyRuntimeAdapterDeleteAfterConfirmedAbsence(
 	ctx context.Context,
 	coord *CoordinatorClient,
-	leaseID, adapterID, workspaceID string,
+	leaseID, expectedProvider, adapterID, workspaceID string,
 ) error {
 	callCtx, cancel := context.WithTimeout(ctx, coordinatorRegistrationTimeout)
 	defer cancel()
-	_, err := coord.CompleteLegacyRuntimeAdapterDelete(callCtx, leaseID, adapterID, workspaceID)
+	_, err := coord.CompleteLegacyRuntimeAdapterDeleteForProvider(callCtx, leaseID, expectedProvider, adapterID, workspaceID)
 	if isCoordinatorNotFound(err) {
 		return nil
 	}
@@ -517,7 +604,7 @@ func (a App) releaseRegisteredCoordinatorLease(ctx context.Context, cfg Config, 
 		return nil
 	}
 	if stopBridge {
-		if _, err := a.stopWebVNCDaemonIfRunning(leaseID); err != nil && a.Stderr != nil {
+		if _, err := a.stopWebVNCDaemonIfRunning(ctx, leaseID); err != nil && a.Stderr != nil {
 			fmt.Fprintf(a.Stderr, "warning: could not stop registered WebVNC bridge for %s: %v\n", leaseID, err)
 		}
 	}
@@ -528,9 +615,15 @@ func (a App) releaseRegisteredCoordinatorLease(ctx context.Context, cfg Config, 
 		}
 		return err
 	}
+	if cfg.macOSPortalAuto {
+		expectedURL := strings.TrimSpace(cfg.macOSPortalCoordinator)
+		if expectedURL == "" || coord.BaseURL != expectedURL {
+			return fmt.Errorf("macOS portal coordinator changed from persisted registration binding")
+		}
+	}
 	callCtx, cancel := context.WithTimeout(ctx, coordinatorRegistrationTimeout)
 	defer cancel()
-	if _, err := coord.ReleaseLease(callCtx, leaseID, false); err != nil {
+	if _, err := coord.ReleaseLeaseForProvider(callCtx, leaseID, false, cfg.Provider); err != nil {
 		return err
 	}
 	return nil

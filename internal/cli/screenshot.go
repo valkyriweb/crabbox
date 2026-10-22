@@ -14,10 +14,11 @@ import (
 func (a App) screenshot(ctx context.Context, args []string) error {
 	defaults := defaultConfig()
 	fs := newFlagSet("screenshot", a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpSSH())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	id := fs.String("id", "", "lease id or slug")
 	output := fs.String("output", "", "local PNG output path")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
+	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
 	networkFlags := registerNetworkModeFlag(fs, defaults)
 	if err := parseFlags(fs, args); err != nil {
@@ -28,8 +29,11 @@ func (a App) screenshot(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := applyProviderFlags(&cfg, fs, providerFlags); err != nil {
+		return err
+	}
 	if isBlacksmithProvider(cfg.Provider) {
-		return exit(2, "desktop screenshots are not supported for provider=%s; Blacksmith owns machine connectivity", cfg.Provider)
+		return Exit(2, "desktop screenshots are not supported for provider=%s; Blacksmith owns machine connectivity", cfg.Provider)
 	}
 	if err := requireLeaseID(*id, "crabbox screenshot --id <lease-id-or-slug> [--output <path>]", cfg); err != nil {
 		return err
@@ -39,12 +43,12 @@ func (a App) screenshot(ctx context.Context, args []string) error {
 		return err
 	}
 	if isStaticProvider(cfg.Provider) && target.TargetOS != targetLinux {
-		return exit(2, "desktop screenshots are not captured from static %s hosts because those are existing host machines, not Crabbox-created desktops", target.TargetOS)
+		return Exit(2, "desktop screenshots are not captured from static %s hosts because those are existing host machines, not Crabbox-created desktops", target.TargetOS)
 	}
 	if err := enforceManagedLeaseCapabilities(cfg, server, leaseID); err != nil {
 		return err
 	}
-	if err := a.claimAndTouchLeaseTarget(ctx, cfg, server, target, leaseID, *reclaim); err != nil {
+	if err := a.claimAndTouchLeaseTarget(ctx, cfg, &server, target, leaseID, *reclaim); err != nil {
 		return err
 	}
 	if err := waitForLoopbackVNC(ctx, &target); err != nil {
@@ -52,7 +56,7 @@ func (a App) screenshot(ctx context.Context, args []string) error {
 	}
 	outPath := strings.TrimSpace(*output)
 	if outPath == "" {
-		outPath = defaultScreenshotPath(leaseID, serverSlug(server))
+		outPath = defaultScreenshotPath(leaseID, ServerSlug(server))
 	}
 	if err := captureDesktopScreenshot(ctx, cfg, target, outPath); err != nil {
 		return err
@@ -69,22 +73,22 @@ func defaultScreenshotPath(leaseID, slug string) string {
 	if strings.TrimSpace(name) == "" {
 		name = "crabbox"
 	}
-	return "crabbox-" + normalizeLeaseSlug(name) + "-screenshot.png"
+	return "crabbox-" + NormalizeLeaseSlug(name) + "-screenshot.png"
 }
 
 func captureDesktopScreenshot(ctx context.Context, cfg Config, target SSHTarget, outputPath string) error {
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		return exit(2, "create screenshot directory: %v", err)
+		return Exit(2, "create screenshot directory: %v", err)
 	}
-	if isLocalMacTarget(target) {
-		return captureLocalMacScreenshot(ctx, outputPath)
-	}
-	if target.TargetOS == targetMacOS {
+	switch desktopScreenshotCapturePathFor(cfg, target, isLocalMacTarget(target)) {
+	case desktopScreenshotCaptureLocalMac:
+		return captureLocalMacScreenshot(ctx, target, outputPath)
+	case desktopScreenshotCaptureRemoteMacVNC:
 		return captureRemoteMacVNCScreenshot(ctx, cfg, target, outputPath)
 	}
 	file, err := os.Create(outputPath)
 	if err != nil {
-		return exit(2, "create screenshot %s: %v", outputPath, err)
+		return Exit(2, "create screenshot %s: %v", outputPath, err)
 	}
 	ok := false
 	defer func() {
@@ -94,25 +98,48 @@ func captureDesktopScreenshot(ctx context.Context, cfg Config, target SSHTarget,
 		}
 	}()
 	if err := runSSHToWriter(ctx, target, screenshotRemoteCommand(target), file); err != nil {
-		return exit(5, "capture screenshot: %v", err)
+		return Exit(5, "capture screenshot: %v", err)
 	}
 	ok = true
 	return nil
 }
 
-func captureLocalMacScreenshot(ctx context.Context, outputPath string) error {
+type desktopScreenshotCapturePath uint8
+
+const (
+	desktopScreenshotCaptureRemoteSSH desktopScreenshotCapturePath = iota
+	desktopScreenshotCaptureLocalMac
+	desktopScreenshotCaptureRemoteMacVNC
+)
+
+func desktopScreenshotCapturePathFor(cfg Config, target SSHTarget, localMacTarget bool) desktopScreenshotCapturePath {
+	if target.TargetOS != targetMacOS {
+		return desktopScreenshotCaptureRemoteSSH
+	}
+	providerName := normalizeProviderName(cfg.Provider)
+	if provider, err := ProviderFor(cfg.Provider); err == nil {
+		providerName = normalizeProviderName(provider.Spec().Name)
+	}
+	if localMacTarget && providerName != "external" && providerName != "exec-provider" {
+		return desktopScreenshotCaptureLocalMac
+	}
+	return desktopScreenshotCaptureRemoteMacVNC
+}
+
+func captureLocalMacScreenshot(ctx context.Context, target SSHTarget, outputPath string) error {
 	if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
-		return exit(2, "prepare screenshot %s: %v", outputPath, err)
+		return Exit(2, "prepare screenshot %s: %v", outputPath, err)
 	}
 	cmd := exec.CommandContext(ctx, "screencapture", "-x", "-t", "png", outputPath)
+	applyTargetChildEnvironment(cmd, target)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(outputPath)
 		if detail := strings.TrimSpace(stderr.String()); detail != "" {
-			return exit(5, "capture local macOS screenshot: %v: %s", err, detail)
+			return Exit(5, "capture local macOS screenshot: %v: %s", err, detail)
 		}
-		return exit(5, "capture local macOS screenshot: %v", err)
+		return Exit(5, "capture local macOS screenshot: %v", err)
 	}
 	return nil
 }
@@ -124,11 +151,9 @@ func runSSHToWriter(ctx context.Context, target SSHTarget, remote string, stdout
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
 		probe := target
 		probe.Port = port
-		cmd := exec.CommandContext(ctx, "ssh", sshArgs(probe, remote)...)
-		cmd.Stdout = stdout
+		transport := sshTransportPreparation{command: remote}
 		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
+		if _, err := transport.runOnce(ctx, probe, "10", "3", stdout, &stderr, false); err != nil {
 			lastErr = err
 			lastMessage = strings.TrimSpace(stderr.String())
 			if shouldRetrySSHPort(err) {

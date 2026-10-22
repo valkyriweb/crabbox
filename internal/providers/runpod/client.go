@@ -1,19 +1,22 @@
 package runpod
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
-// runpodAPI is the minimal RunPod REST surface the provider needs. The
+// runpodAPI covers RunPod pod REST operations and GraphQL account identity. The
 // provider keeps the surface intentionally small: deploy a pod, look it up,
 // list pods, and terminate it. The pod's full SSH coordinates come back as
 // publicIp + portMappings["22"] once the pod reaches RUNNING.
@@ -70,6 +73,8 @@ type runpodRuntime struct {
 }
 
 type runpodPod struct {
+	Env map[string]string `json:"env"`
+
 	ID            string         `json:"id"`
 	Name          string         `json:"name"`
 	ImageName     string         `json:"imageName"`
@@ -103,6 +108,7 @@ func (p runpodPod) SSHEndpoint() runpodSSHEndpoint {
 }
 
 type runpodDeployInput struct {
+	Env               map[string]string
 	Name              string
 	ImageName         string
 	InstanceID        string
@@ -110,39 +116,35 @@ type runpodDeployInput struct {
 	TemplateID        string
 	ContainerDiskInGb int
 	Ports             string
-	StartSSH          bool
+	PublicKey         string
 }
 
-func newRunpodClient(cfg Config, rt Runtime) (runpodAPI, error) {
+func newRunpodClient(cfg core.Config, rt core.Runtime) (runpodAPI, error) {
 	apiKey := strings.TrimSpace(cfg.Runpod.APIKey)
 	if apiKey == "" {
-		return nil, exit(2, "provider=%s requires RUNPOD_API_KEY", providerName)
+		return nil, core.Exit(2, "provider=%s requires RUNPOD_API_KEY", providerName)
 	}
-	apiURL := strings.TrimRight(strings.TrimSpace(blank(cfg.Runpod.APIURL, "https://rest.runpod.io/v1")), "/")
+	apiURL := strings.TrimRight(strings.TrimSpace(cfg.Runpod.APIURL), "/")
 	parsed, err := url.Parse(apiURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, exit(2, "%s url %q is invalid", providerName, apiURL)
+		return nil, core.Exit(2, "%s url %q is invalid", providerName, apiURL)
 	}
-	if parsed.Scheme != "https" && !isLoopbackHTTPURL(parsed) {
-		return nil, exit(2, "%s url %q must use https unless it targets localhost", providerName, apiURL)
+	if parsed.Scheme != "https" && !shared.IsLoopbackHTTPURL(parsed) {
+		return nil, core.Exit(2, "%s url %q must use https unless it targets localhost", providerName, apiURL)
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
 	return &runpodClient{apiKey: apiKey, apiURL: apiURL, httpClient: httpClient}, nil
 }
 
+func runpodRedirectError(destination *url.URL) error {
+	return fmt.Errorf("%s refused cross-origin redirect to %s", providerName, destination.Redacted())
+}
+
 func (c *runpodClient) do(ctx context.Context, method, path string, body any, out any) error {
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.apiURL+path, reader)
+	req, err := shared.NewCompactJSONRequest(ctx, method, c.apiURL+path, body)
 	if err != nil {
 		return err
 	}
@@ -151,27 +153,13 @@ func (c *runpodClient) do(ctx context.Context, method, path string, body any, ou
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := shared.SecureHTTPClient(c.httpClient, req.URL, runpodRedirectError).Do(req)
 	if err != nil {
-		return err
+		return shared.ErrorWithMessage(shared.RedactErrorSecrets(err.Error(), c.apiKey, url.QueryEscape(c.apiKey)), err)
 	}
-	defer resp.Body.Close()
-	data, readErr := io.ReadAll(io.LimitReader(resp.Body, runpodMaxResponseBytes+1))
-	if readErr != nil {
-		return readErr
-	}
-	if len(data) > runpodMaxResponseBytes {
-		return fmt.Errorf("runpod response exceeds %d bytes", runpodMaxResponseBytes)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &runpodAPIError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(data))}
-	}
-	if out != nil && len(strings.TrimSpace(string(data))) > 0 {
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode runpod data: %w", err)
-		}
-	}
-	return nil
+	return shared.DecodeBoundedJSONResponse(resp, runpodMaxResponseBytes, out, providerName, func(code int, status, body string) error {
+		return &runpodAPIError{StatusCode: code, Status: status, Body: shared.RedactErrorSecrets(body, c.apiKey)}
+	})
 }
 
 func normalizeRunpodPod(pod runpodPod) runpodPod {
@@ -188,11 +176,24 @@ func normalizeRunpodPod(pod runpodPod) runpodPod {
 }
 
 func (c *runpodClient) Whoami(ctx context.Context) (runpodMyself, error) {
-	var pods []runpodPod
-	if err := c.do(ctx, http.MethodGet, "/pods", nil, &pods); err != nil {
+	identity := *c
+	identity.apiURL = strings.TrimSuffix(c.apiURL, "/v1")
+	if c.apiURL == core.RunpodConfigDefaultAPIURL {
+		identity.apiURL = "https://api.runpod.io"
+	}
+	var result struct {
+		Data struct {
+			Myself runpodMyself `json:"myself"`
+		} `json:"data"`
+		Errors []json.RawMessage `json:"errors"`
+	}
+	if err := identity.do(ctx, http.MethodPost, "/graphql", map[string]string{"query": "query { myself { id } }"}, &result); err != nil {
 		return runpodMyself{}, err
 	}
-	return runpodMyself{ID: "authenticated"}, nil
+	if len(result.Errors) != 0 || strings.TrimSpace(result.Data.Myself.ID) == "" {
+		return runpodMyself{}, core.Exit(2, "RunPod GraphQL account identity is missing or unavailable")
+	}
+	return result.Data.Myself, nil
 }
 
 func cpuFlavorID(instanceID string) string {
@@ -222,13 +223,23 @@ func runpodDeployPayload(input runpodDeployInput) map[string]any {
 	payload := map[string]any{
 		"name":              input.Name,
 		"imageName":         input.ImageName,
-		"cloudType":         blank(input.CloudType, "SECURE"),
+		"cloudType":         input.CloudType,
 		"containerDiskInGb": input.ContainerDiskInGb,
 		"ports":             []string{input.Ports},
 		"supportPublicIp":   true,
 	}
 	if input.TemplateID != "" {
 		payload["templateId"] = input.TemplateID
+	}
+	env := maps.Clone(input.Env)
+	if publicKey := strings.TrimSpace(input.PublicKey); publicKey != "" {
+		if env == nil {
+			env = map[string]string{}
+		}
+		env["PUBLIC_KEY"] = publicKey
+	}
+	if len(env) != 0 {
+		payload["env"] = env
 	}
 	instanceIDs := runpodInstanceIDs(input.InstanceID)
 	if strings.HasPrefix(strings.ToLower(instanceIDs[0]), "cpu") {
@@ -278,6 +289,11 @@ func (c *runpodClient) deployPod(ctx context.Context, input runpodDeployInput) (
 		return runpodPod{}, fmt.Errorf("create pod returned empty id")
 	}
 	return pod, nil
+}
+
+// Fixed creation submits once; an uncertain response must be reconciled first.
+func (c *runpodClient) DeployFixedPod(ctx context.Context, input runpodDeployInput) (runpodPod, error) {
+	return c.deployPod(ctx, input)
 }
 
 func isRunpodCapacityError(err error) bool {
@@ -343,6 +359,8 @@ func decodePortMappings(raw map[string]any) map[string]int {
 
 func (p *runpodPod) UnmarshalJSON(data []byte) error {
 	var aux struct {
+		Env map[string]string `json:"env"`
+
 		ID            string         `json:"id"`
 		Name          string         `json:"name"`
 		ImageName     string         `json:"imageName"`
@@ -360,6 +378,7 @@ func (p *runpodPod) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("decode runpod response: %w", err)
 	}
 	*p = runpodPod{
+		Env:           aux.Env,
 		ID:            aux.ID,
 		Name:          aux.Name,
 		ImageName:     aux.ImageName,
@@ -374,12 +393,4 @@ func (p *runpodPod) UnmarshalJSON(data []byte) error {
 	}
 	p.PortMappings = decodePortMappings(aux.PortMappings)
 	return nil
-}
-
-func isLoopbackHTTPURL(parsed *url.URL) bool {
-	if parsed.Scheme != "http" {
-		return false
-	}
-	host := strings.ToLower(parsed.Hostname())
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }

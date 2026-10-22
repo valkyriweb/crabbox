@@ -27,9 +27,18 @@ type resolvedSSHCommandTarget struct {
 }
 
 func (a App) resolveSSHCommandTarget(ctx context.Context, command string, args []string, allowShowSecret bool) (resolvedSSHCommandTarget, error) {
+	return a.resolveSSHCommandTargetWithOptions(ctx, command, args, allowShowSecret, sshCommandResolveOptions{})
+}
+
+type sshCommandResolveOptions struct {
+	registerFlags func(*flag.FlagSet)
+	validateFlags func() error
+}
+
+func (a App) resolveSSHCommandTargetWithOptions(ctx context.Context, command string, args []string, allowShowSecret bool, opts sshCommandResolveOptions) (resolvedSSHCommandTarget, error) {
 	defaults := defaultConfig()
 	fs := newFlagSet(command, a.Stderr)
-	provider := fs.String("provider", defaults.Provider, providerHelpSSH())
+	provider := registerProviderSelectionFlag(fs, defaults, providerHelpSSH())
 	id := fs.String("id", "", "lease id or slug")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
 	var showSecret *bool
@@ -39,13 +48,21 @@ func (a App) resolveSSHCommandTarget(ctx context.Context, command string, args [
 	providerFlags := registerProviderFlags(fs, defaults)
 	targetFlags := registerTargetFlags(fs, defaults)
 	networkFlags := registerNetworkModeFlag(fs, defaults)
+	if opts.registerFlags != nil {
+		opts.registerFlags(fs)
+	}
 	if err := parseInterspersedFlags(fs, args); err != nil {
 		return resolvedSSHCommandTarget{}, err
+	}
+	if opts.validateFlags != nil {
+		if err := opts.validateFlags(); err != nil {
+			return resolvedSSHCommandTarget{}, err
+		}
 	}
 	idFlagSet := flagWasSet(fs, "id")
 	setIDFromFirstArg(fs, id)
 	if fs.NArg() > 1 || (idFlagSet && fs.NArg() > 0) {
-		return resolvedSSHCommandTarget{}, exit(2, "usage: crabbox %s [flags] <lease-id-or-slug>", command)
+		return resolvedSSHCommandTarget{}, Exit(2, "usage: crabbox %s [flags] <lease-id-or-slug>", command)
 	}
 	cfg, err := loadSSHCommandConfig(fs, *provider, providerFlags, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
 	if err != nil {
@@ -61,7 +78,10 @@ func (a App) resolveSSHCommandTarget(ctx context.Context, command string, args [
 	if err != nil {
 		return resolvedSSHCommandTarget{}, err
 	}
-	if err := a.claimAndTouchLeaseTarget(ctx, cfg, lease.Server, lease.SSH, lease.LeaseID, *reclaim); err != nil {
+	if err := a.claimAndTouchLeaseTarget(ctx, cfg, &lease.Server, lease.SSH, lease.LeaseID, *reclaim); err != nil {
+		return resolvedSSHCommandTarget{}, err
+	}
+	if err := ensureSSHControlDirectory(lease.SSH); err != nil {
 		return resolvedSSHCommandTarget{}, err
 	}
 	resolved := resolvedSSHCommandTarget{

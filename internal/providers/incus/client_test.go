@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,8 +17,10 @@ import (
 	"testing"
 	"time"
 
+	incusclient "github.com/lxc/incus/v7/client"
 	"github.com/lxc/incus/v7/shared/cliconfig"
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/pkg/sftp"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"golang.org/x/oauth2"
 )
@@ -31,8 +34,7 @@ func (s fakeOIDCTokenSource) GetOIDCTokens() *oidc.Tokens[*oidc.IDTokenClaims] {
 }
 
 func TestDoctorConnectionInfoForConfigUsesNamedRemoteMetadata(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := filepath.Join(home, ".config", "incus")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -72,8 +74,7 @@ func TestDoctorConnectionInfoForConfigUsesNamedRemoteMetadata(t *testing.T) {
 }
 
 func TestDoctorConnectionInfoForConfigUsesAuthenticatedAddressMode(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := writeIncusConfig(t, home, "default-remote: trusted\nremotes:\n  trusted:\n    addr: https://incus.example.test:8443\n    protocol: incus\n")
 	writeClientCertificateFiles(t, configDir)
 
@@ -104,8 +105,7 @@ func TestDoctorConnectionInfoForConfigUsesAuthenticatedAddressMode(t *testing.T)
 }
 
 func TestDoctorConnectionInfoForConfigRejectsAddressWithoutClientAuthentication(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	incusTestHome(t)
 
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
@@ -118,8 +118,7 @@ func TestDoctorConnectionInfoForConfigRejectsAddressWithoutClientAuthentication(
 }
 
 func TestConnectionArgsForAddressDoesNotReuseRemoteTLSClientCertForDifferentAddress(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := writeIncusConfig(t, home, "default-remote: trusted\nremotes:\n  trusted:\n    addr: https://trusted.example.test:8443\n    protocol: incus\n")
 	writeClientCertificateFiles(t, configDir)
 
@@ -137,8 +136,7 @@ func TestConnectionArgsForAddressDoesNotReuseRemoteTLSClientCertForDifferentAddr
 }
 
 func TestConnectionArgsForAddressUsesMatchingRemoteTLSClientCert(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := writeIncusConfig(t, home, "default-remote: trusted\nremotes:\n  trusted:\n    addr: https://trusted.example.test:8443\n    protocol: incus\n")
 	writeClientCertificateFiles(t, configDir)
 
@@ -157,8 +155,7 @@ func TestConnectionArgsForAddressUsesMatchingRemoteTLSClientCert(t *testing.T) {
 }
 
 func TestConnectionArgsForAddressUsesMatchingRemoteOIDCTokens(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := writeIncusConfig(t, home, "default-remote: staging\nremotes:\n  staging:\n    addr: https://staging.incus.example.test:8443\n    auth_type: oidc\n    protocol: incus\n")
 	writeOIDCTokenFile(t, configDir, "staging", oidc.Tokens[*oidc.IDTokenClaims]{
 		Token: &oauth2.Token{
@@ -188,8 +185,7 @@ func TestConnectionArgsForAddressUsesMatchingRemoteOIDCTokens(t *testing.T) {
 }
 
 func TestConnectionArgsForAddressPersistsRefreshedOIDCTokens(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := writeIncusConfig(t, home, "default-remote: staging\nremotes:\n  staging:\n    addr: https://staging.incus.example.test:8443\n    auth_type: oidc\n    protocol: incus\n")
 	writeOIDCTokenFile(t, configDir, "staging", oidc.Tokens[*oidc.IDTokenClaims]{
 		Token: &oauth2.Token{AccessToken: "old-access-token"},
@@ -308,8 +304,7 @@ func TestDisableOIDCKeepAlive(t *testing.T) {
 }
 
 func TestDoctorConnectionInfoForConfigUsesAddressOIDCMode(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	writeIncusConfig(t, home, "default-remote: staging\nremotes:\n  staging:\n    addr: https://staging.incus.example.test:8443\n    auth_type: oidc\n    protocol: incus\n")
 
 	cfg := core.BaseConfig()
@@ -331,8 +326,7 @@ func TestConnectInstanceServerRejectsLocalUnixRemoteOnNonLinux(t *testing.T) {
 		t.Skip("local unix remote is valid on linux")
 	}
 
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := filepath.Join(home, ".config", "incus")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -357,8 +351,7 @@ func TestDoctorConnectionInfoRejectsLocalUnixRemoteOnNonLinux(t *testing.T) {
 		t.Skip("local unix remote is valid on linux")
 	}
 
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := filepath.Join(home, ".config", "incus")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -379,8 +372,7 @@ func TestDoctorConnectionInfoRejectsLocalUnixRemoteOnNonLinux(t *testing.T) {
 }
 
 func TestConnectInstanceServerRejectsMalformedConfigWithExitCodeTwo(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := filepath.Join(home, ".config", "incus")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -400,8 +392,7 @@ func TestConnectInstanceServerRejectsMalformedConfigWithExitCodeTwo(t *testing.T
 }
 
 func TestDoctorConnectionInfoRejectsMalformedConfigWithExitCodeTwo(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := filepath.Join(home, ".config", "incus")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -421,8 +412,7 @@ func TestDoctorConnectionInfoRejectsMalformedConfigWithExitCodeTwo(t *testing.T)
 }
 
 func TestDoctorConnectionInfoRejectsMissingRemoteWithExitCodeTwo(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	writeIncusConfig(t, home, "default-remote: missing\nremotes: {}\n")
 
 	cfg := core.BaseConfig()
@@ -437,8 +427,7 @@ func TestDoctorConnectionInfoRejectsMissingRemoteWithExitCodeTwo(t *testing.T) {
 }
 
 func TestConnectionArgsForAddressRejectsMalformedConfigWithExitCodeTwo(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := filepath.Join(home, ".config", "incus")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -459,8 +448,7 @@ func TestConnectionArgsForAddressRejectsMalformedConfigWithExitCodeTwo(t *testin
 }
 
 func TestConnectionArgsForAddressRejectsMissingServerCertWithExitCodeTwo(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	incusTestHome(t)
 
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
@@ -475,8 +463,7 @@ func TestConnectionArgsForAddressRejectsMissingServerCertWithExitCodeTwo(t *test
 }
 
 func TestConnectionArgsForAddressSkipsOIDCWhenInsecureTLSEnabled(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	configDir := writeIncusConfig(t, home, "default-remote: staging\nremotes:\n  staging:\n    addr: https://staging.incus.example.test:8443\n    auth_type: oidc\n    protocol: incus\n")
 	tokenDir := filepath.Join(configDir, "oidctokens")
 	if err := os.MkdirAll(tokenDir, 0o700); err != nil {
@@ -533,8 +520,7 @@ func TestSelectedProjectPrefersExplicitRemoteThenDefault(t *testing.T) {
 }
 
 func TestSSHHostForConfigFallsBackAcrossSources(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := incusTestHome(t)
 	writeIncusConfig(t, home, "default-remote: lab\nremotes:\n  lab:\n    addr: https://remote.example.test:8443\n    protocol: incus\n")
 
 	cfg := core.BaseConfig()
@@ -591,6 +577,15 @@ func requireExitCode(t *testing.T, err error, code int) core.ExitError {
 	return exitErr
 }
 
+func incusTestHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Incus also consults platform config paths independently of HOME.
+	t.Setenv("INCUS_CONF", filepath.Join(home, ".config", "incus"))
+	return home
+}
+
 func writeIncusConfig(t *testing.T, home string, body string) string {
 	t.Helper()
 	configDir := filepath.Join(home, ".config", "incus")
@@ -644,5 +639,51 @@ func writeOIDCTokenFile(t *testing.T, configDir string, remote string, tokens oi
 	}
 	if err := os.WriteFile(filepath.Join(tokenDir, remote+".json"), content, 0o600); err != nil {
 		t.Fatalf("WriteFile oidc token: %v", err)
+	}
+}
+
+// Exercise the pinned SFTP implementation rather than assuming RealPath resolves links.
+type filesystemTestServer struct {
+	incusclient.InstanceServer
+	t *testing.T
+}
+
+func (s filesystemTestServer) GetInstanceFileSFTP(string) (*sftp.Client, error) {
+	clientConn, serverConn := net.Pipe()
+	server, err := sftp.NewServer(serverConn)
+	if err != nil {
+		clientConn.Close()
+		serverConn.Close()
+		return nil, err
+	}
+	s.t.Cleanup(func() { clientConn.Close(); server.Close(); serverConn.Close() })
+	go func() { _ = server.Serve(); _ = server.Close() }()
+	return sftp.NewClientPipe(clientConn, clientConn)
+}
+
+func TestSDKCheckpointWorkspaceRejectsSymlinkTraversal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Incus guest paths use POSIX directory semantics")
+	}
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workdir := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workdir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(workdir, filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	client := &sdkClient{server: filesystemTestServer{t: t}}
+	if canonical, err := client.CanonicalPath("fixture", workdir); err != nil || canonical != workdir {
+		t.Fatalf("root-disk directory: %q %v", canonical, err)
+	}
+	if _, err := client.CanonicalPath("fixture", filepath.Join(root, "alias")); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlink workspace accepted: %v", err)
+	}
+	if _, err := client.CanonicalPath("fixture", root+"/alias/../workspace"); err == nil {
+		t.Fatal("unclean traversal accepted")
 	}
 }

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,31 +15,64 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unicode/utf16"
+
+	"github.com/openclaw/crabbox/internal/prefixbuffer"
+	xssh "golang.org/x/crypto/ssh"
 )
 
+// SSHJump describes an authenticated SSH transport hop; the destination still
+// has its own end-to-end SSH host key and authentication.
+type SSHJump struct {
+	Relay        bool `json:"relay,omitempty"`
+	useRelay     bool
+	Candidates   []SSHJumpCandidate `json:"candidates,omitempty"`
+	HostKeyAlias string             `json:"-"`
+	Host         string             `json:"host"`
+	Port         int                `json:"port"`
+	HostKey      string             `json:"hostKey"`
+	Fingerprint  string             `json:"fingerprint,omitempty"`
+}
+
 type SSHTarget struct {
-	User                   string
-	Host                   string
-	Key                    string
-	CertificateFile        string
-	KnownHostsFile         string
-	Port                   string
-	FallbackPorts          []string
-	TargetOS               string
-	WindowsMode            string
-	ReadyCheck             string
-	AuthSecret             bool
-	NoControlMaster        bool
-	DisableHostKeyChecking bool
-	NetworkKind            NetworkMode
-	SSHConfigProxy         bool
-	ProxyCommand           string
+	relayConfig             *Config
+	relayCoordinator        *CoordinatorClient
+	SSHJump                 *SSHJump
+	User                    string
+	Host                    string
+	SSHHostKey              string
+	Key                     string
+	CertificateFile         string
+	KnownHostsFile          string
+	AuthoritativeKnownHosts bool // Provider-owned trust; recheck it for every connection.
+	HostKeyAlias            string
+	Port                    string
+	FallbackPorts           []string
+	preparedEndpoint        string
+	TargetOS                string
+	WindowsMode             string
+	ReadyCheck              string
+	AuthSecret              bool
+	NoControlMaster         bool
+	ownerControlPath        string // Private foreground master with an explicit local lifetime owner.
+	DisableHostKeyChecking  bool
+	NetworkKind             NetworkMode
+	SSHConfigProxy          bool
+	SSHConfigFile           string // Provider-owned IdentitiesOnly route; bypass ambient SSH config.
+	SSHConfigData           []byte `json:"-"` // Captured provider config; keep resolution and transport on the same bytes.
+	ProxyCommand            string
+	ChildEnvDenylist        []string
+	// Transport-only overrides can contain credentials; never serialize them.
+	ChildEnv          map[string]string `json:"-"`
+	DiagnosticSecrets []string          `json:"-"` // Provider credentials echoed by local authentication hooks.
+	// Refresh provider-owned credential files before a new transport starts.
+	PrepareConnection func(context.Context) error `json:"-"`
 }
 
 func isLocalMacTarget(target SSHTarget) bool {
@@ -70,21 +105,218 @@ func SSHTargetFromConfig(cfg Config, host string) SSHTarget {
 }
 
 func sshTargetForLease(cfg Config, host, user, port string) SSHTarget {
+	return sshTargetForLeaseConnection(cfg, host, user, port, "", nil)
+}
+
+func sshTargetForLeaseConnection(cfg Config, host, user, port, hostKey string, jump *SSHJump) SSHTarget {
 	if user == "" {
 		user = cfg.SSHUser
 	}
 	if port == "" {
 		port = cfg.SSHPort
 	}
-	return SSHTarget{
-		User:          user,
-		Host:          host,
-		Key:           cfg.SSHKey,
-		Port:          port,
-		FallbackPorts: cfg.SSHFallbackPorts,
-		TargetOS:      cfg.TargetOS,
-		WindowsMode:   cfg.WindowsMode,
+	target := SSHTarget{
+		SSHHostKey: hostKey, SSHJump: jump,
+		User:             user,
+		Host:             host,
+		Key:              cfg.SSHKey,
+		Port:             port,
+		FallbackPorts:    cfg.SSHFallbackPorts,
+		TargetOS:         cfg.TargetOS,
+		WindowsMode:      cfg.WindowsMode,
+		ChildEnvDenylist: externalDesktopChildEnvDenylist(cfg, cfg.TargetOS),
 	}
+	if jump != nil && jump.Relay {
+		relayCfg := cfg
+		target.relayConfig = &relayCfg
+	}
+	configureProviderSSHTarget(cfg, &target)
+	return target
+}
+
+// configureProviderSSHTarget lets the configured provider adjust a target for
+// its platform, such as installing a bootstrap gate ahead of the default
+// readiness command. Providers without the hook leave the target unchanged.
+func configureProviderSSHTarget(cfg Config, target *SSHTarget) {
+	if target == nil {
+		return
+	}
+	if provider, err := ProviderFor(cfg.Provider); err == nil {
+		if configurer, ok := provider.(ProviderSSHTargetConfigurer); ok {
+			configurer.ConfigureSSHTarget(target, sshReadyCommand(*target))
+		}
+	}
+}
+
+// providerReadyCheck reports the readiness check the configured provider
+// installs for a target of the given platform, or "" when the provider keeps
+// the platform default.
+func providerReadyCheck(cfg Config, target SSHTarget) string {
+	probe := SSHTarget{TargetOS: target.TargetOS, WindowsMode: target.WindowsMode}
+	configureProviderSSHTarget(cfg, &probe)
+	return probe.ReadyCheck
+}
+
+// PreserveExternalDesktopChildEnvironmentBoundary records a valid, trusted or
+// programmatic desktop password environment name before an override replaces
+// it. Repository-selected and reserved names cannot influence a later child's
+// environment. The retained names are intentionally monotonic for the lifetime
+// of this Config value: an old operator secret must not become visible merely
+// because a routed lease or explicit override selects a new name.
+func PreserveExternalDesktopChildEnvironmentBoundary(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	name := strings.TrimSpace(cfg.External.Connection.Desktop.PasswordEnv)
+	if name == "" || cfg.credentialProvenance.externalDesktopEnv == credentialSourceRepository {
+		return
+	}
+	if ValidateExternalDesktopPasswordEnvironmentName(name) != nil {
+		return
+	}
+	cfg.externalDesktopEnvDenylist = appendUniqueStrings(
+		cfg.externalDesktopEnvDenylist,
+		name,
+	)
+}
+
+// ExternalDesktopChildEnvironmentDenylist returns retained historical names
+// plus this External config's current effective name. The returned slice is a
+// copy and is safe for callers to extend without mutating Config.
+func ExternalDesktopChildEnvironmentDenylist(cfg Config) []string {
+	return appendUniqueStrings(
+		cfg.externalDesktopEnvDenylist,
+		cfg.External.Connection.Desktop.PasswordEnv,
+	)
+}
+
+func externalDesktopChildEnvDenylist(cfg Config, _ string) []string {
+	// Standalone helpers may run before provider validation. Reuse the same
+	// capture policy so repository-selected or reserved current names cannot
+	// suppress unrelated child credentials such as GH_TOKEN or PATH. Trusted
+	// External secret names remain denied even if repository config switches
+	// the active provider.
+	safe := cfg
+	PreserveExternalDesktopChildEnvironmentBoundary(&safe)
+	return appendUniqueStrings(nil, safe.externalDesktopEnvDenylist...)
+}
+
+// ApplyTargetChildEnvironmentBoundary prevents operator-owned desktop secrets
+// from reaching target-facing local child processes such as ssh, ProxyCommand,
+// rsync, scp, and viewer launchers.
+func ApplyTargetChildEnvironmentBoundary(cfg Config, target *SSHTarget) {
+	if target != nil {
+		target.ChildEnvDenylist = appendUniqueStrings(
+			target.ChildEnvDenylist,
+			externalDesktopChildEnvDenylist(cfg, target.TargetOS)...,
+		)
+	}
+}
+
+func childEnvironmentWithout(env []string, denied ...string) []string {
+	if len(denied) == 0 {
+		return nil
+	}
+	blocked := make(map[string]struct{}, len(denied))
+	for _, name := range denied {
+		if name = strings.TrimSpace(name); name != "" {
+			blocked[strings.ToUpper(name)] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, remove := blocked[strings.ToUpper(name)]; !remove {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+func systemInspectionEnvironment() []string {
+	return []string{"LC_ALL=C"}
+}
+
+func systemInspectionCommand(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.Env = systemInspectionEnvironment()
+	return cmd
+}
+
+func applyTargetChildEnvironment(cmd *exec.Cmd, target SSHTarget) {
+	if cmd == nil || (len(target.ChildEnvDenylist) == 0 && len(target.ChildEnv) == 0) {
+		return
+	}
+	env := cmd.Env
+	if env == nil {
+		env = os.Environ()
+	}
+	overrideNames := make([]string, 0, len(target.ChildEnv))
+	for name := range target.ChildEnv {
+		if ValidShellEnvName(name) {
+			overrideNames = append(overrideNames, name)
+		}
+	}
+	sort.Strings(overrideNames)
+	blocked := append(append([]string(nil), target.ChildEnvDenylist...), overrideNames...)
+	env = childEnvironmentWithout(env, blocked...)
+	for _, name := range overrideNames {
+		env = append(env, name+"="+target.ChildEnv[name])
+	}
+	cmd.Env = env
+}
+
+func directSSHExecutable() string {
+	return directSSHExecutableForGOOS(runtime.GOOS, os.Getenv, os.Stat)
+}
+
+func directSSHExecutableForGOOS(goos string, getenv func(string) string, stat func(string) (os.FileInfo, error)) string {
+	if goos != "windows" {
+		return "ssh"
+	}
+	windowsDir := strings.TrimSpace(getenv("WINDIR"))
+	if windowsDir == "" {
+		return "ssh"
+	}
+	candidate := filepath.Join(windowsDir, "System32", "OpenSSH", "ssh.exe")
+	if info, err := stat(candidate); err == nil && info.Mode().IsRegular() {
+		return candidate
+	}
+	return "ssh"
+}
+
+const sshCommandWaitDelay = 5 * time.Second
+
+func sshCommandContext(ctx context.Context, target SSHTarget, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, directSSHExecutable(), args...)
+	// Cmd.Start returns preparation errors before spawning an unowned listener.
+	if cmd.Err == nil {
+		cmd.Err = context.Cause(ctx)
+		if cmd.Err == nil {
+			cmd.Err = prepareSSHConnection(ctx, target)
+		}
+		if cmd.Err == nil {
+			cmd.Err = ensureSSHControlDirectory(target)
+		}
+	}
+	// A cancelled multiplexed SSH session can leave its ControlPersist master
+	// holding inherited pipes after the session process exits. Bound Go's pipe
+	// drain so cancellation cannot strand the caller in Cmd.Wait.
+	cmd.WaitDelay = sshCommandWaitDelay
+	applyTargetChildEnvironment(cmd, target)
+	return cmd
+}
+
+func prepareSSHConnection(ctx context.Context, target SSHTarget) error {
+	if err := context.Cause(ctx); err != nil {
+		return sshPreparationError{err}
+	}
+	if target.PrepareConnection != nil {
+		if err := target.PrepareConnection(ctx); err != nil {
+			return sshPreparationError{err}
+		}
+	}
+	return nil
 }
 
 func waitForSSH(ctx context.Context, target *SSHTarget, stderr io.Writer) error {
@@ -106,64 +338,235 @@ func BootstrapWaitTimeout(cfg Config) time.Duration {
 	return bootstrapWaitTimeout(cfg)
 }
 
+type sshReadinessProfile struct {
+	connectTimeout     string
+	connectionAttempts string
+}
+
+func sshReadinessProfileForTarget(target SSHTarget) sshReadinessProfile {
+	if target.TargetOS == targetWindows {
+		return sshReadinessProfile{
+			connectTimeout:     "10",
+			connectionAttempts: "3",
+		}
+	}
+	return sshReadinessProfile{
+		connectTimeout:     "5",
+		connectionAttempts: "1",
+	}
+}
+
 func waitForSSHReady(ctx context.Context, target *SSHTarget, stderr io.Writer, phase string, timeout time.Duration) error {
 	start := time.Now()
 	deadline := time.Now().Add(timeout)
+	probeCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	return waitForSSHReadyWithProbeContext(ctx, probeCtx, target, stderr, phase, start, deadline)
+}
+
+func waitForSSHReadyWithProbeContext(ctx, probeCtx context.Context, target *SSHTarget, stderr io.Writer, phase string, start, deadline time.Time) error {
+	profile := sshReadinessProfileForTarget(*target)
 	lastPorts := ""
-	for {
-		if ctx.Err() != nil {
-			return context.Cause(ctx)
+	lastProbe := "transport"
+	// A successful transport probe runs a remote command, so it proves both
+	// reachability and authentication. Recording that keeps a readiness-only
+	// failure from being reported as an unknown-authentication timeout.
+	authenticated := false
+	retryDelay := 250 * time.Millisecond
+	check := func(probeErr error) error {
+		if stopped := sshReadinessProbeContextError(ctx, lastProbe); stopped != nil {
+			return stopped.cause
 		}
-		if time.Now().After(deadline) {
-			if lastPorts != "" {
-				return exit(5, "timed out waiting for SSH on %s during %s ports=%s; %s", target.Host, phase, lastPorts, sshWaitNextAction(phase))
+		if sshReadinessProbeContextError(probeCtx, lastProbe) != nil {
+			var stopped *sshReadinessProbeStopped
+			if errors.As(probeErr, &stopped) {
+				lastProbe = stopped.probe
 			}
-			return exit(5, "timed out waiting for SSH on %s during %s; %s", target.Host, phase, sshWaitNextAction(phase))
+			ports := ""
+			if lastPorts != "" {
+				ports = " ports=" + lastPorts
+			}
+			authentication := "unknown"
+			if authenticated {
+				authentication = "ok"
+			}
+			return Exit(5, "timed out waiting for SSH on %s during %s probe=%s cause=deadline_exceeded authentication=%s%s; %s", target.Host, phase, lastProbe, authentication, ports, sshWaitNextAction(phase))
 		}
-		if target.SSHConfigProxy {
-			if runSSHQuietWithOptionsResolvePort(ctx, target, sshReadyCommand(*target), "5", "1") == nil {
+		return nil
+	}
+	for {
+		if err := check(nil); err != nil {
+			return err
+		}
+		if isWindowsWSL2Target(*target) {
+			lastProbe = "transport"
+			err := probeWSL2SSHReady(probeCtx, target, profile, stderr)
+			if stopped := check(err); stopped != nil {
+				return stopped
+			}
+			if err == nil {
 				return nil
 			}
+			if setupErr := sshReadinessError(err, phase); setupErr != nil {
+				return setupErr
+			}
+			if IsWSLSFTPUnavailable(err) {
+				return err
+			}
+			lastPorts = "wsl2"
+			fmt.Fprintln(stderr, sshWaitProgressMessage(target, phase, "", "", lastPorts, time.Since(start), time.Until(deadline)))
+		} else if target.SSHConfigProxy {
+			lastProbe = "readiness"
+			err := probeProxySSHReady(probeCtx, target, profile)
+			if stopped := check(err); stopped != nil {
+				return stopped
+			}
+			if err == nil {
+				return nil
+			}
+			if setupErr := sshReadinessError(err, phase); setupErr != nil {
+				return setupErr
+			}
 			lastPorts = "proxy"
+			// Readiness failed. A transport probe that still answers runs a
+			// remote command through the same proxy, so reachability and
+			// authentication are proven and readiness is the only thing left.
+			// It owns the active stage while it runs, and a result that cannot
+			// recover by waiting stops the wait, exactly as on the direct route.
+			lastProbe = "transport"
+			if err := check(nil); err != nil {
+				return err
+			}
+			if transportErr := runSSHReadinessProbe(probeCtx, *target, sshTransportProbeCommand(*target), profile.connectTimeout, profile.connectionAttempts); transportErr != nil {
+				if stopped := check(transportErr); stopped != nil {
+					return stopped
+				}
+				if setupErr := sshReadinessError(transportErr, phase); setupErr != nil {
+					return setupErr
+				}
+			} else {
+				authenticated = true
+				lastProbe = "readiness"
+				lastPorts = "proxy:ready"
+			}
 			fmt.Fprintln(stderr, sshWaitProgressMessage(target, phase, target.Port, "", lastPorts, time.Since(start), time.Until(deadline)))
 		} else {
 			reachablePort := ""
 			transportPort := ""
 			probes := make([]string, 0, len(sshPortCandidates(target.Port, target.FallbackPorts)))
 			for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
+				lastProbe = "transport"
+				if err := check(nil); err != nil {
+					return err
+				}
 				probe := *target
 				probe.Port = port
 				probe.FallbackPorts = []string{}
-				conn, err := net.DialTimeout("tcp", net.JoinHostPort(probe.Host, probe.Port), 5*time.Second)
+				dialer := net.Dialer{Timeout: 5 * time.Second}
+				conn, err := dialer.DialContext(probeCtx, "tcp", net.JoinHostPort(probe.Host, probe.Port))
 				if err != nil {
-					probes = append(probes, port+":closed")
+					if stopped := check(err); stopped != nil {
+						return stopped
+					}
+					probes = append(probes, port+":"+sshDialFailureStatus(err))
 					continue
 				}
 				_ = conn.Close()
+				recordCreationObservation(probeCtx, "ssh_tcp_accept")
 				if reachablePort == "" {
 					reachablePort = probe.Port
 				}
-				if runSSHQuietWithOptions(ctx, probe, sshTransportProbeCommand(probe), "5", "1") != nil {
+				// Successful readiness also proves transport. Diagnose transport
+				// separately only when readiness fails, avoiding a healthy-path SSH call.
+				lastProbe = "readiness"
+				if err := check(nil); err != nil {
+					return err
+				}
+				err = runSSHReadinessProbe(probeCtx, probe, sshReadyCommand(probe), profile.connectTimeout, profile.connectionAttempts)
+				if stopped := check(err); stopped != nil {
+					return stopped
+				}
+				if err == nil {
+					if target.Port != probe.Port {
+						fmt.Fprintf(stderr, "using ssh port %s for %s (configured %s not ready)\n", probe.Port, target.Host, target.Port)
+					}
+					target.recordPreparedEndpoint(probe.Port)
+					return nil
+				}
+				if setupErr := sshReadinessError(err, phase); setupErr != nil {
+					return setupErr
+				}
+				lastProbe = "transport"
+				if err := check(nil); err != nil {
+					return err
+				}
+				if err := runSSHReadinessProbe(probeCtx, probe, sshTransportProbeCommand(probe), profile.connectTimeout, profile.connectionAttempts); err != nil {
+					if stopped := check(err); stopped != nil {
+						return stopped
+					}
+					if setupErr := sshReadinessError(err, phase); setupErr != nil {
+						return setupErr
+					}
 					probes = append(probes, port+":tcp")
 					continue
 				}
 				if transportPort == "" {
 					transportPort = probe.Port
 				}
-				if runSSHQuietWithOptions(ctx, probe, sshReadyCommand(probe), "5", "1") == nil {
-					if target.Port != probe.Port {
-						fmt.Fprintf(stderr, "using ssh port %s for %s (configured %s not ready)\n", probe.Port, target.Host, target.Port)
-						target.Port = probe.Port
+				// Transport and authentication both answered on this port; the
+				// readiness command is what is still failing, so report that
+				// stage rather than the probe that just succeeded.
+				authenticated = true
+				lastProbe = "readiness"
+				probes = append(probes, port+":ready")
+				if canWaitForLinuxReadiness(probe) {
+					lastPorts = strings.Join(probes, ",")
+					err := waitForLinuxReadiness(probeCtx, probe, profile, 30*time.Second, func() {
+						fmt.Fprintln(stderr, sshWaitProgressMessage(target, phase, reachablePort, transportPort, lastPorts, time.Since(start), time.Until(deadline)))
+					})
+					if stopped := check(err); stopped != nil {
+						return stopped
 					}
-					return nil
+					if err == nil {
+						if target.Port != probe.Port {
+							fmt.Fprintf(stderr, "using ssh port %s for %s (configured %s not ready)\n", probe.Port, target.Host, target.Port)
+						}
+						target.recordPreparedEndpoint(probe.Port)
+						return nil
+					}
+					if setupErr := sshReadinessError(err, phase); setupErr != nil {
+						return setupErr
+					}
+					if errors.Is(err, context.DeadlineExceeded) || exitCode(err) == 124 {
+						// A full guest wait already paced this retry. Do not add
+						// the boot-time backoff just as the marker may appear.
+						retryDelay = 250 * time.Millisecond
+					}
 				}
-				probes = append(probes, port+":auth")
 			}
 			lastPorts = strings.Join(probes, ",")
+			if transportPort != "" {
+				lastProbe = "readiness"
+			}
 			fmt.Fprintln(stderr, sshWaitProgressMessage(target, phase, reachablePort, transportPort, lastPorts, time.Since(start), time.Until(deadline)))
 		}
-		time.Sleep(10 * time.Second)
+		if err := check(nil); err != nil {
+			return err
+		}
+		// Newly booted guests often become ready just after the first probe.
+		// Back off for longer boots without delaying the first retries.
+		if err := sleepContext(probeCtx, retryDelay); err != nil {
+			return check(err)
+		}
+		retryDelay = min(2*retryDelay, 5*time.Second)
 	}
+}
+
+func sshDialFailureStatus(err error) string {
+	if errors.Is(err, syscall.EHOSTUNREACH) {
+		return "no-route-to-host"
+	}
+	return "closed"
 }
 
 func WaitForSSHReady(ctx context.Context, target *SSHTarget, stderr io.Writer, phase string, timeout time.Duration) error {
@@ -195,21 +598,28 @@ func sshWaitProgressMessage(target *SSHTarget, phase, reachablePort, transportPo
 		return fmt.Sprintf("waiting for %s:%s %s ready-check... elapsed=%s remaining=%s%s", target.Host, transportPort, phase, elapsed, remaining, suffix)
 	}
 	if reachablePort != "" {
-		return fmt.Sprintf("waiting for %s:%s %s ssh-auth... elapsed=%s remaining=%s%s", target.Host, reachablePort, phase, elapsed, remaining, suffix)
+		return fmt.Sprintf("waiting for %s:%s %s ssh-transport... elapsed=%s remaining=%s%s", target.Host, reachablePort, phase, elapsed, remaining, suffix)
 	}
 	return fmt.Sprintf("waiting for %s:%s %s... elapsed=%s remaining=%s%s", target.Host, target.Port, phase, elapsed, remaining, suffix)
 }
 
-func probeSSHReady(ctx context.Context, target *SSHTarget, timeout time.Duration) bool {
+func ProbeSSHReady(ctx context.Context, target *SSHTarget, timeout time.Duration) bool {
 	if target.Host == "" {
 		return false
 	}
+	profile := sshReadinessProfileForTarget(*target)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if isWindowsWSL2Target(*target) {
+		return probeWSL2SSHReady(ctx, target, profile, io.Discard) == nil
+	}
 	if target.SSHConfigProxy {
-		return runSSHQuietWithOptionsResolvePort(ctx, target, sshReadyCommand(*target), "2", "1") == nil
+		return probeProxySSHReady(ctx, target, profile) == nil
 	}
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
+		if sshReadinessProbeContextError(ctx, "transport") != nil {
+			return false
+		}
 		probe := *target
 		probe.Port = port
 		probe.FallbackPorts = []string{}
@@ -219,12 +629,136 @@ func probeSSHReady(ctx context.Context, target *SSHTarget, timeout time.Duration
 			continue
 		}
 		_ = conn.Close()
-		if runSSHQuietWithOptions(ctx, probe, sshReadyCommand(probe), "2", "1") == nil {
-			target.Port = probe.Port
+		if sshReadinessProbeContextError(ctx, "readiness") != nil {
+			return false
+		}
+		if runSSHQuietWithOptions(ctx, probe, sshReadyCommand(probe), profile.connectTimeout, profile.connectionAttempts) == nil {
+			target.recordPreparedEndpoint(probe.Port)
 			return true
 		}
 	}
 	return false
+}
+
+func probeProxySSHReady(ctx context.Context, target *SSHTarget, profile sshReadinessProfile) error {
+	if stopped := sshReadinessProbeContextError(ctx, "readiness"); stopped != nil {
+		return stopped
+	}
+	var lastErr error
+	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
+		if stopped := sshReadinessProbeContextError(ctx, "readiness"); stopped != nil {
+			return stopped
+		}
+		candidate := *target
+		candidate.Port, candidate.FallbackPorts = port, []string{}
+		if lastErr = runSSHReadinessProbe(ctx, candidate, sshReadyCommand(candidate), profile.connectTimeout, profile.connectionAttempts); lastErr != nil {
+			if stopped := sshReadinessProbeContextError(ctx, "readiness"); stopped != nil {
+				return stopped
+			}
+			var setupErr *workspaceOwnerSetupError
+			if errors.As(lastErr, &setupErr) || errors.Is(lastErr, errSSHHostKeyVerification) {
+				return lastErr
+			}
+			continue
+		}
+		target.recordPreparedEndpoint(port)
+		return nil
+	}
+	return lastErr
+}
+
+func probeWSL2SSHReady(ctx context.Context, target *SSHTarget, profile sshReadinessProfile, stderr io.Writer) error {
+	if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
+		return stopped
+	}
+	ports := sshPortCandidates(target.Port, target.FallbackPorts)
+	type outcome struct {
+		err         error
+		missingSFTP bool
+	}
+	outcomes := make([]outcome, 0, len(ports))
+	for _, port := range ports {
+		if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
+			return stopped
+		}
+		probe := *target
+		probe.Port, probe.FallbackPorts = port, []string{}
+		run := func(remote string) error {
+			remoteCommand := wsl2ReadinessCommand(remote)
+			if transportOnly, _ := ctx.Value(nativeRuntimeTransportProbeKey{}).(bool); transportOnly {
+				remoteCommand = wsl2ProbeCommand(remote, "/usr/bin/env BASH_ENV=/dev/null ENV=/dev/null /bin/sh -c")
+			}
+			return runWSLReadinessTransport(ctx, probe, remoteCommand, profile.connectTimeout, profile.connectionAttempts)
+		}
+		if err := run(sshTransportProbeCommand(probe)); err != nil {
+			if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
+				return stopped
+			}
+			if errors.Is(err, errSSHHostKeyVerification) {
+				return err
+			}
+			outcomes = append(outcomes, outcome{err: err})
+			continue
+		}
+		if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
+			return stopped
+		}
+		var diagnostic sshReadinessDiagnostic
+		var diagnosticOutput io.Writer = &diagnostic
+		if stderr != nil {
+			diagnosticOutput = io.MultiWriter(&diagnostic, stderr)
+		}
+		sftpErr := probeWSLSFTPSubsystem(ctx, probe, profile.connectTimeout, profile.connectionAttempts, diagnosticOutput)
+		if err := sshReadinessProbeError(ctx, sftpErr, diagnostic.hostKeyRejected()); err != nil {
+			if stopped := sshReadinessProbeContextError(ctx, "transport"); stopped != nil {
+				return stopped
+			}
+			if errors.Is(err, errSSHHostKeyVerification) {
+				return err
+			}
+			outcomes = append(outcomes, outcome{err: err, missingSFTP: IsWSLSFTPUnavailable(err)})
+			continue
+		}
+		if stopped := sshReadinessProbeContextError(ctx, "readiness"); stopped != nil {
+			return stopped
+		}
+		if transportOnly, _ := ctx.Value(nativeRuntimeTransportProbeKey{}).(bool); transportOnly {
+			target.recordPreparedEndpoint(port)
+			return nil
+		}
+		// Transport/SFTP probes stay lightweight. An owned readiness command
+		// must pass the same staged witness setup as the subsequent workload.
+		if workspaceOwnerFromContext(ctx) != nil {
+			run = func(remote string) error {
+				return runSSHReadinessProbe(ctx, probe, remote, profile.connectTimeout, profile.connectionAttempts)
+			}
+		}
+		if err := run(sshReadyCommand(probe)); err == nil {
+			target.recordPreparedEndpoint(port)
+			return nil
+		} else {
+			if stopped := sshReadinessProbeContextError(ctx, "readiness"); stopped != nil {
+				return stopped
+			}
+			var setupErr *workspaceOwnerSetupError
+			if errors.As(err, &setupErr) || errors.Is(err, errSSHHostKeyVerification) {
+				return err
+			}
+			outcomes = append(outcomes, outcome{err: err})
+		}
+	}
+	allMissing := len(outcomes) == len(ports)
+	var lastErr error
+	for _, result := range outcomes {
+		allMissing = allMissing && result.missingSFTP
+		if !result.missingSFTP {
+			lastErr = result.err
+		}
+	}
+	if allMissing {
+		return errWSLSFTPUnavailable
+	}
+	return lastErr
 }
 
 func probeSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Duration) bool {
@@ -233,10 +767,37 @@ func probeSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Dura
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if scope, _ := ctx.Value(nativeRuntimeScopeKey{}).(*nativeRuntimeScope); scope != nil && scope.selected() && isWindowsWSL2Target(*target) {
+		if err := scope.validateLocal(ctx, *target); err != nil {
+			return false
+		}
+		// Route selection precedes admission. Probe only SSH/WSL transport;
+		// staging here would require an installation on the unselected route.
+		for _, port := range resolvedSSHPortCandidates(*target) {
+			if context.Cause(ctx) != nil {
+				return false
+			}
+			probe := *target
+			probe.Port, probe.FallbackPorts, probe.NoControlMaster = port, []string{}, true
+			command := wsl2ProbeCommand("exit 0", "/usr/bin/env BASH_ENV=/dev/null ENV=/dev/null /bin/sh -c")
+			err := runWSLReadinessTransport(ctx, probe, command, "2", "1")
+			if err == nil {
+				target.recordPreparedEndpoint(port)
+				return true
+			}
+			if errors.Is(err, errSSHHostKeyVerification) {
+				return false
+			}
+		}
+		return false
+	}
 	if target.SSHConfigProxy {
 		return runSSHQuietWithOptionsResolvePort(ctx, target, sshTransportProbeCommand(*target), "2", "1") == nil
 	}
 	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
+		if sshReadinessProbeContextError(ctx, "transport") != nil {
+			return false
+		}
 		probe := *target
 		probe.Port = port
 		probe.FallbackPorts = []string{}
@@ -246,8 +807,11 @@ func probeSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Dura
 			continue
 		}
 		_ = conn.Close()
+		if sshReadinessProbeContextError(ctx, "transport") != nil {
+			return false
+		}
 		if runSSHQuietWithOptions(ctx, probe, sshTransportProbeCommand(probe), "2", "1") == nil {
-			target.Port = probe.Port
+			target.recordPreparedEndpoint(probe.Port)
 			return true
 		}
 	}
@@ -263,12 +827,29 @@ func sshReadyCommand(target SSHTarget) string {
 		return target.ReadyCheck
 	}
 	if isWindowsNativeTarget(target) {
-		return powershellCommand(`$ErrorActionPreference = "Stop"
+		return PowershellCommand(windowsPowerShellPathRefresh + `$ErrorActionPreference = "Stop"
 git --version | Out-Null
 tar --version | Out-Null
+node --version | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "node readiness failed" }
+npm.cmd --version | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "npm readiness failed" }
 if (-not (Test-Path -LiteralPath ` + psQuote(targetWindowsReadyRoot(target)) + `)) { throw "work root missing" }`)
 	}
+	if target.TargetOS == targetMacOS {
+		return sshReadyCommand(SSHTarget{}) + " && " + remotePortableShellInvocation("node --version >/dev/null && npm --version >/dev/null", nil)
+	}
 	return "test -x /usr/local/bin/crabbox-ready && /usr/local/bin/crabbox-ready >/tmp/crabbox-ready.log 2>&1"
+}
+
+func wsl2ReadinessCommand(remote string) string {
+	return wsl2ProbeCommand(remote, "sh -lc")
+}
+
+func wsl2ProbeCommand(remote, interpreter string) string {
+	return PowershellCommand(`$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('` + base64.StdEncoding.EncodeToString([]byte(remote)) + `'))
+& wsl.exe --exec ` + interpreter + ` $c
+exit $LASTEXITCODE`)
 }
 
 func targetWindowsReadyRoot(target SSHTarget) string {
@@ -297,6 +878,239 @@ func uniqueSSHPorts(ports []string) []string {
 	return out
 }
 
+// A prepared endpoint avoids rediscovery within one operation. Keep every
+// advertised candidate: network selection can retarget the same lease to a
+// different host whose reachable SSH port differs.
+func (target *SSHTarget) recordPreparedEndpoint(port string) {
+	if target.Port != port {
+		target.FallbackPorts = sshPortCandidates(target.Port, target.FallbackPorts)
+	}
+	target.Port = port
+	target.preparedEndpoint = net.JoinHostPort(target.Host, port)
+}
+
+// Port probes may retry before delivery; a delivered command must never replay.
+func resolvedSSHPortCandidates(target SSHTarget) []string {
+	if target.preparedEndpoint != "" && target.preparedEndpoint == net.JoinHostPort(target.Host, target.Port) {
+		return []string{target.Port}
+	}
+	return sshPortCandidates(target.Port, target.FallbackPorts)
+}
+
+func resolveSSHPortNoInput(ctx context.Context, target *SSHTarget, connectTimeout, connectionAttempts string, stderr io.Writer) error {
+	ports := resolvedSSHPortCandidates(*target)
+	if len(ports) == 0 {
+		ports = []string{"22"}
+	}
+	if len(ports) == 1 {
+		target.Port = ports[0]
+		return nil
+	}
+	probe := *target
+	probe.FallbackPorts = []string{}
+	var err error
+	for index, port := range ports {
+		probe.Port = port
+		command := sshTransportPreparation{command: sshTransportProbeCommand(probe)}
+		diagnostic := newSynchronizedBuffer(0)
+		_, err = command.runOnce(ctx, probe, connectTimeout, connectionAttempts, io.Discard, &diagnostic, false)
+		if err == nil {
+			target.recordPreparedEndpoint(port)
+			return nil
+		}
+		if !shouldRetrySSHPort(err) || index == len(ports)-1 {
+			if stderr != nil {
+				_, _ = stderr.Write(diagnostic.Bytes())
+			}
+			return err
+		}
+	}
+	return err
+}
+
+type sshTransportPreparation struct {
+	// retirementUnconfirmed records dispatch evidence independently of joined errors.
+	retirementUnconfirmed bool
+	command               string
+	setupMarker           string
+	direct                io.ReadSeeker
+	stage                 *wslStageSpool
+	// replay borrows a finite input owner; its caller closes it after dispatch.
+	replay *replayableSSHInput
+}
+
+type sshCommandLimit struct {
+	execution time.Duration
+	control   bool
+}
+
+const sshMuxDescriptorFailure = "mux_client_request_session: send fds failed"
+
+type sshMuxFailureDetector struct {
+	log      []byte
+	overflow bool
+}
+
+func (d *sshMuxFailureDetector) Write(data []byte) (int, error) {
+	if len(d.log)+len(data) > 512 {
+		d.overflow = true
+	} else if !d.overflow {
+		d.log = append(d.log, data...)
+	}
+	return len(data), nil
+}
+
+func (d *sshMuxFailureDetector) failed() bool {
+	if d.overflow {
+		return false
+	}
+	lines := strings.Split(strings.TrimSuffix(strings.ReplaceAll(string(d.log), "\r\n", "\n"), "\n"), "\n")
+	// Even a local OpenSSH log can embed server-supplied disconnect text.
+	// Require the complete two-line failure, with no surrounding log records.
+	if len(lines) != 2 || lines[1] != sshMuxDescriptorFailure {
+		return false
+	}
+	for fd := 0; fd < 3; fd++ {
+		prefix := fmt.Sprintf("mm_send_fd: sendmsg(%d): ", fd)
+		if strings.HasPrefix(lines[0], prefix) && len(lines[0]) > len(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func prepareSSHTransport(ctx context.Context, target SSHTarget, command string, input io.ReadSeeker, size int64, limit sshCommandLimit) (sshTransportPreparation, error) {
+	if size < 0 || limit.execution < 0 || limit.control && (int64(len(command))+size > sshControlMetadataLimit || limit.execution <= 0) {
+		return sshTransportPreparation{}, errors.New("command exceeds finite transport limits")
+	}
+	if isWindowsWSL2Target(target) {
+		native, err := admittedNativeRuntime(ctx, target)
+		if err != nil {
+			return sshTransportPreparation{}, err
+		}
+		program := wslStageProgram{source: wslLinuxHelper, bootstrap: wslHelperBootstrap}
+		if native != nil {
+			program, err = nativeWSLStageProgram(native, "command", limit.execution)
+			if err != nil {
+				return sshTransportPreparation{}, err
+			}
+		}
+		spool, err := newWSLStageSpoolWithProgram(command, nil, input, size, limit, program)
+		if err == nil && limit.control {
+			if spool.size > sshControlMetadataLimit {
+				_ = spool.close()
+				return sshTransportPreparation{}, errors.New("control envelope exceeds its accounted transport budget")
+			}
+		}
+		return sshTransportPreparation{stage: spool}, err
+	}
+	return sshTransportPreparation{command: wrapRemoteForTarget(target, command), direct: input}, nil
+}
+
+func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, connectTimeout, connectionAttempts string, stdout, stderr io.Writer) error {
+	preparedTarget, err := prepareServeRelayControl(ctx, *target)
+	if err != nil {
+		return err
+	}
+	*target = preparedTarget
+	if p.stage != nil {
+		p.retirementUnconfirmed = true
+		p.stage.setupMarker = p.setupMarker
+		err := p.stage.run(ctx, target, connectTimeout, connectionAttempts, stdout, stderr)
+		// Staged errors may leave work beyond the SSH process; only its full
+		// successful completion currently supplies retirement evidence.
+		p.retirementUnconfirmed = err != nil
+		return err
+	}
+	if err := resolveSSHPortNoInput(ctx, target, connectTimeout, connectionAttempts, stderr); err != nil {
+		return err
+	}
+	multiplexed := target.ownerControlPath != "" || runtime.GOOS != "windows" && !target.AuthSecret && !target.NoControlMaster && !target.AuthoritativeKnownHosts && target.SSHConfigFile == ""
+	for attempt := 0; ; attempt++ {
+		probe := *target
+		if attempt == 2 {
+			probe.NoControlMaster = true
+			probe.ownerControlPath = ""
+		}
+		muxFailure, err := p.runOnce(ctx, probe, connectTimeout, connectionAttempts, stdout, stderr, multiplexed && attempt < 2)
+		if err == nil || ctx.Err() != nil || exitCode(err) != 255 || !muxFailure || attempt == 2 {
+			return err
+		}
+	}
+}
+
+func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget, connectTimeout, connectionAttempts string, stdout, stderr io.Writer, captureLocalDiagnostics bool) (muxFailure bool, err error) {
+	args := sshArgsNoInputWithOptions(target, p.command, connectTimeout, connectionAttempts)
+	if p.direct != nil || p.replay != nil {
+		args = sshArgsWithOptions(target, p.command, connectTimeout, connectionAttempts)
+	}
+	if target.AuthSecret || target.SSHConfigFile != "" {
+		// Every command, including probes and workspace witnesses, needs the same
+		// private identity config as copy/forward transports. Keep it until Wait.
+		session, sessionErr := newSSHTransportSession(ctx, target, false)
+		if sessionErr != nil {
+			return false, sessionErr
+		}
+		defer func() { err = errors.Join(err, session.Close()) }()
+		args = session.commandPrefixWithOptions(connectTimeout, connectionAttempts)
+		if p.direct == nil && p.replay == nil {
+			args = append(args, "-n")
+		}
+		args = append(args, session.host(), p.command)
+	}
+	cmd := sshCommandContext(ctx, target, args...)
+	input, err := p.reset()
+	if err != nil {
+		return false, err
+	}
+	cmd.Stdin = input
+	p.retirementUnconfirmed = true
+	defer func() {
+		// Inspect the command we own, never an arbitrary ExitError found in a
+		// joined error. OpenSSH reserves 255 for transport failure; a normal
+		// exit below that reports remote command completion. Cancellation and
+		// signaled termination cannot establish remote retirement.
+		if cmd.Process == nil {
+			p.retirementUnconfirmed = false // local Start failed: no dispatch
+		} else if ctx.Err() == nil && cmd.ProcessState != nil && cmd.ProcessState.Exited() && cmd.ProcessState.ExitCode() >= 0 && cmd.ProcessState.ExitCode() < 255 {
+			p.retirementUnconfirmed = false
+		}
+	}()
+	stdout, stderr, finish := workspaceOwnerSetupStreams(p.setupMarker, stdout, stderr)
+	defer func() {
+		err = finish(err)
+		var setupErr *workspaceOwnerSetupError
+		if errors.As(err, &setupErr) {
+			muxFailure = false
+		}
+	}()
+	if captureLocalDiagnostics {
+		return runSSHCommandWithLocalDiagnostics(cmd, stdout, stderr)
+	}
+	return false, runSSHCommand(cmd, stdout, stderr)
+}
+
+func (p *sshTransportPreparation) reset() (io.Reader, error) {
+	if p.replay != nil {
+		return p.replay.reset()
+	}
+	if p.direct != nil {
+		if _, err := p.direct.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		return p.direct, nil
+	}
+	return nil, nil
+}
+
+func (p *sshTransportPreparation) close() error {
+	var err error
+	if p.stage != nil {
+		err = errors.Join(err, p.stage.close())
+	}
+	return err
+}
+
 func runSSHQuiet(ctx context.Context, target SSHTarget, remote string) error {
 	return runSSHQuietWithOptions(ctx, target, remote, "10", "3")
 }
@@ -305,76 +1119,135 @@ func RunSSHQuiet(ctx context.Context, target SSHTarget, remote string) error {
 	return runSSHQuiet(ctx, target, remote)
 }
 
+// RunSSHOutput runs remote on target and returns its trimmed stdout. It is the
+// exported entry point for provider backends (e.g. the Phala TDX attestation
+// fetch) that need to capture a remote command's stdout rather than merely
+// asserting it succeeded.
+func RunSSHOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
+	return runSSHOutput(ctx, target, remote)
+}
+
 func runSSHQuietWithOptions(ctx context.Context, target SSHTarget, remote, connectTimeout, connectionAttempts string) error {
 	return runSSHQuietWithOptionsResolvePort(ctx, &target, remote, connectTimeout, connectionAttempts)
 }
 
-func runSSHQuietWithOptionsResolvePort(ctx context.Context, target *SSHTarget, remote, connectTimeout, connectionAttempts string) error {
-	remote = wrapRemoteForTarget(*target, remote)
-	var lastErr error
-	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		probe := *target
-		probe.Port = port
-		probe.FallbackPorts = []string{}
-		cmd := exec.CommandContext(ctx, "ssh", sshArgsNoInputWithOptions(probe, remote, connectTimeout, connectionAttempts)...)
-		err := runSSHCommand(cmd, io.Discard, io.Discard)
-		if err == nil {
-			target.Port = probe.Port
-			return nil
-		}
-		lastErr = err
-		if !shouldRetrySSHPort(err) {
-			return err
-		}
+type sshPreparationError struct{ error }
+
+func (e sshPreparationError) Unwrap() error { return e.error }
+
+// executeSSH owns workspace preparation; executePreparedSSH is the lower,
+// generic transport boundary and has no knowledge of workspace ownership.
+func executeSSH(ctx context.Context, target *SSHTarget, remote string, input io.ReadSeeker, size int64, limit time.Duration, connectTimeout, attempts string, stdout, stderr io.Writer) (err error) {
+	_, err = executeSSHWithRetirement(ctx, target, remote, input, size, limit, connectTimeout, attempts, stdout, stderr)
+	return err
+}
+
+// executeSSHWithRetirement keeps remote lifetime evidence separate from local
+// diagnostics and spool errors. An owner cleanup failure remains conservative.
+func executeSSHWithRetirement(ctx context.Context, target *SSHTarget, remote string, input io.ReadSeeker, size int64, limit time.Duration, connectTimeout, attempts string, stdout, stderr io.Writer) (retirementUnconfirmed bool, err error) {
+	var inputSize *int64
+	if input != nil {
+		inputSize = &size
 	}
-	return lastErr
+	prepared, err := prepareWorkspaceOwnerRemote(ctx, *target, remote, inputSize)
+	if err != nil {
+		return false, sshPreparationError{err}
+	}
+	defer func() {
+		if err != nil {
+			cleanupErr := prepared.close(ctx, *target)
+			retirementUnconfirmed = retirementUnconfirmed || cleanupErr != nil
+			err = errors.Join(err, cleanupErr)
+		}
+	}()
+	commandLimit := sshCommandLimit{execution: limit}
+	transport, err := prepareSSHTransport(ctx, *target, prepared.command, input, size, commandLimit)
+	if err != nil {
+		return false, sshPreparationError{err}
+	}
+	transport.setupMarker = prepared.setupMarker
+	err = transport.execute(ctx, target, commandLimit, connectTimeout, attempts, stdout, stderr)
+	return transport.retirementUnconfirmed, err
+}
+
+func executePreparedSSH(ctx context.Context, target *SSHTarget, command string, input io.ReadSeeker, size int64, limit sshCommandLimit, connectTimeout, attempts string, stdout, stderr io.Writer) (err error) {
+	transport, err := prepareSSHTransport(ctx, *target, command, input, size, limit)
+	if err != nil {
+		return sshPreparationError{err}
+	}
+	return transport.execute(ctx, target, limit, connectTimeout, attempts, stdout, stderr)
+}
+
+func (transport *sshTransportPreparation) execute(ctx context.Context, target *SSHTarget, limit sshCommandLimit, connectTimeout, attempts string, stdout, stderr io.Writer) (err error) {
+	defer func() { err = errors.Join(err, transport.close()) }()
+	if limit.execution > 0 {
+		// Only staged WSL transport has a size-dependent call budget.
+		var bytes int64
+		if transport.stage != nil {
+			bytes = transport.stage.size
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, sshTransportCallBudget(*target, bytes, limit))
+		defer cancel()
+	}
+	err = transport.run(ctx, target, connectTimeout, attempts, stdout, stderr)
+	if err == nil {
+		err = context.Cause(ctx)
+	}
+	return err
+}
+
+func runSSHQuietWithOptionsResolvePort(ctx context.Context, target *SSHTarget, remote, connectTimeout, connectionAttempts string) error {
+	return executeSSH(ctx, target, remote, nil, 0, 0, connectTimeout, connectionAttempts, io.Discard, io.Discard)
 }
 
 func runSSHOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
-	remote = wrapRemoteForTarget(target, remote)
-	var lastOut []byte
-	var lastErr error
-	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		probe := target
-		probe.Port = port
-		cmd := exec.CommandContext(ctx, "ssh", sshArgsNoInput(probe, remote)...)
-		var out bytes.Buffer
-		err := runSSHCommand(cmd, &out, io.Discard)
-		if err == nil {
-			return strings.TrimSpace(out.String()), nil
-		}
-		lastOut = out.Bytes()
-		lastErr = err
-		if !shouldRetrySSHPort(err) {
-			return "", err
-		}
-	}
-	return strings.TrimSpace(string(lastOut)), lastErr
+	return runSSHOutputWithRemoteWaitTimeout(ctx, target, remote, 0, "10", "3")
+}
+
+func runSSHOutputWithRemoteWaitTimeout(ctx context.Context, target SSHTarget, remote string, waitTimeout time.Duration, connectTimeout, connectionAttempts string) (string, error) {
+	var out bytes.Buffer
+	err := executeSSH(ctx, &target, remote, nil, 0, waitTimeout, connectTimeout, connectionAttempts, &out, io.Discard)
+	return strings.TrimSpace(out.String()), err
 }
 
 func runSSHCombinedOutput(ctx context.Context, target SSHTarget, remote string) (string, error) {
-	remote = wrapRemoteForTarget(target, remote)
-	var lastOut []byte
+	return runSSHCombinedOutputLimit(ctx, target, remote, 0)
+}
+
+func runSSHCombinedOutputLimit(ctx context.Context, target SSHTarget, remote string, maxBytes int) (string, error) {
+	out := newSynchronizedBuffer(maxBytes)
+	err := executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+	return strings.TrimSpace(out.String()), err
+}
+
+var idempotentSSHRetryDelay = 2 * time.Second
+
+func runIdempotentSSHCombinedOutput(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	return runIdempotentSSHCombinedOutputLimit(ctx, target, remote, retryDelay, 0)
+}
+
+func runIdempotentSSHCombinedOutputLimit(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration, maxBytes int) (string, error) {
+	var lastOut string
 	var lastErr error
-	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		probe := target
-		probe.Port = port
-		// Crabbox's SSH helpers intentionally execute commands assembled by
-		// typed remote-command builders. Callers must shell-quote user data
-		// before it reaches this boundary; see remoteCommand/shellQuote tests.
-		cmd := exec.CommandContext(ctx, "ssh", sshArgsNoInput(probe, remote)...)
-		var out synchronizedBuffer
-		err := runSSHCommand(cmd, &out, &out)
-		if err == nil {
-			return strings.TrimSpace(out.String()), nil
+	for attempt := 0; attempt < 2; attempt++ {
+		lastOut, lastErr = runSSHCombinedOutputLimit(ctx, target, remote, maxBytes)
+		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
+			return lastOut, lastErr
 		}
-		lastOut = out.Bytes()
-		lastErr = err
-		if !shouldRetrySSHPort(err) {
-			return strings.TrimSpace(out.String()), err
+		// Only callers whose entire remote command is safe to repeat may use
+		// this helper. Transfer, hydration, and user commands stay outside it.
+		if err := sleepContext(ctx, retryDelay); err != nil {
+			return lastOut, err
 		}
 	}
-	return strings.TrimSpace(string(lastOut)), lastErr
+	return lastOut, lastErr
+}
+
+func runWSL2ControlScriptCombinedOutput(ctx context.Context, target SSHTarget, remote string, waitTimeout time.Duration, connectTimeout, connectionAttempts string) (string, error) {
+	out := newSynchronizedBuffer(0)
+	err := executeSSH(ctx, &target, remote, nil, 0, waitTimeout, connectTimeout, connectionAttempts, &out, &out)
+	return strings.TrimSpace(out.String()), err
 }
 
 func runSSHInputQuiet(ctx context.Context, target SSHTarget, remote, input string) error {
@@ -382,7 +1255,6 @@ func runSSHInputQuiet(ctx context.Context, target SSHTarget, remote, input strin
 }
 
 func runSSHInput(ctx context.Context, target SSHTarget, remote string, input io.Reader, stdout, stderr io.Writer) error {
-	remote = wrapRemoteForTarget(target, remote)
 	if input == nil {
 		input = strings.NewReader("")
 	}
@@ -390,48 +1262,21 @@ func runSSHInput(ctx context.Context, target SSHTarget, remote string, input io.
 	if err != nil {
 		return err
 	}
-	var lastErr error
-	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		probe := target
-		probe.Port = port
-		cmd := exec.CommandContext(ctx, "ssh", sshArgs(probe, remote)...)
-		cmd.Stdin = bytes.NewReader(data)
-		err := runSSHCommand(cmd, stdout, stderr)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !shouldRetrySSHPort(err) {
-			return err
-		}
-	}
-	return lastErr
+	return runSSHInputStream(ctx, target, remote, bytes.NewReader(data), stdout, stderr)
 }
 
 func runSSHInputStream(ctx context.Context, target SSHTarget, remote string, input io.ReadSeeker, stdout, stderr io.Writer) error {
-	remote = wrapRemoteForTarget(target, remote)
 	if input == nil {
 		input = strings.NewReader("")
 	}
-	var lastErr error
-	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		if _, err := input.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		probe := target
-		probe.Port = port
-		cmd := exec.CommandContext(ctx, "ssh", sshArgs(probe, remote)...)
-		cmd.Stdin = input
-		err := runSSHCommand(cmd, stdout, stderr)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !shouldRetrySSHPort(err) {
-			return err
-		}
+	size, err := input.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
 	}
-	return lastErr
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return executeSSH(ctx, &target, remote, input, size, 0, "10", "3", stdout, stderr)
 }
 
 func runSSHStream(ctx context.Context, target SSHTarget, remote string, stdout, stderr io.Writer) int {
@@ -439,34 +1284,52 @@ func runSSHStream(ctx context.Context, target SSHTarget, remote string, stdout, 
 	return code
 }
 
-func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, stdout, stderr io.Writer) (int, error) {
-	remote = wrapRemoteForTarget(target, remote)
-	lastCode := 7
-	var lastErr error
-	for _, port := range sshPortCandidates(target.Port, target.FallbackPorts) {
-		probe := target
-		probe.Port = port
-		cmd := exec.CommandContext(ctx, "ssh", sshArgsNoInput(probe, remote)...)
-		err := runSSHCommand(cmd, stdout, stderr)
-		if err == nil {
-			return 0, nil
+func runSSHStreamResult(ctx context.Context, target SSHTarget, remote string, stdout, stderr io.Writer) (code int, err error) {
+	// Some streaming callers retain only the exit code. Report proven setup
+	// failures here, once, without changing workload stderr or exit semantics.
+	defer func() {
+		var setupErr *workspaceOwnerSetupError
+		if stderr == nil || !errors.As(err, &setupErr) {
+			return
 		}
-		lastErr = err
-		lastCode = exitCode(err)
-		if !shouldRetrySSHPort(err) {
-			return lastCode, err
+		detail := setupErr.Error() + "\n"
+		n, writeErr := io.WriteString(stderr, detail)
+		if writeErr == nil && n < len(detail) {
+			writeErr = io.ErrShortWrite
 		}
+		err = errors.Join(err, writeErr)
+	}()
+	err = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", stdout, stderr)
+	var preparation sshPreparationError
+	if errors.As(err, &preparation) {
+		return 7, err
 	}
-	return lastCode, lastErr
+	return exitCode(err), err
 }
 
 func runSSHCommand(cmd *exec.Cmd, stdout, stderr io.Writer) error {
 	return runCommandWithPlatformStreams(cmd, stdout, stderr)
 }
 
+func sameCommandStreamWriter(left, right io.Writer) bool {
+	defer func() {
+		_ = recover()
+	}()
+	return left == right
+}
+
+// Construct explicitly so SSH's nonpositive limits remain unlimited.
 type synchronizedBuffer struct {
 	mu  sync.Mutex
-	buf bytes.Buffer
+	buf prefixbuffer.Buffer
+}
+
+func newSynchronizedBuffer(limit int) synchronizedBuffer {
+	buf := prefixbuffer.NewUnlimited()
+	if limit > 0 {
+		buf = prefixbuffer.NewLimited(limit)
+	}
+	return synchronizedBuffer{buf: buf}
 }
 
 func (b *synchronizedBuffer) Write(data []byte) (int, error) {
@@ -478,18 +1341,67 @@ func (b *synchronizedBuffer) Write(data []byte) (int, error) {
 func (b *synchronizedBuffer) Bytes() []byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.buf.Exceeded() {
+		return nil
+	}
 	return bytes.Clone(b.buf.Bytes())
 }
 
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.buf.Exceeded() {
+		return ""
+	}
 	return b.buf.String()
+}
+
+func (b *synchronizedBuffer) boundedString() (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String(), b.buf.Exceeded()
+}
+
+type gitOriginDiagnosticsTruncatedError struct {
+	err error
+}
+
+func (e *gitOriginDiagnosticsTruncatedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *gitOriginDiagnosticsTruncatedError) Unwrap() error {
+	return e.err
+}
+
+func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	var (
+		out       synchronizedBuffer
+		lastErr   error
+		truncated bool
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		out = newSynchronizedBuffer(gitSeedDiagnosticLimit)
+		lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
+			break
+		}
+		if err := sleepContext(ctx, retryDelay); err != nil {
+			lastErr = err
+			break
+		}
+	}
+	output, truncated := out.boundedString()
+	output = strings.TrimSpace(output)
+	if truncated && lastErr != nil {
+		lastErr = &gitOriginDiagnosticsTruncatedError{err: lastErr}
+	}
+	return output, lastErr
 }
 
 func isSSHCommandExitError(err error) bool {
 	var exitErr *exec.ExitError
-	return asExitError(err, &exitErr)
+	return errors.As(err, &exitErr)
 }
 
 func sshArgs(target SSHTarget, remote string) []string {
@@ -501,6 +1413,10 @@ func sshArgsNoInput(target SSHTarget, remote string) []string {
 }
 
 func shouldRetrySSHPort(err error) bool {
+	var setupErr *workspaceOwnerSetupError
+	if errors.As(err, &setupErr) {
+		return false
+	}
 	return exitCode(err) == 255
 }
 
@@ -523,34 +1439,46 @@ func sshBaseArgs(target SSHTarget) []string {
 	return sshBaseArgsWithOptions(target, "10", "3")
 }
 
+func sshForwardingDenyArgs() []string {
+	return []string{
+		"-o", "ForwardAgent=no",
+		"-o", "ForwardX11=no",
+		"-o", "ForwardX11Trusted=no",
+	}
+}
+
 func sshBaseArgsWithOptions(target SSHTarget, connectTimeout, connectionAttempts string) []string {
-	args := []string{
+	connectTimeout = relaySSHConnectTimeout(connectTimeout, usesServeRelay(target))
+	args := append(sshForwardingDenyArgs(),
 		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=" + connectTimeout,
-		"-o", "ConnectionAttempts=" + connectionAttempts,
+		"-o", "ConnectTimeout="+connectTimeout,
+		"-o", "ConnectionAttempts="+connectionAttempts,
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=2",
 		"-p", target.Port,
+	)
+	if target.SSHConfigFile != "" {
+		args = append(args, "-F", target.SSHConfigFile,
+			"-o", "RemoteCommand=none", "-o", "RequestTTY=auto", "-o", "ClearAllForwardings=yes")
 	}
-	if target.DisableHostKeyChecking {
+	args = append(args, sshHostKeyVerificationArgs(target)...)
+	if target.ownerControlPath != "" {
+		args = append(args, "-o", "ControlMaster=no", "-o", "ControlPersist=no", "-o", "ControlPath="+target.ownerControlPath)
+	} else if target.AuthSecret || target.NoControlMaster || target.AuthoritativeKnownHosts || target.SSHConfigFile != "" {
 		args = append(args,
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "UserKnownHostsFile=/dev/null",
-			"-o", "LogLevel=ERROR",
+			"-o", "ControlMaster=no",
+			"-o", "ControlPath=none",
+			"-o", "ControlPersist=no",
 		)
-	} else {
-		args = append(args,
-			"-o", "StrictHostKeyChecking=accept-new",
-			"-o", "UserKnownHostsFile="+sshConfigFileValue(knownHostsFile(target)),
-		)
-	}
-	if target.AuthSecret || target.NoControlMaster {
-		args = append(args, "-o", "ControlMaster=no")
 	} else if runtime.GOOS == "windows" {
 		// Windows OpenSSH does not support Unix domain sockets for
 		// connection multiplexing; ControlMaster causes
 		// "getsockname failed: Not a socket" errors.
-		args = append(args, "-o", "ControlMaster=no")
+		args = append(args,
+			"-o", "ControlMaster=no",
+			"-o", "ControlPath=none",
+			"-o", "ControlPersist=no",
+		)
 	} else {
 		args = append(args,
 			"-o", "ControlMaster=auto",
@@ -568,6 +1496,53 @@ func sshBaseArgsWithOptions(target SSHTarget, connectTimeout, connectionAttempts
 		args = append(args, "-o", "ProxyCommand="+target.ProxyCommand)
 	}
 	return args
+}
+
+func sshHostKeyVerificationArgs(target SSHTarget) []string {
+	if target.DisableHostKeyChecking {
+		return []string{
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "LogLevel=ERROR",
+		}
+	}
+	strictHostKeyChecking := "accept-new"
+	if target.HostKeyAlias != "" || strings.TrimSpace(target.SSHHostKey) != "" || target.AuthoritativeKnownHosts {
+		strictHostKeyChecking = "yes"
+	}
+	args := []string{
+		"-o", "StrictHostKeyChecking=" + strictHostKeyChecking,
+		"-o", "UserKnownHostsFile=" + sshConfigFileValue(knownHostsFile(target)),
+	}
+	if strings.TrimSpace(target.SSHHostKey) != "" || target.AuthoritativeKnownHosts {
+		args = append(args,
+			"-o", "GlobalKnownHostsFile=none",
+			"-o", "KnownHostsCommand=none",
+			"-o", "VerifyHostKeyDNS=no",
+			"-o", "UpdateHostKeys=no",
+			"-o", "CheckHostIP=no",
+		)
+	}
+	if target.HostKeyAlias != "" {
+		args = append(args,
+			"-o", "HostKeyAlias="+target.HostKeyAlias,
+		)
+		if !target.AuthoritativeKnownHosts {
+			args = append(args, "-o", "HostKeyAlgorithms="+sshHostKeyAlgorithms(target))
+		}
+	}
+	return args
+}
+
+func sshHostKeyAlgorithms(target SSHTarget) string {
+	algorithm := "ssh-ed25519"
+	if fields := strings.Fields(target.SSHHostKey); len(fields) > 0 {
+		algorithm = fields[0]
+	}
+	if algorithm == xssh.KeyAlgoRSA {
+		return xssh.KeyAlgoRSASHA512 + "," + xssh.KeyAlgoRSASHA256
+	}
+	return algorithm
 }
 
 func minDuration(left, right time.Duration) time.Duration {
@@ -600,13 +1575,20 @@ func sshControlPath(target SSHTarget) string {
 		target.Key,
 		target.CertificateFile,
 		target.KnownHostsFile,
+		target.HostKeyAlias,
+		strings.TrimSpace(target.SSHHostKey),
 		target.ProxyCommand,
 	}, "\x00")
+	if leaseDir := sshControlLeaseDirectory(target); leaseDir != "" {
+		sum := sha256.Sum256([]byte(scope))
+		return filepath.Join(sshControlDirectory(leaseDir), base64.RawURLEncoding.EncodeToString(sum[:16])+"-%C")
+	}
 	sum := sha1.Sum([]byte(scope))
 	return filepath.Join("/tmp", "crabbox-ssh-"+hex.EncodeToString(sum[:4])+"-%C")
 }
 
 type rsyncOptions struct {
+	Compression       string
 	Debug             bool
 	Delete            bool
 	Checksum          bool
@@ -625,16 +1607,25 @@ func normalizeRsyncOptions(opts rsyncOptions) rsyncOptions {
 	return opts
 }
 
-func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []string, stdout, stderr io.Writer, opts rsyncOptions) error {
+func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []string, stdout, stderr io.Writer, opts rsyncOptions) (err error) {
 	opts = normalizeRsyncOptions(opts)
-	if opts.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		defer cancel()
+	session, wslExe, mountRoot, err := newWorkspaceRsyncSession(ctx, target)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, session.Close()) }()
+	archiveMode := "-az"
+	if !syncCompressionEnabled(opts.Compression) {
+		archiveMode = "-a"
 	}
 	args := []string{
-		"-az",
-		"-e", strings.Join(shellWords(append([]string{"ssh"}, sshBaseArgs(target)...)), " "),
+		archiveMode,
+		"-e", session.rsyncRemoteShellWithOptions("10", "3"),
+	}
+	if opts.Timeout > 0 {
+		// Rsync observes protocol I/O even in quiet mode. A wall-clock context
+		// deadline kills healthy large transfers; console output is not progress.
+		args = append(args, fmt.Sprintf("--timeout=%d", (opts.Timeout-1)/time.Second+1))
 	}
 	if opts.NoTimes {
 		args = append(args, "--no-times", "--omit-dir-times")
@@ -648,33 +1639,79 @@ func rsync(ctx context.Context, target SSHTarget, src, dst string, excludes []st
 	if opts.UseFilesFrom {
 		args = append(args, "--files-from=-", "--from0")
 	}
+	owner := workspaceOwnerFromContext(ctx)
 	if isWindowsWSL2Target(target) {
 		args = append(args, "--rsync-path", "wsl.exe rsync")
+	} else if owner != nil && !isWindowsNativeTarget(target) {
+		// openrsync removes shell quoting from --rsync-path before invoking SSH.
+		// A single private executable path works with both rsync implementations.
+		receiver, stageErr := stageRsyncWorkspaceReceiver(ctx, target, owner)
+		if stageErr != nil {
+			return stageErr
+		}
+		defer func() { err = errors.Join(err, receiver.close(ctx, target)) }()
+		args = append(args, "--rsync-path", receiver.command)
 	}
-	for _, exclude := range excludes {
-		args = append(args, "--exclude", exclude)
+	if !opts.UseFilesFrom {
+		for _, exclude := range excludes {
+			args = append(args, "--exclude", exclude)
+		}
 	}
 	if opts.Debug {
 		args = append(args, "--stats", "--itemize-changes", "--progress")
 	}
-	args = append(args, ensureTrailingSlash(rsyncLocalPath(src)), target.User+"@"+target.Host+":"+dst+"/")
-	start := time.Now()
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = windowsRsyncCommand(ctx, target, args)
-	} else {
-		cmd = exec.CommandContext(ctx, "rsync", args...)
+	args = append(args, "--", ensureTrailingSlash(rsyncLocalPath(src)), session.host()+":"+dst+"/")
+	handle, err := resolvedRsyncCommand(ctx, target, args, wslExe, mountRoot)
+	if err != nil {
+		return err
 	}
+	cmd := handle.cmd
+	guardStarted := false
+	if owner != nil && isWindowsWSL2Target(target) {
+		rawCtx := contextWithoutWorkspaceOwner(ctx)
+		if err := runSSHQuiet(rawCtx, target, owner.rsyncPrepareCommand()); err != nil {
+			return Exit(7, "prepare rsync workspace witness: %v", err)
+		}
+		if _, err := runWorkspaceOwnerBackgroundOutput(rawCtx, target, owner, owner.rsyncGuardPayload(dst)); err != nil {
+			return Exit(7, "start rsync workspace witness: %v", err)
+		}
+		if err := owner.WaitForChild(rawCtx, owner.callTimeout()); err != nil {
+			return err
+		}
+		guardStarted = true
+	}
+	start := time.Now()
 	if opts.UseFilesFrom {
 		cmd.Stdin = bytes.NewReader(opts.FilesFrom)
 	}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	stopHeartbeat := startSyncHeartbeat(stderr, start, opts.HeartbeatInterval)
-	err := cmd.Run()
+	err = handle.Start()
+	if err == nil {
+		err = handle.Wait()
+	}
 	stopHeartbeat()
-	if ctx.Err() == context.DeadlineExceeded {
-		return exit(6, "rsync timed out after %s; next_action=retry with --full-resync, then use a fresh lease if sync still stalls", opts.Timeout)
+	if ctx.Err() != nil {
+		err = errors.Join(err, ctx.Err())
+	} else if opts.Timeout > 0 && exitCode(err) == 30 {
+		err = Exit(6, "rsync stalled with no I/O progress for %s; next_action=retry with --full-resync, then use a fresh lease if sync still stalls", opts.Timeout)
+	}
+	if guardStarted {
+		guardCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owner.quiesceTimeout())
+		guardErr := finishRsyncWorkspaceWitness(guardCtx, target, owner)
+		cancel()
+		if guardErr != nil {
+			err = errors.Join(err, Exit(7, "finish rsync workspace witness: %v", guardErr))
+		}
+	}
+	if owner != nil && !isWindowsNativeTarget(target) && !isWindowsWSL2Target(target) {
+		quiesceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owner.quiesceTimeout())
+		quiesceErr := waitWorkspaceOwnerNoChild(quiesceCtx, owner, owner.callTimeout())
+		cancel()
+		if quiesceErr != nil {
+			err = errors.Join(err, Exit(7, "finish rsync workspace receiver: %v", quiesceErr))
+		}
 	}
 	if opts.Debug {
 		fmt.Fprintf(stderr, "rsync elapsed=%s checksum=%t delete=%t\n", time.Since(start).Round(time.Millisecond), opts.Checksum, opts.Delete)
@@ -687,7 +1724,7 @@ func wrapRemoteForTarget(target SSHTarget, remote string) string {
 		if strings.HasPrefix(remote, "powershell.exe ") || strings.HasPrefix(remote, "powershell ") {
 			return remote
 		}
-		return powershellCommand(remote)
+		return PowershellCommand(remote)
 	}
 	if isWindowsWSL2Target(target) {
 		return wsl2Command(remote)
@@ -697,7 +1734,7 @@ func wrapRemoteForTarget(target SSHTarget, remote string) string {
 
 func wsl2Command(remote string) string {
 	encoded := base64.StdEncoding.EncodeToString([]byte(remote))
-	return powershellCommand(`$ErrorActionPreference = "Stop"
+	return PowershellCommand(`$ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $dir = "C:\ProgramData\crabbox\commands"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -765,81 +1802,70 @@ func rsyncLocalPathForGOOS(goos, path string) string {
 	return path
 }
 
-// windowsRsyncCommand builds an exec.Cmd for rsync on Windows.
-// MSYS2/Cygwin rsync has broken signal handling with Windows SSH child
-// processes, so we prefer WSL rsync when available. The SSH key is copied
-// into WSL /tmp with correct permissions, and paths within args are
-// converted to WSL mount paths.
-func windowsRsyncCommand(ctx context.Context, target SSHTarget, args []string) *exec.Cmd {
+func windowsRsyncWSLExecutable(ctx context.Context, target SSHTarget) (string, bool) {
 	wslExe, err := exec.LookPath("wsl.exe")
 	if err != nil {
 		wslExe, err = exec.LookPath("wsl")
 	}
-	// Fall back to native rsync when WSL is absent or lacks native tools.
-	if err != nil || !windowsWSLHasNativeRsyncSSH(ctx, wslExe) {
-		return windowsNativeRsyncCommand(ctx, args)
+	if err != nil || !windowsWSLHasNativeRsyncSSH(ctx, target, wslExe) {
+		return "", false
 	}
-	mountRoot := windowsWSLMountRoot(ctx, wslExe)
-
-	// Prepare WSL key: copy with correct permissions.
-	wslKey := ""
-	knownHostsPath := ""
-	wslKnownHosts := ""
-	if target.Key != "" {
-		wslKey = "/tmp/crabbox-wsl-" + filepath.Base(filepath.Dir(target.Key))
-		knownHostsPath = knownHostsFile(target)
-		if keyData, err := os.ReadFile(windowsHostPath(target.Key)); err == nil {
-			cpCmd := exec.CommandContext(ctx, wslExe, "sh", "-c",
-				fmt.Sprintf("umask 077; cat > %s && chmod 600 %s",
-					shellQuote(wslKey),
-					shellQuote(wslKey)))
-			cpCmd.Stdin = bytes.NewReader(keyData)
-			if err := cpCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: copy SSH key into WSL for rsync failed: %v\n", err)
-				return windowsNativeRsyncCommand(ctx, args)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "warning: read SSH key for WSL rsync failed: %s: %v\n", target.Key, err)
-			return windowsNativeRsyncCommand(ctx, args)
-		}
-		if knownHostsData, err := os.ReadFile(windowsHostPath(knownHostsPath)); err == nil {
-			wslKnownHosts = wslKey + "-known_hosts"
-			cpKnownHostsCmd := exec.CommandContext(ctx, wslExe, "sh", "-c",
-				fmt.Sprintf("cat > %s && chmod 600 %s",
-					shellQuote(wslKnownHosts),
-					shellQuote(wslKnownHosts)))
-			cpKnownHostsCmd.Stdin = bytes.NewReader(knownHostsData)
-			if err := cpKnownHostsCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: copy known_hosts into WSL for rsync failed: %v\n", err)
-				wslKnownHosts = ""
-			}
-		}
-	}
-
-	// Convert all args: replace Windows paths inside strings (including
-	// the -e "ssh ..." arg which embeds key and known_hosts paths).
-	wslArgs := make([]string, len(args))
-	for i, arg := range args {
-		converted := windowsToWSLPathWithRoot(arg, mountRoot)
-		// Replace key path with WSL temp copy inside -e string
-		if wslKey != "" && target.Key != "" {
-			keyWSL := windowsToWSLMountPathWithRoot(target.Key, mountRoot)
-			converted = strings.ReplaceAll(converted, keyWSL, wslKey)
-		}
-		// Replace known_hosts path
-		if knownHostsPath != "" && wslKnownHosts != "" {
-			khWSL := windowsToWSLMountPathWithRoot(knownHostsPath, mountRoot)
-			converted = strings.ReplaceAll(converted, khWSL, wslKnownHosts)
-		}
-		wslArgs[i] = converted
-	}
-	return exec.CommandContext(ctx, wslExe, append([]string{"rsync"}, wslArgs...)...)
+	return wslExe, true
 }
 
-func windowsNativeRsyncCommand(ctx context.Context, args []string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "rsync", args...)
-	cmd.Env = append(os.Environ(), "MSYS2_ARG_CONV_EXCL=*", "MSYS_NO_PATHCONV=1", "CYGWIN=nodosfilewarning")
-	return cmd
+func windowsNativeRsyncCommandSpec(args []string) (string, []string, error) {
+	rsyncPath, sshPath, err := resolveWindowsNativeRsyncPair(exec.LookPath, os.Stat)
+	if err != nil {
+		return "", nil, err
+	}
+	pairedArgs, err := bindWindowsNativeRsyncSSH(args, sshPath)
+	if err != nil {
+		return "", nil, err
+	}
+	return rsyncPath, pairedArgs, nil
+}
+
+func resolveWindowsNativeRsyncPair(lookPath func(string) (string, error), stat func(string) (os.FileInfo, error)) (string, string, error) {
+	rsyncPath, err := lookPath("rsync.exe")
+	if err != nil {
+		return "", "", Exit(2, "native Windows transfers require rsync.exe on PATH with a sibling ssh.exe in the same directory; install MSYS2 rsync and OpenSSH together, or use the supported WSL2 transport")
+	}
+	if absolute, absoluteErr := filepath.Abs(rsyncPath); absoluteErr == nil {
+		rsyncPath = absolute
+	}
+	sshPath := filepath.Join(filepath.Dir(rsyncPath), "ssh.exe")
+	info, err := stat(sshPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", "", Exit(2, "native Windows rsync requires its matching sibling OpenSSH at %s next to %s; install MSYS2 rsync and OpenSSH together, or use the supported WSL2 transport", sshPath, rsyncPath)
+	}
+	return rsyncPath, sshPath, nil
+}
+
+func bindWindowsNativeRsyncSSH(args []string, sshPath string) ([]string, error) {
+	paired := append([]string(nil), args...)
+	for index := 0; index < len(paired); index++ {
+		if paired[index] != "-e" {
+			continue
+		}
+		if index+1 >= len(paired) {
+			return nil, Exit(2, "native Windows rsync command is missing its owned -e remote shell value")
+		}
+		const ownedSSH = "'ssh'"
+		remoteShell := paired[index+1]
+		if !strings.HasPrefix(remoteShell, ownedSSH) || len(remoteShell) > len(ownedSSH) && remoteShell[len(ownedSSH)] != ' ' {
+			return nil, Exit(2, "native Windows rsync command has an unsupported -e remote shell; Crabbox must own the OpenSSH pairing")
+		}
+		paired[index+1] = rsyncShellWords([]string{sshPath})[0] + remoteShell[len(ownedSSH):]
+		return paired, nil
+	}
+	return nil, Exit(2, "native Windows rsync command is missing its owned -e remote shell")
+}
+
+func applyWindowsNativeRsyncEnvironment(cmd *exec.Cmd) {
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = append(cmd.Env, "MSYS2_ARG_CONV_EXCL=*", "MSYS_NO_PATHCONV=1", "CYGWIN=nodosfilewarning")
 }
 
 func windowsHostPath(path string) string {
@@ -851,12 +1877,19 @@ func windowsHostPath(path string) string {
 	return path
 }
 
-func windowsWSLHasNativeRsyncSSH(ctx context.Context, wslExe string) bool {
+func windowsWSLHasNativeRsyncSSH(ctx context.Context, target SSHTarget, wslExe string) bool {
 	if strings.TrimSpace(wslExe) == "" {
 		return false
 	}
-	out, err := exec.CommandContext(ctx, wslExe, "sh", "-c", "rsync_path=$(command -v rsync) || exit 1; ssh_path=$(command -v ssh) || exit 1; printf '%s\\n%s\\n' \"$rsync_path\" \"$ssh_path\"").Output()
+	cmd := windowsWSLNativeToolProbeCommand(ctx, wslExe)
+	applyTargetChildEnvironment(cmd, target)
+	out, err := cmd.Output()
 	return err == nil && windowsWSLNativeToolPaths(string(out))
+}
+
+func windowsWSLNativeToolProbeCommand(ctx context.Context, wslExe string) *exec.Cmd {
+	// Direct command output is intentional: assignment plus printf produced blank lines on real Windows/WSL systems.
+	return exec.CommandContext(ctx, wslExe, "sh", "-c", "command -v rsync || exit 1; command -v ssh || exit 1")
 }
 
 func windowsWSLNativeToolPaths(output string) bool {
@@ -947,11 +1980,13 @@ func windowsToWSLPathWithRoot(s, mountRoot string) string {
 	return s
 }
 
-func windowsWSLMountRoot(ctx context.Context, wslExe string) string {
+func windowsWSLMountRoot(ctx context.Context, target SSHTarget, wslExe string) string {
 	if runtime.GOOS != "windows" {
 		return "/mnt"
 	}
-	out, err := exec.CommandContext(ctx, wslExe, "sh", "-c", "if [ -d /mnt/host/c ]; then printf /mnt/host; else printf /mnt; fi").Output()
+	cmd := exec.CommandContext(ctx, wslExe, "sh", "-c", "if [ -d /mnt/host/c ]; then printf /mnt/host; else printf /mnt; fi")
+	applyTargetChildEnvironment(cmd, target)
+	out, err := cmd.Output()
 	if err == nil {
 		if value := strings.TrimSpace(string(out)); value != "" {
 			return value
@@ -968,14 +2003,91 @@ func ShellQuote(s string) string {
 	return shellQuote(s)
 }
 
+// LiteralPOSIXPath keeps CDPATH, OLDPWD, and option parsing out of path operands.
+func LiteralPOSIXPath(value string) string {
+	if value != "" && !strings.HasPrefix(value, "/") {
+		return "./" + value
+	}
+	return value
+}
+
+func shellPathQuote(value string) string {
+	return shellQuote(LiteralPOSIXPath(value))
+}
+
+// Capture relative paths in the receiving shell before its cwd changes.
+func shellAbsolutePath(value string) string {
+	value = LiteralPOSIXPath(value)
+	if strings.HasPrefix(value, "./") {
+		return `"$PWD"/` + shellQuote(value)
+	}
+	return shellQuote(value)
+}
+
 func psQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-func powershellCommand(script string) string {
+func PowershellCommand(script string) string {
 	script = `$ProgressPreference = "SilentlyContinue"` + "\n" + script
 	encoded := base64.StdEncoding.EncodeToString(utf16LE([]byte(script)))
 	return "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
+}
+
+// Win32-OpenSSH inherits an overlapped pipe. Use its asynchronous handle contract
+// so a pending SSH write can complete before the server closes stdin at EOF.
+func windowsPowerShellCopyExactInput(destination string, inputSize int64) string {
+	// An empty frame must not bind stdin, which may already be at EOF.
+	// Disable FileStream read-ahead so bytes after this frame remain on stdin.
+	return `$remaining = [Int64]` + strconv.FormatInt(inputSize, 10) + `
+if ($remaining -gt 0) {
+	if (-not ("Cbx.SshStdin" -as [type])) {
+		Add-Type -Name SshStdin -Namespace Cbx -MemberDefinition '[DllImport("kernel32.dll")]public static extern IntPtr GetStdHandle(int n);'
+	}
+	$stdinHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new([Cbx.SshStdin]::GetStdHandle(-10), $false)
+	$stdin = $null
+	try {
+		$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true)
+		$buffer = New-Object byte[] 65536
+		while ($remaining -gt 0) {
+			$readSize = [int][Math]::Min([Int64]$buffer.Length, $remaining)
+			$read = $stdin.ReadAsync($buffer, 0, $readSize).GetAwaiter().GetResult()
+			if ($read -le 0) { throw "SSH stdin ended before the framed payload" }
+			` + destination + `.Write($buffer, 0, $read)
+			$remaining -= $read
+		}
+	} finally {
+		if ($null -ne $stdin) { $stdin.Dispose() }
+		$stdinHandle.Dispose()
+	}
+}
+`
+}
+
+// OpenSSH sessions can inherit PATH from before bootstrap updated the registry.
+const windowsPowerShellPathRefresh = `$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+`
+
+func windowsPowerShellStdinScriptCommand(inputSize int) string {
+	return PowershellCommand(windowsPowerShellPathRefresh + `$ErrorActionPreference = "Stop"
+$path = Join-Path $env:TEMP ("crabbox-stdin-command-" + [Guid]::NewGuid().ToString("N") + ".ps1")
+try {
+	$scriptFile = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+	try {
+		$bom = [byte[]](0xEF, 0xBB, 0xBF)
+		$scriptFile.Write($bom, 0, $bom.Length)
+` + windowsPowerShellCopyExactInput("$scriptFile", int64(inputSize)) + `		$scriptFile.Flush($true)
+	} finally {
+		$scriptFile.Dispose()
+	}
+	& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path
+	$code = $LASTEXITCODE
+} finally {
+	Remove-Item -Force -LiteralPath $path -ErrorAction SilentlyContinue
+}
+if ($null -eq $code) { $code = 0 }
+exit $code
+`)
 }
 
 func utf16LE(input []byte) []byte {
@@ -988,95 +2100,72 @@ func utf16LE(input []byte) []byte {
 }
 
 func remoteCommand(workdir string, env map[string]string, command []string) string {
-	return remoteCommandWithEnvFile(workdir, env, "", command)
-}
-
-func remoteCommandWithEnvFile(workdir string, env map[string]string, envFile string, command []string) string {
-	return remoteCommandWithEnvFiles(workdir, env, singleEnvFile(envFile), command)
+	return remoteCommandWithEnvFiles(workdir, env, nil, command)
 }
 
 func remoteCommandWithEnvFiles(workdir string, env map[string]string, envFiles []string, command []string) string {
+	return remotePortableWorkloadCommand(workdir, env, envFiles, `exec "$@"`, command)
+}
+
+func remotePortableWorkloadCommand(workdir string, env map[string]string, envFiles []string, body string, arguments []string) string {
 	var b strings.Builder
 	writeRemoteCommandPrefix(&b, workdir, env, envFiles)
-	b.WriteString("bash -lc ")
-	b.WriteString(shellQuote(remoteBashLoginScript(workdir, `exec "$@"`)))
-	b.WriteString(" bash")
-	for _, word := range command {
+	b.WriteString(remotePortableShellInvocation(remoteBashLoginScript(body), nil))
+	b.WriteString(` "$1"`)
+	for _, argument := range arguments {
+		b.WriteByte(' ')
+		b.WriteString(shellQuote(argument))
+	}
+	return b.String() + ")"
+}
+
+func remotePortableShellInvocation(body string, arguments []string) string {
+	var b strings.Builder
+	// Resolve Bash after applying the command environment. Never retry a user
+	// workload based on its exit code: 127 can be the workload's own result.
+	script := "if command -v bash >/dev/null 2>&1; then\n  exec bash -lc " + shellQuote(body) + " bash \"$@\"\nfi\n" + body
+	b.WriteString("/bin/sh -c ")
+	b.WriteString(shellQuote(script))
+	b.WriteString(" sh")
+	for _, word := range arguments {
 		b.WriteByte(' ')
 		b.WriteString(shellQuote(word))
 	}
 	return b.String()
 }
 
-func remoteShellCommand(workdir string, env map[string]string, script string) string {
-	return remoteShellCommandWithEnvFile(workdir, env, "", script)
+// Control programs are non-login POSIX source, not user shell workloads.
+func remotePOSIXControlCommand(script string) string {
+	return "/usr/bin/env BASH_ENV=/dev/null ENV=/dev/null /bin/sh -c " + shellQuote(script)
 }
 
-func remoteShellCommandWithEnvFile(workdir string, env map[string]string, envFile, script string) string {
-	return remoteShellCommandWithEnvFiles(workdir, env, singleEnvFile(envFile), script)
+func remoteHermeticPOSIXControlCommand(script string) string {
+	return "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C BASH_ENV=/dev/null ENV=/dev/null /bin/sh -c " + shellQuote(script)
+}
+
+func remoteShellCommand(workdir string, env map[string]string, script string) string {
+	return remoteShellCommandWithEnvFiles(workdir, env, nil, script)
 }
 
 func remoteShellCommandWithEnvFiles(workdir string, env map[string]string, envFiles []string, script string) string {
 	var b strings.Builder
 	writeRemoteCommandPrefix(&b, workdir, env, envFiles)
-	b.WriteString("bash -lc ")
-	b.WriteString(shellQuote(remoteBashLoginScript(workdir, script)))
+	fmt.Fprintf(&b, "bash -lc %s bash \"$1\")", shellQuote(remoteBashLoginScript(script)))
 	return b.String()
 }
 
-func remoteBashLoginScript(workdir, script string) string {
-	// Some sandbox images run bash startup files that cd back to $HOME for
-	// login shells. Keep the outer cd for env-file loading, then restore cwd
-	// inside bash -lc before the user command runs.
-	return "cd " + shellQuote(workdir) + " && " + script
+func remoteBashLoginScript(script string) string {
+	// Restore the selected directory after env files or login startup change cwd.
+	// Passing the resolved path avoids evaluating a relative path twice.
+	return `cd -- "$1" && shift && ` + script
 }
 
 func shellScriptFromArgv(command []string) string {
-	parts := make([]string, 0, len(command))
-	seenCommand := false
-	for _, word := range command {
-		if isShellControlOperator(word) {
-			parts = append(parts, word)
-			if resetsShellCommandPosition(word) {
-				seenCommand = false
-			}
-			continue
-		}
-		if !seenCommand && isShellEnvAssignment(word) {
-			key, value, _ := strings.Cut(word, "=")
-			parts = append(parts, key+"="+shellQuote(value))
-			continue
-		}
-		seenCommand = true
-		parts = append(parts, shellQuote(word))
-	}
-	return strings.Join(parts, " ")
+	return shellScriptFromArgvWithLiteralArgs(command, nil)
 }
 
 func ShellScriptFromArgv(command []string) string {
 	return shellScriptFromArgv(command)
-}
-
-func isShellEnvAssignment(word string) bool {
-	if word == "" {
-		return false
-	}
-	idx := strings.IndexByte(word, '=')
-	if idx <= 0 {
-		return false
-	}
-	for i, r := range word[:idx] {
-		if i == 0 {
-			if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_') {
-				return false
-			}
-			continue
-		}
-		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_') {
-			return false
-		}
-	}
-	return true
 }
 
 func isShellControlOperator(word string) bool {
@@ -1098,25 +2187,23 @@ func resetsShellCommandPosition(word string) bool {
 }
 
 func writeRemoteCommandPrefix(b *strings.Builder, workdir string, env map[string]string, envFiles []string) {
-	b.WriteString("cd ")
-	b.WriteString(shellQuote(workdir))
-	b.WriteString(" && ")
+	fmt.Fprintf(b, "(cd %s && set -- \"$PWD\" && ", shellPathQuote(workdir))
 	for _, envFile := range envFiles {
 		envFile = strings.TrimSpace(envFile)
 		if envFile == "" {
 			continue
 		}
-		b.WriteString("if [ -f ")
-		b.WriteString(shellQuote(envFile))
-		b.WriteString(" ]; then . ")
-		b.WriteString(shellQuote(envFile))
-		b.WriteString("; fi && ")
+		if isSSHCommandEnvFile(envFile) {
+			fmt.Fprintf(b, `. "$1"/%s && `, shellQuote(envFile))
+			continue
+		}
+		fmt.Fprintf(b, "if [ -f %s ]; then . %s; fi && ", shellQuote(envFile), shellQuote(envFile))
 	}
 	for k, v := range env {
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(shellQuote(v))
-		b.WriteByte(' ')
+		if !ValidShellEnvName(k) {
+			continue
+		}
+		fmt.Fprintf(b, "%s=%s ", k, shellQuote(v))
 	}
 }
 
@@ -1140,23 +2227,63 @@ func ShellWords(words []string) []string {
 }
 
 func remoteMkdir(workdir string) string {
-	return "mkdir -p " + shellQuote(workdir)
+	return "mkdir -p " + shellPathQuote(workdir)
 }
 
 func remoteResetWorkdir(workdir string) string {
 	parent := filepath.ToSlash(filepath.Dir(workdir))
-	script := "set -eu\nmkdir -p " + shellQuote(parent) + "\nrm -rf -- " + shellQuote(workdir) + "\nmkdir -p " + shellQuote(workdir)
-	return "bash -lc " + shellQuote(script)
+	script := "set -eu\nmkdir -p " + shellPathQuote(parent) + "\nrm -rf -- " + shellPathQuote(workdir) + "\nmkdir -p " + shellPathQuote(workdir)
+	return remotePortableShellInvocation(script, nil)
+}
+
+func remoteExactGitRootFunction() string {
+	return `exact_git_root() {
+  git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  git_root="$(cd -P -- "$git_root" 2>/dev/null && pwd -P)" || return 1
+  [ "$git_root" = "$(pwd -P)" ]
+}
+`
+}
+
+func remoteGitWorkspaceFunctions() string {
+	return remoteExactGitRootFunction() + `usable_git_workspace() (
+  exact_git_root || exit 1
+  git rev-parse --verify HEAD^{commit} >/dev/null 2>&1 || exit 1
+  workspace_index="$(git rev-parse --git-path index 2>/dev/null)" || exit 1
+  case "$workspace_index" in /*) ;; *) workspace_index="$PWD/$workspace_index" ;; esac
+  [ -f "$workspace_index" ] || exit 1
+  workspace_tree="$(git write-tree 2>/dev/null)" || exit 1
+  [ -n "$workspace_tree" ]
+)
+normalize_git_remote() {
+  case "$1" in
+    git@github.com:*) remote_path="${1#git@github.com:}"; remote_path="${remote_path%.git}"; printf 'https://github.com/%s.git' "$remote_path" ;;
+    *) printf %s "$1" ;;
+  esac
+}
+origin_matches() {
+  actual_origin="$(git remote get-url origin 2>/dev/null)" || return 1
+  [ "$(normalize_git_remote "$actual_origin")" = "$expected_origin" ]
+}
+repair_origin() {
+  if git remote get-url origin >/dev/null 2>&1; then
+    git remote set-url origin "$expected_origin" >/dev/null 2>&1
+  else
+    git remote add origin "$expected_origin" >/dev/null 2>&1
+  fi && origin_matches
+}
+`
 }
 
 func remoteGitHydrateStatus(workdir, baseRef, expectedSHA string) string {
 	if baseRef == "" || expectedSHA == "" {
 		return "printf ''"
 	}
-	script := `cd ` + shellQuote(workdir) + ` && ` + remoteSyncMetaDirScript() + `
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	script := `cd ` + shellPathQuote(workdir) + ` && ` + remoteGitWorkspaceFunctions() + `
+if ! exact_git_root; then
   exit 0
 fi
+` + remoteSyncMetaDirScript() + `
 marker="$meta_dir/git-hydrate-base"
 remote_sha="$(git rev-parse --verify ` + shellQuote("refs/remotes/origin/"+baseRef+"^{commit}") + ` 2>/dev/null || git rev-parse --verify ` + shellQuote("origin/"+baseRef+"^{commit}") + ` 2>/dev/null || true)"
 if [ "$remote_sha" = ` + shellQuote(expectedSHA) + ` ]; then
@@ -1170,54 +2297,215 @@ fi
 if [ -n "$remote_sha" ] && git merge-base --is-ancestor ` + shellQuote(expectedSHA) + ` "$remote_sha" >/dev/null 2>&1; then
   printf 'remote base contains local'
 fi`
-	return "bash -lc " + shellQuote(script)
+	return remotePOSIXControlCommand(script)
 }
 
-func remoteGitSeed(workdir, remoteURL, head string) string {
-	remoteURL = normalizeGitRemoteURL(remoteURL)
-	if remoteURL == "" || head == "" {
+func remoteGitSeed(workdir string, plan gitCoherencePlan) string {
+	if !plan.seedEnabled() {
 		return "true"
 	}
-	parent := filepath.ToSlash(filepath.Dir(workdir))
-	return "if [ ! -d " + shellQuote(workdir+"/.git") + " ]; then " +
-		"mkdir -p " + shellQuote(parent) + "; " +
-		"tmp=$(mktemp -d " + shellQuote(parent+"/.seed.XXXXXX") + "); " +
-		"if git clone --quiet --filter=blob:none --no-checkout " + shellQuote(remoteURL) + " \"$tmp\" >/dev/null 2>&1; then " +
-		"if (cd \"$tmp\" && (git fetch --quiet --depth=1 origin " + shellQuote(head) + " || true) && (git checkout --quiet " + shellQuote(head) + " || git checkout --quiet FETCH_HEAD)); then " +
-		"rm -rf " + shellQuote(workdir) + " && mv \"$tmp\" " + shellQuote(workdir) + "; " +
-		"else rm -rf \"$tmp\"; fi; " +
-		"else rm -rf \"$tmp\"; fi; " +
-		"fi"
+	seed := `origin_git clone --quiet --filter=blob:none --no-checkout --single-branch --branch ` + shellQuote(plan.Branch) + ` "$expected_origin" "$tmp"`
+	prepare, seedManifest := "", ""
+	if plan.Tree != "" {
+		// A verified private seed owns its tracked files, including excluded
+		// paths that the first manifest must prune. Seed-only trees may have
+		// gitlinks, which must not become managed file deletions.
+		seedManifest = remoteSyncMetaDirScript() + `mkdir -p "$meta_dir"
+git ls-files -z > "$meta_dir/sync-manifest"
+`
+	}
+	checkoutGit := "git"
+	prerequisiteExitCode := 127
+	if plan.Branch == "" {
+		prerequisiteExitCode = gitOriginRuntimeFallbackExitCode
+		prepare = `origin_git init --quiet --template= "$tmp"
+origin_git -C "$tmp" remote add origin "$expected_origin"
+`
+		seed = `origin_git -C "$tmp" fetch --quiet --filter=blob:none --no-tags origin ` + shellQuote(plan.Target)
+		checkoutGit = "origin_git"
+	}
+	script := `set -e
+printf 'crabbox-git-seed phase=prerequisite\n'
+command -v git >/dev/null 2>&1 || exit ` + strconv.Itoa(prerequisiteExitCode) + `
+printf 'crabbox-git-seed phase=prepare\n'
+workdir=` + shellAbsolutePath(workdir) + `
+# Keep clone publication and cleanup anchored across directory changes.
+[ -n "$workdir" ] || { echo 'crabbox-git-seed: missing workspace path' >&2; exit 2; }
+parent="$workdir"
+# Keep staging outside directory suffixes without changing the destination.
+while :; do
+  case "$parent" in
+    */) parent="${parent%/}" ;;
+    */.) parent="${parent%/.}" ;;
+    *) break ;;
+  esac
+done
+parent="${parent%/*}"
+parent="${parent:-/}"
+expected_origin=` + shellQuote(plan.RemoteURL) + `
+expected_tree=` + shellQuote(plan.Tree) + `
+` + remoteGitOriginTransportFunctions() + `
+` + remoteGitWorkspaceFunctions() + `
+reject_seed_destination() {
+  echo 'crabbox-git-seed: unsafe workspace; refusing seed publication' >&2
+  exit ` + strconv.Itoa(gitSeedUnsafeWorkspaceExitCode) + `
+}
+require_empty_seed_destination() {
+  if [ -e "$workdir" ] || [ -L "$workdir" ]; then
+    [ -d "$workdir" ] && [ ! -L "$workdir" ] || reject_seed_destination
+    [ -r "$workdir" ] && [ -x "$workdir" ] || reject_seed_destination
+    if [ -e "$workdir/.git" ] || [ -L "$workdir/.git" ] ||
+       { [ -e "$workdir/HEAD" ] && { [ -d "$workdir/objects" ] || [ -d "$workdir/refs" ]; }; }; then
+      reject_seed_destination
+    fi
+    # The sentinel also detects entries whose names consist only of newlines.
+    entries="$(ls -A -- "$workdir" && printf .)" || reject_seed_destination
+    [ "$entries" = . ] || exit ` + strconv.Itoa(gitSeedRawWorkspaceExitCode) + `
+  fi
+}
+if [ -d "$workdir" ]; then
+  cd "$workdir" || reject_seed_destination
+  if usable_git_workspace; then
+    printf 'crabbox-git-seed phase=origin\n'
+    repair_origin
+    exit 0
+  fi
+fi
+require_empty_seed_destination
+mkdir -p "$parent"
+tmp="$(mktemp -d "$parent/.seed.XXXXXX")"
+transport_error="$tmp.transport-error"
+cleanup_seed() { rm -rf -- "$tmp"; rm -f -- "$transport_error"; }
+trap cleanup_seed EXIT
+` + prepare + `
+printf 'crabbox-git-seed phase=clone\n'
+if ! { ` + seed + `; } >/dev/null 2>"$transport_error"; then
+  cat "$transport_error" >&2
+  exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
+fi
+printf 'crabbox-git-seed phase=checkout\n'
+` + checkoutGit + ` -C "$tmp" checkout --quiet --detach ` + shellQuote(plan.Target) + `
+printf 'crabbox-git-seed phase=verify\n'
+[ "$(git -C "$tmp" rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ]
+cd "$tmp"
+usable_git_workspace
+if [ -n "$expected_tree" ]; then
+  [ "$(git write-tree)" = "$expected_tree" ]
+fi
+printf 'crabbox-git-seed phase=origin\n'
+repair_origin
+` + seedManifest + `
+printf 'crabbox-git-seed phase=publish\n'
+cd /
+require_empty_seed_destination
+# Never recursively remove files that appeared while the clone was prepared.
+if [ -d "$workdir" ]; then rmdir -- "$workdir" || reject_seed_destination; fi
+mv -- "$tmp" "$workdir"
+rm -f -- "$transport_error"
+trap - EXIT
+`
+	return remotePOSIXControlCommand(script)
+}
+
+func remoteGitOriginTransportFunctions() string {
+	return `origin_git() {
+  /usr/bin/env -i HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never GIT_SSH_COMMAND=/bin/false \
+    /usr/bin/git -c credential.helper= -c credential.interactive=never -c core.hooksPath=/dev/null \
+      -c protocol.allow=never -c protocol.file.allow=always -c protocol.http.allow=always \
+      -c protocol.https.allow=always -c protocol.ext.allow=never -c protocol.git.allow=never \
+      -c protocol.ssh.allow=never "$@"
+}
+`
 }
 
 func normalizeGitRemoteURL(remoteURL string) string {
+	if gitRemoteURLHasCredentials(remoteURL) {
+		return ""
+	}
 	if strings.HasPrefix(remoteURL, "git@github.com:") {
 		return "https://github.com/" + strings.TrimSuffix(strings.TrimPrefix(remoteURL, "git@github.com:"), ".git") + ".git"
 	}
 	return remoteURL
 }
 
-func remoteReadSyncFingerprint(workdir string) string {
-	script := "cd " + shellQuote(workdir) + " && " + remoteSyncMetaDirScript() + "cat \"$meta_dir/sync-fingerprint\" 2>/dev/null || true"
-	return "bash -lc " + shellQuote(script)
+func remoteReadSyncFingerprint(workdir string, plan gitCoherencePlan) string {
+	if !plan.enabled() {
+		return "printf ''"
+	}
+	script := "cd " + shellPathQuote(workdir) + " && " + `expected_origin=` + shellQuote(plan.RemoteURL) + `
+` + remoteGitWorkspaceFunctions() + `
+if ! exact_git_root || ! origin_matches; then
+  exit 0
+fi
+` + remoteSyncMetaDirScript() + `
+committed="$meta_dir/sync-finalize-token"
+complete="$meta_dir/sync-finalize-complete-token"
+if [ -f "$committed" ] && [ -f "$complete" ] &&
+   [ "$(cat "$committed")" = "$(cat "$complete")" ] &&
+   [ "$(git rev-parse --verify HEAD^{commit} 2>/dev/null || true)" = ` + shellQuote(plan.Target) + ` ] &&
+   [ "$(git write-tree 2>/dev/null || true)" = ` + shellQuote(plan.Tree) + ` ]; then
+  cat "$meta_dir/sync-fingerprint" 2>/dev/null || true
+fi`
+	return remotePOSIXControlCommand(script)
+}
+
+func remoteInvalidateSyncFingerprintForTarget(target SSHTarget, workdir string, plainManifest bool) string {
+	if isWindowsNativeTarget(target) {
+		return PowershellCommand("exit 0")
+	}
+	metadataScript := remoteSyncMetaDirScript()
+	shellCommand := func(script string) string { return remotePortableShellInvocation(script, nil) }
+	if plainManifest {
+		metadataScript = remotePlainManifestGitFunction() + remotePlainManifestSyncMetaDirScript()
+		shellCommand = remoteHermeticPOSIXControlCommand
+	}
+	workdir = LiteralPOSIXPath(workdir)
+	script := `set -e
+set -- ` + shellQuote(workdir) + `
+if [ ! -d "$1" ]; then
+  # Check traversal separately: GNU rm -f also ignores ENOTDIR.
+  parent="$1"
+  while [ "$parent" != / ] && [ "${parent%/}" != "$parent" ]; do
+    parent=${parent%/}
+  done
+  while [ ! -e "$parent" ] && [ ! -L "$parent" ]; do
+    case "$parent" in
+      ""|/|.) break ;;
+      */*) parent=${parent%/*} ;;
+      *) parent=. ;;
+    esac
+    parent=${parent:-/}
+  done
+  (cd -- "$parent")
+  /bin/rm -f -- "$1/.crabbox/sync-fingerprint"
+else
+cd -- "$1"
+` + metadataScript + `
+/bin/rm -f -- "$meta_dir/sync-fingerprint"
+fi`
+	return shellCommand(script)
 }
 
 type remoteSyncFinalizeOptions struct {
 	AllowMassDeletions bool
 	HydrateGit         bool
+	GitOverlay         bool
+	PlainManifest      bool
 	BaseRef            string
 	BaseSHA            string
 	Fingerprint        string
+	Token              string
+	Coherence          gitCoherencePlan
 }
 
-func remoteWriteSyncManifestNew(workdir string) string {
-	script := "cd " + shellQuote(workdir) + " && " + remoteSyncMetaDirScript() + "mkdir -p \"$meta_dir\" && cat > \"$meta_dir/sync-manifest.new\""
-	return "bash -lc " + shellQuote(script)
+func remoteSyncPendingManifestName(token string) string {
+	return "sync-manifest." + token + ".new"
 }
 
-func remoteWriteSyncDeletedNew(workdir string) string {
-	script := "cd " + shellQuote(workdir) + " && " + remoteSyncMetaDirScript() + "mkdir -p \"$meta_dir\" && cat > \"$meta_dir/sync-deleted.new\""
-	return "bash -lc " + shellQuote(script)
+func remoteSyncPendingDeletedName(token string) string {
+	return "sync-deleted." + token + ".new"
 }
 
 func remoteSyncInterpreterCommand(python, perl, args string) string {
@@ -1230,62 +2518,267 @@ func remoteSyncInterpreterCommand(python, perl, args string) string {
 		"; else echo " + shellQuote("missing required sync interpreter: need python3, python, or perl") + " >&2; exit 127; fi"
 }
 
-func remoteWriteSyncManifestsNew(workdir string) string {
-	python := `import sys
+func remoteSyncPruneFiles(token string) string {
+	return `prune_paths= prune_octets= old_sorted= new_sorted=
+cleanup_prune_files() {
+  prune_exit=$?
+  trap - 0
+  for prune_file in "$prune_paths" "$prune_octets" "$old_sorted" "$new_sorted"; do
+    if [ -n "$prune_file" ]; then
+      if /bin/rm -f -- "$prune_file"; then :; else
+        prune_cleanup_exit=$?
+        if [ "$prune_exit" -eq 0 ]; then prune_exit=$prune_cleanup_exit; fi
+      fi
+    fi
+  done
+  # An explicit exit in a login Bash shell invokes its logout hook. Return the
+  # captured control status through a non-login shell after cleanup instead.
+  exec /bin/sh -c 'exit "$1"' sh "$prune_exit"
+}
+trap cleanup_prune_files 0
+prune_paths=$(mktemp "$meta_dir/sync-prune.` + token + `.paths.XXXXXX")
+prune_octets=$(mktemp "$meta_dir/sync-prune.` + token + `.octets.XXXXXX")
+`
+}
 
-reader = getattr(sys.stdin, "buffer", sys.stdin)
-manifest_len = int(reader.readline())
-manifest = reader.read(manifest_len)
-deleted = reader.read()
+// Keep NUL framing outside shell variables. The sentinel preserves filenames
+// ending in newlines when command substitution decodes a complete record.
+func remoteSyncNULConsumer(deleteBody string) string {
+	return "delete_paths() {\n" + remoteNULRecordLoop("rel", `"$1"`, `"$prune_octets"`, deleteBody, "return $?") + "}\n"
+}
+
+// Each inline loop has its own variables and scratch stream, so nested record
+// decoding cannot overwrite an outer loop or lose the caller's positional args.
+func remoteNULRecordLoop(record, input, octets, body, readFailure string) string {
+	return `if (printf 'a\000b\000' | {
+  IFS= read -r -d '' nul_probe && [ "$nul_probe" = a ] &&
+  IFS= read -r -d '' nul_probe && [ "$nul_probe" = b ]
+}) 2>/dev/null; then
+  cat ` + input + ` > ` + octets + ` || ` + readFailure + `
+  while LC_ALL=C IFS= read -r -d '' ` + record + `_read; do
+    ` + record + `=$` + record + `_read
+` + body + `
+  done < ` + octets + `
+else
+  LC_ALL=C od -An -v -t o1 ` + input + ` > ` + octets + ` || ` + readFailure + `
+  ` + record + `_encoded=
+  while IFS= read -r ` + record + `_octet_line; do
+    for ` + record + `_octet in $` + record + `_octet_line; do
+      if [ "$` + record + `_octet" != 000 ]; then
+        ` + record + `_encoded="$` + record + `_encoded\0$` + record + `_octet"
+        continue
+      fi
+      ` + record + `=$(printf '%b.' "$` + record + `_encoded")
+      ` + record + `=${` + record + `%.}
+      ` + record + `_encoded=
+` + body + `
+    done
+  done < ` + octets + `
+fi
+`
+}
+
+const remoteSyncDeletePathBody = `      case "$rel" in ''|/*|../*|*/../*) continue ;; esac
+      rm -f -- "$rel"
+      dir=$(dirname -- "$rel")
+      while [ "$dir" != . ] && [ "$dir" != / ]; do
+        rmdir -- "$dir" 2>/dev/null || break
+        dir=$(dirname -- "$dir")
+      done`
+
+func remoteWriteSyncManifestsNew(workdir, finalizeToken string) string {
+	return remoteWriteSyncManifestsNewWithMetadataMode(workdir, finalizeToken, remoteSyncMetaDirScript(), false)
+}
+
+func remoteWriteSyncManifestsNewMode(workdir, finalizeToken string, plainManifest bool) string {
+	if !plainManifest {
+		return remoteWriteSyncManifestsNew(workdir, finalizeToken)
+	}
+	return remoteWriteSyncManifestsNewWithMetadataMode(
+		workdir,
+		finalizeToken,
+		remotePlainManifestGitFunction()+remotePlainManifestSyncMetaDirScript(),
+		true,
+	)
+}
+
+func remoteWriteSyncManifestsNewWithMetadata(workdir, finalizeToken, metadataScript string) string {
+	return remoteWriteSyncManifestsNewWithMetadataMode(workdir, finalizeToken, metadataScript, true)
+}
+
+func remoteWriteSyncManifestsNewWithMetadataMode(workdir, finalizeToken, metadataScript string, hermetic bool, coldProbe ...bool) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
+	if hermetic {
+		metadataScript = gitOverlayHermeticFunctions() + metadataScript
+	}
+	probe := ""
+	if len(coldProbe) != 0 && coldProbe[0] {
+		probe = remoteColdSyncProbe(workdir)
+	}
+	script := "set -e\n" + probe + "mkdir -p " + shellPathQuote(workdir) + "\ncd " + shellPathQuote(workdir) + "\n" + metadataScript + `mkdir -p "$meta_dir"
+` + remoteSyncAbandonedMetadataCleanup() + `
+if ! IFS= read -r manifest_len; then
+  echo "invalid sync manifest length" >&2
+  exit 1
+fi
+case "$manifest_len" in
+  ''|*[!0-9]*|0[0-9]*) echo "invalid sync manifest length" >&2; exit 1 ;;
+esac
+if ! IFS= read -r deleted_len; then
+  echo "invalid sync deleted length" >&2
+  exit 1
+fi
+case "$deleted_len" in
+  ''|*[!0-9]*|0[0-9]*) echo "invalid sync deleted length" >&2; exit 1 ;;
+esac
+# Full blocks plus one exact remainder preserve framing across short pipe reads.
+# Older/minimal dd keeps byte-sized input records but still buffers disk writes.
+fullblock=
+if dd iflag=fullblock count=0 </dev/null >/dev/null 2>&1; then fullblock=1; fi
+write_frame() {
+  frame_len=$1
+  if [ "$fullblock" = 1 ]; then
+    {
+      dd iflag=fullblock bs=65536 count="$((frame_len / 65536))" 2>/dev/null
+      remainder=$((frame_len % 65536))
+      if [ "$remainder" -ne 0 ]; then
+        dd iflag=fullblock bs="$remainder" count=1 2>/dev/null
+      fi
+    } > "$2"
+  else
+    dd ibs=1 obs=65536 count="$frame_len" of="$2" 2>/dev/null
+  fi
+}
+write_frame "$manifest_len" "$meta_dir/` + manifestName + `"
+manifest_size=$(wc -c < "$meta_dir/` + manifestName + `" | tr -d '[:space:]')
+if [ "$manifest_size" != "$manifest_len" ]; then
+  echo "short sync manifest: got $manifest_size want $manifest_len" >&2
+  exit 1
+fi
+write_frame "$deleted_len" "$meta_dir/` + deletedName + `"
+deleted_size=$(wc -c < "$meta_dir/` + deletedName + `" | tr -d '[:space:]')
+if [ "$deleted_size" != "$deleted_len" ]; then
+  echo "short sync deleted manifest: got $deleted_size want $deleted_len" >&2
+  exit 1
+fi
+`
+	if probe != "" {
+		script += "\nif [ \"$cold_sync\" = 1 ]; then printf '" + coldSyncReady + "'; fi\n"
+	}
+	if hermetic {
+		return remoteHermeticPOSIXControlCommand(script)
+	}
+	return remotePortableShellInvocation(script, nil)
+}
+
+func syncManifestInputForTarget(target SSHTarget, manifestData, deletedData []byte) string {
+	if isWindowsWSL2Target(target) {
+		manifestEncoded := base64.StdEncoding.EncodeToString(manifestData)
+		deletedEncoded := base64.StdEncoding.EncodeToString(deletedData)
+		return fmt.Sprintf("%d\n%d\n", len(manifestEncoded), len(deletedEncoded)) + manifestEncoded + deletedEncoded
+	}
+	return fmt.Sprintf("%d\n%d\n", len(manifestData), len(deletedData)) + string(manifestData) + string(deletedData)
+}
+
+func remoteWriteSyncManifestsNewForTarget(target SSHTarget, workdir, finalizeToken string) string {
+	return remoteWriteSyncManifestsNewForTargetMode(target, workdir, finalizeToken, false)
+}
+
+func remoteWriteSyncManifestsNewForTargetMode(target SSHTarget, workdir, finalizeToken string, plainManifest bool) string {
+	if isWindowsWSL2Target(target) {
+		return remoteWriteSyncManifestsNewPythonMode(workdir, finalizeToken, plainManifest)
+	}
+	return remoteWriteSyncManifestsNewMode(workdir, finalizeToken, plainManifest)
+}
+
+func remoteDiscardSyncPendingMetadata(workdir, finalizeToken string, plainManifest bool) string {
+	metadataScript := remoteSyncMetaDirScript()
+	shellCommand := remotePOSIXControlCommand
+	if plainManifest {
+		metadataScript = remotePlainManifestGitFunction() + remotePlainManifestSyncMetaDirScript()
+		shellCommand = remoteHermeticPOSIXControlCommand
+	}
+	script := `set -e
+cd ` + shellPathQuote(workdir) + `
+` + metadataScript + `
+/bin/rm -f -- "$meta_dir/` + remoteSyncPendingManifestName(finalizeToken) + `" "$meta_dir/` + remoteSyncPendingDeletedName(finalizeToken) + `"
+`
+	return shellCommand(script)
+}
+
+func remoteWriteSyncManifestsNewPython(workdir, finalizeToken string) string {
+	return remoteWriteSyncManifestsNewPythonMode(workdir, finalizeToken, false)
+}
+
+func remoteWriteSyncManifestsNewPythonMode(workdir, finalizeToken string, plainManifest bool) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
+	python := `import base64
+import sys
+
+def read_len(name):
+    line = sys.stdin.buffer.readline()
+    try:
+        return int(line.strip())
+    except ValueError:
+        raise SystemExit(f"invalid {name} length")
+
+manifest_len = read_len("sync manifest")
+deleted_len = read_len("sync deleted")
+manifest_encoded = sys.stdin.buffer.read(manifest_len)
+if len(manifest_encoded) != manifest_len:
+    raise SystemExit(f"short sync manifest: got {len(manifest_encoded)} want {manifest_len}")
+deleted_encoded = sys.stdin.buffer.read(deleted_len)
+if len(deleted_encoded) != deleted_len:
+    raise SystemExit(f"short sync deleted manifest: got {len(deleted_encoded)} want {deleted_len}")
+manifest = base64.b64decode(manifest_encoded)
+deleted = base64.b64decode(deleted_encoded)
+
 with open(sys.argv[1], "wb") as handle:
     handle.write(manifest)
 with open(sys.argv[2], "wb") as handle:
     handle.write(deleted)
 `
-	perl := `use strict;
-use warnings;
-
-my $len = <STDIN>;
-defined $len or die "missing manifest length\n";
-chomp $len;
-$len =~ /\A\d+\z/ or die "invalid manifest length\n";
-my $manifest = "";
-while (length($manifest) < $len) {
-    my $chunk = "";
-    my $read = read(STDIN, $chunk, $len - length($manifest));
-    defined $read or die "read manifest failed: $!\n";
-    $read > 0 or die "short manifest read\n";
-    $manifest .= $chunk;
+	mkdir, pythonCommand := "mkdir -p ", "python3 -c "
+	metadataScript, cleanup := remoteSyncMetaDirScript(), remoteSyncAbandonedMetadataCleanup()
+	shellCommand := func(script string) string { return remotePortableShellInvocation(script, nil) }
+	if plainManifest {
+		mkdir, pythonCommand = "/bin/mkdir -p -- ", "/usr/bin/python3 -c "
+		metadataScript = remotePlainManifestGitFunction() + remotePlainManifestSyncMetaDirScript()
+		cleanup = remotePlainSyncAbandonedMetadataCleanup()
+		shellCommand = remoteHermeticPOSIXControlCommand
+	}
+	script := "set -e\n" + mkdir + shellPathQuote(workdir) + "\ncd " + shellPathQuote(workdir) + "\n" + metadataScript + mkdir + "\"$meta_dir\"\n" +
+		cleanup + "\n" +
+		pythonCommand + shellQuote(python) + " \"$meta_dir/" + manifestName + "\" \"$meta_dir/" + deletedName + "\"\n"
+	return shellCommand(script)
 }
-local $/;
-my $deleted = <STDIN>;
-$deleted = "" unless defined $deleted;
-open my $manifest_fh, ">", $ARGV[0] or die "open manifest: $!\n";
-binmode $manifest_fh;
-print {$manifest_fh} $manifest or die "write manifest: $!\n";
-close $manifest_fh or die "close manifest: $!\n";
-open my $deleted_fh, ">", $ARGV[1] or die "open deleted: $!\n";
-binmode $deleted_fh;
-print {$deleted_fh} $deleted or die "write deleted: $!\n";
-close $deleted_fh or die "close deleted: $!\n";
-`
-	script := "mkdir -p " + shellQuote(workdir) + " && cd " + shellQuote(workdir) + " && " + remoteSyncMetaDirScript() + "mkdir -p \"$meta_dir\" && " + remoteSyncInterpreterCommand(python, perl, "\"$meta_dir/sync-manifest.new\" \"$meta_dir/sync-deleted.new\"")
-	return "bash -lc " + shellQuote(script)
+
+func remotePlainSyncAbandonedMetadataCleanup() string {
+	return `/usr/bin/find "$meta_dir" -type f \( -name 'sync-manifest.new' -o -name 'sync-deleted.new' -o -name 'sync-manifest.*.new' -o -name 'sync-deleted.*.new' -o -name 'sync-manifest.*.sorted' -o -name 'sync-prune.*' -o -name 'sync-finalize-token.tmp.*' -o -name 'sync-finalize-complete-token.tmp.*' -o -name 'sync-git-status.*' \) -mtime +7 -exec /bin/rm -f -- {} \; 2>/dev/null || true`
+}
+
+func remoteSyncAbandonedMetadataCleanup() string {
+	return `find "$meta_dir" -type f \( -name 'sync-manifest.new' -o -name 'sync-deleted.new' -o -name 'sync-manifest.*.new' -o -name 'sync-deleted.*.new' -o -name 'sync-manifest.*.sorted' -o -name 'sync-prune.*' -o -name 'sync-finalize-token.tmp.*' -o -name 'sync-finalize-complete-token.tmp.*' -o -name 'sync-git-status.*' \) -mtime +7 -exec rm -f -- {} \; 2>/dev/null || true`
 }
 
 func remoteSeedSyncManifestFromGit(workdir string) string {
-	script := "set -e\ncd " + shellQuote(workdir) + `
+	script := "set -e\ncd " + shellPathQuote(workdir) + `
+` + remoteGitWorkspaceFunctions() + `
 ` + remoteSyncMetaDirScript() + `
 old="$meta_dir/sync-manifest"
-if [ ! -f "$old" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [ ! -f "$old" ] && exact_git_root; then
   mkdir -p "$meta_dir"
   git ls-files -z > "$old"
 fi
 `
-	return "bash -lc " + shellQuote(script)
+	return remotePOSIXControlCommand(script)
 }
 
-func remotePruneSyncManifest(workdir string) string {
+func remotePruneSyncManifest(workdir, finalizeToken string) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
 	python := `import sys
 
 def read_manifest(path):
@@ -1317,34 +2810,65 @@ my %new = map { $_ => 1 } read_manifest($ARGV[1]);
 binmode STDOUT;
 print STDOUT map { $_ . "\0" } grep { !$new{$_} } @old;
 `
-	script := "set -e -o pipefail\ncd " + shellQuote(workdir) + `
+	script := "set -e\n" + `
 ` + remoteSyncMetaDirScript() + `
 old="$meta_dir/sync-manifest"
-new="$meta_dir/sync-manifest.new"
-deleted="$meta_dir/sync-deleted.new"
-delete_paths() {
-  while IFS= read -r -d '' rel; do
-    case "$rel" in ''|/*|../*|*/../*) continue ;; esac
-    rm -f -- "$rel"
-    dir=$(dirname -- "$rel")
-    while [ "$dir" != . ] && [ "$dir" != / ]; do
-      rmdir -- "$dir" 2>/dev/null || break
-      dir=$(dirname -- "$dir")
-    done
-  done
-}
+new="$meta_dir/` + manifestName + `"
+deleted="$meta_dir/` + deletedName + `"
+if [ ! -f "$deleted" ] && { [ ! -f "$old" ] || [ ! -f "$new" ]; }; then exit 0; fi
+` + remoteSyncPruneFiles(finalizeToken) + remoteSyncNULConsumer(remoteSyncDeletePathBody) + `
 manifest_removed_paths() {
   ` + remoteSyncInterpreterCommand(python, perl, "\"$old\" \"$new\"") + `
 }
-if [ -f "$deleted" ]; then delete_paths < "$deleted"; fi
-if [ -f "$old" ] && [ -f "$new" ]; then manifest_removed_paths | delete_paths; fi
+if [ -f "$deleted" ]; then delete_paths "$deleted"; fi
+if [ -f "$old" ] && [ -f "$new" ]; then
+  manifest_removed_paths > "$prune_paths"
+  delete_paths "$prune_paths"
+fi
 `
-	return "bash -lc " + shellQuote(script)
+	return remotePortableWorkloadCommand(workdir, nil, nil, script, nil)
 }
 
-func remoteApplySyncManifest(workdir string) string {
-	script := "set -e; cd " + shellQuote(workdir) + "; " + remoteSyncMetaDirScript() + "mkdir -p \"$meta_dir\"; new=\"$meta_dir/sync-manifest.new\"; deleted=\"$meta_dir/sync-deleted.new\"; rm -f \"$deleted\"; mv \"$new\" \"$meta_dir/sync-manifest\""
-	return "bash -lc " + shellQuote(script)
+func remotePruneSyncManifestForTarget(target SSHTarget, workdir, finalizeToken string) string {
+	return remotePruneSyncManifestForTargetMode(target, workdir, finalizeToken, false)
+}
+
+func remotePruneSyncManifestForTargetMode(target SSHTarget, workdir, finalizeToken string, plainManifest bool, allowMassDeletions ...bool) string {
+	if plainManifest {
+		return remotePruneSafeSyncManifest(
+			workdir,
+			finalizeToken,
+			remotePlainManifestGitFunction()+remotePlainManifestSyncMetaDirScript(),
+			allowMassDeletions...,
+		)
+	}
+	if isWindowsWSL2Target(target) {
+		return remotePruneSyncManifestCoreutils(workdir, finalizeToken)
+	}
+	return remotePruneSyncManifest(workdir, finalizeToken)
+}
+
+func remotePruneSyncManifestCoreutils(workdir, finalizeToken string) string {
+	manifestName := remoteSyncPendingManifestName(finalizeToken)
+	deletedName := remoteSyncPendingDeletedName(finalizeToken)
+	script := "set -e\n" + `
+` + remoteSyncMetaDirScript() + `
+old="$meta_dir/sync-manifest"
+new="$meta_dir/` + manifestName + `"
+deleted="$meta_dir/` + deletedName + `"
+if [ ! -f "$deleted" ] && { [ ! -f "$old" ] || [ ! -f "$new" ]; }; then exit 0; fi
+` + remoteSyncPruneFiles(finalizeToken) + remoteSyncNULConsumer(remoteSyncDeletePathBody) + `
+if [ -f "$deleted" ]; then delete_paths "$deleted"; fi
+if [ -f "$old" ] && [ -f "$new" ]; then
+  old_sorted="$meta_dir/sync-manifest.` + finalizeToken + `.old.sorted"
+  new_sorted="$meta_dir/sync-manifest.` + finalizeToken + `.new.sorted"
+  LC_ALL=C sort -z "$old" > "$old_sorted"
+  LC_ALL=C sort -z "$new" > "$new_sorted"
+  LC_ALL=C comm -z -23 "$old_sorted" "$new_sorted" > "$prune_paths"
+  delete_paths "$prune_paths"
+fi
+`
+	return remotePortableWorkloadCommand(workdir, nil, nil, script, nil)
 }
 
 func remoteFinalizeSync(workdir string, opts remoteSyncFinalizeOptions) string {
@@ -1352,59 +2876,353 @@ func remoteFinalizeSync(workdir string, opts remoteSyncFinalizeOptions) string {
 	if opts.AllowMassDeletions {
 		allowValue = "1"
 	}
+	plainManifestRecovery := opts.PlainManifest && opts.Coherence.enabled()
+	manifestName := remoteSyncPendingManifestName(opts.Token)
+	deletedName := remoteSyncPendingDeletedName(opts.Token)
+	gitFunctions := remoteGitWorkspaceFunctions()
+	metadataScript := remoteSyncMetaDirScript()
+	if opts.GitOverlay || plainManifestRecovery {
+		gitFunctions = gitOverlayHermeticFunctions() + gitFunctions
+		metadataScript = remotePlainSyncMetaDirScript()
+	} else if opts.PlainManifest {
+		gitFunctions = remotePlainManifestGitFunction()
+		metadataScript = remotePlainManifestSyncMetaDirScript()
+	}
 	script := `set -e
-cd ` + shellQuote(workdir) + `
-` + remoteSyncMetaDirScript() + `
+cd ` + shellPathQuote(workdir) + `
+` + gitFunctions + `
+` + metadataScript + `
 mkdir -p "$meta_dir"
-new="$meta_dir/sync-manifest.new"
-deleted="$meta_dir/sync-deleted.new"
-rm -f "$deleted"
-mv "$new" "$meta_dir/sync-manifest"
-if test -d .git && git status --short >/tmp/crabbox-git-status 2>/dev/null; then
-  deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' /tmp/crabbox-git-status)
+new="$meta_dir/` + manifestName + `"
+deleted="$meta_dir/` + deletedName + `"
+manifest="$meta_dir/sync-manifest"
+committed_token="$meta_dir/sync-finalize-token"
+complete_token="$meta_dir/sync-finalize-complete-token"
+expected_token=` + shellQuote(opts.Token) + `
+publish_fingerprint=` + shellQuote(opts.Fingerprint) + `
+case "$expected_token" in
+  ''|*[!0-9a-f]*) echo "remote sync finalize failed: invalid sync token" >&2; exit 67 ;;
+esac
+` + remoteSyncFinalizeLockScript() + `
+git_status="$meta_dir/sync-git-status.$expected_token.$$"
+rm -f "$git_status"
+if [ -f "$manifest" ] &&
+   [ -f "$committed_token" ] && [ "$(cat "$committed_token")" = "$expected_token" ] &&
+   [ -f "$complete_token" ] && [ "$(cat "$complete_token")" = "$expected_token" ]; then
+  exit 0
+fi
+rm -f "$complete_token"
+if [ -f "$new" ]; then
+  committed_tmp="$committed_token.tmp.$$"
+  printf %s "$expected_token" > "$committed_tmp"
+  mv "$committed_tmp" "$committed_token"
+  rm -f "$deleted"
+  mv "$new" "$manifest"
+elif [ ! -f "$manifest" ] || [ ! -f "$committed_token" ] || [ "$(cat "$committed_token")" != "$expected_token" ]; then
+  echo "remote sync finalize failed: no committed manifest for this sync" >&2
+  exit 67
+fi
+`
+	if opts.GitOverlay {
+		script += remoteGitOverlayFinalizeScript(opts.Coherence, allowValue)
+	} else if plainManifestRecovery {
+		script += remoteGitOverlayRecoveryFinalizeScript(opts.Coherence, opts.BaseRef, opts.BaseSHA, allowValue)
+	} else if opts.PlainManifest {
+		script += `publish_fingerprint=
+git_root=
+if git_root="$(plain_git rev-parse --show-toplevel 2>/dev/null)" &&
+   git_root="$(cd -P -- "$git_root" 2>/dev/null && pwd -P)" &&
+   [ "$git_root" = "$(pwd -P)" ] &&
+   plain_git status --porcelain=v1 --untracked-files=normal >"$git_status" 2>/dev/null; then
+  deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' "$git_status")
   if [ ` + shellQuote(allowValue) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
     echo "remote sync sanity failed: $deletions tracked deletions" >&2
-    awk '/^ D|^D / { print "  " substr($0,4) }' /tmp/crabbox-git-status | head -20 >&2
+    awk '/^ D|^D / { print "  " substr($0,4) }' "$git_status" | head -20 >&2
+    exit 66
+  fi
+fi
+rm -f "$meta_dir/git-hydrate-base"
+`
+	} else if opts.Coherence.enabled() {
+		script += remoteGitCoherenceFinalizeScript(opts.Coherence, allowValue)
+	} else {
+		script += `publish_fingerprint=
+if exact_git_root && git status --short >"$git_status" 2>/dev/null; then
+  deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' "$git_status")
+  if [ ` + shellQuote(allowValue) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
+    echo "remote sync sanity failed: $deletions tracked deletions" >&2
+    awk '/^ D|^D / { print "  " substr($0,4) }' "$git_status" | head -20 >&2
     exit 66
   fi
 fi
 `
-	if opts.HydrateGit && opts.BaseRef != "" {
+	}
+	if !opts.GitOverlay && !opts.PlainManifest && opts.HydrateGit && opts.BaseRef != "" {
 		refspec := "+refs/heads/" + opts.BaseRef + ":refs/remotes/origin/" + opts.BaseRef
-		script += `if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin >/dev/null 2>&1; then
-  git fetch --quiet --unshallow origin ` + shellQuote(refspec) + ` || git fetch --quiet --depth=1000 origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(refspec) + ` || git fetch --quiet origin ` + shellQuote(opts.BaseRef) + ` || true
+		script += `if exact_git_root && git remote get-url origin >/dev/null 2>&1; then
+  hydrate_fetch() { git fetch --quiet --filter=blob:none origin "$@"; }
+  if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+    hydrate_fetch --unshallow ` + shellQuote(refspec) + ` || hydrate_fetch --depth=1000 ` + shellQuote(refspec) + ` || hydrate_fetch ` + shellQuote(refspec) + ` || hydrate_fetch ` + shellQuote(opts.BaseRef) + ` || true
+  else
+    hydrate_fetch ` + shellQuote(refspec) + ` || hydrate_fetch ` + shellQuote(opts.BaseRef) + ` || true
+  fi
 fi
 `
 	}
-	if opts.BaseRef != "" && opts.BaseSHA != "" {
-		script += `printf %s ` + shellQuote(opts.BaseRef+" "+opts.BaseSHA+"\n") + ` > "$meta_dir/git-hydrate-base" || true
+	if (!opts.PlainManifest || plainManifestRecovery) && opts.BaseRef != "" && opts.BaseSHA != "" {
+		script += `base_tmp="$meta_dir/git-hydrate-base.tmp.$$"
+printf %s ` + shellQuote(opts.BaseRef+" "+opts.BaseSHA+"\n") + ` > "$base_tmp"
+mv "$base_tmp" "$meta_dir/git-hydrate-base"
 `
 	}
-	if opts.Fingerprint != "" {
-		script += `printf %s ` + shellQuote(opts.Fingerprint) + ` > "$meta_dir/sync-fingerprint" || true
+	script += `if [ -n "$publish_fingerprint" ]; then
+  fingerprint_tmp="$meta_dir/sync-fingerprint.tmp.$$"
+  printf %s "$publish_fingerprint" > "$fingerprint_tmp"
+  mv "$fingerprint_tmp" "$meta_dir/sync-fingerprint"
+else
+  rm -f "$meta_dir/sync-fingerprint"
+fi
+complete_tmp="$complete_token.tmp.$$"
+printf %s "$expected_token" > "$complete_tmp"
+mv "$complete_tmp" "$complete_token"
+coherence_committed=1
+`
+	if opts.GitOverlay || plainManifestRecovery {
+		return remoteHermeticPOSIXControlCommand(script)
+	}
+	if opts.PlainManifest {
+		return remoteHermeticPOSIXControlCommand(script)
+	}
+	return remotePOSIXControlCommand(script)
+}
+
+func runRemoteFinalizeSync(ctx context.Context, target SSHTarget, workdir string, opts remoteSyncFinalizeOptions) (string, error, string, bool) {
+	out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	reason, fallback := gitOriginRuntimeFallbackResult(opts.Coherence.RemoteURL, out, err)
+	if !fallback {
+		return out, err, "", false
+	}
+	opts.HydrateGit, opts.GitOverlay, opts.PlainManifest = false, false, true
+	opts.Fingerprint, opts.Coherence = "", gitCoherencePlan{}
+	out, err = runIdempotentSSHGitOriginAttempt(ctx, target, remoteFinalizeSync(workdir, opts), idempotentSSHRetryDelay)
+	return out, err, reason, true
+}
+
+func remoteGitOverlayFinalizeScript(plan gitCoherencePlan, allowMassDeletions string) string {
+	return `
+if ! overlay_workspace_safe "$PWD" || ! exact_git_root; then
+  echo "remote overlay finalize failed: unsafe Git workspace" >&2
+  exit 67
+fi
+if [ "$(git remote get-url origin 2>/dev/null || true)" != ` + shellQuote(plan.RemoteURL) + ` ] ||
+   [ "$(git rev-parse --verify HEAD^{commit} 2>/dev/null || true)" != ` + shellQuote(plan.Target) + ` ] ||
+   [ "$(git write-tree 2>/dev/null || true)" != ` + shellQuote(plan.Tree) + ` ]; then
+  echo "remote overlay finalize failed: Git identity changed" >&2
+  exit 67
+fi
+git diff-files --name-status >"$git_status" 2>/dev/null || {
+  echo "remote overlay finalize failed: Git status inspection failed" >&2
+  exit 67
+}
+deletions=$(awk '$1 == "D" { n++ } END { print n+0 }' "$git_status")
+if [ ` + shellQuote(allowMassDeletions) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
+  echo "remote sync sanity failed: $deletions tracked deletions" >&2
+  exit 66
+fi
+`
+}
+
+func remoteGitOverlayRecoveryFinalizeScript(plan gitCoherencePlan, baseRef, baseSHA, allowMassDeletions string) string {
+	if !plan.enabled() {
+		return `echo "Git overlay recovery requires the original coherence plan" >&2; exit 67
 `
 	}
-	return "bash -lc " + shellQuote(script)
+	script := `publish_fingerprint=
+if ! overlay_workspace_safe "$PWD" || ! overlay_runtime_state_safe "$PWD" || ! exact_git_root; then
+  echo "Git overlay recovery requires an isolated safe Git workspace" >&2
+  exit 67
+fi
+if [ "$(git remote get-url origin 2>/dev/null || true)" != ` + shellQuote(plan.RemoteURL) + ` ]; then
+  echo "Git overlay recovery requires the original safe Git origin" >&2
+  exit 67
+fi
+`
+	if baseRef != "" && baseSHA != "" {
+		script += `if [ "$(git rev-parse --verify ` + shellQuote("refs/remotes/origin/"+baseRef+"^{commit}") + ` 2>/dev/null || true)" != ` + shellQuote(baseSHA) + ` ] ||
+   ! git merge-base ` + shellQuote(baseSHA) + ` ` + shellQuote(plan.Target) + ` >/dev/null 2>&1; then
+  echo "Git overlay recovery requires the planned base ref and history" >&2
+  exit 67
+fi
+`
+	}
+	return script + remoteGitCoherenceFinalizeScript(plan, allowMassDeletions)
+}
+
+func remoteGitCoherenceFinalizeScript(plan gitCoherencePlan, allowMassDeletions string) string {
+	return `
+coherence_committed=; coherence_mutated=; head_changed=; index_changed=
+tmp_ref="refs/crabbox/sync-$expected_token"; advertised_branch=` + shellQuote(plan.Branch) + `; expected_origin=` + shellQuote(plan.RemoteURL) + `
+` + remoteGitOriginTransportFunctions() + `
+coherence_fetch() {
+  set -- --quiet --filter=blob:none --no-tags
+  # An existing shallow boundary can hide ancestors of the advertised branch.
+  if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+    set -- "$@" --unshallow
+  fi
+  origin_git fetch "$@" "$expected_origin" "+refs/heads/$advertised_branch:$tmp_ref"
+}
+if ! exact_git_root; then
+	publish_fingerprint=
+elif ! repair_origin; then
+	echo "remote sync finalize failed: Git origin repair failed" >&2; cleanup_finalize_lock; exit 67
+elif transport_error="$meta_dir/sync-fetch-error.$expected_token.$$"; ! coherence_fetch 2>"$transport_error"; then
+	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true
+	echo "remote sync finalize failed: Git coherence fetch failed" >&2
+	cat "$transport_error" >&2
+	cleanup_finalize_lock
+	exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
+elif ! git merge-base --is-ancestor ` + shellQuote(plan.Target) + ` "$tmp_ref" >/dev/null 2>&1; then
+	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: requested commit is not on advertised branch" >&2; cleanup_finalize_lock; exit 67
+elif [ "$(git rev-parse --verify ` + shellQuote(plan.Target+"^{tree}") + ` 2>/dev/null || true)" != ` + shellQuote(plan.Tree) + ` ]; then
+	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: requested Git tree verification failed" >&2; cleanup_finalize_lock; exit 67
+else
+  coherence_cleanup() {
+    status=$?
+    if [ -z "$coherence_committed" ] && [ -n "$coherence_mutated" ]; then
+      if [ -n "$head_changed" ]; then
+        if git update-ref --no-deref HEAD "$old_head" ` + shellQuote(plan.Target) + `; then
+          if [ -n "$old_sym" ] && ! git symbolic-ref -q HEAD >/dev/null 2>&1 &&
+             [ "$(git rev-parse --verify HEAD^{commit} 2>/dev/null || true)" = "$old_head" ] &&
+             [ "$(git rev-parse --verify "$old_sym^{commit}" 2>/dev/null || true)" = "$old_head" ]; then git symbolic-ref HEAD "$old_sym" || status=67; fi
+        else status=67; fi
+      fi
+      if [ -n "$index_changed" ] && [ "$(cat "$index_lock" 2>/dev/null || true)" = "$index_marker" ] && cmp -s "$index_path" "$index_verify"; then
+        cp -p "$index_backup" "$index_restore" && mv "$index_restore" "$index_path" || status=67
+      elif [ -n "$index_changed" ]; then status=67; fi
+    fi
+    git update-ref -d "$tmp_ref" "$fetched_head" >/dev/null 2>&1 || true; rm -f "${index_backup:-}" "${index_candidate:-}" "${index_verify:-}" "${index_restore:-}"
+    if [ -n "${index_lock:-}" ] && [ "$(cat "$index_lock" 2>/dev/null || true)" = "${index_marker:-}" ]; then rm -f "$index_lock"; fi
+    # Bash 5.2 can corrupt function context when a successful EXIT handler re-exits.
+    cleanup_finalize_lock; trap - EXIT; if [ "$status" -ne 0 ]; then exit "$status"; fi
+  }
+  trap coherence_cleanup EXIT
+  fetched_head="$(git rev-parse --verify "$tmp_ref^{commit}")"; old_head="$(git rev-parse --verify HEAD^{commit})"
+  old_sym="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
+  index_path="$(git rev-parse --git-path index)"
+  case "$index_path" in /*) ;; *) index_path="$PWD/$index_path" ;; esac
+  index_lock="$index_path.lock"; index_marker="$expected_token.$$"
+  index_backup="$index_path.crabbox.$$.backup"; index_candidate="$index_path.crabbox.$$.new"; index_verify="$index_path.crabbox.$$.verify"; index_restore="$index_path.crabbox.$$.restore"
+  cp -p "$index_path" "$index_backup"; git read-tree --reset --index-output="$index_candidate" ` + shellQuote(plan.Target) + `
+  [ "$(GIT_INDEX_FILE="$index_candidate" git write-tree)" = ` + shellQuote(plan.Tree) + ` ]
+  GIT_INDEX_FILE="$index_candidate" git diff-files --name-status >"$git_status" 2>/dev/null ||
+    { echo "remote sync sanity failed: candidate Git index inspection failed" >&2; exit 67; }
+  deletions=$(awk '$1 == "D" { n++ } END { print n+0 }' "$git_status"); [ ` + shellQuote(allowMassDeletions) + ` = '1' ] || [ "$deletions" -lt 200 ]
+  (set -C; printf %s "$index_marker" > "$index_lock") || { echo "remote sync finalize failed: Git index is busy" >&2; exit 67; }
+  cmp -s "$index_path" "$index_backup" || { echo "remote sync finalize failed: Git index changed concurrently" >&2; exit 67; }
+  cp -p "$index_candidate" "$index_verify"; mv "$index_candidate" "$index_path"; index_changed=1; coherence_mutated=1
+  cmp -s "$index_path" "$index_verify" && [ "$(GIT_INDEX_FILE="$index_verify" git write-tree)" = ` + shellQuote(plan.Tree) + ` ] || { echo "remote sync finalize failed: installed Git index verification failed" >&2; exit 67; }
+  git update-ref --no-deref HEAD ` + shellQuote(plan.Target) + ` "$old_head"; head_changed=1
+  [ "$(git rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ]
+fi
+`
+}
+
+func remoteSyncFinalizeLockScript() string {
+	return `lock_path="$meta_dir/sync-finalize-lock"
+lock_waits=0
+while ! ln -s "$$" "$lock_path" 2>/dev/null; do
+  lock_owner=$(readlink "$lock_path" 2>/dev/null || true)
+  lock_owner_live=
+  case "$lock_owner" in
+    ''|*[!0-9]*) ;;
+    *) if kill -0 "$lock_owner" 2>/dev/null; then lock_owner_live=1; fi ;;
+  esac
+  if [ -n "$lock_owner_live" ]; then
+    sleep 1
+  else
+    sleep 1
+    confirmed_owner=$(readlink "$lock_path" 2>/dev/null || true)
+    if [ "$confirmed_owner" = "$lock_owner" ]; then
+      owner_dead=
+      case "$confirmed_owner" in
+        ''|*[!0-9]*) owner_dead=1 ;;
+        *) if ! kill -0 "$confirmed_owner" 2>/dev/null; then owner_dead=1; fi ;;
+      esac
+      if [ -n "$owner_dead" ]; then
+        stale_lock="$lock_path.stale.$$"
+        if mv "$lock_path" "$stale_lock" 2>/dev/null; then
+          moved_owner=$(readlink "$stale_lock" 2>/dev/null || true)
+          if [ "$moved_owner" != "$confirmed_owner" ]; then
+            if [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+              mv "$stale_lock" "$lock_path" 2>/dev/null || true
+            fi
+            echo "remote sync finalize failed: lock ownership changed during recovery" >&2
+            exit 67
+          fi
+          rm -f "$stale_lock"
+          continue
+        fi
+      fi
+    fi
+  fi
+  lock_waits=$((lock_waits + 1))
+  if [ "$lock_waits" -ge 120 ]; then
+    echo "remote sync finalize failed: timed out waiting for active finalize" >&2
+    exit 67
+  fi
+done
+cleanup_finalize_lock() {
+  if [ -n "${git_status:-}" ]; then
+    rm -f -- "$git_status"
+  fi
+  if [ -n "${transport_error:-}" ]; then
+    rm -f -- "$transport_error"
+  fi
+  if [ "$(readlink "$lock_path" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$lock_path"
+  fi
+}
+trap cleanup_finalize_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+`
 }
 
 func remoteSyncMetaDirScript() string {
-	return "meta_dir=$(if [ -d .git ]; then printf %s .git/crabbox; else printf %s .crabbox; fi); "
+	return remoteSyncMetaDirScriptWithGit("git")
 }
 
-func remoteSyncSanity(workdir string, allowMassDeletions bool) string {
-	allowValue := ""
-	if allowMassDeletions {
-		allowValue = "1"
-	}
-	return "cd " + shellQuote(workdir) + " && " +
-		"if test -d .git && git status --short >/tmp/crabbox-git-status 2>/dev/null; then " +
-		"deletions=$(awk '/^ D|^D / { n++ } END { print n+0 }' /tmp/crabbox-git-status); " +
-		"if [ " + shellQuote(allowValue) + " != '1' ] && [ \"$deletions\" -ge 200 ]; then " +
-		"echo \"remote sync sanity failed: $deletions tracked deletions\" >&2; " +
-		"awk '/^ D|^D / { print \"  \" substr($0,4) }' /tmp/crabbox-git-status | head -20 >&2; " +
-		"exit 66; " +
-		"fi; " +
-		"fi"
+func remoteSyncMetaDirScriptWithGit(gitCommand string) string {
+	return `meta_dir=$(git_root=; if git_root="$(` + gitCommand + ` rev-parse --show-toplevel 2>/dev/null)" &&
+  git_root="$(cd -P -- "$git_root" 2>/dev/null && pwd -P)" &&
+  [ "$git_root" = "$(pwd -P)" ]; then ` + gitCommand + ` rev-parse --git-path crabbox; else printf %s .crabbox; fi)
+case "$meta_dir" in /*) ;; *) meta_dir="$PWD/$meta_dir" ;; esac
+`
+}
+
+func remotePlainManifestSyncMetaDirScript() string {
+	return remoteSyncMetaDirScriptWithGit("plain_git")
+}
+
+func remotePlainManifestGitFunction() string {
+	return `plain_git() {
+  /usr/bin/env -i HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_ATTR_NOSYSTEM=1 \
+    GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false GCM_INTERACTIVE=Never \
+    /usr/bin/git -c credential.helper= -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+      -c core.attributesFile=/dev/null -c protocol.allow=never "$@"
+}
+`
+}
+
+func remotePlainSyncMetaDirScript() string {
+	return `if ! overlay_workspace_safe "$PWD" || ! overlay_metadata_safe "$PWD"; then
+  echo "Git overlay requires isolated, nonsymlink workspace metadata" >&2
+  exit 67
+fi
+meta_dir="$PWD/.git/crabbox"
+`
 }
 
 func exitCode(err error) int {
@@ -1412,7 +3230,7 @@ func exitCode(err error) int {
 		return 0
 	}
 	var exitErr *exec.ExitError
-	if asExitError(err, &exitErr) {
+	if errors.As(err, &exitErr) {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			return status.ExitStatus()
 		}
@@ -1427,4 +3245,18 @@ func parseServerID(s string) (int64, bool) {
 
 func ParseServerID(s string) (int64, bool) {
 	return parseServerID(s)
+}
+
+// PruneArchiveSyncManifestCommand preserves remote-only files while pruning the
+// previous archive manifest with the same path checks as Git overlay sync.
+func PruneArchiveSyncManifestCommand(workdir, token string, allowMassDeletions bool) string {
+	metadata := `if [ -L .crabbox ] || [ ! -d .crabbox ]; then
+  echo "archive sync requires nonsymlink metadata" >&2; exit 67
+fi
+meta_dir="$PWD/.crabbox"
+for file in "$meta_dir/sync-manifest" "$meta_dir/sync-manifest.` + token + `.new" "$meta_dir/sync-deleted.` + token + `.new"; do
+  if [ -L "$file" ]; then echo "archive sync refuses symlink manifest" >&2; exit 67; fi
+done
+`
+	return remotePruneSafeSyncManifest(workdir, token, metadata, allowMassDeletions)
 }

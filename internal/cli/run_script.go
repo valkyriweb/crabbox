@@ -21,7 +21,7 @@ type RunScriptSpec struct {
 
 func loadRunScript(path string, stdin bool, input io.Reader) (*RunScriptSpec, error) {
 	if path != "" && stdin {
-		return nil, exit(2, "--script and --script-stdin are mutually exclusive")
+		return nil, Exit(2, "--script and --script-stdin are mutually exclusive")
 	}
 	if path == "" && !stdin {
 		return nil, nil
@@ -39,10 +39,10 @@ func loadRunScript(path string, stdin bool, input io.Reader) (*RunScriptSpec, er
 		data, err = os.ReadFile(path)
 	}
 	if err != nil {
-		return nil, exit(2, "read script %s: %v", source, err)
+		return nil, Exit(2, "read script %s: %v", source, err)
 	}
 	if len(data) == 0 {
-		return nil, exit(2, "script %s is empty", source)
+		return nil, Exit(2, "script %s is empty", source)
 	}
 	sum := sha256.Sum256(data)
 	name := safeScriptName(source, hex.EncodeToString(sum[:])[:12])
@@ -90,6 +90,10 @@ func runScriptForTarget(spec *RunScriptSpec, target SSHTarget) *RunScriptSpec {
 }
 
 func uploadRunScript(ctx context.Context, target SSHTarget, workdir string, spec *RunScriptSpec) error {
+	return uploadRunScriptAfter(ctx, target, workdir, spec, "")
+}
+
+func uploadRunScriptAfter(ctx context.Context, target SSHTarget, workdir string, spec *RunScriptSpec, prepare string) error {
 	if spec == nil {
 		return nil
 	}
@@ -97,25 +101,42 @@ func uploadRunScript(ctx context.Context, target SSHTarget, workdir string, spec
 	if isWindowsNativeTarget(target) {
 		remote = windowsRemoteUploadRunScriptCommand(workdir, spec.RemotePath)
 	}
+	if prepare != "" {
+		// Preparation previously had no stdin; login hooks must not consume script bytes.
+		remote = "( " + prepare + " ) </dev/null && " + remote
+	}
 	var stdout, stderr bytes.Buffer
-	if err := runSSHInput(ctx, target, remote, bytes.NewReader(spec.Data), &stdout, &stderr); err != nil {
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		stdout.Reset()
+		stderr.Reset()
+		err = runSSHInput(ctx, target, remote, bytes.NewReader(spec.Data), &stdout, &stderr)
+		if err == nil || !shouldRetrySSHPort(err) || attempt == 1 {
+			break
+		}
+		// Preparation and overwriting the same script are safe to repeat.
+		if err = sleepContext(ctx, idempotentSSHRetryDelay); err != nil {
+			break
+		}
+	}
+	if err != nil {
 		detail := trimFailureDetail(strings.TrimSpace(stdout.String() + "\n" + stderr.String()))
 		if detail != "" {
-			return exit(7, "upload script %s: %v: %s", spec.RemotePath, err, detail)
+			return Exit(7, "upload script %s: %v: %s", spec.RemotePath, err, detail)
 		}
-		return exit(7, "upload script %s: %v", spec.RemotePath, err)
+		return Exit(7, "upload script %s: %v", spec.RemotePath, err)
 	}
 	return nil
 }
 
 func remoteUploadRunScriptCommand(workdir, remotePath string) string {
 	dir := filepath.ToSlash(filepath.Dir(remotePath))
-	script := "set -eu\n" +
-		"cd " + shellQuote(workdir) + "\n" +
+	script := "set -eu\numask 077\n" +
+		"cd " + shellPathQuote(workdir) + "\n" +
 		"mkdir -p " + shellQuote(dir) + "\n" +
 		"cat > " + shellQuote(remotePath) + "\n" +
 		"chmod 700 " + shellQuote(remotePath) + "\n"
-	return "bash -lc " + shellQuote(script)
+	return remotePOSIXControlCommand(script)
 }
 
 func windowsRemoteUploadRunScriptCommand(workdir, remotePath string) string {
@@ -144,48 +165,39 @@ if ($hasBom) {
   [System.IO.File]::WriteAllBytes($fullPath, $out)
 }
 `
-	return powershellCommand(script)
-}
-
-func remoteRunScriptCommandWithEnvFile(workdir string, env map[string]string, envFile string, script *RunScriptSpec, args []string) string {
-	return remoteRunScriptCommandWithEnvFiles(workdir, env, singleEnvFile(envFile), script, args)
+	return PowershellCommand(script)
 }
 
 func remoteRunScriptCommandWithEnvFiles(workdir string, env map[string]string, envFiles []string, script *RunScriptSpec, args []string) string {
 	var b strings.Builder
 	writeRemoteCommandPrefix(&b, workdir, env, envFiles)
+	// Uploaded scripts retain their login startup directory semantics.
 	if script.Shebang {
-		b.WriteString("bash -lc ")
-		b.WriteString(shellQuote(`exec "$@"`))
-		b.WriteString(" bash ")
+		b.WriteString(remotePortableShellInvocation(`exec "$@"`, nil))
 	} else {
 		b.WriteString("bash -lc ")
 		b.WriteString(shellQuote(`exec bash "$@"`))
-		b.WriteString(" bash ")
+		b.WriteString(" bash")
+	}
+	b.WriteByte(' ')
+	if !strings.HasPrefix(script.RemotePath, "/") {
+		// Use the workspace captured before env files or login startup change cwd.
+		b.WriteString(`"$1"/`)
 	}
 	b.WriteString(shellQuote(script.RemotePath))
 	for _, arg := range args {
 		b.WriteByte(' ')
 		b.WriteString(shellQuote(arg))
 	}
-	return b.String()
+	return b.String() + ")"
 }
 
 func windowsRemoteRunScriptCommandWithEnvFiles(workdir string, env map[string]string, envFiles []string, script *RunScriptSpec, args []string) string {
 	var b bytes.Buffer
 	writeWindowsRemotePrefix(&b, workdir, env, envFiles)
-	b.WriteString("$__crabboxScript = " + psQuote(script.RemotePath) + "\n")
-	b.WriteString("$__crabboxArgs = @(")
-	for i, arg := range args {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(psQuote(arg))
-	}
-	b.WriteString(")\n")
-	b.WriteString("& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $__crabboxScript @__crabboxArgs\n")
-	b.WriteString("exit $LASTEXITCODE\n")
-	return powershellCommand(b.String())
+	command := []string{"powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script.RemotePath}
+	writeWindowsCommandInvocation(&b, append(command, args...))
+	return PowershellCommand(b.String())
 }
 
 func runScriptDisplay(script *RunScriptSpec, args []string) string {

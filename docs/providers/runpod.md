@@ -35,20 +35,74 @@ at `root@<publicIp>:<publicPort>` and uses its standard SSH transport. RunPod's
 basic SSH proxy is not used, because rsync needs the SCP/SFTP support the proxy
 lacks.
 
-**SSH auth is public-key only.** Upload your ED25519 public key on the RunPod
-settings page once; RunPod injects it into every pod you launch. Crabbox does
-not manage that key.
+SSH-endpoint discovery has a ten-minute budget covering both API requests and
+jittered retry waits. Caller cancellation stops discovery and retains its error
+cause; a completed provider response is not replaced by a simultaneous
+cancellation. An independent API-client timeout remains a request failure.
+
+**SSH auth is public-key only.** Crabbox reads the public key matching its
+configured SSH key and supplies it to the pod as `PUBLIC_KEY`. The default image
+installs that key for SSH; a custom image must honor `PUBLIC_KEY` and start SSH.
+Provide an existing key with `ssh.key` in config or `CRABBOX_SSH_KEY`; the default is
+`~/.ssh/id_ed25519`. A matching public-key file must exist alongside it.
+
+### Fixed lease IDs
+
+Fixed-lease orchestrators can use
+`crabbox warmup --provider runpod --lease-id cbx_abcdef123456 --keep=true`.
+The local claim binds the ID to the repository, RunPod account, API endpoint,
+pod settings, lifecycle policy, and a stored per-lease SSH key. Repeating the
+same intent returns the same pod; changing its intent or account exits with
+`lease_id_conflict`. API-key rotation within the same account is allowed.
+
+Crabbox journals the attempt before submitting one create request. The pod name
+and its `CRABBOX_LEASE_ID`, `CRABBOX_FIXED_ATTEMPT`, and
+`CRABBOX_FIXED_INTENT` environment markers identify the pod after a lost
+response. These are provider metadata, not local configuration variables.
+An unresolved attempt never submits another create, even if inventory is empty.
+Preserve the local state directory and SSH key for recovery.
+
+Inspect/status, heartbeat, and stop resolve the durable claim and recheck the
+account and pod identity. Inspection does not prepare SSH or renew the claim.
+Stop retains a terminal receipt, so a released ID cannot create another pod.
+Fixed creation sends the configured GPU candidates in one native request;
+ordinary creation retains its existing sequential capacity fallback.
 
 ### Lifecycle
 
 - **Acquire** — deploys a pod named `crabbox-<slug>-<leaseSuffix>`, then waits
   for the public TCP mapping for port 22.
-- **Resolve** — looks up an existing pod by lease id, pod id, or pod name.
+- **Resolve** — read-only status can look up a pod by lease id, pod id, or pod
+  name. Reusing an existing pod requires an exact local claim bound to its
+  RunPod id and name; use `--reclaim` once to adopt an unclaimed or legacy pod
+  explicitly.
 - **List** — enumerates the caller's pods via `GET /v1/pods` and filters to the
   `crabbox-` prefix unless `--all` is set.
-- **Release** — calls `DELETE /v1/pods/{id}`, terminating the pod immediately.
-- **Doctor** — runs read-only pod-list checks only; it never creates a pod, so
-  it is safe to run on every CI invocation.
+- **Release** — requires the exact resource-bound local claim, fetches the pod
+  again to match its id and name, then calls `DELETE /v1/pods/{id}`. Raw ids,
+  names, and legacy claims alone cannot terminate a pod.
+- **Doctor** — runs read-only identity and pod-list checks; it never creates a
+  pod, so it is safe to run on every CI invocation.
+
+The local claim owns heartbeat activity, idle timeout, creation time, TTL, and
+keep policy. Read-only status and list preserve recorded lifecycle values without
+renewing the claim or replacing them with current configuration. Unclaimed pods
+have no inferred lifecycle history; explicit adoption initializes that policy.
+Native stopped or failed state still takes precedence over stored activity.
+After a native restart, a saved runtime stop/failure no longer masks the running
+pod. Logical deletion and expiry holds remain intact.
+
+An ordinary heartbeat preserves the recorded idle timeout. An explicit
+`--idle-timeout` commits the new timeout together with activity, without extending
+the recorded creation-based TTL. Missing or stale claim snapshots, cancellation,
+and changed pod identity are errors rather than successful updates. Earlier
+releases returned heartbeat changes without persisting them; repeat an intended
+timeout change after upgrading if it was not recorded in the claim.
+
+Release uses the exact claim observed during acquisition or resolution. If that
+claim changes before deletion, release refuses the stale target without deleting
+the pod; resolve it again before retrying. It never substitutes a newer claim for
+the observed one.
 
 ## Capabilities
 
@@ -96,7 +150,15 @@ curl https://rest.runpod.io/v1/pods \
 ```
 
 Crabbox sends the identical `Authorization: Bearer $RUNPOD_API_KEY` header to
-the REST pod endpoints.
+the REST pod endpoints. Cross-origin redirects are rejected before credentials
+or pod-create bodies can be replayed to another destination.
+
+Account identity uses GraphQL `myself { id }` at
+`https://api.runpod.io/graphql`, using the same Bearer authorization header as
+REST; credentials never enter the query string. Transport errors redact the key. Custom REST endpoints use
+`/graphql` under the configured base with a trailing `/v1` removed.
+Doctor and fixed leases require this identity query as well as REST pod access.
+RunPod currently documents GraphQL retirement in early 2027.
 
 ## Config
 
@@ -148,20 +210,39 @@ CRABBOX_RUNPOD_USER
 CRABBOX_RUNPOD_WORK_ROOT
 ```
 
+### Input and default behavior
+
+The nine settings use shared typed bindings; API keys remain environment-only.
+Nonempty strings override prior values without trimming, while empty YAML or
+environment strings preserve them. Visited string flags can explicitly clear a
+value before the existing selected-provider defaults run.
+
+For `diskGB`, omitted/null/zero YAML preserves the prior value; a nonzero integer,
+including a negative value, assigns. The environment parser preserves the prior
+value for malformed input but accepts parsed zero and negative integers. Runtime
+defaults then replace a nonpositive disk size with 20 GB. File application and
+runtime defaulting are separate steps.
+
+The raw provider `user` and `workRoot` defaults remain empty. The values in the
+example above are effective settings: Runpod can inherit a custom generic SSH
+user or work root, otherwise using its existing `root` and `/tmp/crabbox`
+fallbacks. Endpoint provenance and credential-destination checks remain unchanged.
+
 ## Cost discipline
 
 Pods are terminated immediately on release. If `--keep` is set, the pod stays
 up and keeps accruing cost until you terminate it. Run
-`crabbox list --provider runpod` to spot leaked pods, and
-`crabbox stop --provider runpod <id>` to clean them up.
+`crabbox list --provider runpod` to spot leaked pods. A Crabbox-claimed pod can
+be cleaned up with `crabbox stop --provider runpod <id>`. Adopt an unclaimed
+pod first through a supported reuse command such as
+`crabbox run --provider runpod --id <pod-id> --reclaim -- true`, or terminate
+it directly in RunPod.
 
 ## Gotchas
 
 - A funded RunPod account is required. `crabbox doctor --provider runpod`
-  succeeds on a zero-balance account because it only reads the pod list — the
+  succeeds on a zero-balance account because it only reads identity and pods — the
   balance shortfall only surfaces when an `Acquire` runs.
-- Upload your ED25519 public key to RunPod once before any pod bootstrap will
-  accept your SSH session.
 - The pod's public SSH port is allocated at runtime and changes between pods;
   never hard-code `--ssh-port`.
 - RunPod's basic SSH proxy is not a Crabbox transport, because rsync needs

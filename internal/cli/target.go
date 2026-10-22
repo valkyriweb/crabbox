@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"os"
 	"path"
@@ -33,8 +34,14 @@ const (
 func normalizeTargetConfig(cfg *Config) {
 	cfg.TargetOS = normalizeTargetOS(cfg.TargetOS)
 	cfg.WindowsMode = normalizeWindowsMode(cfg.WindowsMode)
-	if cfg.Provider == "aws" && cfg.TargetOS == targetMacOS && cfg.SSHUser == baseConfig().SSHUser {
-		cfg.SSHUser = "ec2-user"
+	if cfg.Provider == "aws" && cfg.TargetOS == targetMacOS {
+		if cfg.SSHUser == baseConfig().SSHUser {
+			cfg.SSHUser = "ec2-user"
+		}
+		// EC2 Mac uses Apple's socket-activated Remote Login service, whose
+		// launchd socket remains on port 22 even when sshd_config lists others.
+		cfg.SSHPort = "22"
+		cfg.SSHFallbackPorts = nil
 	}
 	if cfg.Provider == "aws" && cfg.TargetOS == targetWindows && cfg.WindowsMode == windowsModeWSL2 && cfg.SSHUser == baseConfig().SSHUser {
 		cfg.SSHUser = "Administrator"
@@ -43,9 +50,19 @@ func normalizeTargetConfig(cfg *Config) {
 		if cfg.Static.User != "" && cfg.SSHUser == baseConfig().SSHUser {
 			cfg.SSHUser = cfg.Static.User
 		}
+		// Selector normalization runs before command flags apply. A root derived
+		// from an earlier login user stays implicit and follows the final one.
+		if !IsWorkRootExplicit(cfg) && cfg.WorkRoot == cfg.derivedStaticWorkRoot {
+			cfg.WorkRoot = ""
+		}
 	}
-	if isDefaultWorkRoot(cfg.WorkRoot) {
-		cfg.WorkRoot = defaultWorkRootForTarget(cfg.TargetOS, cfg.WindowsMode)
+	if shouldDeriveTargetWorkRoot(cfg) {
+		if isStaticProvider(cfg.Provider) && cfg.TargetOS == targetMacOS {
+			cfg.WorkRoot = path.Join("/Users", staticLoginUser(*cfg), "crabbox")
+			cfg.derivedStaticWorkRoot = cfg.WorkRoot
+		} else {
+			cfg.WorkRoot = defaultWorkRootForTarget(cfg.TargetOS, cfg.WindowsMode)
+		}
 	}
 	if isStaticProvider(cfg.Provider) {
 		if cfg.Static.Port != "" && cfg.SSHPort == baseConfig().SSHPort {
@@ -58,6 +75,24 @@ func normalizeTargetConfig(cfg *Config) {
 	if (cfg.Provider == "namespace-devbox" || cfg.Provider == "namespace") && isDefaultWorkRoot(cfg.WorkRoot) && cfg.Namespace.WorkRoot != "" {
 		cfg.WorkRoot = cfg.Namespace.WorkRoot
 	}
+	if cfg.Provider == "sealos-devbox" && (IsSealosDevboxWorkRootExplicit(cfg) || (!IsWorkRootExplicit(cfg) && isDefaultWorkRoot(cfg.WorkRoot))) {
+		cfg.WorkRoot = EffectiveSealosDevboxWorkRoot(*cfg)
+	}
+}
+
+func shouldDeriveTargetWorkRoot(cfg *Config) bool {
+	if strings.TrimSpace(cfg.WorkRoot) == "" {
+		return true
+	}
+	if IsWorkRootExplicit(cfg) {
+		return false
+	}
+	// The external provider owns its work root. This also covers persisted
+	// routing state, whose root must survive target normalization verbatim.
+	if (cfg.Provider == "external" || cfg.Provider == "exec-provider") && strings.TrimSpace(cfg.External.WorkRoot) != "" && cfg.WorkRoot == cfg.External.WorkRoot {
+		return false
+	}
+	return isDefaultWorkRoot(cfg.WorkRoot)
 }
 
 func isDefaultWorkRoot(value string) bool {
@@ -111,51 +146,63 @@ func validateTargetConfig(cfg Config) error {
 	switch cfg.TargetOS {
 	case targetLinux, targetMacOS, targetWindows, targetWorkerRuntime:
 	default:
-		return exit(2, "target must be linux, macos, windows, or worker-runtime")
+		return Exit(2, "target must be linux, macos, windows, or worker-runtime")
 	}
 	if cfg.TargetOS != targetWindows && cfg.WindowsMode != windowsModeNormal {
-		return exit(2, "windows.mode is only valid with target=windows")
+		return Exit(2, "windows.mode is only valid with target=windows")
 	}
 	if cfg.TargetOS == targetWindows {
 		switch cfg.WindowsMode {
 		case windowsModeNormal, windowsModeWSL2:
 		default:
-			return exit(2, "windows.mode must be normal or wsl2")
+			return Exit(2, "windows.mode must be normal or wsl2")
 		}
 	}
 	return nil
 }
 
 func validateProviderTarget(cfg Config) error {
+	// Config loading also applies defaults, before lease flags resolve the target.
+	// Check selector compatibility only at this final lease admission boundary.
+	if spec := osImageSpecs[cfg.OSImage]; spec.Provider != "" &&
+		(cfg.Provider != spec.Provider || normalizeTargetOS(cfg.TargetOS) != spec.Target) {
+		return Exit(2, "os %s requires provider=%s target=%s", spec.Selector, spec.Provider, spec.Target)
+	}
 	provider, err := validateProviderTargetSupport(cfg)
 	if err != nil {
 		return err
 	}
 	if !providerSpecSupportsTarget(provider.Spec(), cfg.TargetOS, cfg.WindowsMode) {
-		return exit(2, "%s", unsupportedManagedTargetMessageForConfig(provider.Name(), cfg))
+		return Exit(2, "%s", unsupportedManagedTargetMessageForConfig(provider.Spec().Name, cfg))
 	}
 	machineTarget := cfg.TargetOS != targetWorkerRuntime
-	if machineTarget && (provider.Name() == "tart" || provider.Name() == "apple-vz") && cfg.architectureExplicit && effectiveArchitectureForConfig(cfg) != ArchitectureARM64 {
-		return exit(2, "provider=%s supports architecture=arm64 only", provider.Name())
+	_, ownsArchitecture := provider.(ProviderArchitectureCapability)
+	if machineTarget && !ownsArchitecture && (provider.Spec().Name == "tart" || provider.Spec().Name == "apple-vm" || provider.Spec().Name == "lume" || provider.Spec().Name == "aws-lambda-microvm") && cfg.architectureExplicit && effectiveArchitectureForConfig(cfg) != ArchitectureARM64 {
+		return Exit(2, "provider=%s supports architecture=arm64 only", provider.Spec().Name)
 	}
-	if machineTarget && effectiveArchitectureForConfig(cfg) == ArchitectureARM64 {
-		if provider.Name() != "azure" && provider.Name() != "aws" && provider.Name() != "tart" && provider.Name() != "apple-vz" {
-			return exit(2, "architecture=arm64 currently supports provider=azure, provider=aws, provider=tart, or provider=apple-vz")
+	architecture := effectiveArchitectureForConfig(cfg)
+	if machineTarget && ownsArchitecture && !providerSupportsArchitecture(provider, cfg, architecture) {
+		return Exit(2, "provider=%s does not support target=%s windows.mode=%s architecture=%s", provider.Spec().Name, cfg.TargetOS, cfg.WindowsMode, architecture)
+	}
+	if machineTarget && !ownsArchitecture && architecture == ArchitectureARM64 {
+		if !providerSupportsArchitecture(provider, cfg, architecture) {
+			return Exit(2, "architecture=arm64 currently supports provider=azure, provider=aws, provider=tart, provider=apple-container, provider=apple-vm, provider=lume, provider=aws-lambda-microvm, provider=external, or a provider with runtime-native architecture support such as provider=local-container")
 		}
 		if cfg.TargetOS != targetLinux &&
-			!(provider.Name() == "azure" && cfg.TargetOS == targetWindows) &&
-			!(provider.Name() == "tart" && cfg.TargetOS == targetMacOS) {
-			return exit(2, "architecture=arm64 currently supports target=linux, provider=azure target=windows, or provider=tart target=macos only")
+			!(provider.Spec().Name == "azure" && cfg.TargetOS == targetWindows) &&
+			!((provider.Spec().Name == "tart" || provider.Spec().Name == "lume") && cfg.TargetOS == targetMacOS) &&
+			!(provider.Spec().Name == "external" && (cfg.TargetOS == targetMacOS || cfg.TargetOS == targetWindows)) {
+			return Exit(2, "architecture=arm64 currently supports target=linux, provider=azure target=windows, provider=tart/provider=lume target=macos, or provider=external target=macos/windows only")
 		}
-		if provider.Name() == "azure" && cfg.TargetOS == targetWindows && cfg.WindowsMode == windowsModeWSL2 {
-			return exit(2, "provider=azure target=windows architecture=arm64 supports windows.mode=normal only; windows.mode=wsl2 requires nested virtualization, which Azure Cobalt ARM64 VM sizes do not support")
+		if provider.Spec().Name == "azure" && cfg.TargetOS == targetWindows && cfg.WindowsMode == windowsModeWSL2 {
+			return Exit(2, "provider=azure target=windows architecture=arm64 supports windows.mode=normal only; windows.mode=wsl2 requires nested virtualization, which Azure Cobalt ARM64 VM sizes do not support")
 		}
-		if provider.Name() == "azure" && cfg.TargetOS == targetWindows && !azureWindowsARM64HasExplicitImage(cfg) {
-			return exit(2, "provider=azure target=windows architecture=arm64 requires azure.image or CRABBOX_AZURE_IMAGE with an ARM64 Windows image; the built-in Windows default is x64")
+		if provider.Spec().Name == "azure" && cfg.TargetOS == targetWindows && !azureWindowsARM64HasExplicitImage(cfg) {
+			return Exit(2, "provider=azure target=windows architecture=arm64 requires azure.image or CRABBOX_AZURE_IMAGE with an ARM64 Windows image; the built-in Windows default is x64")
 		}
 	}
-	if (cfg.TargetOS == targetLinux || (provider.Name() == "azure" && cfg.TargetOS == targetWindows)) && strings.TrimSpace(cfg.ServerType) != "" {
-		switch provider.Name() {
+	if (cfg.TargetOS == targetLinux || (provider.Spec().Name == "azure" && cfg.TargetOS == targetWindows)) && strings.TrimSpace(cfg.ServerType) != "" {
+		switch provider.Spec().Name {
 		case "aws":
 			if err := validateArchitectureServerType("AWS instance type", cfg, awsInstanceTypeIsARM64(cfg.ServerType)); err != nil {
 				return err
@@ -166,23 +213,42 @@ func validateProviderTarget(cfg Config) error {
 			}
 		}
 	}
-	if provider.Name() == "aws" &&
+	if provider.Spec().Name == "aws" &&
 		cfg.TargetOS == targetWindows &&
 		cfg.WindowsMode == windowsModeWSL2 &&
 		cfg.ServerTypeExplicit &&
 		!awsInstanceTypeSupportsNestedVirtualization(cfg.ServerType) {
-		return exit(2, "provider=aws target=windows windows.mode=wsl2 requires an instance type with AWS nested virtualization; %s is not supported. Use --type m8i.4xlarge or omit --type and choose class=standard|fast|large|beast", cfg.ServerType)
+		return Exit(2, "provider=aws target=windows windows.mode=wsl2 requires an instance type with AWS nested virtualization; %s is not supported. Use --type m8i.4xlarge or omit --type and choose class=tiny|small|standard|fast|large|beast", cfg.ServerType)
 	}
 	if cfg.Provider == "aws" && cfg.TargetOS == targetMacOS {
 		if cfg.HostID == "" && cfg.AWSMacHostID == "" && cfg.Coordinator == "" {
-			return exit(2, "provider=aws target=macos requires CRABBOX_HOST_ID, hostId, CRABBOX_AWS_MAC_HOST_ID, or aws.macHostId for an allocated host")
+			return Exit(2, "provider=aws target=macos requires CRABBOX_HOST_ID, hostId, CRABBOX_AWS_MAC_HOST_ID, or aws.macHostId for an allocated host")
 		}
 		if cfg.Capacity.Market != "on-demand" {
-			return exit(2, "provider=aws target=macos requires --market on-demand; EC2 Mac instances are not Spot")
+			return Exit(2, "provider=aws target=macos requires --market on-demand; EC2 Mac instances are not Spot")
 		}
-		return nil
+		return validateProviderClassSelector(provider, cfg)
 	}
-	return nil
+	return validateProviderClassSelector(provider, cfg)
+}
+
+func providerSupportsArchitecture(provider Provider, cfg Config, architecture string) bool {
+	if capability, ok := provider.(ProviderArchitectureCapability); ok {
+		return capability.SupportsArchitecture(cfg, architecture)
+	}
+	if architecture == ArchitectureARM64 {
+		return providerSupportsARM64(provider.Spec().Name)
+	}
+	return true
+}
+
+func providerSupportsARM64(name string) bool {
+	switch name {
+	case "azure", "aws", "tart", "apple-container", "apple-vm", "lume", "aws-lambda-microvm", "external":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateProviderTargetSupport(cfg Config) (Provider, error) {
@@ -191,7 +257,7 @@ func validateProviderTargetSupport(cfg Config) (Provider, error) {
 		return nil, err
 	}
 	if !providerSpecSupportsTarget(provider.Spec(), cfg.TargetOS, cfg.WindowsMode) {
-		return nil, exit(2, "%s", unsupportedManagedTargetMessageForConfig(provider.Name(), cfg))
+		return nil, Exit(2, "%s", unsupportedManagedTargetMessageForConfig(provider.Spec().Name, cfg))
 	}
 	return provider, nil
 }
@@ -199,10 +265,10 @@ func validateProviderTargetSupport(cfg Config) (Provider, error) {
 func validateArchitectureServerType(kind string, cfg Config, serverTypeARM64 bool) error {
 	architecture := effectiveArchitectureForConfig(cfg)
 	if architecture == ArchitectureARM64 && !serverTypeARM64 {
-		return exit(2, "architecture=arm64 requires an ARM64 %s; %s is not ARM64", kind, cfg.ServerType)
+		return Exit(2, "architecture=arm64 requires an ARM64 %s; %s is not ARM64", kind, cfg.ServerType)
 	}
 	if cfg.architectureExplicit && cfg.Architecture == ArchitectureAMD64 && serverTypeARM64 {
-		return exit(2, "architecture=amd64 requires an amd64 %s; %s is ARM64", kind, cfg.ServerType)
+		return Exit(2, "architecture=amd64 requires an amd64 %s; %s is ARM64", kind, cfg.ServerType)
 	}
 	return nil
 }
@@ -222,6 +288,9 @@ func providerSpecSupportsTarget(spec ProviderSpec, targetOS, windowsMode string)
 
 func unsupportedManagedTargetMessageForConfig(provider string, cfg Config) string {
 	target := cfg.TargetOS
+	if provider == "lume" {
+		return "provider=lume supports target=macos only"
+	}
 	if provider == "azure" {
 		if target == targetMacOS {
 			return "provider=azure managed provisioning supports target=linux and Windows only; use provider=aws with an EC2 Mac Dedicated Host or provider=ssh for existing macOS hosts"
@@ -262,20 +331,28 @@ const staticLeaseIDPrefix = "static_"
 // and restores the original static host from the local claim when the caller
 // did not already pass --static-host.
 func autoRouteStaticLease(cfg *Config, fs *flag.FlagSet, id string) error {
+	return autoRouteStaticLeaseContext(context.Background(), cfg, fs, id)
+}
+
+func autoRouteStaticLeaseContext(ctx context.Context, cfg *Config, fs *flag.FlagSet, id string) error {
 	id = strings.TrimSpace(id)
 	suffix, hasStaticPrefix := strings.CutPrefix(id, staticLeaseIDPrefix)
 	if flagWasSet(fs, "provider") && !isStaticProvider(cfg.Provider) {
 		return nil
 	}
-	claim, hasClaim, err := staticLeaseClaim(id)
+	authoritative := ProviderSelectionIsAuthoritativeRoute(*cfg)
+	if authoritative && !isStaticProvider(cfg.Provider) {
+		return nil
+	}
+	claim, hasClaim, err := staticLeaseClaimContext(ctx, id)
 	if err != nil {
 		return err
 	}
 	if (!hasStaticPrefix || suffix == "") && !hasClaim {
 		return nil
 	}
-	if !flagWasSet(fs, "provider") {
-		cfg.Provider = staticProvider
+	if !flagWasSet(fs, "provider") && !authoritative {
+		setProviderSelection(cfg, staticProvider, providerSelectionLeaseContext)
 	}
 	if !isStaticProvider(cfg.Provider) {
 		return nil
@@ -293,6 +370,10 @@ func autoRouteStaticLease(cfg *Config, fs *flag.FlagSet, id string) error {
 // external lease was acquired. This keeps existing leases addressable after
 // the user's current external configuration changes.
 func autoRouteExternalLease(cfg *Config, fs *flag.FlagSet, id string) error {
+	return autoRouteExternalLeaseContext(context.Background(), cfg, fs, id)
+}
+
+func autoRouteExternalLeaseContext(ctx context.Context, cfg *Config, fs *flag.FlagSet, id string) error {
 	providerExplicit := flagWasSet(fs, "provider")
 	if providerExplicit {
 		cfg.providerExplicit = true
@@ -303,17 +384,17 @@ func autoRouteExternalLease(cfg *Config, fs *flag.FlagSet, id string) error {
 	if flagWasSet(fs, "windows-mode") {
 		cfg.windowsModeFlagExplicit = true
 	}
-	return autoRouteExternalLeaseWithHints(
-		cfg,
+	return autoRouteExternalLeaseWithHintsContext(
+		ctx, cfg,
 		id,
 		flagWasSet(fs, "external-routing-file"),
-		cfg.targetFlagExplicit,
-		cfg.windowsModeFlagExplicit,
+		IsExternalDesktopTargetExplicit(cfg),
+		IsExternalDesktopWindowsModeExplicit(cfg),
 	)
 }
 
 func autoRouteExternalLeaseForConfig(cfg *Config, id string) error {
-	return autoRouteExternalLeaseWithHints(cfg, id, false, cfg.targetFlagExplicit, cfg.windowsModeFlagExplicit)
+	return autoRouteExternalLeaseWithHints(cfg, id, false, IsExternalDesktopTargetExplicit(cfg), IsExternalDesktopWindowsModeExplicit(cfg))
 }
 
 func routeExternalLeaseClaim(cfg *Config, leaseID string) error {
@@ -323,7 +404,7 @@ func routeExternalLeaseClaim(cfg *Config, leaseID string) error {
 	}
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
-			return exit(2, "external routing state is missing for lease %s; refusing unverified cleanup", leaseID)
+			return Exit(2, "external routing state is missing for lease %s; refusing unverified cleanup", leaseID)
 		}
 		return err
 	}
@@ -333,32 +414,40 @@ func routeExternalLeaseClaim(cfg *Config, leaseID string) error {
 }
 
 func autoRouteExternalLeaseWithHints(cfg *Config, id string, routingExplicit, targetExplicit, windowsModeExplicit bool) error {
+	return autoRouteExternalLeaseWithHintsContext(context.Background(), cfg, id, routingExplicit, targetExplicit, windowsModeExplicit)
+}
+
+func autoRouteExternalLeaseWithHintsContext(ctx context.Context, cfg *Config, id string, routingExplicit, targetExplicit, windowsModeExplicit bool) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil
 	}
 	provider, providerErr := ProviderFor(cfg.Provider)
-	providerSelected := providerErr == nil && provider.Name() == "external"
+	providerSelected := providerErr == nil && provider.Spec().Name == "external"
 	if cfg.providerExplicit {
-		if providerErr != nil || provider.Name() != "external" {
+		if providerErr != nil || provider.Spec().Name != "external" {
 			return nil
 		}
 	}
 	if routingExplicit {
 		if !cfg.providerExplicit {
-			cfg.Provider = "external"
+			setProviderSelection(cfg, "external", providerSelectionFlag)
 		}
 		return restoreExternalLeaseTarget(cfg, targetExplicit, windowsModeExplicit)
 	}
+	authoritative := ProviderSelectionIsAuthoritativeRoute(*cfg)
+	if authoritative && !providerSelected {
+		return nil
+	}
 	if providerSelected && strings.TrimSpace(cfg.External.RoutingFile) != "" {
 		if !cfg.External.routingLoaded {
-			if err := loadExternalRoutingConfig(cfg, cfg.External.RoutingFile); err != nil {
+			if err := loadExternalRoutingConfig(cfg, cfg.External.RoutingFile, false); err != nil {
 				return err
 			}
 		}
 		return restoreExternalLeaseTarget(cfg, targetExplicit, windowsModeExplicit)
 	}
-	claim, ok, err := uniqueExternalLeaseClaim(id, providerSelected)
+	claim, ok, err := uniqueExternalLeaseClaimContext(ctx, id, providerSelected)
 	if err != nil || !ok {
 		return err
 	}
@@ -371,25 +460,66 @@ func autoRouteExternalLeaseWithHints(cfg *Config, id string, routingExplicit, ta
 			if providerSelected {
 				return restoreExternalLeaseTarget(cfg, targetExplicit, windowsModeExplicit)
 			}
-			return exit(2, "external routing state is missing for lease %s; select provider=external explicitly only if the current lifecycle still owns it", claim.LeaseID)
+			return Exit(2, "external routing state is missing for lease %s; select provider=external explicitly only if the current lifecycle still owns it", claim.LeaseID)
 		}
 		return err
 	}
-	if !cfg.providerExplicit {
-		cfg.Provider = "external"
+	if !cfg.providerExplicit && !authoritative {
+		setProviderSelection(cfg, "external", providerSelectionLeaseContext)
 	}
-	if err := loadExternalRoutingConfig(cfg, path); err != nil {
+	if err := loadExternalRoutingConfig(cfg, path, true); err != nil {
 		return err
 	}
 	return restoreExternalLeaseTarget(cfg, targetExplicit, windowsModeExplicit)
 }
 
-func loadExternalRoutingConfig(cfg *Config, path string) error {
-	routing, err := LoadExternalRouting(path)
+func loadExternalRoutingConfig(cfg *Config, path string, claimBound bool) error {
+	return loadExternalRoutingConfigWithDigest(cfg, path, "", claimBound)
+}
+
+func loadExternalRoutingConfigWithDigest(cfg *Config, path, expectedDigest string, claimBound bool) error {
+	var (
+		routing ExternalConfig
+		err     error
+	)
+	if strings.TrimSpace(expectedDigest) == "" {
+		routing, err = LoadExternalRouting(path)
+	} else {
+		routing, err = LoadExternalRoutingWithDigest(path, expectedDigest)
+	}
 	if err != nil {
 		return err
 	}
+	if claimBound {
+		cfg.credentialProvenance.externalRouting = credentialSourceRepository
+		if routing.routingCredentialVersion >= externalRoutingCredentialVersion {
+			cfg.credentialProvenance.externalRouting = credentialSourceTrustedFile
+		}
+	}
+	explicitTargetOS := cfg.TargetOS
+	explicitWindowsMode := cfg.WindowsMode
+	explicitTargetSource := cfg.credentialProvenance.externalDesktopTarget
+	explicitWindowsModeSource := cfg.credentialProvenance.externalDesktopMode
+	targetExplicit := IsExternalDesktopTargetExplicit(cfg)
+	windowsModeExplicit := IsExternalDesktopWindowsModeExplicit(cfg)
+	windowsModeDerivedFromTarget := targetExplicit && normalizeTargetOS(explicitTargetOS) != targetWindows && !windowsModeExplicit
+	PreserveExternalDesktopChildEnvironmentBoundary(cfg)
 	cfg.External = routing
+	cfg.TargetOS, cfg.WindowsMode = ExternalRoutingTarget(routing)
+	MarkExternalRoutingCredentialSources(cfg)
+	MarkExternalRoutingTargetRestored(cfg, !targetExplicit, !windowsModeExplicit && !windowsModeDerivedFromTarget)
+	ApplyExternalDesktopEnvironmentOverrides(cfg)
+	if targetExplicit {
+		cfg.TargetOS = explicitTargetOS
+		cfg.credentialProvenance.externalDesktopTarget = explicitTargetSource
+	}
+	if windowsModeExplicit {
+		cfg.WindowsMode = explicitWindowsMode
+		cfg.credentialProvenance.externalDesktopMode = explicitWindowsModeSource
+	} else if windowsModeDerivedFromTarget {
+		cfg.WindowsMode = windowsModeNormal
+		cfg.credentialProvenance.externalDesktopMode = explicitTargetSource
+	}
 	if strings.TrimSpace(routing.WorkRoot) != "" {
 		cfg.WorkRoot = routing.WorkRoot
 	}
@@ -402,39 +532,42 @@ func restoreExternalLeaseTarget(cfg *Config, targetExplicit, windowsModeExplicit
 		cfg.WorkRoot = cfg.External.WorkRoot
 	}
 	if !targetExplicit {
-		cfg.TargetOS = targetLinux
+		cfg.TargetOS, _ = ExternalRoutingTarget(cfg.External)
 		cfg.inferredTargetProvider = ""
 	}
 	if !windowsModeExplicit {
 		cfg.WindowsMode = windowsModeNormal
+		if normalizeTargetOS(cfg.TargetOS) == targetWindows {
+			_, cfg.WindowsMode = ExternalRoutingTarget(cfg.External)
+		}
 	}
 	normalizeTargetConfig(cfg)
 	return validateTargetConfig(*cfg)
 }
 
-func uniqueExternalLeaseClaim(identifier string, providerSelected bool) (leaseClaim, bool, error) {
-	exact, exists, err := readLeaseClaimWithPresence(identifier)
+func uniqueExternalLeaseClaimContext(ctx context.Context, identifier string, providerSelected bool) (leaseClaim, bool, error) {
+	exact, exists, err := ReadLeaseClaimWithPresence(identifier)
 	if err != nil {
 		return leaseClaim{}, false, err
 	}
 	if exists {
-		if exact.Provider != "external" {
+		if canonicalClaimProvider(exact.Provider) != "external" {
 			return leaseClaim{}, false, nil
 		}
 		return exact, true, nil
 	}
-	claims, err := listLeaseClaims()
+	claims, err := ListLeaseClaimsContext(ctx)
 	if err != nil {
 		return leaseClaim{}, false, err
 	}
 	matches := make([]leaseClaim, 0, 1)
 	externalMatches := make([]leaseClaim, 0, 1)
 	for _, claim := range claims {
-		if !leaseClaimMatchesIdentifier(claim, identifier) {
+		if !LeaseClaimMatchesIdentifier(claim, identifier) {
 			continue
 		}
 		matches = append(matches, claim)
-		if claim.Provider == "external" {
+		if canonicalClaimProvider(claim.Provider) == "external" {
 			externalMatches = append(externalMatches, claim)
 		}
 	}
@@ -454,13 +587,13 @@ func uniqueExternalLeaseClaim(identifier string, providerSelected bool) (leaseCl
 		for _, claim := range candidates {
 			ids = append(ids, claim.LeaseID)
 		}
-		return leaseClaim{}, false, exit(2, "multiple lease claims match %q: %s; use a lease id or an explicit provider", identifier, strings.Join(ids, ", "))
+		return leaseClaim{}, false, Exit(2, "multiple lease claims match %q: %s; use a lease id or an explicit provider", identifier, strings.Join(ids, ", "))
 	}
 	return externalMatches[0], true, nil
 }
 
-func staticLeaseClaim(id string) (leaseClaim, bool, error) {
-	claim, ok, err := resolveLeaseClaim(id)
+func staticLeaseClaimContext(ctx context.Context, id string) (leaseClaim, bool, error) {
+	claim, ok, err := ResolveLeaseClaimContext(ctx, id)
 	if err != nil || !ok || !isStaticProvider(claim.Provider) {
 		return leaseClaim{}, false, err
 	}
@@ -506,6 +639,24 @@ func isWindowsWSL2Target(target SSHTarget) bool {
 	return target.TargetOS == targetWindows && target.WindowsMode == windowsModeWSL2
 }
 
+// Validate explicit platform assertions before lease labels replace defaults.
+func validateResolvedLeasePlatform(cfg Config, server Server) error {
+	targetOS := strings.TrimSpace(server.Labels["target"])
+	if cfg.targetFlagExplicit && targetOS != "" && normalizeTargetOS(targetOS) != normalizeTargetOS(cfg.TargetOS) {
+		return Exit(2, "lease target mismatch: requested=%s recorded=%s; remove --target to use the recorded platform", cfg.TargetOS, targetOS)
+	}
+	if cfg.windowsModeFlagExplicit {
+		if targetOS != "" && normalizeTargetOS(targetOS) != targetWindows {
+			return Exit(2, "lease Windows mode mismatch: --windows-mode requires a Windows lease, recorded target=%s", targetOS)
+		}
+		mode := strings.TrimSpace(server.Labels["windows_mode"])
+		if mode != "" && normalizeWindowsMode(mode) != normalizeWindowsMode(cfg.WindowsMode) {
+			return Exit(2, "lease Windows mode mismatch: requested=%s recorded=%s; remove --windows-mode to use the recorded mode", cfg.WindowsMode, mode)
+		}
+	}
+	return nil
+}
+
 func applyResolvedLeaseConfig(cfg *Config, server Server, target *SSHTarget) {
 	if cfg == nil || target == nil {
 		return
@@ -519,15 +670,39 @@ func applyResolvedLeaseConfig(cfg *Config, server Server, target *SSHTarget) {
 	} else if cfg.TargetOS != targetWindows {
 		cfg.WindowsMode = ""
 	}
-	if workRoot := strings.TrimSpace(server.Labels["work_root"]); workRoot != "" {
+	workRoot := strings.TrimSpace(server.Labels["work_root"])
+	normalizeTargetConfig(cfg)
+	if workRoot != "" {
 		cfg.WorkRoot = workRoot
 	}
-	normalizeTargetConfig(cfg)
+	previous := *target
 	target.TargetOS = cfg.TargetOS
 	target.WindowsMode = cfg.WindowsMode
+	refreshProviderReadyCheck(*cfg, previous, target)
+	ApplyTargetChildEnvironmentBoundary(*cfg, target)
 	if target.User == "" || target.User == configuredSSHUser {
 		target.User = cfg.SSHUser
 	}
+}
+
+// refreshProviderReadyCheck replaces a readiness check the provider installed
+// for the target's previous platform once recorded lease labels select a
+// different one. A target resolved under configuration defaults otherwise
+// keeps probing a Windows lease with its Linux bootstrap gate. Readiness
+// commands that are not the provider default for the previous platform are
+// operator or provider choices for this host and stay untouched, as does a
+// target whose platform did not change.
+func refreshProviderReadyCheck(cfg Config, previous SSHTarget, target *SSHTarget) {
+	if target == nil {
+		return
+	}
+	if previous.TargetOS == target.TargetOS && previous.WindowsMode == target.WindowsMode {
+		return
+	}
+	if target.ReadyCheck != "" && target.ReadyCheck != providerReadyCheck(cfg, previous) {
+		return
+	}
+	target.ReadyCheck = providerReadyCheck(cfg, *target)
 }
 
 func applyStoredLeaseClaimConfig(cfg *Config, claim leaseClaim) {
@@ -549,11 +724,7 @@ func applyStoredLeaseClaimConfig(cfg *Config, claim leaseClaim) {
 }
 
 func remoteJoin(cfg Config, parts ...string) string {
-	values := make([]string, 0, len(parts)+1)
-	if cfg.WorkRoot != "" {
-		values = append(values, cfg.WorkRoot)
-	}
-	values = append(values, parts...)
+	values := append([]string{cfg.WorkRoot}, parts...)
 	if cfg.TargetOS == targetWindows && cfg.WindowsMode == windowsModeNormal {
 		return windowsPathJoin(values...)
 	}
@@ -580,3 +751,9 @@ func windowsPathJoin(parts ...string) string {
 	}
 	return out
 }
+
+// NormalizeTargetOS canonicalizes a target name without changing configuration.
+func NormalizeTargetOS(value string) string { return normalizeTargetOS(value) }
+
+// NormalizeWindowsMode canonicalizes a mode without changing configuration.
+func NormalizeWindowsMode(value string) string { return normalizeWindowsMode(value) }

@@ -155,6 +155,14 @@ atomically rotated token is never pinned in the relay process. Coordinator
 authentication may be a static login token or the normal shell-free
 token-command configuration.
 
+The first ticket for a previously unused adapter ID creates a ten-minute
+provisional owner/org claim. A successful agent connection or registered lease
+binding makes that claim durable. Another normally authenticated owner may
+recover an expired provisional claim only when it has no connected agent,
+pending relay request, unexpired ticket, live registered lease, or pending
+workspace deletion. Existing adapter claims created before this contract are
+treated as durable, so upgrades do not change current adapter ownership.
+
 `--local-socket` is required. It must be an absolute, clean Unix-socket path in
 an existing directory owned by the current user and not writable by group or
 others. The socket must also be owned by the current user with mode `0600`.
@@ -186,6 +194,7 @@ Allowed operations are exactly:
 - `GET /v1/workspaces/{id}`
 - `DELETE /v1/workspaces/{id}`
 - `POST /v1/workspaces/{id}/connections/desktop`
+- `POST /v1/workspaces/{id}/connections/native-vnc`
 
 There is no arbitrary URL, shell, argv, environment, file, or provider-command
 surface. Request and response bodies are UTF-8 strings bounded to 64 KiB.
@@ -194,7 +203,7 @@ requests time out after nine seconds, and the coordinator allows five more
 seconds for response delivery. Every frame carries that absolute Unix
 millisecond deadline; the connector rejects expired frames before local
 dispatch and caps the local request context to the earlier of that deadline or
-its own timeout. Desktop connection setup
+its own timeout. Desktop and native VNC connection setup
 gets the configured `--connection-timeout` plus 30 seconds of relay overhead,
 and the connector negotiates that deadline plus five seconds of response grace
 with the coordinator. The setup value may not exceed 24 hours. Set it to the
@@ -485,6 +494,9 @@ closed otherwise. Declarative external adapters additionally require raw
 inventory, plus a standalone
 `{{cloudId}}` argument in every release command, so an adapter never provisions a resource it
 cannot later re-attest and release exactly.
+The direct `proxmox` provider exposes the contract when its configuration is
+complete. Its scope binds the API endpoint, node, token ID and clone settings;
+see [Proxmox runtime adapter](../providers/proxmox.md#runtime-adapter).
 Provider identity discovery itself uses the bounded inspection context and the
 same durable child registry, process-group watchdog, termination, and reap path;
 a hung configured binary cannot block startup or shutdown indefinitely.
@@ -544,12 +556,16 @@ credential store or child environment; never put them in HTTP requests.
 
 [`scripts/install-linux-desktop.sh`](../../scripts/install-linux-desktop.sh) is
 the reusable open-source Debian/Ubuntu guest bootstrap. It installs
-XFCE/Xvfb/x11vnc plus noVNC and websockify from distribution packages, creates
+XFCE/TigerVNC plus noVNC and websockify from distribution packages, creates
 the Crabbox desktop state files, binds VNC only to `127.0.0.1:5900`, and starts
 hardened systemd services. The generated VNC password is owned by the desktop
 user with mode `0600`; it is never readable through a shared primary group. It
 also installs `/usr/local/bin/crabbox-start-desktop`, the reset helper used by
-WebVNC to restart the matching XFCE and x11vnc units. The bootstrap installs
+WebVNC to restart the matching XFCE and TigerVNC units. TigerVNC accepts
+client-requested desktop resizing; `CRABBOX_DESKTOP_GEOMETRY` sets the initial
+width, height, and depth. An explicit 8-bit depth retains the fixed-size
+Xvfb/x11vnc backend with an 8-bit TrueColor default visual so XFCE clients render;
+16/24/32-bit depths use TigerVNC. The bootstrap installs
 `sudo` and a mode-`0440` sudoers rule granting only the desktop user passwordless
 execution of that root-owned helper; it does not grant general sudo access. It
 installs no proprietary browser. External provider lifecycle configuration can

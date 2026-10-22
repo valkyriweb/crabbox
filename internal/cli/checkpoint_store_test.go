@@ -11,7 +11,7 @@ import (
 
 func TestCheckpointStoreCreateReadList(t *testing.T) {
 	store := checkpointStore{root: t.TempDir()}
-	first, err := store.Create(checkpointRecord{
+	first, _, err := store.Reserve(checkpointRecord{
 		ID:        "chk_first",
 		Name:      "first",
 		Kind:      checkpointKindArchive,
@@ -24,7 +24,10 @@ func TestCheckpointStoreCreateReadList(t *testing.T) {
 	if first.ID != "chk_first" {
 		t.Fatalf("id=%q", first.ID)
 	}
-	second, err := store.Create(checkpointRecord{
+	if first.LastUsedAt != first.CreatedAt {
+		t.Fatalf("lastUsedAt=%q, want createdAt=%q", first.LastUsedAt, first.CreatedAt)
+	}
+	second, _, err := store.Reserve(checkpointRecord{
 		ID:        "chk_second",
 		Name:      "second",
 		Kind:      checkpointKindArchive,
@@ -67,6 +70,43 @@ func TestCheckpointStoreCreateReadList(t *testing.T) {
 	}
 }
 
+func TestCheckpointStoreListRequiresPublishedMetadata(t *testing.T) {
+	store := checkpointStore{root: t.TempDir()}
+	published, _, err := store.Reserve(checkpointRecord{ID: "chk_published"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := store.Paths("chk_pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(paths.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Reserve has claimed the directory, but the atomic metadata write has not
+	// published yet. A killed writer can leave exactly this state behind.
+	if err := os.WriteFile(filepath.Join(paths.Dir, ".checkpoint.json.tmp-test"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 || records[0].ID != published.ID {
+		t.Fatalf("unpublished reservation broke inventory: records=%v err=%v", records, err)
+	}
+	if err := os.WriteFile(paths.Meta, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(); err == nil || !strings.Contains(err.Error(), "parse checkpoint") {
+		t.Fatalf("published corrupt metadata was hidden: %v", err)
+	}
+	published.ID = "chk_pending"
+	if err := store.Write(published); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := store.List(); err != nil || len(records) != 2 {
+		t.Fatalf("published reservation missing: records=%v err=%v", records, err)
+	}
+}
+
 func TestCheckpointStoreReserveWritesMetadata(t *testing.T) {
 	store := checkpointStore{root: t.TempDir()}
 	record, paths, err := store.Reserve(checkpointRecord{
@@ -101,23 +141,23 @@ func TestCheckpointStoreReserveWritesMetadata(t *testing.T) {
 
 func TestCheckpointStoreRejectsDuplicatesAndUnsafeIDs(t *testing.T) {
 	store := checkpointStore{root: t.TempDir()}
-	if _, err := store.Create(checkpointRecord{ID: "chk_ok", CreatedAt: "2026-05-09T10:00:00Z"}); err != nil {
+	if _, _, err := store.Reserve(checkpointRecord{ID: "chk_ok", CreatedAt: "2026-05-09T10:00:00Z"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := store.Create(checkpointRecord{ID: "chk_ok", CreatedAt: "2026-05-09T10:01:00Z"}); err == nil {
+	if _, _, err := store.Reserve(checkpointRecord{ID: "chk_ok", CreatedAt: "2026-05-09T10:01:00Z"}); err == nil {
 		t.Fatal("duplicate checkpoint succeeded")
 	}
-	if _, err := store.Create(checkpointRecord{ID: "../bad", CreatedAt: "2026-05-09T10:01:00Z"}); err == nil {
+	if _, _, err := store.Reserve(checkpointRecord{ID: "../bad", CreatedAt: "2026-05-09T10:01:00Z"}); err == nil {
 		t.Fatal("unsafe checkpoint id succeeded")
 	}
-	if _, err := store.Create(checkpointRecord{ID: "chk_bad/slash", CreatedAt: "2026-05-09T10:01:00Z"}); err == nil {
+	if _, _, err := store.Reserve(checkpointRecord{ID: "chk_bad/slash", CreatedAt: "2026-05-09T10:01:00Z"}); err == nil {
 		t.Fatal("slash checkpoint id succeeded")
 	}
 }
 
 func TestCheckpointStoreRejectsMetadataIDMismatch(t *testing.T) {
 	store := checkpointStore{root: t.TempDir()}
-	record, err := store.Create(checkpointRecord{
+	record, _, err := store.Reserve(checkpointRecord{
 		ID:        "chk_source",
 		Kind:      checkpointKindArchive,
 		CreatedAt: "2026-05-09T10:00:00Z",
@@ -163,7 +203,7 @@ func TestCheckpointStoreConcurrentSameIDAllowsOneWriter(t *testing.T) {
 	for i := 0; i < workers; i++ {
 		go func(i int) {
 			<-start
-			_, err := store.Create(checkpointRecord{
+			_, _, err := store.Reserve(checkpointRecord{
 				ID:        "chk_race",
 				Name:      fmt.Sprintf("worker-%d", i),
 				CreatedAt: "2026-05-09T10:00:00Z",
@@ -193,7 +233,7 @@ func TestCheckpointStoreConcurrentSameIDAllowsOneWriter(t *testing.T) {
 
 func TestCheckpointStoreFillsIDAndCreatedAt(t *testing.T) {
 	store := checkpointStore{root: t.TempDir()}
-	record, err := store.Create(checkpointRecord{Name: "generated"})
+	record, _, err := store.Reserve(checkpointRecord{Name: "generated"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -202,5 +242,38 @@ func TestCheckpointStoreFillsIDAndCreatedAt(t *testing.T) {
 	}
 	if record.CreatedAt == "" {
 		t.Fatal("createdAt not filled")
+	}
+	if record.LastUsedAt != record.CreatedAt {
+		t.Fatalf("lastUsedAt=%q, want createdAt=%q", record.LastUsedAt, record.CreatedAt)
+	}
+}
+
+func TestCheckpointStoreDefaultsMissingLastUsedAtOnReadWithoutMigration(t *testing.T) {
+	store := checkpointStore{root: t.TempDir()}
+	paths, err := store.Paths("chk_legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte(`{"id":"chk_legacy","kind":"workspace-archive","createdAt":"2026-05-09T10:00:00Z","crabboxVersion":"0.42.0","repo":{}}` + "\n")
+	if err := os.WriteFile(paths.Meta, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	record, _, err := store.Read("chk_legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.LastUsedAt != record.CreatedAt {
+		t.Fatalf("lastUsedAt=%q, want createdAt=%q", record.LastUsedAt, record.CreatedAt)
+	}
+	data, err := os.ReadFile(paths.Meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "lastUsedAt") {
+		t.Fatalf("read eagerly migrated legacy metadata: %s", data)
 	}
 }

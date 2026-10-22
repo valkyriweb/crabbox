@@ -2,6 +2,7 @@ package tenki
 
 import (
 	"flag"
+	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -12,17 +13,31 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return tenkiProvider }
-func (Provider) Aliases() []string { return nil }
+func (Provider) BackendCapabilities() core.Backend { return &tenkiBackend{} }
+
+func (Provider) ClaimScope(cfg core.Config) string {
+	// Workspace and project no longer select Tenki CLI inventory. Keep them in
+	// the local claim identity so older scoped leases can still be resolved and
+	// released without weakening their original ownership fence.
+	endpoint := strings.TrimRight(strings.TrimSpace(cfg.Tenki.Endpoint), "/")
+	if endpoint == "" {
+		endpoint = "default"
+	}
+	return "endpoint:" + endpoint + "|workspace:" + strings.TrimSpace(cfg.Tenki.Workspace) + "|project:" + strings.TrimSpace(cfg.Tenki.Project)
+}
 
 func (Provider) Spec() core.ProviderSpec {
+	auth := core.DirectProviderAuthentication(core.ProviderAuthenticationCLI)
+	auth[0].Description = "Tenki SSH credentials currently expire after about 10 minutes (server policy; the signed validity window includes clock tolerance). Crabbox refreshes them before new connections; established commands can continue beyond expiry."
 	return core.ProviderSpec{
-		Name:        tenkiProvider,
-		Family:      tenkiProvider,
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync},
-		Coordinator: core.CoordinatorNever,
+		Authentication:   auth,
+		Name:             tenkiProvider,
+		Family:           tenkiProvider,
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -38,18 +53,6 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return NewTenkiBackend(p.Spec(), cfg, rt)
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "tenki doctor backend unavailable")
-	}
-	return doctor, nil
-}
-
 func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.Tenki.Image != "" {
 		return cfg.Tenki.Image
@@ -57,9 +60,5 @@ func (Provider) ServerTypeForConfig(cfg core.Config) string {
 	if cfg.Tenki.Snapshot != "" {
 		return "snapshot"
 	}
-	return "sandbox"
-}
-
-func (Provider) ServerTypeForClass(string) string {
 	return "sandbox"
 }

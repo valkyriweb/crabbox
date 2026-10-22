@@ -2,6 +2,7 @@ package applemachine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,97 +12,119 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type backend struct {
-	spec ProviderSpec
-	cfg  Config
-	rt   Runtime
+	spec core.ProviderSpec
+	cfg  core.Config
+	rt   core.Runtime
 }
 
 var hostGOOS, hostGOARCH = runtime.GOOS, runtime.GOARCH
 
-func newBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func newBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	cfg.Provider = providerName
 	return &backend{spec: spec, cfg: cfg, rt: rt}
 }
 
-func (b *backend) Spec() ProviderSpec { return b.spec }
+func (b *backend) Spec() core.ProviderSpec { return b.spec }
 
-func (b *backend) Doctor(ctx context.Context, _ DoctorRequest) (DoctorResult, error) {
+func (b *backend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
 	if err := requireHost(); err != nil {
-		return DoctorResult{}, err
+		return core.DoctorResult{}, err
 	}
-	result, err := b.rt.Exec.Run(ctx, LocalCommandRequest{Name: blank(b.cfg.AppleContainer.CLIPath, "container"), Args: []string{"--version"}})
+	result, err := b.rt.Exec.Run(ctx, core.LocalCommandRequest{Name: core.Blank(b.cfg.AppleContainer.CLIPath, "container"), Args: []string{"--version"}})
 	if err != nil {
-		return DoctorResult{}, exit(3, "Apple container CLI unavailable: %s", failureDetail(result, err))
+		return core.DoctorResult{}, core.Exit(3, "Apple container CLI unavailable: %s", failureDetail(result, err))
 	}
 	machines, err := b.listMachines(ctx)
 	if err != nil {
-		return DoctorResult{}, err
+		return core.DoctorResult{}, err
 	}
-	return DoctorResult{Provider: providerName, Message: fmt.Sprintf("cli=ready control_plane=local inventory=ready leases=%d version=%s", len(machines), strings.TrimSpace(result.Stdout))}, nil
+	return core.DoctorResult{Provider: providerName, Message: fmt.Sprintf("cli=ready control_plane=local inventory=ready leases=%d version=%s", len(machines), strings.TrimSpace(result.Stdout))}, nil
 }
 
-func (b *backend) Warmup(ctx context.Context, req WarmupRequest) error {
+func (b *backend) Warmup(ctx context.Context, req core.WarmupRequest) error {
 	started := time.Now()
-	leaseID, slug, name, err := b.createLease(ctx, req.Repo, req.Reclaim, req.RequestedSlug)
+	claim, err := b.createLease(ctx, req.Repo, req.Reclaim, req.RequestedSlug)
 	if err != nil {
 		return err
 	}
+	leaseID, slug, name := claim.LeaseID, claim.Slug, claim.CloudID
 	fmt.Fprintf(b.rt.Stdout, "leased %s slug=%s provider=%s machine=%s\n", leaseID, slug, providerName, name)
 	total := time.Since(started)
-	fmt.Fprintf(b.rt.Stdout, "warmup complete total=%s\n", total.Round(time.Millisecond))
-	if req.TimingJSON {
-		return writeTimingJSON(b.rt.Stderr, timingReport{Provider: providerName, LeaseID: leaseID, Slug: slug, TotalMs: total.Milliseconds(), ExitCode: 0})
-	}
-	return nil
+	return shared.CompleteWarmup(b.rt, req.TimingJSON, shared.WarmupCompletion{
+		Provider: providerName,
+		LeaseID:  leaseID,
+		Slug:     slug,
+		Total:    total,
+	})
 }
 
-func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
+func (b *backend) Run(ctx context.Context, req core.RunRequest) (result core.RunResult, retErr error) {
 	if err := requireHost(); err != nil {
-		return RunResult{}, err
+		return core.RunResult{}, err
 	}
 	if req.SyncOnly || req.ApplyLocalPatch || req.FreshPR.Number > 0 {
-		return RunResult{}, exit(2, "provider=%s uses the host home mount; sync-only, patch upload, and fresh-PR preparation are not supported", providerName)
+		return core.RunResult{}, core.Exit(2, "provider=%s uses the host home mount; sync-only, patch upload, and fresh-PR preparation are not supported", providerName)
 	}
 	if err := validateRepoMount(req.Repo.Root); err != nil {
-		return RunResult{}, err
+		return core.RunResult{}, err
 	}
 	started := time.Now()
-	leaseID, slug, name := "", "", ""
+	var claim core.LeaseClaim
 	acquired := false
 	var err error
 	if strings.TrimSpace(req.ID) == "" {
-		leaseID, slug, name, err = b.createLease(ctx, req.Repo, req.Reclaim, req.RequestedSlug)
+		claim, err = b.createLease(ctx, req.Repo, req.Reclaim, req.RequestedSlug)
 		acquired = err == nil
 	} else {
-		leaseID, slug, name, err = b.resolveLease(req.ID, req.Repo.Root, req.Reclaim)
+		claim, err = b.resolveLease(ctx, req.ID, req.Repo.Root, req.Reclaim)
 	}
 	if err != nil {
-		return RunResult{}, err
+		return core.RunResult{}, err
 	}
-	failed := false
-	if acquired && !req.Keep {
-		defer func() {
-			if failed && req.KeepOnFailure {
-				fmt.Fprintf(b.rt.Stderr, "kept failed apple-machine lease=%s slug=%s\n", leaseID, slug)
-				return
-			}
-			if err := b.removeMachine(context.Background(), name); err != nil {
-				fmt.Fprintf(b.rt.Stderr, "warning: %v\n", err)
-				return
-			}
-			removeLeaseClaim(leaseID)
-		}()
+	leaseID, slug, name := claim.LeaseID, claim.Slug, claim.CloudID
+	result = core.RunResult{
+		Provider: providerName, LeaseID: leaseID, Slug: slug, SyncDelegated: true,
+		Session: &core.RunSessionHandle{
+			Provider: providerName, LeaseID: leaseID, Slug: slug, Reused: !acquired, Kept: true,
+			CleanupCommand: appleMachineCleanupCommand(leaseID),
+		},
 	}
+	defer func() {
+		result, retErr = shared.PinDelegatedRunFailure(result, retErr)
+		shouldStop := acquired && !req.Keep
+		if shouldStop && retErr != nil && req.KeepOnFailure {
+			shouldStop = false
+			fmt.Fprintf(b.rt.Stderr, "kept failed apple-machine lease=%s slug=%s\n", leaseID, slug)
+		}
+		if shouldStop {
+			if cleanupErr := b.removeBoundLease(context.Background(), claim); cleanupErr != nil {
+				result, retErr = shared.AppendDelegatedRunFailure(result, retErr, fmt.Errorf("apple-machine cleanup failed: %w", cleanupErr), 1)
+			} else {
+				result.Session.Kept = false
+			}
+		}
+		result.Total = time.Since(started)
+		result = core.FinalizeRunResult(result, retErr)
+		if req.TimingJSON {
+			timingErr := core.WriteTimingJSON(b.rt.Stderr, core.TimingReportWithRunResult(core.TimingReport{
+				Provider: providerName, LeaseID: leaseID, Slug: slug, SyncDelegated: true, SyncSkipped: true,
+				CommandMs: result.Command.Milliseconds(), TotalMs: result.Total.Milliseconds(),
+				ExitCode: result.ExitCode, Label: strings.TrimSpace(req.Label),
+			}, result, retErr))
+			result, retErr = shared.AppendDelegatedRunFailure(result, retErr, timingErr, 1)
+		}
+	}()
 	args := []string{"machine", "run", "--name", name}
 	if root := strings.TrimSpace(req.Repo.Root); root != "" {
 		args = append(args, "--cwd", root)
 	}
 	envFile, cleanup, err := writeEnvFile(req.Env, req.Options.EnvAllow)
 	if err != nil {
-		return RunResult{}, err
+		return result, err
 	}
 	if cleanup != nil {
 		defer cleanup()
@@ -109,26 +132,36 @@ func (b *backend) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	}
 	command := req.Command
 	if req.ShellMode {
-		command = []string{"/bin/sh", "-lc", shellScriptFromArgv(req.Command)}
+		command = []string{"/bin/sh", "-lc", core.ShellScriptFromArgv(req.Command)}
 	}
 	if len(command) == 0 {
-		return RunResult{}, exit(2, "provider=%s requires a command", providerName)
+		return result, core.Exit(2, "provider=%s requires a command", providerName)
 	}
 	args = append(args, command...)
 	commandStarted := time.Now()
-	result, runErr := b.command(ctx, args, req.Repo.Root)
-	commandDuration := time.Since(commandStarted)
-	out := RunResult{ExitCode: result.ExitCode, Command: commandDuration, Total: time.Since(started), SyncDelegated: true, Provider: providerName, LeaseID: leaseID, Slug: slug, CommandText: strings.Join(req.Command, " ")}
-	if req.TimingJSON {
-		if err := writeTimingJSON(b.rt.Stderr, timingReport{Provider: providerName, LeaseID: leaseID, Slug: slug, SyncDelegated: true, SyncSkipped: true, CommandMs: out.Command.Milliseconds(), TotalMs: out.Total.Milliseconds(), ExitCode: out.ExitCode, Label: strings.TrimSpace(req.Label)}); err != nil {
-			return out, err
-		}
+	req.Observation.Phase(core.RunPhaseCommand)
+	commandBackend := *b
+	commandBackend.rt.Stdout, commandBackend.rt.Stderr = req.Observation.CommandWriters(b.rt.Stdout, b.rt.Stderr, core.RunOutputProvider)
+	native, runErr := commandBackend.command(ctx, args, req.Repo.Root)
+	result.Command = time.Since(commandStarted)
+	result.CommandText = strings.Join(req.Command, " ")
+	classificationErr := runErr
+	if core.IsPlainLocalCommandExit(native, runErr) {
+		classificationErr = nil
 	}
+	outcome := shared.FinalizeDelegatedCommandOutcome(native.ExitCode, classificationErr)
+	result.ExitCode, result.Status, result.ErrorKind = outcome.ExitCode, outcome.Status, outcome.ErrorKind
 	if runErr != nil {
-		failed = true
-		return out, exit(result.ExitCode, "apple-machine command failed: %s", failureDetail(result, runErr))
+		return result, shared.ExitErrorWithCause(result.ExitCode, fmt.Sprintf("apple-machine command failed: %s", failureDetail(native, runErr)), runErr)
 	}
-	return out, nil
+	if result.ExitCode != 0 {
+		return result, core.Exit(result.ExitCode, "apple-machine command exited %d", result.ExitCode)
+	}
+	return result, nil
+}
+
+func appleMachineCleanupCommand(leaseID string) string {
+	return "crabbox stop --provider " + providerName + " --id " + core.ShellQuote(leaseID)
 }
 
 func writeEnvFile(env map[string]string, explicitlyAllowed []string) (string, func(), error) {
@@ -140,7 +173,7 @@ func writeEnvFile(env map[string]string, explicitlyAllowed []string) (string, fu
 	for key := range env {
 		if machineOwnedEnv(key) {
 			if explicit[strings.ToUpper(strings.TrimSpace(key))] {
-				return "", nil, exit(2, "provider=%s cannot forward host-owned environment variable %s; set it inside the machine command instead", providerName, key)
+				return "", nil, core.Exit(2, "provider=%s cannot forward host-owned environment variable %s; set it inside the machine command instead", providerName, key)
 			}
 			continue
 		}
@@ -152,29 +185,29 @@ func writeEnvFile(env map[string]string, explicitlyAllowed []string) (string, fu
 	sort.Strings(keys)
 	file, err := os.CreateTemp("", "crabbox-apple-machine-env-*.env")
 	if err != nil {
-		return "", nil, exit(2, "create apple-machine env file: %v", err)
+		return "", nil, core.Exit(2, "create apple-machine env file: %v", err)
 	}
 	cleanup := func() { _ = os.Remove(file.Name()) }
 	if err := file.Chmod(0o600); err != nil {
 		file.Close()
 		cleanup()
-		return "", nil, exit(2, "secure apple-machine env file: %v", err)
+		return "", nil, core.Exit(2, "secure apple-machine env file: %v", err)
 	}
 	for _, key := range keys {
 		if strings.ContainsAny(key, "=\r\n") || strings.ContainsAny(env[key], "\r\n") {
 			file.Close()
 			cleanup()
-			return "", nil, exit(2, "apple-machine environment values cannot contain newlines")
+			return "", nil, core.Exit(2, "apple-machine environment values cannot contain newlines")
 		}
 		if _, err := fmt.Fprintf(file, "%s=%s\n", key, env[key]); err != nil {
 			file.Close()
 			cleanup()
-			return "", nil, exit(2, "write apple-machine env file: %v", err)
+			return "", nil, core.Exit(2, "write apple-machine env file: %v", err)
 		}
 	}
 	if err := file.Close(); err != nil {
 		cleanup()
-		return "", nil, exit(2, "close apple-machine env file: %v", err)
+		return "", nil, core.Exit(2, "close apple-machine env file: %v", err)
 	}
 	return file.Name(), cleanup, nil
 }
@@ -188,132 +221,207 @@ func machineOwnedEnv(key string) bool {
 	}
 }
 
-func (b *backend) List(ctx context.Context, _ ListRequest) ([]LeaseView, error) {
+func (b *backend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
 	machines, err := b.listMachines(ctx)
 	if err != nil {
 		return nil, err
 	}
-	claims, err := coreClaims()
+	claims, err := core.ListLeaseClaims()
 	if err != nil {
 		return nil, err
 	}
-	byName := map[string]claimView{}
+	byName := map[string]core.LeaseClaim{}
 	for _, claim := range claims {
 		if claim.Provider == providerName {
-			byName[machineName(claim.LeaseID)] = claimView{leaseID: claim.LeaseID, slug: claim.Slug}
+			byName[machineName(claim.LeaseID)] = claim
 		}
 	}
-	views := make([]LeaseView, 0)
+	views := make([]core.LeaseView, 0)
 	for _, item := range machines {
 		claim, ok := byName[item.ID]
 		if !ok {
 			continue
 		}
-		views = append(views, machineServer(item, claim.leaseID, claim.slug, b.cfg))
+		if err := core.WithLeaseClaimUnchangedContext(ctx, claim.LeaseID, claim, func() error {
+			_, err := b.verifyMachineIdentity(ctx, claim)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+		views = append(views, machineServer(item, claim.LeaseID, claim.Slug, b.cfg))
 	}
 	return views, nil
 }
 
-func (b *backend) Status(ctx context.Context, req StatusRequest) (StatusView, error) {
-	leaseID, slug, name, err := b.resolveLease(req.ID, "", false)
+func (b *backend) Status(ctx context.Context, req core.StatusRequest) (core.StatusView, error) {
+	claim, err := b.resolveLease(ctx, req.ID, "", false)
 	if err != nil {
-		return StatusView{}, err
+		return core.StatusView{}, err
 	}
-	item, err := b.inspectMachine(ctx, name)
+	var item machine
+	err = core.WithLeaseClaimUnchangedContext(ctx, claim.LeaseID, claim, func() error {
+		var err error
+		item, err = b.verifyMachineIdentity(ctx, claim)
+		return err
+	})
 	if err != nil {
-		return StatusView{}, err
+		return core.StatusView{}, err
 	}
-	server := machineServer(item, leaseID, slug, b.cfg)
-	return StatusView{ID: leaseID, Slug: slug, Provider: providerName, TargetOS: targetLinux, State: server.Status, ServerID: name, ServerType: server.ServerType.Name, Ready: machineReady(item.Status), Labels: server.Labels}, nil
+	server := machineServer(item, claim.LeaseID, claim.Slug, b.cfg)
+	return core.StatusView{ID: claim.LeaseID, Slug: claim.Slug, Provider: providerName, TargetOS: targetLinux, State: server.Status, ServerID: claim.CloudID, ServerType: server.ServerType.Name, Ready: machineReady(item.Status), Labels: server.Labels}, nil
 }
 
-func (b *backend) Stop(ctx context.Context, req StopRequest) error {
-	leaseID, _, name, err := b.resolveLease(req.ID, "", false)
+func (b *backend) Stop(ctx context.Context, req core.StopRequest) error {
+	claim, err := b.resolveLease(ctx, req.ID, "", false)
 	if err != nil {
 		return err
 	}
-	if err := b.removeMachine(ctx, name); err != nil {
+	if err := b.removeBoundLease(ctx, claim); err != nil {
 		return err
 	}
-	removeLeaseClaim(leaseID)
-	fmt.Fprintf(b.rt.Stderr, "released lease=%s machine=%s\n", leaseID, name)
+	fmt.Fprintf(b.rt.Stderr, "released lease=%s machine=%s\n", claim.LeaseID, claim.CloudID)
 	return nil
 }
 
-func (b *backend) createLease(ctx context.Context, repo Repo, reclaim bool, requestedSlug string) (string, string, string, error) {
+func (b *backend) createLease(ctx context.Context, repo core.Repo, reclaim bool, requestedSlug string) (core.LeaseClaim, error) {
 	if err := requireHost(); err != nil {
-		return "", "", "", err
+		return core.LeaseClaim{}, err
 	}
 	if err := validateRepoMount(repo.Root); err != nil {
-		return "", "", "", err
+		return core.LeaseClaim{}, err
 	}
-	leaseID := newLeaseID()
-	slug, err := allocateClaimLeaseSlug(leaseID, requestedSlug)
+	if strings.TrimSpace(repo.Root) == "" {
+		return core.LeaseClaim{}, core.Exit(2, "apple-machine acquisition requires a repository root for durable ownership")
+	}
+	leaseID := core.NewLeaseID()
+	slug, err := core.AllocateClaimLeaseSlug(leaseID, requestedSlug)
 	if err != nil {
-		return "", "", "", err
+		return core.LeaseClaim{}, err
+	}
+	root, err := b.storageRoot(ctx)
+	if err != nil {
+		return core.LeaseClaim{}, err
 	}
 	name := machineName(leaseID)
 	if err := b.createMachine(ctx, name); err != nil {
-		return "", "", "", err
+		return core.LeaseClaim{}, fmt.Errorf("%w; creation may be incomplete: inspect container machine inspect %s before manual cleanup", err, core.ShellQuote(name))
 	}
-	if err := b.waitMachineReady(ctx, name); err != nil {
-		_ = b.removeMachine(context.Background(), name)
-		return "", "", "", err
+	retained := func(err error) (core.LeaseClaim, error) {
+		return core.LeaseClaim{}, fmt.Errorf("%w; retained machine=%s lease=%s: inspect container machine inspect %s before manual cleanup", err, name, leaseID, core.ShellQuote(name))
 	}
-	if err := claimLease(leaseID, slug, repo.Root, b.cfg.IdleTimeout, reclaim); err != nil {
-		_ = b.removeMachine(context.Background(), name)
-		return "", "", "", err
+	retainedAfterRollback := func(primary, cleanup error) (core.LeaseClaim, error) {
+		code := core.ExitCodeForError(primary, 1)
+		_, combined := retained(errors.Join(primary, cleanup))
+		return core.LeaseClaim{}, shared.ExitErrorWithCause(code, combined.Error(), combined)
 	}
-	return leaseID, slug, name, nil
-}
-
-func (b *backend) waitMachineReady(ctx context.Context, name string) error {
-	deadline := time.NewTimer(30 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		result, err := b.rt.Exec.Run(ctx, LocalCommandRequest{
-			Name: blank(strings.TrimSpace(b.cfg.AppleContainer.CLIPath), "container"),
-			Args: []string{"machine", "run", "--name", name, ":"},
-		})
-		if err == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return exit(5, "Apple container machine %q did not become ready: %s", name, failureDetail(result, err))
-		case <-ticker.C:
-		}
-	}
-}
-
-func (b *backend) resolveLease(identifier, repoRoot string, reclaim bool) (string, string, string, error) {
-	claim, ok, err := resolveLeaseClaim(identifier)
+	currentRoot, err := b.storageRoot(ctx)
 	if err != nil {
-		return "", "", "", err
+		return retained(err)
+	}
+	if currentRoot != root {
+		return retained(fmt.Errorf("Apple container daemon storage changed during creation"))
+	}
+	if _, err := b.inspectMachine(ctx, name); err != nil {
+		return retained(err)
+	}
+	identity, err := createMachineIdentity(root, name)
+	if err != nil {
+		return retained(err)
+	}
+	server := machineServer(machine{ID: name}, leaseID, slug, b.cfg)
+	server.ImmutableID = identity
+	server.Labels["apple_machine_storage"] = root
+	binding := core.LeaseClaim{Provider: providerName, ProviderScope: root, LeaseID: leaseID, Slug: slug, CloudID: name, CloudImmutableID: identity, Labels: server.Labels}
+	claim, err := core.ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurableAfterContext(ctx, leaseID, slug, b.cfg, root, server, core.SSHTarget{}, repo.Root, b.cfg.IdleTimeout, reclaim, core.LeaseClaim{}, false, func() error {
+		_, err := b.verifyMachineIdentity(ctx, binding)
+		return err
+	})
+	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), machineCleanupTimeout)
+		cleanupErr := core.CleanupLeaseClaimIfUnchangedAfterContext(cleanupCtx, leaseID, core.LeaseClaim{}, false, func() error {
+			return b.deleteBoundMachine(cleanupCtx, binding)
+		})
+		cancel()
+		if cleanupErr != nil {
+			return retainedAfterRollback(err, cleanupErr)
+		}
+		return core.LeaseClaim{}, err
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err = core.WithLeaseClaimUnchangedContext(readyCtx, leaseID, claim, func() error {
+		if _, err := b.verifyMachineIdentity(readyCtx, claim); err != nil {
+			return err
+		}
+		return b.waitMachineReady(readyCtx, claim)
+	})
+	if err != nil {
+		if cleanupErr := b.removeBoundLease(context.WithoutCancel(ctx), claim); cleanupErr != nil {
+			return retainedAfterRollback(err, cleanupErr)
+		}
+		return core.LeaseClaim{}, err
+	}
+	return claim, nil
+}
+
+func (b *backend) waitMachineReady(ctx context.Context, claim core.LeaseClaim) error {
+	type observation struct {
+		err error
+	}
+	_, err := shared.Poll(ctx, 0, 500*time.Millisecond, shared.SleepContext,
+		func(ctx context.Context) (observation, error) {
+			if _, err := b.verifyMachineIdentity(ctx, claim); err != nil {
+				return observation{}, err
+			}
+			_, err := b.control(ctx, []string{"machine", "run", "--name", claim.CloudID, ":"})
+			return observation{err: err}, nil
+		},
+		func(_ context.Context, current observation, identityErr error) (bool, error) {
+			if identityErr != nil {
+				return false, identityErr
+			}
+			return current.err == nil, nil
+		}, nil)
+	if err != nil {
+		return fmt.Errorf("Apple container machine %q did not become ready: %w", claim.CloudID, err)
+	}
+	return nil
+}
+
+func (b *backend) resolveLease(ctx context.Context, identifier, repoRoot string, reclaim bool) (core.LeaseClaim, error) {
+	claim, ok, exact, err := core.ResolveLeaseClaimForProviderWithExact(identifier, providerName)
+	if err != nil {
+		return core.LeaseClaim{}, err
+	}
+	if (exact || core.IsCanonicalLeaseID(identifier)) && (!exact || !ok || claim.LeaseID != identifier) {
+		return core.LeaseClaim{}, shared.ErrStrictClaimMismatch
 	}
 	if !ok {
-		return "", "", "", exit(4, "apple-machine lease %q was not found", identifier)
+		return core.LeaseClaim{}, core.Exit(4, "apple-machine lease %q was not found", identifier)
+	}
+	if _, err := machineClaimBinding(claim); err != nil {
+		return core.LeaseClaim{}, err
 	}
 	if repoRoot != "" {
-		if err := claimLease(claim.LeaseID, claim.Slug, repoRoot, time.Duration(claim.IdleTimeoutSeconds)*time.Second, reclaim); err != nil {
-			return "", "", "", err
-		}
+		server := machineServer(machine{ID: claim.CloudID}, claim.LeaseID, claim.Slug, b.cfg)
+		server.ImmutableID = claim.CloudImmutableID
+		server.Labels = shared.CloneLabels(claim.Labels)
+		return core.ClaimLeaseTargetForRepoConfigScopeIfUnchangedDurableAfterContext(ctx, claim.LeaseID, claim.Slug, b.cfg, claim.ProviderScope, server, core.SSHTarget{}, repoRoot, time.Duration(claim.IdleTimeoutSeconds)*time.Second, reclaim, claim, true, func() error {
+			_, err := b.verifyMachineIdentity(ctx, claim)
+			return err
+		})
 	}
-	return claim.LeaseID, claim.Slug, machineName(claim.LeaseID), nil
+	return claim, nil
 }
 
 func machineName(leaseID string) string {
 	return "crabbox-" + strings.TrimPrefix(leaseID, "cbx_")
 }
 
-func machineServer(item machine, leaseID, slug string, cfg Config) Server {
+func machineServer(item machine, leaseID, slug string, cfg core.Config) core.Server {
 	labels := map[string]string{"crabbox": "true", "provider": providerName, "lease": leaseID, "slug": slug, "target": targetLinux}
-	server := Server{Provider: providerName, CloudID: item.ID, Name: item.ID, Status: item.Status, Labels: labels}
-	server.ServerType.Name = blank(cfg.AppleContainer.Image, "ubuntu:26.04")
+	server := core.Server{Provider: providerName, CloudID: item.ID, Name: item.ID, Status: item.Status, Labels: labels}
+	server.ServerType.Name = core.Blank(cfg.AppleContainer.Image, "ubuntu:26.04")
 	return server
 }
 
@@ -328,26 +436,28 @@ func machineReady(status string) bool {
 
 func requireHost() error {
 	if hostGOOS != "darwin" || hostGOARCH != "arm64" {
-		return exit(2, "provider=%s requires Apple silicon macOS", providerName)
+		return core.Exit(2, "provider=%s requires Apple silicon macOS", providerName)
 	}
 	return nil
 }
 
 func validateRepoMount(root string) error {
-	if strings.TrimSpace(root) == "" {
+	if strings.TrimSpace(root) == "" && os.Getenv("XDG_STATE_HOME") == "" {
 		return nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return exit(2, "resolve home directory: %v", err)
+		return core.Exit(2, "resolve home directory: %v", err)
+	}
+	if err := core.ValidateManagedStateTransferScope("apple-machine home mount", home); err != nil {
+		return err
+	}
+	if strings.TrimSpace(root) == "" {
+		return nil
 	}
 	rel, err := filepath.Rel(home, root)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return exit(2, "provider=%s requires the repository under %s because container machine shares the host home directory", providerName, home)
+		return core.Exit(2, "provider=%s requires the repository under %s because container machine shares the host home directory", providerName, home)
 	}
 	return nil
 }
-
-type claimView struct{ leaseID, slug string }
-
-func coreClaims() ([]core.LeaseClaim, error) { return core.ListLeaseClaims() }

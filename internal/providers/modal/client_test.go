@@ -16,7 +16,7 @@ import (
 
 func TestModalExecPreservesRemoteExit125(t *testing.T) {
 	runner := &modalClientRunner{writeResult: "125"}
-	client := &modalPythonClient{cfg: newTestConfig(), rt: Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard}}
+	client := &modalPythonClient{cfg: newTestConfig(), rt: core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard}}
 
 	code, err := client.Exec(context.Background(), modalExecRequest{
 		SandboxID: "sb-123",
@@ -35,9 +35,201 @@ func TestModalExecPreservesRemoteExit125(t *testing.T) {
 	}
 }
 
+func TestModalTransportErrorsPreserveCauses(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded, io.ErrShortWrite} {
+		for _, operation := range []string{"exec", "upload", "json"} {
+			t.Run(operation+"/"+cause.Error(), func(t *testing.T) {
+				runner := &modalClientRunner{result: core.LocalCommandResult{ExitCode: 1}, err: cause}
+				client := &modalPythonClient{cfg: newTestConfig(), rt: core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard}}
+				var err error
+				switch operation {
+				case "exec":
+					_, err = client.Exec(t.Context(), modalExecRequest{SandboxID: "sb-123", Command: []string{"true"}})
+				case "upload":
+					err = client.UploadFile(t.Context(), "sb-123", "local", "/tmp/remote")
+				default:
+					var result map[string]any
+					err = client.runJSON(t.Context(), "fixture", nil, &result)
+				}
+				if !errors.Is(err, cause) {
+					t.Fatalf("transport cause lost: %v, want %v", err, cause)
+				}
+			})
+		}
+	}
+}
+
+const modalScopeTestFixture = `
+import sys, types
+class Config:
+    def get(self, key):
+        assert key == "server_url"
+        return "https://api.modal.com,https://api.modal2.com"
+config_module = types.ModuleType("modal.config")
+config_module.config = Config()
+sys.modules["modal.config"] = config_module
+client_handle = object()
+class Client:
+    @staticmethod
+    def from_env(): return client_handle
+class Workspace:
+    name = "example-workspace"
+    @staticmethod
+    def from_context(*, client):
+        assert client is client_handle
+        return Workspace()
+    def hydrate(self): pass
+class Environment:
+    name = "my-app-dev"
+    object_id = "en-123"
+    @staticmethod
+    def from_name(name, *, client, create_if_missing):
+        assert name == "my-app-dev" and client is client_handle and not create_if_missing
+        return Environment()
+    @staticmethod
+    def from_context(*, client):
+        assert client is client_handle
+        return Environment()
+    def hydrate(self): pass
+class AppHandle:
+    app_id = "ap-123"
+app_handle = AppHandle()
+`
+
+func TestModalCreateScriptScopesNamedSecretsThroughParentApp(t *testing.T) {
+	python, err := osexec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not found: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "modal.py"), []byte(modalScopeTestFixture+`
+class App:
+    @staticmethod
+    def lookup(name, **kwargs):
+        assert name == "crabbox-canary"
+        assert kwargs == {"create_if_missing": True, "environment_name": "my-app-dev", "client": client_handle}
+        return app_handle
+
+class Image:
+    @staticmethod
+    def from_registry(name):
+        assert name == "python:3.13-slim"
+        return "image-handle"
+
+class Secret:
+    @staticmethod
+    def from_name(name, **kwargs):
+        assert kwargs == {"environment_name": "my-app-dev"}
+        return name
+
+class CreatedSandbox:
+    object_id = "sb-canary"
+    name = ""
+    def poll(self):
+        return None
+    def get_tags(self):
+        return {}
+    def set_tags(self, tags):
+        pass
+    def detach(self):
+        pass
+
+class Sandbox:
+    @staticmethod
+    def create(**kwargs):
+        assert "environment_name" not in kwargs
+        assert kwargs["app"] is app_handle
+        assert kwargs["client"] is client_handle
+        assert kwargs["tags"] == {}
+        assert kwargs["image"] == "image-handle"
+        assert kwargs["secrets"] == ["example", "sample"]
+        return CreatedSandbox()
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(modalCreateSandboxRequest{
+		App:            "crabbox-canary",
+		Image:          "python:3.13-slim",
+		TimeoutSeconds: 300,
+		Environment:    "my-app-dev",
+		Secrets:        []string{"example", "sample"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command(python, "-c", modalCreateScript, string(payload))
+	cmd.Env = append(os.Environ(), "PYTHONPATH="+dir, "PYTHONDONTWRITEBYTECODE=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("create script failed: %v; output=%s", err, out)
+	}
+	var sandbox modalSandbox
+	if err := json.Unmarshal(out, &sandbox); err != nil {
+		t.Fatalf("decode output %q: %v", out, err)
+	}
+	if sandbox.ID != "sb-canary" || sandbox.Status != "running" {
+		t.Fatalf("sandbox=%#v", sandbox)
+	}
+}
+
+func TestModalListCarriesConfiguredEnvironment(t *testing.T) {
+	runner := &modalClientRunner{stdout: "[]\n"}
+	cfg := newTestConfig()
+	cfg.Modal.Environment = "my-app-dev"
+	client := &modalPythonClient{cfg: cfg, rt: core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard}}
+
+	if _, err := client.ListSandboxes(context.Background(), map[string]string{"crabbox": "true"}); err != nil {
+		t.Fatal(err)
+	}
+	if runner.payload["environment"] != "my-app-dev" {
+		t.Fatalf("list payload=%#v", runner.payload)
+	}
+}
+
+func TestModalListScriptScopesAppLookupToEnvironment(t *testing.T) {
+	python, err := osexec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not found: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "modal.py"), []byte(modalScopeTestFixture+`
+class App:
+    @staticmethod
+    def lookup(name, **kwargs):
+        assert name == "crabbox-canary"
+        assert kwargs == {"create_if_missing": False, "environment_name": "my-app-dev", "client": client_handle}
+        return app_handle
+
+class Sandbox:
+    @staticmethod
+    def list(**kwargs):
+        assert kwargs == {"app_id": "ap-123", "tags": {"crabbox": "true"}, "client": client_handle}
+        return []
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"app":         "crabbox-canary",
+		"environment": "my-app-dev",
+		"tags":        map[string]string{"crabbox": "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := osexec.Command(python, "-c", modalListScript, string(payload))
+	cmd.Env = append(os.Environ(), "PYTHONPATH="+dir, "PYTHONDONTWRITEBYTECODE=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list script failed: %v; output=%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "[]" {
+		t.Fatalf("list output=%q", out)
+	}
+}
+
 func TestModalExecReportsTransportExit125(t *testing.T) {
 	runner := &modalClientRunner{result: core.LocalCommandResult{ExitCode: modalTransportExitCode}}
-	client := &modalPythonClient{cfg: newTestConfig(), rt: Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard}}
+	client := &modalPythonClient{cfg: newTestConfig(), rt: core.Runtime{Exec: runner, Stdout: io.Discard, Stderr: io.Discard}}
 
 	code, err := client.Exec(context.Background(), modalExecRequest{
 		SandboxID: "sb-123",
@@ -117,11 +309,12 @@ type modalClientRunner struct {
 	payload     map[string]any
 	resultPath  string
 	writeResult string
+	stdout      string
 	result      core.LocalCommandResult
 	err         error
 }
 
-func (r *modalClientRunner) Run(_ context.Context, req LocalCommandRequest) (core.LocalCommandResult, error) {
+func (r *modalClientRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 	if len(req.Args) >= 3 {
 		if err := json.Unmarshal([]byte(req.Args[2]), &r.payload); err == nil {
 			r.resultPath, _ = r.payload["result_path"].(string)
@@ -129,6 +322,9 @@ func (r *modalClientRunner) Run(_ context.Context, req LocalCommandRequest) (cor
 				_ = os.WriteFile(r.resultPath, []byte(r.writeResult), 0o600)
 			}
 		}
+	}
+	if r.stdout != "" && req.Stdout != nil {
+		_, _ = io.WriteString(req.Stdout, r.stdout)
 	}
 	return r.result, r.err
 }

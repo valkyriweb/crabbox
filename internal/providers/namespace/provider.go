@@ -2,6 +2,7 @@ package namespace
 
 import (
 	"flag"
+	"strings"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 )
@@ -12,19 +13,68 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return namespaceProvider }
-func (Provider) Aliases() []string {
-	return []string{"namespace", "namespace-devboxes"}
-}
+var _ core.ProviderClassProfileProvider = Provider{}
+
+var classProfiles = buildClassProfiles()
+
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        namespaceProvider,
-		Family:      "namespace",
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"namespace", "namespace-devboxes"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationCLI),
+		Name:             namespaceProvider,
+		Family:           "namespace",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionMapped,
 	}
+}
+
+func (Provider) ClassProfiles() []core.ProviderClassProfile {
+	return classProfiles
+}
+
+func buildClassProfiles() []core.ProviderClassProfile {
+	classes := core.CanonicalProviderClasses()
+	types := []string{"S", "S", "S", "M", "L", "XL"}
+	profiles := make([]core.ProviderClassProfile, 0, len(classes))
+	for index, class := range classes {
+		profiles = append(profiles, core.ProviderClassProfileFromMachines(
+			class, core.TargetLinux, "", core.ProviderClassArchitectureAMD64,
+			[]core.ProviderClassMachine{{Type: types[index], Architecture: core.ProviderClassArchitectureAMD64}},
+		))
+	}
+	return profiles
+}
+
+func (Provider) ServerTypeForConfig(cfg core.Config) string {
+	if strings.TrimSpace(cfg.Namespace.Size) != "" {
+		return strings.ToUpper(strings.TrimSpace(cfg.Namespace.Size))
+	}
+	if cfg.ServerTypeExplicit && strings.TrimSpace(cfg.ServerType) != "" {
+		return strings.ToUpper(strings.TrimSpace(cfg.ServerType))
+	}
+	return core.ProviderClassPrimaryTypeForProfiles(classProfiles, cfg, namespaceSizeForClass(cfg.Class))
+}
+
+func (Provider) ServerTypeOverrideForConfig(cfg core.Config) (string, bool) {
+	size := strings.TrimSpace(cfg.Namespace.Size)
+	return strings.ToUpper(size), size != ""
+}
+
+func namespaceSizeForClass(class string) string {
+	normalized := strings.ToLower(strings.TrimSpace(class))
+	if normalized != class {
+		cfg := core.Config{Provider: namespaceProvider, TargetOS: core.TargetLinux, Architecture: core.ArchitectureAMD64, Class: normalized}
+		if candidates, matched := core.ProviderClassCandidatesForProfiles(classProfiles, cfg); matched {
+			return candidates[0]
+		}
+	}
+	if class == "" {
+		return "M"
+	}
+	return strings.ToUpper(strings.TrimSpace(class))
 }
 func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
 	return RegisterNamespaceProviderFlags(fs, defaults)
@@ -34,16 +84,4 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 }
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	return NewNamespaceLeaseBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "namespace-devbox doctor backend unavailable")
-	}
-	return doctor, nil
 }

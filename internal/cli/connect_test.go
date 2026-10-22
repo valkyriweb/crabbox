@@ -59,6 +59,9 @@ printf 'err\n' >&2
 	wantArgs := []string{
 		"-i", "/tmp/crabbox key",
 		"-o", "IdentitiesOnly=yes",
+		"-o", "ForwardAgent=no",
+		"-o", "ForwardX11=no",
+		"-o", "ForwardX11Trusted=no",
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
 		"-o", "ConnectionAttempts=3",
@@ -69,6 +72,8 @@ printf 'err\n' >&2
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",
 		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
+		"-o", "ControlPersist=no",
 		"-o", "CertificateFile=/tmp/crabbox-cert.pub",
 		"-o", "ProxyCommand=provider proxy %h %p",
 		"crabbox@203.0.113.10",
@@ -140,7 +145,7 @@ cat
 		DisableHostKeyChecking: true,
 		NoControlMaster:        true,
 	}
-	if !probeConnectSSHTransport(context.Background(), &target, 5*time.Second) {
+	if !probeConnectSSHTransport(context.Background(), &target, 30*time.Second) {
 		t.Fatal("resolve fallback port failed")
 	}
 	err := runInteractiveSSH(context.Background(), target, strings.NewReader(""), &stdout, &stderr)

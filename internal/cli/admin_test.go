@@ -4,12 +4,112 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestAdminLeasesUsesConfiguredAuthorization(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		noCredentials bool
+		tokenCommand  bool
+		adminToken    string
+		responseCode  int
+	}{
+		{name: "missing broker credentials", noCredentials: true, responseCode: http.StatusOK},
+		{name: "configured session", responseCode: http.StatusOK},
+		{name: "configured token command", tokenCommand: true, responseCode: http.StatusOK},
+		{name: "explicit admin token overrides session", adminToken: "explicit-admin", responseCode: http.StatusOK},
+		{name: "explicit admin token overrides command", tokenCommand: true, adminToken: "explicit-admin", responseCode: http.StatusOK},
+		{name: "server denies non-admin session", responseCode: http.StatusForbidden},
+		{name: "denied explicit token does not fall back", adminToken: "denied-admin", responseCode: http.StatusForbidden},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				wantToken := "configured-session"
+				if tt.adminToken != "" {
+					wantToken = tt.adminToken
+				}
+				if r.Method != http.MethodGet || r.URL.Path != "/v1/admin/leases" || r.Header.Get("Authorization") != "Bearer "+wantToken {
+					t.Errorf("unexpected admin request: %s %s, authorization matched=%t", r.Method, r.URL.Path, r.Header.Get("Authorization") == "Bearer "+wantToken)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.responseCode)
+				if tt.responseCode == http.StatusForbidden {
+					_, _ = io.WriteString(w, `{"error":"forbidden"}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"leases":[]}`)
+			}))
+			defer server.Close()
+			broker := map[string]any{"url": server.URL, "token": "configured-session"}
+			if tt.noCredentials {
+				delete(broker, "token")
+			}
+			if tt.tokenCommand {
+				broker["token"] = "superseded-session"
+				command := []string{os.Args[0], "-test.run=^TestCoordinatorTokenCommandHelper$"}
+				t.Setenv("CRABBOX_TOKEN_HELPER", "1")
+				t.Setenv("CRABBOX_TOKEN_HELPER_VALUE", "configured-session")
+				if tt.adminToken != "" {
+					// An explicit admin credential must not execute the normal credential command.
+					command = []string{filepath.Join(t.TempDir(), "must-not-run")}
+				}
+				encodedCommand, err := json.Marshal(command)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("CRABBOX_COORDINATOR_TOKEN_COMMAND", string(encodedCommand))
+			}
+			if tt.adminToken != "" {
+				broker["adminToken"] = tt.adminToken
+			}
+			config, err := json.Marshal(map[string]any{"broker": broker})
+			if err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, config, 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CRABBOX_CONFIG", configPath)
+			app := App{Stdout: io.Discard, Stderr: io.Discard}
+			err = app.adminLeases(context.Background(), []string{"--json"})
+			if tt.noCredentials {
+				var exitErr ExitError
+				if !errors.As(err, &exitErr) || exitErr.Code != 2 || !strings.Contains(err.Error(), "broker authentication") {
+					t.Errorf("err=%v, want missing broker authentication before request", err)
+				}
+				if requests != 0 {
+					t.Errorf("requests=%d, want no unauthenticated admin request", requests)
+				}
+				return
+			}
+			if tt.responseCode == http.StatusForbidden {
+				var httpErr CoordinatorHTTPError
+				if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusForbidden {
+					t.Fatalf("err=%v, want coordinator authorization denial", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if requests != 1 {
+				t.Fatalf("requests=%d, want one authoritative admin request", requests)
+			}
+		})
+	}
+}
 
 func TestAdminMacHostsRequiresForceForAllocate(t *testing.T) {
 	app := App{Stdout: io.Discard, Stderr: io.Discard}
@@ -118,6 +218,7 @@ func TestAdminAWSPolicyPrintsProviderPermissions(t *testing.T) {
 	out := stdout.String()
 	for _, want := range []string{
 		`"ec2:RunInstances"`,
+		`"ec2:DescribeInstanceTypes"`,
 		`"ec2:TerminateInstances"`,
 		`"ec2:CreateSecurityGroup"`,
 		`"ec2:CreateImage"`,
@@ -141,6 +242,7 @@ func TestAdminAWSPolicyCanIncludeMacHostPermissions(t *testing.T) {
 	out := stdout.String()
 	for _, want := range []string{
 		`"ec2:RunInstances"`,
+		`"ec2:DescribeInstanceTypes"`,
 		`"ec2:AllocateHosts"`,
 		`"ec2:ReleaseHosts"`,
 		`"ec2:CreateAction": "AllocateHosts"`,
@@ -157,6 +259,49 @@ func TestAdminAWSPolicyCanIncludeMacHostPermissions(t *testing.T) {
 	}
 	if len(doc.Statement) < 6 {
 		t.Fatalf("combined policy statements=%d, want provider plus mac-host statements", len(doc.Statement))
+	}
+}
+
+func TestAdminProviderPoliciesAllowInstanceMetadata(t *testing.T) {
+	for _, command := range []string{"aws-policy", "providers"} {
+		for _, option := range [][]string{nil, {"--mac-hosts"}, {"--host-lifecycle"}, {"--target", "macos"}} {
+			t.Run(command+"/"+strings.Join(option, "_"), func(t *testing.T) {
+				var stdout bytes.Buffer
+				app := App{Stdout: &stdout, Stderr: io.Discard}
+				var err error
+				if command == "aws-policy" {
+					err = app.adminAWSPolicy(option)
+				} else {
+					err = app.adminProviders(context.Background(), append([]string{"policy", "--provider", "aws"}, option...))
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				var policy struct {
+					Statement []struct {
+						Effect   string
+						Action   any
+						Resource string
+					}
+				}
+				if err := json.Unmarshal(stdout.Bytes(), &policy); err != nil {
+					t.Fatal(err)
+				}
+				for _, statement := range policy.Statement {
+					if statement.Effect != "Allow" || statement.Resource != "*" {
+						continue
+					}
+					if actions, ok := statement.Action.([]any); ok {
+						for _, action := range actions {
+							if action == "ec2:DescribeInstanceTypes" {
+								return
+							}
+						}
+					}
+				}
+				t.Fatal("policy does not allow ec2:DescribeInstanceTypes on all resources")
+			})
+		}
 	}
 }
 
@@ -228,5 +373,109 @@ func TestSanitizeMacHostDryRunChecks(t *testing.T) {
 	}
 	if strings.Contains(got, "123456789012") || strings.Contains(got, "Encoded authorization") {
 		t.Fatalf("message leaked provider details: %q", got)
+	}
+}
+
+func TestAdminHostReservation(t *testing.T) {
+	for _, tc := range []struct {
+		name, action, method string
+		force                bool
+	}{
+		{"inspect", "reservation", http.MethodGet, false},
+		{"clear", "clear", http.MethodPost, false},
+		{"force clear", "clear", http.MethodPost, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != tc.method || r.URL.Path != "/v1/admin/hosts/h-123abc/reservation" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				if r.URL.Query().Get("region") != "eu-west-1" || r.URL.Query().Get("provider") != "aws" || r.URL.Query().Get("target") != "macos" {
+					t.Errorf("unexpected scope: %s", r.URL.RawQuery)
+				}
+				if (r.URL.Query().Get("force") == "true") != tc.force {
+					t.Error("incorrect force flag")
+				}
+				if r.Header.Get("Authorization") != "Bearer admin-token" {
+					t.Error("missing admin auth")
+				}
+				_, _ = io.WriteString(w, `{"hostID":"h-123abc","reservations":[],"cleared":0}`)
+			}))
+			defer server.Close()
+			t.Setenv("CRABBOX_COORDINATOR", server.URL)
+			t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+			args := []string{tc.action, "h-123abc", "--region", "eu-west-1", "--json"}
+			if tc.force {
+				args = append(args, "--force")
+			}
+			var stdout bytes.Buffer
+			app := App{Stdout: &stdout, Stderr: io.Discard}
+			if err := app.adminMacHosts(context.Background(), args); err != nil {
+				t.Fatal(err)
+			}
+			var result struct {
+				HostID string `json:"hostID"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.HostID != "h-123abc" {
+				t.Fatalf("unexpected output: %s (%v)", stdout.String(), err)
+			}
+		})
+	}
+}
+
+func TestAdminHostReservationRejectsInvalidArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"reservation"}, {"clear"}, {"reservation", "h-123abc", "--force"},
+		{"clear", "h-123abc", "extra"}, {"reservation", "h-123abc", "--provider", "gcp"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			app := App{Stdout: io.Discard, Stderr: io.Discard}
+			if err := app.adminHosts(context.Background(), args); err == nil {
+				t.Fatal("expected argument error")
+			}
+		})
+	}
+}
+
+func TestAdminHostReservationPreservesConflict(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":"host_in_use","message":"reservation references a provisioning lease"}`)
+	}))
+	defer server.Close()
+	t.Setenv("CRABBOX_COORDINATOR", server.URL)
+	t.Setenv("CRABBOX_COORDINATOR_ADMIN_TOKEN", "admin-token")
+	app := App{Stdout: io.Discard, Stderr: io.Discard}
+	if err := app.adminHosts(context.Background(), []string{"clear", "h-123abc"}); err == nil || !strings.Contains(err.Error(), "host_in_use") {
+		t.Fatalf("expected host conflict, got %v", err)
+	}
+}
+
+func TestAdminHostReservationClearCannotReleaseHostOnOlderCoordinator(t *testing.T) {
+	var released bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Older coordinators dispatch host DELETE using only the first path segment.
+		if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/admin/hosts/h-") {
+			released = true
+			_, _ = io.WriteString(w, `{"released":["h-123abc"]}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"not_found"}`)
+	}))
+	defer server.Close()
+	client := &CoordinatorClient{BaseURL: server.URL, Token: "synthetic-admin-token"}
+	_, err := client.AdminHostReservation(context.Background(), "eu-west-1", "h-123abc", true, true)
+	if err == nil {
+		t.Fatal("expected unsupported-route error")
+	}
+	if released {
+		t.Fatal("reservation clear released a Dedicated Host")
 	}
 }

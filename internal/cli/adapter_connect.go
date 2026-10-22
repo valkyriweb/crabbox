@@ -67,7 +67,7 @@ type adapterRelay struct {
 
 func (a App) adapterConnect(ctx context.Context, args []string) error {
 	if err := adapterConnectHostSupported(); err != nil {
-		return exit(2, "%v", err)
+		return Exit(2, "%v", err)
 	}
 	fs := newFlagSet("adapter connect", a.Stderr)
 	id := fs.String("id", getenv("CRABBOX_ADAPTER_ID", ""), "coordinator adapter id")
@@ -78,28 +78,28 @@ func (a App) adapterConnect(ctx context.Context, args []string) error {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return exit(2, "usage: crabbox adapter connect --id <adapter-id> --local-socket <path> --token-file <path> [--connection-timeout <duration>]")
+		return Exit(2, "usage: crabbox adapter connect --id <adapter-id> --local-socket <path> --token-file <path> [--connection-timeout <duration>]")
 	}
 	adapterID := strings.TrimSpace(*id)
 	if !validControllerWorkspaceID(adapterID) {
-		return exit(2, "--id must be a lowercase DNS-style name with at most 63 characters")
+		return Exit(2, "--id must be a lowercase DNS-style name with at most 63 characters")
 	}
 	if strings.TrimSpace(*tokenFile) == "" {
-		return exit(2, "--token-file is required")
+		return Exit(2, "--token-file is required")
 	}
 	if *connectionTimeout <= 0 {
-		return exit(2, "--connection-timeout must be greater than zero")
+		return Exit(2, "--connection-timeout must be greater than zero")
 	}
 	if *connectionTimeout > adapterRelayMaxConnectionTime {
-		return exit(2, "--connection-timeout must not exceed %s", adapterRelayMaxConnectionTime)
+		return Exit(2, "--connection-timeout must not exceed %s", adapterRelayMaxConnectionTime)
 	}
 	desktopRequestTimeout := *connectionTimeout + adapterRelayConnectionOverhead
 	if desktopRequestTimeout <= *connectionTimeout {
-		return exit(2, "--connection-timeout is too large")
+		return Exit(2, "--connection-timeout is too large")
 	}
 	socketPath, err := normalizeAdapterUnixSocketPath(strings.TrimSpace(*localSocket))
 	if err != nil {
-		return exit(2, "--local-socket: %v", err)
+		return Exit(2, "--local-socket: %v", err)
 	}
 	loadLocalToken := func() (string, error) {
 		return readAdapterToken(*tokenFile)
@@ -109,7 +109,7 @@ func (a App) adapterConnect(ctx context.Context, args []string) error {
 	}
 	localClient, err := newAdapterLocalClient(socketPath, desktopRequestTimeout)
 	if err != nil {
-		return exit(2, "--local-socket: %v", err)
+		return Exit(2, "--local-socket: %v", err)
 	}
 	if _, err := configuredAdapterCoordinatorClient(); err != nil {
 		return err
@@ -141,10 +141,10 @@ func configuredAdapterCoordinatorClient() (*CoordinatorClient, error) {
 		return nil, err
 	}
 	if !configured || coord == nil || strings.TrimSpace(coord.BaseURL) == "" {
-		return nil, exit(2, "adapter connect requires a configured coordinator; run crabbox login --url <coordinator-url> first")
+		return nil, Exit(2, "adapter connect requires a configured coordinator; run crabbox login --url <coordinator-url> first")
 	}
 	if !coord.hasConfiguredAuth() {
-		return nil, exit(2, "adapter connect requires coordinator authentication; run crabbox login --url <coordinator-url> first")
+		return nil, Exit(2, "adapter connect requires coordinator authentication; run crabbox login --url <coordinator-url> first")
 	}
 	return coord, nil
 }
@@ -238,7 +238,7 @@ func connectAdapterRelay(
 	}
 	defer ws.Close(websocket.StatusNormalClosure, "adapter relay stopped")
 	if status != nil {
-		fmt.Fprintf(status, "adapter relay connected id=%s coordinator=%s local_socket=%s\n", adapterID, coord.BaseURL, localSocket)
+		fmt.Fprintf(status, "adapter relay connected id=%s coordinator=%s local_socket=%s\n", adapterID, redactedConfigURL(coord.BaseURL), localSocket)
 	}
 	return relay.serve(ctx)
 }
@@ -418,7 +418,7 @@ func (r *adapterRelay) handle(ctx context.Context, request adapterRelayRequest) 
 }
 
 func adapterRelayTimeoutForRequest(request adapterRelayRequest, desktopTimeout time.Duration) time.Duration {
-	if request.Method == http.MethodPost && strings.HasSuffix(request.Path, "/connections/desktop") {
+	if request.Method == http.MethodPost && (strings.HasSuffix(request.Path, "/connections/desktop") || strings.HasSuffix(request.Path, "/connections/native-vnc")) {
 		if desktopTimeout <= 0 {
 			desktopTimeout = adapterRelayDefaultConnectionTime + adapterRelayConnectionOverhead
 		}
@@ -481,12 +481,16 @@ func adapterRelayCanonicalPath(method, requestPath string) (string, bool) {
 		return "", false
 	}
 	rest := strings.TrimPrefix(requestPath, prefix)
-	if method == http.MethodPost && strings.HasSuffix(rest, "/connections/desktop") {
-		workspaceID := strings.TrimSuffix(rest, "/connections/desktop")
+	if method == http.MethodPost && (strings.HasSuffix(rest, "/connections/desktop") || strings.HasSuffix(rest, "/connections/native-vnc")) {
+		suffix := "/connections/desktop"
+		if strings.HasSuffix(rest, "/connections/native-vnc") {
+			suffix = "/connections/native-vnc"
+		}
+		workspaceID := strings.TrimSuffix(rest, suffix)
 		if !validControllerWorkspaceID(workspaceID) {
 			return "", false
 		}
-		return prefix + url.PathEscape(workspaceID) + "/connections/desktop", true
+		return prefix + url.PathEscape(workspaceID) + suffix, true
 	}
 	if (method != http.MethodGet && method != http.MethodDelete) || !validControllerWorkspaceID(rest) {
 		return "", false

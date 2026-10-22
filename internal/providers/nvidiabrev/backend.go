@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 const (
@@ -32,47 +35,47 @@ func (e *brevOrgChangedError) Error() string {
 }
 
 type nvidiaBrevBackend struct {
-	spec ProviderSpec
-	cfg  Config
-	rt   Runtime
+	spec core.ProviderSpec
+	cfg  core.Config
+	rt   core.Runtime
 }
 
-func NewNvidiaBrevBackend(spec ProviderSpec, cfg Config, rt Runtime) Backend {
+func NewNvidiaBrevBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
 	applyNvidiaBrevDefaults(&cfg)
 	cfg.Provider = providerName
 	return &nvidiaBrevBackend{spec: spec, cfg: cfg, rt: rt}
 }
 
-func (b *nvidiaBrevBackend) Spec() ProviderSpec { return b.spec }
+func (b *nvidiaBrevBackend) Spec() core.ProviderSpec { return b.spec }
 
-func (b *nvidiaBrevBackend) Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error) {
+func (b *nvidiaBrevBackend) Acquire(ctx context.Context, req core.AcquireRequest) (core.LeaseTarget, error) {
 	client, err := b.client()
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	cfg := b.configForRun()
 	leaseID := newLeaseID()
 	existing, err := b.listServers(ctx, client, true)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	claims, err := listLeaseClaims()
+	claims, err := core.ListLeaseClaims()
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	createOrg, err := client.activeOrg(ctx)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	slug := allocateBrevLeaseSlug(leaseID, req.RequestedSlug, existing, claims)
 	name := brevProviderName(leaseID, slug)
 	fmt.Fprintf(b.rt.Stderr, "provisioning provider=%s lease=%s slug=%s name=%s gpu=%s keep=%v\n", providerName, leaseID, slug, name, cfg.NvidiaBrev.GPUName, req.Keep)
 
 	if err := client.rejectOrgScopedMutation("create"); err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if err := client.create(ctx, name); err != nil {
-		return LeaseTarget{}, b.reconcileCreateFailure(client, brevWorkspace{Name: name}, createOrg.ID, leaseID, slug, cfg, req, err)
+		return core.LeaseTarget{}, b.reconcileCreateFailure(client, brevWorkspace{Name: name}, createOrg.ID, leaseID, slug, cfg, req, err)
 	}
 	workspace, workspaceOrgID, err := b.waitForWorkspaceReady(ctx, client, name)
 	if err != nil {
@@ -83,19 +86,19 @@ func (b *nvidiaBrevBackend) Acquire(ctx context.Context, req AcquireRequest) (Le
 			if workspaceIdentifier(workspace) == "" {
 				workspace.Name = name
 			}
-			err = b.retainFailedCreatedWorkspace(workspace, firstNonEmpty(workspaceOrgID, createOrg.ID), leaseID, slug, cfg, req, "kept_acquire_failed", err)
+			err = b.retainFailedCreatedWorkspace(workspace, shared.FirstNonBlankTrimmed(workspaceOrgID, createOrg.ID), leaseID, slug, cfg, req, "kept_acquire_failed", err)
 		} else {
 			if workspaceIdentifier(workspace) == "" {
 				workspace.Name = name
 			}
 			err = b.rollbackOrRetainCreatedWorkspace(workspace, createOrg.ID, leaseID, slug, cfg, req, err)
 		}
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	if workspaceOrgID != createOrg.ID {
-		var err error = exit(2, "active Brev organization changed while creating workspace %s", safeWorkspaceRef(workspace))
+		var err error = core.Exit(2, "active Brev organization changed while creating workspace %s", safeWorkspaceRef(workspace))
 		err = b.retainAmbiguousCreateOrganizationClaim(workspace, createOrg.ID, workspaceOrgID, workspaceOrgID, leaseID, slug, cfg, req, err)
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	lease, err := b.prepareLease(ctx, client, cfg, workspace, workspaceOrgID, leaseID, slug, req.Keep, true)
 	if err != nil {
@@ -104,7 +107,7 @@ func (b *nvidiaBrevBackend) Acquire(ctx context.Context, req AcquireRequest) (Le
 		} else {
 			err = b.rollbackOrRetainCreatedWorkspace(workspace, createOrg.ID, leaseID, slug, cfg, req, err)
 		}
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	lease.Server.Labels["brev_org_id"] = workspaceOrgID
 	if err := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, lease.Server, lease.SSH, req.Repo.Root, req.Reclaim); err != nil {
@@ -113,36 +116,36 @@ func (b *nvidiaBrevBackend) Acquire(ctx context.Context, req AcquireRequest) (Le
 		} else {
 			err = b.rollbackOrRetainCreatedWorkspace(workspace, createOrg.ID, leaseID, slug, cfg, req, err)
 		}
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	fmt.Fprintf(b.rt.Stderr, "provisioned lease=%s workspace=%s state=ready\n", leaseID, safeWorkspaceRef(workspace))
 	return lease, nil
 }
 
-func (b *nvidiaBrevBackend) Resolve(ctx context.Context, req ResolveRequest) (LeaseTarget, error) {
+func (b *nvidiaBrevBackend) Resolve(ctx context.Context, req core.ResolveRequest) (core.LeaseTarget, error) {
 	client, err := b.client()
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	cfg := b.configForRun()
 	claim, claimed, claimErr := resolveNvidiaBrevClaim(req.ID)
 	if claimErr != nil {
-		return LeaseTarget{}, claimErr
+		return core.LeaseTarget{}, claimErr
 	}
 	if claimed && strings.EqualFold(strings.TrimSpace(claim.Labels["state"]), "deleting") {
 		if req.ReleaseOnly || req.StatusOnly {
 			return deletingLeaseTarget(claim), nil
 		}
-		return LeaseTarget{}, exit(4, "nvidia-brev lease=%s is deleting", claim.LeaseID)
+		return core.LeaseTarget{}, core.Exit(4, "nvidia-brev lease=%s is deleting", claim.LeaseID)
 	}
 	if claimed && req.StatusOnly && createRecoveryClaim(claim) {
 		workspaces, err := client.list(ctx, true)
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
-		_, found, err := findBrevWorkspace(workspaces, firstNonEmpty(claim.CloudID, claim.Labels["brev_workspace_name"]))
+		_, found, err := findBrevWorkspace(workspaces, shared.FirstNonBlankTrimmed(claim.CloudID, claim.Labels["brev_workspace_name"]))
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		if !found {
 			return claimStateLeaseTarget(claim), nil
@@ -153,27 +156,32 @@ func (b *nvidiaBrevBackend) Resolve(ctx context.Context, req ResolveRequest) (Le
 	}
 	if claimed && strings.TrimSpace(cfg.NvidiaBrev.Org) == "" && strings.TrimSpace(claim.Labels["brev_org_id"]) != "" {
 		if _, err := verifyActiveBrevOrgScope(ctx, client, claim); err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 	}
 	workspace, leaseID, slug, claim, err := b.resolveWorkspace(ctx, client, req.ID)
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
-	lease := LeaseTarget{Server: workspaceToClaimedServer(cfg, workspace, leaseID, slug, claim), LeaseID: leaseID}
+	cfg.NvidiaBrev.Target = effectiveBrevTarget(cfg, claim.Labels)
+	lease := core.LeaseTarget{Server: workspaceToClaimedServer(cfg, workspace, leaseID, slug, claim), LeaseID: leaseID}
+	core.SetServerLeaseClaimSnapshot(&lease.Server, claim, claim.LeaseID != "")
 	activeOrgID := ""
 	if strings.TrimSpace(cfg.NvidiaBrev.Org) == "" && !req.ReleaseOnly {
 		activeOrgID, err = verifyActiveBrevOrgScope(ctx, client, claim)
 		if err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 		lease.Server.Labels["brev_org_id"] = activeOrgID
 	}
 	if req.ReleaseOnly || req.StatusOnly {
-		if req.ReadyProbe && brevWorkspaceReady(workspace) {
-			target, targetErr := b.resolveSSHTarget(ctx, client, cfg, workspace, firstNonEmpty(activeOrgID, claim.Labels["brev_org_id"]))
+		// Ordinary status probes an existing route; only --wait prepares it.
+		ownedRoute := claim.CloudID != "" && claim.CloudID == workspace.ID && claim.Labels["brev_org_id"] == activeOrgID
+		cachedProbe := req.StatusOnly && !req.ReleaseOnly && strings.TrimSpace(cfg.NvidiaBrev.Org) == "" && ownedRoute
+		if brevWorkspaceReady(workspace) && (req.ReadyProbe || cachedProbe) {
+			target, targetErr := b.resolveSSHTarget(ctx, client, cfg, workspace, shared.FirstNonBlankTrimmed(activeOrgID, claim.Labels["brev_org_id"]), req.ReadyProbe, claim.Labels[brevSSHConfigDigestLabel])
 			if targetErr != nil {
-				return LeaseTarget{}, targetErr
+				return core.LeaseTarget{}, targetErr
 			}
 			lease.SSH = target
 		}
@@ -185,7 +193,7 @@ func (b *nvidiaBrevBackend) Resolve(ctx context.Context, req ResolveRequest) (Le
 			starting.Status = "STARTING"
 			startingServer := workspaceToClaimedServer(cfg, starting, leaseID, slug, claim)
 			startingServer.Labels["brev_org_id"] = activeOrgID
-			updatedClaim, updateErr := updateLeaseClaimEndpointIfUnchangedAfter(leaseID, claim, startingServer, SSHTarget{}, func() error {
+			updatedClaim, updateErr := core.UpdateLeaseClaimEndpointIfUnchangedAfter(leaseID, claim, startingServer, core.SSHTarget{}, func() error {
 				if err := requireActiveBrevOrg(ctx, client, activeOrgID); err != nil {
 					return err
 				}
@@ -193,44 +201,45 @@ func (b *nvidiaBrevBackend) Resolve(ctx context.Context, req ResolveRequest) (Le
 				return client.start(ctx, workspaceIdentifier(workspace))
 			})
 			if updateErr != nil {
-				return LeaseTarget{}, updateErr
+				return core.LeaseTarget{}, updateErr
 			}
 			claim = updatedClaim
 			workspace, _, err = b.waitForWorkspaceReady(ctx, client, workspaceIdentifier(workspace))
 			if err != nil {
-				return LeaseTarget{}, err
+				return core.LeaseTarget{}, err
 			}
 		} else {
 			workspace, err = b.startStoppedWorkspace(ctx, client, workspace, activeOrgID)
 			if err != nil {
-				return LeaseTarget{}, err
+				return core.LeaseTarget{}, err
 			}
 		}
 		lease.Server = workspaceToClaimedServer(cfg, workspace, leaseID, slug, claim)
 		lease.Server.Labels["brev_org_id"] = activeOrgID
 	}
-	target, err := b.resolveSSHTarget(ctx, client, cfg, workspace, activeOrgID)
+	target, err := b.resolveSSHTarget(ctx, client, cfg, workspace, activeOrgID, true, "")
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	lease.SSH = target
+	lease.Server.Labels[brevSSHConfigDigestLabel] = brevSSHConfigDigest(target.SSHConfigData)
 	if req.Repo.Root != "" && isCrabboxBrevWorkspace(workspace) {
-		updatedClaim, claimErr := claimLeaseTargetForRepoConfigIfUnchanged(leaseID, slug, cfg, lease.Server, lease.SSH, req.Repo.Root, req.Reclaim, claim, claim.LeaseID != "")
+		updated, claimErr := claimLeaseTargetForRepoConfigIfUnchanged(leaseID, slug, cfg, lease.Server, lease.SSH, req.Repo.Root, req.Reclaim, claim, claim.LeaseID != "")
 		if claimErr != nil {
-			return LeaseTarget{}, claimErr
+			return core.LeaseTarget{}, claimErr
 		}
-		claim = updatedClaim
+		core.SetServerLeaseClaimSnapshot(&lease.Server, updated, true)
 	} else if claim.LeaseID != "" {
-		updatedClaim, claimErr := updateLeaseClaimEndpointIfUnchanged(leaseID, claim, lease.Server, lease.SSH)
+		updated, claimErr := core.UpdateLeaseClaimEndpointIfUnchanged(leaseID, claim, lease.Server, lease.SSH)
 		if claimErr != nil {
-			return LeaseTarget{}, claimErr
+			return core.LeaseTarget{}, claimErr
 		}
-		claim = updatedClaim
+		core.SetServerLeaseClaimSnapshot(&lease.Server, updated, true)
 	}
 	return lease, nil
 }
 
-func (b *nvidiaBrevBackend) List(ctx context.Context, req ListRequest) ([]LeaseView, error) {
+func (b *nvidiaBrevBackend) List(ctx context.Context, req core.ListRequest) ([]core.LeaseView, error) {
 	client, err := b.client()
 	if err != nil {
 		return nil, err
@@ -238,7 +247,18 @@ func (b *nvidiaBrevBackend) List(ctx context.Context, req ListRequest) ([]LeaseV
 	return b.listServers(ctx, client, req.All)
 }
 
-func (b *nvidiaBrevBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error {
+func (b *nvidiaBrevBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	_, err := b.ReleaseLeaseWithOutcome(ctx, req)
+	return err
+}
+
+func (b *nvidiaBrevBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.ReleaseLeaseRequest) (core.ReleaseLeaseOutcome, error) {
+	var outcome core.ReleaseLeaseOutcome
+	err := b.releaseLease(ctx, req, &outcome)
+	return outcome, err
+}
+
+func (b *nvidiaBrevBackend) releaseLease(ctx context.Context, req core.ReleaseLeaseRequest, outcome *core.ReleaseLeaseOutcome) error {
 	client, err := b.client()
 	if err != nil {
 		return err
@@ -246,13 +266,13 @@ func (b *nvidiaBrevBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRe
 	if err := client.rejectOrgScopedMutation("release"); err != nil {
 		return err
 	}
-	identifier := firstNonEmpty(req.Lease.LeaseID, req.Lease.Server.CloudID, req.Lease.Server.Name)
+	identifier := shared.FirstNonBlankTrimmed(req.Lease.LeaseID, req.Lease.Server.CloudID, req.Lease.Server.Name)
 	if claim, claimed, claimErr := resolveNvidiaBrevClaim(identifier); claimErr != nil {
 		return claimErr
 	} else if claimed && strings.EqualFold(strings.TrimSpace(claim.Labels["state"]), "deleting") {
-		return b.reconcileDeletingClaim(ctx, client, claim)
+		return b.reconcileDeletingClaimWithOutcome(ctx, client, claim, outcome)
 	} else if claimed && createRecoveryClaim(claim) {
-		return b.reconcileCreateRecoveryClaim(ctx, client, claim)
+		return b.reconcileCreateRecoveryClaim(ctx, client, claim, outcome)
 	} else if claimed && strings.TrimSpace(claim.Labels["brev_org_id"]) != "" {
 		if _, err := verifyActiveBrevOrgScope(ctx, client, claim); err != nil {
 			return err
@@ -263,22 +283,22 @@ func (b *nvidiaBrevBackend) ReleaseLease(ctx context.Context, req ReleaseLeaseRe
 		return err
 	}
 	if claim.LeaseID == "" {
-		return exit(2, "refusing to release nvidia-brev workspace %s without a local Crabbox claim", safeWorkspaceRef(workspace))
+		return core.Exit(2, "refusing to release nvidia-brev workspace %s without a local Crabbox claim", safeWorkspaceRef(workspace))
 	}
 	if claim.Provider != providerName {
-		return exit(2, "lease=%s is claimed by provider=%s; refusing nvidia-brev release", claim.LeaseID, claim.Provider)
+		return core.Exit(2, "lease=%s is claimed by provider=%s; refusing nvidia-brev release", claim.LeaseID, claim.Provider)
 	}
 	if !claimMatchesWorkspace(claim, workspace) {
-		return exit(2, "lease=%s claim does not match nvidia-brev workspace %s", claim.LeaseID, safeWorkspaceRef(workspace))
+		return core.Exit(2, "lease=%s claim does not match nvidia-brev workspace %s", claim.LeaseID, safeWorkspaceRef(workspace))
 	}
 	action := b.releaseAction(claim.Labels)
 	if action == "stop" {
 		return b.stopWorkspaceAndPersistClaim(ctx, client, workspace, claim)
 	}
-	return b.deleteWorkspaceAndRemoveClaim(ctx, client, workspace, claim)
+	return b.deleteWorkspaceAndRemoveClaimWithOutcome(ctx, client, workspace, claim, outcome)
 }
 
-func (b *nvidiaBrevBackend) RetainLeaseClaimAfterRelease(lease LeaseTarget) bool {
+func (b *nvidiaBrevBackend) RetainLeaseClaimAfterRelease(lease core.LeaseTarget) bool {
 	if b.releaseResultAction(lease.Server.Labels) != "stop" {
 		return false
 	}
@@ -290,8 +310,8 @@ func (b *nvidiaBrevBackend) RetainLeaseClaimAfterRelease(lease LeaseTarget) bool
 	return true
 }
 
-func (b *nvidiaBrevBackend) ReleaseLeaseMessage(lease LeaseTarget) string {
-	workspace := firstNonEmpty(lease.Server.CloudID, lease.Server.Name, "-")
+func (b *nvidiaBrevBackend) ReleaseLeaseMessage(lease core.LeaseTarget) string {
+	workspace := shared.FirstNonBlankTrimmed(lease.Server.CloudID, lease.Server.Name, "-")
 	if b.releaseResultAction(lease.Server.Labels) == "stop" {
 		if createRecoveryLabels(lease.Server.Labels) && lease.LeaseID != "" {
 			if _, retained, err := resolveLeaseClaimForProvider(lease.LeaseID); err == nil && !retained {
@@ -303,46 +323,54 @@ func (b *nvidiaBrevBackend) ReleaseLeaseMessage(lease LeaseTarget) string {
 	return fmt.Sprintf("deleted lease=%s workspace=%s", lease.LeaseID, workspace)
 }
 
-func (b *nvidiaBrevBackend) Touch(_ context.Context, req TouchRequest) (Server, error) {
-	server := req.Lease.Server
-	cfg := b.configForRun()
-	if req.IdleTimeout > 0 {
-		cfg.IdleTimeout = req.IdleTimeout
+func (b *nvidiaBrevBackend) AuthorizeStatusTouchClaim(ctx context.Context, lease core.LeaseTarget, claim core.LeaseClaim) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	var claim LeaseClaim
-	var claimed bool
-	var err error
-	if req.Lease.LeaseID != "" {
-		claim, claimed, err = resolveLeaseClaimForProvider(req.Lease.LeaseID)
-		if err != nil {
-			return server, err
-		}
-		if claimed {
-			switch state := strings.ToLower(strings.TrimSpace(claim.Labels["state"])); state {
-			case "stopped", "deleting":
-				return server, exit(4, "nvidia-brev lease=%s is %s", claim.LeaseID, state)
+	if strings.TrimSpace(b.cfg.NvidiaBrev.Org) != "" {
+		return core.Exit(4, "nvidiaBrev.org scopes read-only Brev inventory; refusing lease touch")
+	}
+	expected, exists, set := core.ServerLeaseClaimSnapshot(lease.Server)
+	if !set || !exists || expected.Revision != claim.Revision || claim.Provider != providerName ||
+		lease.LeaseID != claim.LeaseID || claim.CloudID == "" || lease.Server.CloudID != claim.CloudID ||
+		claim.Labels["brev_org_id"] == "" || lease.Server.Labels["brev_org_id"] != claim.Labels["brev_org_id"] {
+		return core.Exit(4, "nvidia-brev lease %s touch identity or claim changed; resolve again", lease.LeaseID)
+	}
+	switch state := strings.ToLower(strings.TrimSpace(claim.Labels["state"])); state {
+	case "stopped", "stopping", "deleting":
+		return core.Exit(4, "nvidia-brev lease=%s is %s", claim.LeaseID, state)
+	}
+	return nil
+}
+
+func (b *nvidiaBrevBackend) Touch(ctx context.Context, req core.TouchRequest) (core.Server, error) {
+	updated, err := shared.CommitClaimTouch(ctx, req, shared.ClaimTouchPolicy{
+		Provider:  providerName,
+		Authorize: b.AuthorizeStatusTouchClaim,
+		Prepare: func(claim core.LeaseClaim) (map[string]string, time.Time) {
+			now := core.ClockNow(b.rt.Clock).UTC()
+			labels := core.TouchDirectLeaseLabelsWithIdleTimeoutOverride(shared.ClaimLifecycleLabels(claim), b.configForRun(), req.State, now, req.IdleTimeoutOverride)
+			// Only a prepared target supplies new provenance; heartbeats preserve it.
+			if req.Lease.SSH.SSHConfigData != nil {
+				labels[brevSSHConfigDigestLabel] = brevSSHConfigDigest(req.Lease.SSH.SSHConfigData)
+				if target := req.Lease.Server.Labels["brev_target"]; target != "" {
+					labels["brev_target"] = target
+				}
 			}
-			server = serverWithClaimLabels(server, claim)
-		}
+			return labels, now
+		},
+	})
+	if err != nil {
+		return core.Server{}, err
 	}
-	if server.Labels == nil {
-		server.Labels = map[string]string{}
-	}
-	server.Labels = touchDirectLeaseLabels(server.Labels, cfg, req.State)
-	if strings.TrimSpace(req.State) != "" {
-		server.Status = strings.TrimSpace(req.State)
-	} else if state := strings.TrimSpace(server.Labels["state"]); state != "" {
-		server.Status = state
-	}
-	if claimed && claim.RepoRoot != "" {
-		if _, err := claimLeaseTargetForRepoConfigIfUnchanged(claim.LeaseID, claim.Slug, cfg, server, req.Lease.SSH, claim.RepoRoot, false, claim, true); err != nil {
-			return server, err
-		}
-	}
+	server := req.Lease.Server
+	server.Labels = shared.CloneLabels(updated.Labels)
+	server.Status = server.Labels["state"]
+	core.SetServerLeaseClaimSnapshot(&server, updated, true)
 	return server, nil
 }
 
-func (b *nvidiaBrevBackend) Cleanup(ctx context.Context, req CleanupRequest) error {
+func (b *nvidiaBrevBackend) Cleanup(ctx context.Context, req core.CleanupRequest) error {
 	client, err := b.client()
 	if err != nil {
 		return err
@@ -358,7 +386,7 @@ func (b *nvidiaBrevBackend) Cleanup(ctx context.Context, req CleanupRequest) err
 	}
 	var errs []error
 	handledDeletingWorkspaces := map[string]struct{}{}
-	claims, err := listLeaseClaims()
+	claims, err := core.ListLeaseClaims()
 	if err != nil {
 		return err
 	}
@@ -374,7 +402,7 @@ func (b *nvidiaBrevBackend) Cleanup(ctx context.Context, req CleanupRequest) err
 		handledDeletingWorkspaces[brevWorkspaceKey(workspace)] = struct{}{}
 		identifier := workspaceIdentifier(workspace)
 		if identifier == "" {
-			errs = append(errs, exit(2, "nvidia-brev deleting lease=%s has no workspace id or name", claim.LeaseID))
+			errs = append(errs, core.Exit(2, "nvidia-brev deleting lease=%s has no workspace id or name", claim.LeaseID))
 			continue
 		}
 		if req.DryRun {
@@ -451,7 +479,7 @@ func (b *nvidiaBrevBackend) Cleanup(ctx context.Context, req CleanupRequest) err
 	return errors.Join(errs...)
 }
 
-func (b *nvidiaBrevBackend) cleanupEligible(workspace brevWorkspace, claim LeaseClaim, claimed bool) (bool, string) {
+func (b *nvidiaBrevBackend) cleanupEligible(workspace brevWorkspace, claim core.LeaseClaim, claimed bool) (bool, string) {
 	if !claimed {
 		return false, "no-local-cleanup-claim"
 	}
@@ -496,7 +524,7 @@ func parseBrevClaimTime(value string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func (b *nvidiaBrevBackend) stopWorkspaceAndPersistClaim(ctx context.Context, client *brevClient, workspace brevWorkspace, claim LeaseClaim) error {
+func (b *nvidiaBrevBackend) stopWorkspaceAndPersistClaim(ctx context.Context, client *brevClient, workspace brevWorkspace, claim core.LeaseClaim) error {
 	updated, err := b.ensureClaimActiveBrevOrgScope(ctx, client, workspace, claim)
 	if err != nil {
 		return err
@@ -510,7 +538,11 @@ func (b *nvidiaBrevBackend) stopWorkspaceAndPersistClaim(ctx context.Context, cl
 	})
 }
 
-func (b *nvidiaBrevBackend) deleteWorkspaceAndRemoveClaim(ctx context.Context, client *brevClient, workspace brevWorkspace, claim LeaseClaim) error {
+func (b *nvidiaBrevBackend) deleteWorkspaceAndRemoveClaim(ctx context.Context, client *brevClient, workspace brevWorkspace, claim core.LeaseClaim) error {
+	return b.deleteWorkspaceAndRemoveClaimWithOutcome(ctx, client, workspace, claim, &core.ReleaseLeaseOutcome{})
+}
+
+func (b *nvidiaBrevBackend) deleteWorkspaceAndRemoveClaimWithOutcome(ctx context.Context, client *brevClient, workspace brevWorkspace, claim core.LeaseClaim, outcome *core.ReleaseLeaseOutcome) error {
 	updatedClaim, err := b.ensureClaimActiveBrevOrgScope(ctx, client, workspace, claim)
 	if err != nil {
 		return err
@@ -520,7 +552,7 @@ func (b *nvidiaBrevBackend) deleteWorkspaceAndRemoveClaim(ctx context.Context, c
 	deleting.Status = "deleting"
 	deleting.Labels["state"] = "deleting"
 	deleting.Labels["release"] = "delete"
-	updated, err := updateLeaseClaimEndpointIfUnchanged(claim.LeaseID, claim, deleting, SSHTarget{})
+	updated, err := core.UpdateLeaseClaimEndpointIfUnchanged(claim.LeaseID, claim, deleting, core.SSHTarget{})
 	if err != nil {
 		return err
 	}
@@ -530,56 +562,56 @@ func (b *nvidiaBrevBackend) deleteWorkspaceAndRemoveClaim(ctx context.Context, c
 	if err := b.releaseWorkspace(ctx, client, workspace, "delete"); err != nil {
 		return err
 	}
-	return b.finishDeletingClaim(ctx, client, workspace, updated)
+	return b.finishDeletingClaimWithOutcome(ctx, client, workspace, updated, outcome)
 }
 
-func (b *nvidiaBrevBackend) ensureClaimActiveBrevOrgScope(ctx context.Context, client *brevClient, workspace brevWorkspace, claim LeaseClaim) (LeaseClaim, error) {
+func (b *nvidiaBrevBackend) ensureClaimActiveBrevOrgScope(ctx context.Context, client *brevClient, workspace brevWorkspace, claim core.LeaseClaim) (core.LeaseClaim, error) {
 	if strings.TrimSpace(claim.Labels["brev_org_id"]) != "" {
 		_, err := verifyActiveBrevOrgScope(ctx, client, claim)
 		if err != nil {
-			return LeaseClaim{}, err
+			return core.LeaseClaim{}, err
 		}
 		return claim, nil
 	}
 	active, err := client.activeOrg(ctx)
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	workspaces, err := client.list(ctx, true)
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	current, found, err := findBrevWorkspace(workspaces, workspaceIdentifier(workspace))
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	if !found || !claimMatchesWorkspace(claim, current) {
-		return LeaseClaim{}, exit(2, "cannot safely bind nvidia-brev lease=%s to the active organization; local claim retained", claim.LeaseID)
+		return core.LeaseClaim{}, core.Exit(2, "cannot safely bind nvidia-brev lease=%s to the active organization; local claim retained", claim.LeaseID)
 	}
 	after, err := client.activeOrg(ctx)
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	if active.ID != after.ID {
-		return LeaseClaim{}, exit(2, "active Brev organization changed while validating lease scope; local claim retained")
+		return core.LeaseClaim{}, core.Exit(2, "active Brev organization changed while validating lease scope; local claim retained")
 	}
 	server := workspaceToClaimedServer(b.configForRun(), current, claim.LeaseID, claim.Slug, claim)
 	server.Labels["brev_org_id"] = active.ID
-	updated, err := updateLeaseClaimEndpointIfUnchanged(claim.LeaseID, claim, server, SSHTarget{})
+	updated, err := core.UpdateLeaseClaimEndpointIfUnchanged(claim.LeaseID, claim, server, core.SSHTarget{})
 	if err != nil {
-		return LeaseClaim{}, err
+		return core.LeaseClaim{}, err
 	}
 	return updated, nil
 }
 
-func verifyActiveBrevOrgScope(ctx context.Context, client *brevClient, claim LeaseClaim) (string, error) {
+func verifyActiveBrevOrgScope(ctx context.Context, client *brevClient, claim core.LeaseClaim) (string, error) {
 	active, err := client.activeOrg(ctx)
 	if err != nil {
 		return "", err
 	}
 	stored := strings.TrimSpace(claim.Labels["brev_org_id"])
 	if stored != "" && stored != active.ID {
-		return "", exit(2, "active Brev organization changed; run `brev set` for the lease organization before lifecycle operations")
+		return "", core.Exit(2, "active Brev organization changed; verify `brev org ls` and use credentials for the lease organization (BREV_API_KEY overrides `brev set`); local claim retained")
 	}
 	return active.ID, nil
 }
@@ -590,15 +622,15 @@ func requireActiveBrevOrg(ctx context.Context, client *brevClient, orgID string)
 		return err
 	}
 	if strings.TrimSpace(orgID) == "" || active.ID != strings.TrimSpace(orgID) {
-		return exit(2, "active Brev organization changed; run `brev set` for the lease organization before retrying")
+		return core.Exit(2, "active Brev organization changed; verify `brev org ls` and use credentials for the lease organization (BREV_API_KEY overrides `brev set`) before retrying")
 	}
 	return nil
 }
 
-func (b *nvidiaBrevBackend) deletingClaimWorkspace(ctx context.Context, client *brevClient, claim LeaseClaim) (brevWorkspace, bool, error) {
+func (b *nvidiaBrevBackend) deletingClaimWorkspace(ctx context.Context, client *brevClient, claim core.LeaseClaim) (brevWorkspace, bool, error) {
 	orgID := strings.TrimSpace(claim.Labels["brev_org_id"])
 	if orgID == "" {
-		return brevWorkspace{}, false, exit(2, "nvidia-brev deleting lease=%s has no organization scope; local claim retained", claim.LeaseID)
+		return brevWorkspace{}, false, core.Exit(2, "nvidia-brev deleting lease=%s has no organization scope; local claim retained", claim.LeaseID)
 	}
 	if err := requireActiveBrevOrg(ctx, client, orgID); err != nil {
 		return brevWorkspace{}, false, err
@@ -618,9 +650,13 @@ func (b *nvidiaBrevBackend) deletingClaimWorkspace(ctx context.Context, client *
 	return current, found, nil
 }
 
-func (b *nvidiaBrevBackend) reconcileDeletingClaim(ctx context.Context, client *brevClient, claim LeaseClaim) error {
+func (b *nvidiaBrevBackend) reconcileDeletingClaim(ctx context.Context, client *brevClient, claim core.LeaseClaim) error {
+	return b.reconcileDeletingClaimWithOutcome(ctx, client, claim, &core.ReleaseLeaseOutcome{})
+}
+
+func (b *nvidiaBrevBackend) reconcileDeletingClaimWithOutcome(ctx context.Context, client *brevClient, claim core.LeaseClaim, outcome *core.ReleaseLeaseOutcome) error {
 	if strings.EqualFold(strings.TrimSpace(claim.Labels["brev_recovery"]), "org_changed") {
-		return exit(2, "nvidia-brev active organization changed during workspace creation; automatic deletion is unsafe and recovery claim for lease=%s was retained for manual reconciliation", claim.LeaseID)
+		return core.Exit(2, "nvidia-brev active organization changed during workspace creation; automatic deletion is unsafe and recovery claim for lease=%s was retained for manual reconciliation", claim.LeaseID)
 	}
 	workspace := brevWorkspace{
 		ID:     claim.CloudID,
@@ -628,7 +664,7 @@ func (b *nvidiaBrevBackend) reconcileDeletingClaim(ctx context.Context, client *
 		Status: claim.Labels["brev_status"],
 	}
 	if workspaceIdentifier(workspace) == "" {
-		return exit(2, "nvidia-brev deleting lease=%s has no workspace id or name", claim.LeaseID)
+		return core.Exit(2, "nvidia-brev deleting lease=%s has no workspace id or name", claim.LeaseID)
 	}
 	current, found, err := b.deletingClaimWorkspace(ctx, client, claim)
 	if err != nil {
@@ -638,10 +674,11 @@ func (b *nvidiaBrevBackend) reconcileDeletingClaim(ctx context.Context, client *
 		if strings.EqualFold(strings.TrimSpace(claim.Labels["brev_recovery"]), "create_unknown") && strings.TrimSpace(claim.CloudID) == "" {
 			createdAt, ok := parseBrevClaimTime(claim.Labels["created_at"])
 			if !ok || time.Since(createdAt) < brevCreateRecoveryGrace {
-				return exit(5, "nvidia-brev workspace for lease=%s has not appeared; ambiguous create recovery claim retained", claim.LeaseID)
+				return core.Exit(5, "nvidia-brev workspace for lease=%s has not appeared; ambiguous create recovery claim retained", claim.LeaseID)
 			}
 		}
-		return removeLeaseClaimIfUnchanged(claim.LeaseID, claim)
+		outcome.Terminal = true
+		return core.RemoveLeaseClaimIfUnchanged(claim.LeaseID, claim)
 	}
 	if !strings.EqualFold(strings.TrimSpace(current.Status), "deleting") {
 		if err := requireActiveBrevOrg(ctx, client, claim.Labels["brev_org_id"]); err != nil {
@@ -651,30 +688,35 @@ func (b *nvidiaBrevBackend) reconcileDeletingClaim(ctx context.Context, client *
 			return err
 		}
 	}
-	return b.finishDeletingClaim(ctx, client, current, claim)
+	return b.finishDeletingClaimWithOutcome(ctx, client, current, claim, outcome)
 }
 
-func (b *nvidiaBrevBackend) finishDeletingClaim(ctx context.Context, client *brevClient, workspace brevWorkspace, claim LeaseClaim) error {
+func (b *nvidiaBrevBackend) finishDeletingClaim(ctx context.Context, client *brevClient, workspace brevWorkspace, claim core.LeaseClaim) error {
+	return b.finishDeletingClaimWithOutcome(ctx, client, workspace, claim, &core.ReleaseLeaseOutcome{})
+}
+
+func (b *nvidiaBrevBackend) finishDeletingClaimWithOutcome(ctx context.Context, client *brevClient, workspace brevWorkspace, claim core.LeaseClaim, outcome *core.ReleaseLeaseOutcome) error {
 	if err := b.waitForWorkspaceDeleted(ctx, client, workspace, strings.TrimSpace(claim.Labels["brev_org_id"])); err != nil {
 		return err
 	}
-	return removeLeaseClaimIfUnchanged(claim.LeaseID, claim)
+	outcome.Terminal = true
+	return core.RemoveLeaseClaimIfUnchanged(claim.LeaseID, claim)
 }
 
-func deletingLeaseTarget(claim LeaseClaim) LeaseTarget {
+func deletingLeaseTarget(claim core.LeaseClaim) core.LeaseTarget {
 	return claimLeaseTargetWithStatus(claim, "deleting")
 }
 
-func claimStateLeaseTarget(claim LeaseClaim) LeaseTarget {
-	return claimLeaseTargetWithStatus(claim, firstNonEmpty(claim.Labels["state"], "failed"))
+func claimStateLeaseTarget(claim core.LeaseClaim) core.LeaseTarget {
+	return claimLeaseTargetWithStatus(claim, shared.FirstNonBlankTrimmed(claim.Labels["state"], "failed"))
 }
 
-func claimLeaseTargetWithStatus(claim LeaseClaim, status string) LeaseTarget {
+func claimLeaseTargetWithStatus(claim core.LeaseClaim, status string) core.LeaseTarget {
 	labels := make(map[string]string, len(claim.Labels))
 	for key, value := range claim.Labels {
 		labels[key] = value
 	}
-	server := Server{
+	server := core.Server{
 		CloudID:  claim.CloudID,
 		Provider: providerName,
 		Name:     labels["brev_workspace_name"],
@@ -682,10 +724,10 @@ func claimLeaseTargetWithStatus(claim LeaseClaim, status string) LeaseTarget {
 		Labels:   labels,
 	}
 	server.ServerType.Name = labels["server_type"]
-	return LeaseTarget{LeaseID: claim.LeaseID, Server: server}
+	return core.LeaseTarget{LeaseID: claim.LeaseID, Server: server}
 }
 
-func createRecoveryClaim(claim LeaseClaim) bool {
+func createRecoveryClaim(claim core.LeaseClaim) bool {
 	return createRecoveryLabels(claim.Labels)
 }
 
@@ -698,7 +740,7 @@ func createRecoveryLabels(labels map[string]string) bool {
 	}
 }
 
-func (b *nvidiaBrevBackend) reconcileCreateRecoveryClaim(ctx context.Context, client *brevClient, claim LeaseClaim) error {
+func (b *nvidiaBrevBackend) reconcileCreateRecoveryClaim(ctx context.Context, client *brevClient, claim core.LeaseClaim, outcome *core.ReleaseLeaseOutcome) error {
 	current, found, err := b.deletingClaimWorkspace(ctx, client, claim)
 	if err != nil {
 		return err
@@ -706,14 +748,15 @@ func (b *nvidiaBrevBackend) reconcileCreateRecoveryClaim(ctx context.Context, cl
 	if !found {
 		createdAt, ok := parseBrevClaimTime(claim.Labels["created_at"])
 		if !ok || time.Since(createdAt) < brevCreateRecoveryGrace {
-			return exit(5, "nvidia-brev workspace for lease=%s has not appeared; create recovery claim retained", claim.LeaseID)
+			return core.Exit(5, "nvidia-brev workspace for lease=%s has not appeared; create recovery claim retained", claim.LeaseID)
 		}
-		return removeLeaseClaimIfUnchanged(claim.LeaseID, claim)
+		outcome.Terminal = true
+		return core.RemoveLeaseClaimIfUnchanged(claim.LeaseID, claim)
 	}
 	if b.releaseAction(claim.Labels) == "stop" {
 		return b.stopWorkspaceAndPersistClaim(ctx, client, current, claim)
 	}
-	return b.deleteWorkspaceAndRemoveClaim(ctx, client, current, claim)
+	return b.deleteWorkspaceAndRemoveClaimWithOutcome(ctx, client, current, claim, outcome)
 }
 
 func brevWorkspaceKey(workspace brevWorkspace) string {
@@ -725,98 +768,86 @@ func brevWorkspaceKey(workspace brevWorkspace) string {
 
 func (b *nvidiaBrevBackend) waitForWorkspaceDeleted(ctx context.Context, client *brevClient, workspace brevWorkspace, orgID string) error {
 	if orgID == "" {
-		return exit(2, "nvidia-brev deleting lease has no organization scope; local claim retained")
+		return core.Exit(2, "nvidia-brev deleting lease has no organization scope; local claim retained")
 	}
 	id := workspaceIdentifier(workspace)
 	deadline := time.Now().Add(brevDeletePollTimeout)
 	if err := requireActiveBrevOrg(ctx, client, orgID); err != nil {
 		return err
 	}
-	for {
-		workspaces, err := client.list(ctx, true)
-		if err != nil {
-			return err
-		}
-		_, found, err := findBrevWorkspace(workspaces, id)
-		if err != nil {
-			return err
-		}
-		if !found {
-			if err := requireActiveBrevOrg(ctx, client, orgID); err != nil {
-				return err
+	_, err := shared.Poll(context.WithoutCancel(ctx), 0, brevDeletePollInterval,
+		func(context.Context, time.Duration) error {
+			if err := shared.SleepContext(ctx, brevDeletePollInterval); err != nil {
+				return ctx.Err()
 			}
 			return nil
-		}
-		if time.Now().After(deadline) {
-			return exit(5, "timed out waiting for nvidia-brev workspace %s deletion; local claim retained", safeWorkspaceRef(workspace))
-		}
-		timer := time.NewTimer(brevDeletePollInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+		},
+		func(context.Context) ([]brevWorkspace, error) { return client.list(ctx, true) },
+		func(_ context.Context, workspaces []brevWorkspace, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			_, found, err := findBrevWorkspace(workspaces, id)
+			if err != nil {
+				return false, err
+			}
+			if !found {
+				if err := requireActiveBrevOrg(ctx, client, orgID); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			if time.Now().After(deadline) {
+				return false, core.Exit(5, "timed out waiting for nvidia-brev workspace %s deletion; local claim retained", safeWorkspaceRef(workspace))
+			}
+			return false, nil
+		}, nil)
+	return err
 }
 
-func (b *nvidiaBrevBackend) persistStoppedClaim(workspace brevWorkspace, claim LeaseClaim, action func() error) error {
+func (b *nvidiaBrevBackend) persistStoppedClaim(workspace brevWorkspace, claim core.LeaseClaim, action func() error) error {
 	stopped := workspaceToClaimedServer(b.configForRun(), workspace, claim.LeaseID, claim.Slug, claim)
 	stopped.Status = "stopped"
 	stopped.Labels["state"] = "stopped"
 	stopped.Labels["release"] = "stop"
-	if _, err := updateLeaseClaimEndpointIfUnchangedAfter(claim.LeaseID, claim, stopped, SSHTarget{}, action); err != nil {
+	if _, err := core.UpdateLeaseClaimEndpointIfUnchangedAfter(claim.LeaseID, claim, stopped, core.SSHTarget{}, action); err != nil {
 		return fmt.Errorf("persist stopped nvidia-brev lease claim: %w", err)
 	}
 	return nil
 }
 
-func (b *nvidiaBrevBackend) Doctor(ctx context.Context, _ DoctorRequest) (DoctorResult, error) {
+func (b *nvidiaBrevBackend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
 	client, err := b.client()
 	if err != nil {
-		return DoctorResult{}, err
+		return core.DoctorResult{}, err
 	}
 	if _, err := client.version(ctx); err != nil {
-		return DoctorResult{}, exit(2, "nvidia-brev CLI check failed: %v", err)
+		return core.DoctorResult{}, core.Exit(2, "nvidia-brev CLI check failed: %v", err)
 	}
 	workspaces, err := client.list(ctx, false)
 	if err != nil {
-		return DoctorResult{}, exit(1, "nvidia-brev auth/list check failed: %v", err)
+		return core.DoctorResult{}, core.Exit(1, "nvidia-brev auth/list check failed: %v", err)
 	}
-	return cliDoctorResult(providerName, len(workspaces), "unchecked"), nil
+	return core.CLIDoctorResult(providerName, len(workspaces), "unchecked"), nil
 }
 
 func (b *nvidiaBrevBackend) client() (*brevClient, error) {
 	return newBrevClient(b.configForRun(), b.rt)
 }
 
-func (b *nvidiaBrevBackend) configForRun() Config {
+func (b *nvidiaBrevBackend) configForRun() core.Config {
 	cfg := b.cfg
 	applyNvidiaBrevDefaults(&cfg)
 	return cfg
 }
 
-func applyNvidiaBrevDefaults(cfg *Config) {
+func applyNvidiaBrevDefaults(cfg *core.Config) {
 	cfg.Provider = providerName
 	if cfg.TargetOS == "" {
 		cfg.TargetOS = targetLinux
 	}
-	if cfg.NvidiaBrev.CLI == "" {
-		cfg.NvidiaBrev.CLI = "brev"
-	}
-	if cfg.NvidiaBrev.GPUName == "" {
-		cfg.NvidiaBrev.GPUName = "A100"
-	}
-	if cfg.NvidiaBrev.Mode == "" {
-		cfg.NvidiaBrev.Mode = "vm"
-	}
-	if cfg.NvidiaBrev.ReleaseAction == "" {
-		cfg.NvidiaBrev.ReleaseAction = "delete"
-	}
-	if cfg.NvidiaBrev.Target == "" {
-		cfg.NvidiaBrev.Target = "container"
-	}
-	cfg.NvidiaBrev.WorkRoot = effectiveNvidiaBrevWorkRoot(*cfg)
+	cfg.NvidiaBrev = cfg.NvidiaBrev.WithRuntimeDefaults()
+	cfg.NvidiaBrev.WorkRoot = core.EffectiveNvidiaBrevWorkRoot(*cfg)
 	if cfg.NvidiaBrev.User != "" {
 		cfg.SSHUser = cfg.NvidiaBrev.User
 	}
@@ -835,79 +866,106 @@ func (b *nvidiaBrevBackend) waitForWorkspaceReady(ctx context.Context, client *b
 	}
 	var observed brevWorkspace
 	observedOrgID := ""
-	for {
-		workspaces, err := client.list(ctx, true)
-		if err != nil {
-			return brevWorkspace{}, "", err
-		}
-		workspace, found, err := findBrevWorkspace(workspaces, name)
-		if err != nil {
-			return brevWorkspace{}, "", err
-		}
-		if found {
-			observed = workspace
-		}
-		if found && observedOrgID == "" {
-			activeAfter, err := client.activeOrg(ctx)
-			if err != nil {
-				return brevWorkspace{}, "", err
-			}
-			if activeBefore.ID != activeAfter.ID {
-				return workspace, activeBefore.ID, &brevOrgChangedError{beforeID: activeBefore.ID, afterID: activeAfter.ID}
-			}
-			observedOrgID = activeAfter.ID
-		}
-		if found && brevWorkspaceReady(workspace) {
-			activeAfter, err := client.activeOrg(ctx)
-			if err != nil {
-				return brevWorkspace{}, "", err
-			}
-			if observedOrgID != activeAfter.ID {
-				return workspace, observedOrgID, &brevOrgChangedError{beforeID: observedOrgID, afterID: activeAfter.ID}
-			}
-			return workspace, activeAfter.ID, nil
-		}
-		if time.Now().After(deadline) {
-			if found {
-				activeAfter, orgErr := client.activeOrg(ctx)
-				if orgErr != nil {
-					return brevWorkspace{}, "", orgErr
-				}
-				if observedOrgID != "" && observedOrgID != activeAfter.ID {
-					return workspace, observedOrgID, &brevOrgChangedError{beforeID: observedOrgID, afterID: activeAfter.ID}
-				}
-				return workspace, observedOrgID, exit(5, "timed out waiting for nvidia-brev workspace %s to become ready (status=%s build=%s shell=%s health=%s)", safeWorkspaceRef(workspace), workspace.Status, workspace.BuildStatus, workspace.ShellStatus, workspace.HealthStatus)
-			}
-			return observed, observedOrgID, exit(5, "timed out waiting for nvidia-brev workspace %q to appear", name)
-		}
-		timer := time.NewTimer(brevAcquirePollInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return brevWorkspace{}, "", ctx.Err()
-		case <-timer.C:
-		}
+	var errorWorkspace brevWorkspace
+	errorOrgID := ""
+	type observation struct {
+		workspace brevWorkspace
+		found     bool
 	}
+	result, err := shared.Poll(context.WithoutCancel(ctx), 0, brevAcquirePollInterval,
+		func(context.Context, time.Duration) error {
+			if err := shared.SleepContext(ctx, brevAcquirePollInterval); err != nil {
+				return ctx.Err()
+			}
+			return nil
+		},
+		func(context.Context) (observation, error) {
+			workspaces, err := client.list(ctx, true)
+			if err != nil {
+				return observation{}, err
+			}
+			workspace, found, err := findBrevWorkspace(workspaces, name)
+			return observation{workspace: workspace, found: found}, err
+		},
+		func(_ context.Context, current observation, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			workspace, found := current.workspace, current.found
+			if found {
+				observed = workspace
+			}
+			if found && observedOrgID == "" {
+				activeAfter, err := client.activeOrg(ctx)
+				if err != nil {
+					return false, err
+				}
+				if activeBefore.ID != activeAfter.ID {
+					errorWorkspace = workspace
+					errorOrgID = activeBefore.ID
+					return false, &brevOrgChangedError{beforeID: activeBefore.ID, afterID: activeAfter.ID}
+				}
+				observedOrgID = activeAfter.ID
+			}
+			if found && brevWorkspaceReady(workspace) {
+				activeAfter, err := client.activeOrg(ctx)
+				if err != nil {
+					return false, err
+				}
+				if observedOrgID != activeAfter.ID {
+					errorWorkspace = workspace
+					errorOrgID = observedOrgID
+					return false, &brevOrgChangedError{beforeID: observedOrgID, afterID: activeAfter.ID}
+				}
+				observedOrgID = activeAfter.ID
+				return true, nil
+			}
+			if time.Now().After(deadline) {
+				if found {
+					activeAfter, orgErr := client.activeOrg(ctx)
+					if orgErr != nil {
+						return false, orgErr
+					}
+					if observedOrgID != "" && observedOrgID != activeAfter.ID {
+						errorWorkspace = workspace
+						errorOrgID = observedOrgID
+						return false, &brevOrgChangedError{beforeID: observedOrgID, afterID: activeAfter.ID}
+					}
+					errorWorkspace = workspace
+					errorOrgID = observedOrgID
+					return false, core.Exit(5, "timed out waiting for nvidia-brev workspace %s to become ready (status=%s build=%s shell=%s health=%s)", safeWorkspaceRef(workspace), workspace.Status, workspace.BuildStatus, workspace.ShellStatus, workspace.HealthStatus)
+				}
+				errorWorkspace = observed
+				errorOrgID = observedOrgID
+				return false, core.Exit(5, "timed out waiting for nvidia-brev workspace %q to appear", name)
+			}
+			return false, nil
+		}, nil)
+	if err != nil {
+		return errorWorkspace, errorOrgID, err
+	}
+	return result.Value.workspace, observedOrgID, nil
 }
 
-func (b *nvidiaBrevBackend) prepareLease(ctx context.Context, client *brevClient, cfg Config, workspace brevWorkspace, orgID, leaseID, slug string, keep, probeSSH bool) (LeaseTarget, error) {
-	target, err := b.resolveSSHTarget(ctx, client, cfg, workspace, orgID)
+func (b *nvidiaBrevBackend) prepareLease(ctx context.Context, client *brevClient, cfg core.Config, workspace brevWorkspace, orgID, leaseID, slug string, keep, probeSSH bool) (core.LeaseTarget, error) {
+	target, err := b.resolveSSHTarget(ctx, client, cfg, workspace, orgID, true, "")
 	if err != nil {
-		return LeaseTarget{}, err
+		return core.LeaseTarget{}, err
 	}
 	server := workspaceToServer(cfg, workspace, leaseID, slug, keep)
+	server.Labels[brevSSHConfigDigestLabel] = brevSSHConfigDigest(target.SSHConfigData)
 	if probeSSH {
 		if err := waitForSSH(ctx, &target, b.rt.Stderr); err != nil {
-			return LeaseTarget{}, err
+			return core.LeaseTarget{}, err
 		}
 	}
-	return LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
+	return core.LeaseTarget{Server: server, SSH: target, LeaseID: leaseID}, nil
 }
 
 func (b *nvidiaBrevBackend) startStoppedWorkspace(ctx context.Context, client *brevClient, workspace brevWorkspace, orgID string) (brevWorkspace, error) {
 	id := workspaceIdentifier(workspace)
 	if id == "" {
-		return brevWorkspace{}, exit(2, "nvidia-brev start requires workspace id or name")
+		return brevWorkspace{}, core.Exit(2, "nvidia-brev start requires workspace id or name")
 	}
 	if err := requireActiveBrevOrg(ctx, client, orgID); err != nil {
 		return brevWorkspace{}, err
@@ -920,33 +978,47 @@ func (b *nvidiaBrevBackend) startStoppedWorkspace(ctx context.Context, client *b
 	return workspace, err
 }
 
-func (b *nvidiaBrevBackend) resolveSSHTarget(ctx context.Context, client *brevClient, cfg Config, workspace brevWorkspace, orgID string) (SSHTarget, error) {
+func (b *nvidiaBrevBackend) resolveSSHTarget(ctx context.Context, client *brevClient, cfg core.Config, workspace brevWorkspace, orgID string, refresh bool, expectedDigest string) (core.SSHTarget, error) {
 	if strings.TrimSpace(cfg.NvidiaBrev.Org) != "" {
-		return SSHTarget{}, exit(2, "nvidiaBrev.org scopes read-only Brev inventory only; brev refresh does not support --org, so SSH lifecycle resolution is unsafe. Run `brev set` for the desired active org or remove nvidiaBrev.org before using nvidia-brev SSH lifecycle commands")
+		return core.SSHTarget{}, core.Exit(2, "nvidiaBrev.org scopes read-only Brev inventory only; brev refresh does not support --org, so SSH lifecycle resolution is unsafe. Run `brev set` for the desired active org or remove nvidiaBrev.org before using nvidia-brev SSH lifecycle commands")
 	}
 	if err := requireActiveBrevOrg(ctx, client, orgID); err != nil {
-		return SSHTarget{}, err
+		return core.SSHTarget{}, err
 	}
-	if err := client.refresh(ctx); err != nil {
-		return SSHTarget{}, err
+	if !refresh && expectedDigest == "" {
+		return core.SSHTarget{}, nil
+	}
+	if refresh {
+		if err := client.refresh(ctx); err != nil {
+			return core.SSHTarget{}, err
+		}
 	}
 	path := defaultBrevSSHConfigPath()
 	data, err := os.ReadFile(path)
+	if !refresh && errors.Is(err, os.ErrNotExist) {
+		return core.SSHTarget{}, nil
+	}
 	if err != nil {
-		return SSHTarget{}, exit(2, "read nvidia-brev SSH config %s: %v", path, err)
+		return core.SSHTarget{}, core.Exit(2, "read nvidia-brev SSH config %s: %v", path, err)
 	}
 	if err := requireActiveBrevOrg(ctx, client, orgID); err != nil {
-		return SSHTarget{}, err
+		return core.SSHTarget{}, err
+	}
+	if !refresh && brevSSHConfigDigest(data) != expectedDigest {
+		return core.SSHTarget{}, nil
 	}
 	alias := brevSSHConfigAlias(workspace.Name, cfg.NvidiaBrev.Target)
-	target, err := selectBrevSSHTarget(cfg, string(data), alias)
+	target, err := client.resolveSSHConfig(ctx, cfg, path, alias, data)
+	if !refresh && errors.Is(err, errBrevSSHRouteMissing) {
+		return core.SSHTarget{}, nil
+	}
 	if err != nil {
-		return SSHTarget{}, err
+		return core.SSHTarget{}, err
 	}
 	return target, nil
 }
 
-func (b *nvidiaBrevBackend) rollbackOrRetainCreatedWorkspace(workspace brevWorkspace, orgID, leaseID, slug string, cfg Config, req AcquireRequest, cause error) error {
+func (b *nvidiaBrevBackend) rollbackOrRetainCreatedWorkspace(workspace brevWorkspace, orgID, leaseID, slug string, cfg core.Config, req core.AcquireRequest, cause error) error {
 	server := workspaceToServer(cfg, workspace, leaseID, slug, false)
 	server.Status = "deleting"
 	server.Labels["state"] = "deleting"
@@ -955,7 +1027,7 @@ func (b *nvidiaBrevBackend) rollbackOrRetainCreatedWorkspace(workspace brevWorks
 	if workspace.ID == "" {
 		server.Labels["brev_recovery"] = "create_unknown"
 	}
-	persistErr := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, SSHTarget{}, req.Repo.Root, req.Reclaim)
+	persistErr := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, req.Repo.Root, req.Reclaim)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	client, err := b.client()
@@ -993,7 +1065,7 @@ func (b *nvidiaBrevBackend) rollbackOrRetainCreatedWorkspace(workspace brevWorks
 	return cause
 }
 
-func (b *nvidiaBrevBackend) retainAmbiguousCreateOrganizationClaim(workspace brevWorkspace, createOrgID, observedOrgID, currentOrgID, leaseID, slug string, cfg Config, req AcquireRequest, cause error) error {
+func (b *nvidiaBrevBackend) retainAmbiguousCreateOrganizationClaim(workspace brevWorkspace, createOrgID, observedOrgID, currentOrgID, leaseID, slug string, cfg core.Config, req core.AcquireRequest, cause error) error {
 	server := workspaceToServer(cfg, workspace, leaseID, slug, req.Keep)
 	server.Status = "deleting"
 	server.Labels["state"] = "deleting"
@@ -1003,13 +1075,13 @@ func (b *nvidiaBrevBackend) retainAmbiguousCreateOrganizationClaim(workspace bre
 	server.Labels["brev_observed_org_id"] = observedOrgID
 	server.Labels["brev_current_org_id"] = currentOrgID
 	delete(server.Labels, "brev_org_id")
-	if err := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, SSHTarget{}, req.Repo.Root, req.Reclaim); err != nil {
+	if err := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, req.Repo.Root, req.Reclaim); err != nil {
 		return errors.Join(cause, fmt.Errorf("persist nvidia-brev organization-change recovery claim: %w", err))
 	}
-	return errors.Join(cause, exit(2, "automatic rollback is unsafe because workspace ownership is ambiguous; recovery claim retained for lease=%s", leaseID))
+	return errors.Join(cause, core.Exit(2, "automatic rollback is unsafe because workspace ownership is ambiguous; recovery claim retained for lease=%s", leaseID))
 }
 
-func (b *nvidiaBrevBackend) reconcileCreateFailure(client *brevClient, workspace brevWorkspace, createOrgID, leaseID, slug string, cfg Config, req AcquireRequest, cause error) error {
+func (b *nvidiaBrevBackend) reconcileCreateFailure(client *brevClient, workspace brevWorkspace, createOrgID, leaseID, slug string, cfg core.Config, req core.AcquireRequest, cause error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	activeBefore, err := client.activeOrg(ctx)
@@ -1046,7 +1118,7 @@ func (b *nvidiaBrevBackend) reconcileCreateFailure(client *brevClient, workspace
 	return b.rollbackOrRetainCreatedWorkspace(current, createOrgID, leaseID, slug, cfg, req, cause)
 }
 
-func (b *nvidiaBrevBackend) retainCreateUnknownClaim(workspace brevWorkspace, orgID, leaseID, slug string, cfg Config, req AcquireRequest, cause error) error {
+func (b *nvidiaBrevBackend) retainCreateUnknownClaim(workspace brevWorkspace, orgID, leaseID, slug string, cfg core.Config, req core.AcquireRequest, cause error) error {
 	if req.Keep {
 		return b.retainFailedCreatedWorkspace(workspace, orgID, leaseID, slug, cfg, req, "create_unknown", cause)
 	}
@@ -1056,20 +1128,20 @@ func (b *nvidiaBrevBackend) retainCreateUnknownClaim(workspace brevWorkspace, or
 	server.Labels["release"] = "delete"
 	server.Labels["brev_org_id"] = orgID
 	server.Labels["brev_recovery"] = "create_unknown"
-	if err := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, SSHTarget{}, req.Repo.Root, req.Reclaim); err != nil {
+	if err := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, req.Repo.Root, req.Reclaim); err != nil {
 		return errors.Join(cause, fmt.Errorf("persist nvidia-brev ambiguous create recovery claim: %w", err))
 	}
 	return errors.Join(cause, fmt.Errorf("nvidia-brev create outcome is ambiguous; recovery claim retained for lease=%s", leaseID))
 }
 
-func (b *nvidiaBrevBackend) retainFailedCreatedWorkspace(workspace brevWorkspace, orgID, leaseID, slug string, cfg Config, req AcquireRequest, recovery string, cause error) error {
+func (b *nvidiaBrevBackend) retainFailedCreatedWorkspace(workspace brevWorkspace, orgID, leaseID, slug string, cfg core.Config, req core.AcquireRequest, recovery string, cause error) error {
 	server := workspaceToServer(cfg, workspace, leaseID, slug, true)
 	server.Status = "failed"
 	server.Labels["state"] = "failed"
 	server.Labels["keep"] = "true"
 	server.Labels["brev_org_id"] = orgID
 	server.Labels["brev_recovery"] = recovery
-	if err := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, SSHTarget{}, req.Repo.Root, req.Reclaim); err != nil {
+	if err := persistLeaseTargetForRepoConfig(leaseID, slug, cfg, server, core.SSHTarget{}, req.Repo.Root, req.Reclaim); err != nil {
 		return errors.Join(cause, fmt.Errorf("persist retained nvidia-brev recovery claim: %w", err))
 	}
 	return errors.Join(cause, fmt.Errorf("nvidia-brev workspace retained after acquisition failure; recovery claim stored for lease=%s", leaseID))
@@ -1082,55 +1154,55 @@ func recoveryClaimError(err error) error {
 	return fmt.Errorf("persist nvidia-brev recovery claim before rollback: %w", err)
 }
 
-func (b *nvidiaBrevBackend) resolveWorkspace(ctx context.Context, client *brevClient, id string) (brevWorkspace, string, string, LeaseClaim, error) {
+func (b *nvidiaBrevBackend) resolveWorkspace(ctx context.Context, client *brevClient, id string) (brevWorkspace, string, string, core.LeaseClaim, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return brevWorkspace{}, "", "", LeaseClaim{}, exit(2, "nvidia-brev resolve requires lease id, slug, workspace id, or workspace name")
+		return brevWorkspace{}, "", "", core.LeaseClaim{}, core.Exit(2, "nvidia-brev resolve requires lease id, slug, workspace id, or workspace name")
 	}
 	claim, claimed, err := resolveNvidiaBrevClaim(id)
 	if err != nil {
-		return brevWorkspace{}, "", "", LeaseClaim{}, err
+		return brevWorkspace{}, "", "", core.LeaseClaim{}, err
 	}
 	workspaces, err := client.list(ctx, true)
 	if err != nil {
-		return brevWorkspace{}, "", "", LeaseClaim{}, err
+		return brevWorkspace{}, "", "", core.LeaseClaim{}, err
 	}
 	if claimed {
-		workspaceRef := firstNonEmpty(claim.CloudID, claim.Labels["brev_workspace_name"])
+		workspaceRef := shared.FirstNonBlankTrimmed(claim.CloudID, claim.Labels["brev_workspace_name"])
 		if workspace, found, err := findBrevWorkspace(workspaces, workspaceRef); err != nil {
-			return brevWorkspace{}, "", "", LeaseClaim{}, err
+			return brevWorkspace{}, "", "", core.LeaseClaim{}, err
 		} else if found {
 			if !claimMatchesWorkspace(claim, workspace) {
-				return brevWorkspace{}, "", "", LeaseClaim{}, exit(2, "lease=%s claim does not match nvidia-brev workspace %s", claim.LeaseID, safeWorkspaceRef(workspace))
+				return brevWorkspace{}, "", "", core.LeaseClaim{}, core.Exit(2, "lease=%s claim does not match nvidia-brev workspace %s", claim.LeaseID, safeWorkspaceRef(workspace))
 			}
 			leaseID, slug := brevLeaseIdentity(workspace, claim)
 			return workspace, leaseID, slug, claim, nil
 		}
 		if workspaceRef != "" {
-			return brevWorkspace{}, "", "", LeaseClaim{}, exit(4, "nvidia-brev workspace for lease=%s not found", claim.LeaseID)
+			return brevWorkspace{}, "", "", core.LeaseClaim{}, core.Exit(4, "nvidia-brev workspace for lease=%s not found", claim.LeaseID)
 		}
 	}
 	workspace, found, err := findBrevWorkspace(workspaces, id)
 	if err != nil {
-		return brevWorkspace{}, "", "", LeaseClaim{}, err
+		return brevWorkspace{}, "", "", core.LeaseClaim{}, err
 	}
 	if !found {
-		return brevWorkspace{}, "", "", LeaseClaim{}, exit(4, "nvidia-brev workspace not found: %s", id)
+		return brevWorkspace{}, "", "", core.LeaseClaim{}, core.Exit(4, "nvidia-brev workspace not found: %s", id)
 	}
 	if !claimed {
-		claim, claimed, err = resolveLeaseClaimForProviderCloudID(workspace.ID)
+		claim, _, err = resolveLeaseClaimForProviderCloudID(workspace.ID)
 		if err != nil {
-			return brevWorkspace{}, "", "", LeaseClaim{}, err
+			return brevWorkspace{}, "", "", core.LeaseClaim{}, err
 		}
 	}
 	leaseID, slug := brevLeaseIdentity(workspace, claim)
 	return workspace, leaseID, slug, claim, nil
 }
 
-func resolveNvidiaBrevClaim(identifier string) (LeaseClaim, bool, error) {
+func resolveNvidiaBrevClaim(identifier string) (core.LeaseClaim, bool, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
-		return LeaseClaim{}, false, nil
+		return core.LeaseClaim{}, false, nil
 	}
 	if claim, ok, err := resolveLeaseClaimForProvider(identifier); err != nil || ok {
 		return claim, ok, err
@@ -1138,34 +1210,34 @@ func resolveNvidiaBrevClaim(identifier string) (LeaseClaim, bool, error) {
 	if claim, ok, err := resolveLeaseClaimForProviderCloudID(identifier); err != nil || ok {
 		return claim, ok, err
 	}
-	claims, err := listLeaseClaims()
+	claims, err := core.ListLeaseClaims()
 	if err != nil {
-		return LeaseClaim{}, false, err
+		return core.LeaseClaim{}, false, err
 	}
-	var match LeaseClaim
+	var match core.LeaseClaim
 	for _, claim := range claims {
 		if claim.Provider != providerName || strings.TrimSpace(claim.Labels["brev_workspace_name"]) != identifier {
 			continue
 		}
 		if match.LeaseID != "" {
-			return LeaseClaim{}, false, exit(2, "multiple provider=%s claims match workspace name %s", providerName, identifier)
+			return core.LeaseClaim{}, false, core.Exit(2, "multiple provider=%s claims match workspace name %s", providerName, identifier)
 		}
 		match = claim
 	}
 	return match, match.LeaseID != "", nil
 }
 
-func (b *nvidiaBrevBackend) listServers(ctx context.Context, client *brevClient, all bool) ([]LeaseView, error) {
+func (b *nvidiaBrevBackend) listServers(ctx context.Context, client *brevClient, all bool) ([]core.LeaseView, error) {
 	workspaces, err := client.list(ctx, all)
 	if err != nil {
 		return nil, err
 	}
-	claims, err := listLeaseClaims()
+	claims, err := core.ListLeaseClaims()
 	if err != nil {
 		return nil, err
 	}
-	claimsByCloudID := map[string]LeaseClaim{}
-	claimsByWorkspaceName := map[string]LeaseClaim{}
+	claimsByCloudID := map[string]core.LeaseClaim{}
+	claimsByWorkspaceName := map[string]core.LeaseClaim{}
 	for _, claim := range claims {
 		if claim.Provider != providerName {
 			continue
@@ -1182,11 +1254,11 @@ func (b *nvidiaBrevBackend) listServers(ctx context.Context, client *brevClient,
 			continue
 		}
 		if existing := claimsByWorkspaceName[name]; existing.LeaseID != "" && existing.LeaseID != claim.LeaseID {
-			return nil, exit(2, "multiple provider=%s recovery claims match workspace name %s", providerName, name)
+			return nil, core.Exit(2, "multiple provider=%s recovery claims match workspace name %s", providerName, name)
 		}
 		claimsByWorkspaceName[name] = claim
 	}
-	servers := make([]LeaseView, 0, len(workspaces))
+	servers := make([]core.LeaseView, 0, len(workspaces))
 	for _, workspace := range workspaces {
 		claim := claimsByCloudID[workspace.ID]
 		if claim.LeaseID == "" {
@@ -1204,7 +1276,7 @@ func (b *nvidiaBrevBackend) listServers(ctx context.Context, client *brevClient,
 func (b *nvidiaBrevBackend) releaseWorkspace(ctx context.Context, client *brevClient, workspace brevWorkspace, action string) error {
 	id := workspaceIdentifier(workspace)
 	if id == "" {
-		return exit(2, "nvidia-brev release requires workspace id or name")
+		return core.Exit(2, "nvidia-brev release requires workspace id or name")
 	}
 	switch normalizeNvidiaBrevReleaseAction(action) {
 	case "stop":
@@ -1261,14 +1333,14 @@ func findBrevWorkspace(workspaces []brevWorkspace, idOrName string) (brevWorkspa
 			continue
 		}
 		if match.ID != "" || match.Name != "" {
-			return brevWorkspace{}, false, exit(2, "nvidia-brev workspace %q is ambiguous", idOrName)
+			return brevWorkspace{}, false, core.Exit(2, "nvidia-brev workspace %q is ambiguous", idOrName)
 		}
 		match = workspace
 	}
 	return match, match.ID != "" || match.Name != "", nil
 }
 
-func workspaceToServer(cfg Config, workspace brevWorkspace, leaseID, slug string, keep bool) Server {
+func workspaceToServer(cfg core.Config, workspace brevWorkspace, leaseID, slug string, keep bool) core.Server {
 	labels := directLeaseLabels(cfg, leaseID, slug, providerName, "", keep)
 	labels["state"] = normalizeBrevState(workspace)
 	labels["release"] = normalizeNvidiaBrevReleaseAction(cfg.NvidiaBrev.ReleaseAction)
@@ -1285,19 +1357,30 @@ func workspaceToServer(cfg Config, workspace brevWorkspace, leaseID, slug string
 	if workspace.InstanceKind != "" {
 		labels["instance_kind"] = workspace.InstanceKind
 	}
-	server := Server{
+	server := core.Server{
 		CloudID:  workspace.ID,
 		Provider: providerName,
 		Name:     workspace.Name,
 		Status:   labels["state"],
 		Labels:   labels,
 	}
-	server.ServerType.Name = firstNonEmpty(workspace.InstanceType, workspace.WorkspaceClass, cfg.NvidiaBrev.Type, cfg.NvidiaBrev.GPUName)
+	server.ServerType.Name = shared.FirstNonBlankTrimmed(workspace.InstanceType, workspace.WorkspaceClass, cfg.NvidiaBrev.Type, cfg.NvidiaBrev.GPUName)
 	server.Labels["server_type"] = server.ServerType.Name
 	return server
 }
 
-func workspaceToClaimedServer(cfg Config, workspace brevWorkspace, leaseID, slug string, claim LeaseClaim) Server {
+// Target is a retained connection choice. A fresh default must not move a
+// lease between the host and container; explicit input may deliberately do so.
+func effectiveBrevTarget(cfg core.Config, labels map[string]string) string {
+	target := strings.TrimSpace(cfg.NvidiaBrev.Target)
+	if core.IsNvidiaBrevTargetExplicit(&cfg) || (target != "" && target != "container") {
+		return target
+	}
+	return shared.FirstNonBlankTrimmed(labels["brev_target"], target, "container")
+}
+
+func workspaceToClaimedServer(cfg core.Config, workspace brevWorkspace, leaseID, slug string, claim core.LeaseClaim) core.Server {
+	cfg.NvidiaBrev.Target = effectiveBrevTarget(cfg, claim.Labels)
 	server := workspaceToServer(cfg, workspace, leaseID, slug, false)
 	if workspace.InstanceType == "" && workspace.WorkspaceClass == "" {
 		if storedType := strings.TrimSpace(claim.Labels["server_type"]); storedType != "" {
@@ -1308,7 +1391,7 @@ func workspaceToClaimedServer(cfg Config, workspace brevWorkspace, leaseID, slug
 	return serverWithClaimLabels(server, claim)
 }
 
-func serverWithClaimLabels(server Server, claim LeaseClaim) Server {
+func serverWithClaimLabels(server core.Server, claim core.LeaseClaim) core.Server {
 	if len(claim.Labels) == 0 {
 		return server
 	}
@@ -1326,7 +1409,6 @@ func serverWithClaimLabels(server Server, claim LeaseClaim) Server {
 		"brev_workspace_id",
 		"brev_workspace_name",
 		"brev_status",
-		"brev_target",
 	} {
 		delete(labels, key)
 		if value := server.Labels[key]; value != "" {
@@ -1334,6 +1416,7 @@ func serverWithClaimLabels(server Server, claim LeaseClaim) Server {
 		}
 	}
 	for _, key := range []string{
+		"brev_target",
 		"server_type",
 		"brev_build_status",
 		"brev_shell_status",
@@ -1398,7 +1481,7 @@ func oneOf(value string, allowed ...string) bool {
 }
 
 func workspaceIdentifier(workspace brevWorkspace) string {
-	return firstNonEmpty(workspace.ID, workspace.Name)
+	return shared.FirstNonBlankTrimmed(workspace.ID, workspace.Name)
 }
 
 func safeWorkspaceRef(workspace brevWorkspace) string {
@@ -1408,7 +1491,7 @@ func safeWorkspaceRef(workspace brevWorkspace) string {
 	return workspace.Name
 }
 
-func claimMatchesWorkspace(claim LeaseClaim, workspace brevWorkspace) bool {
+func claimMatchesWorkspace(claim core.LeaseClaim, workspace brevWorkspace) bool {
 	if claim.CloudID != "" {
 		return claim.CloudID == workspace.ID
 	}
@@ -1423,7 +1506,7 @@ func claimMatchesWorkspace(claim LeaseClaim, workspace brevWorkspace) bool {
 	return false
 }
 
-func brevLeaseIdentity(workspace brevWorkspace, claim LeaseClaim) (string, string) {
+func brevLeaseIdentity(workspace brevWorkspace, claim core.LeaseClaim) (string, string) {
 	if claim.LeaseID != "" {
 		return claim.LeaseID, claim.Slug
 	}
@@ -1468,7 +1551,7 @@ func parseBrevProviderName(name string) (string, string) {
 	return "cbx_" + id, slug
 }
 
-func allocateBrevLeaseSlug(leaseID, requested string, servers []LeaseView, claims []LeaseClaim) string {
+func allocateBrevLeaseSlug(leaseID, requested string, servers []core.LeaseView, claims []core.LeaseClaim) string {
 	base := fitBrevSlugForName(requested, leaseID)
 	if base == "" {
 		base = fitBrevSlugForName(strings.TrimPrefix(leaseID, "cbx_"), leaseID)
@@ -1486,7 +1569,7 @@ func allocateBrevLeaseSlug(leaseID, requested string, servers []LeaseView, claim
 	return brevSlugWithCollisionSuffix(base, strings.TrimPrefix(leaseID, "cbx_"), leaseID)
 }
 
-func brevSlugInUse(slug, leaseID string, servers []LeaseView, claims []LeaseClaim) bool {
+func brevSlugInUse(slug, leaseID string, servers []core.LeaseView, claims []core.LeaseClaim) bool {
 	for _, server := range servers {
 		if normalizeBrevSlug(server.Labels["slug"]) == slug {
 			return true

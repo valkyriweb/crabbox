@@ -12,18 +12,16 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string { return nil }
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "local-vm",
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetWindows, WindowsMode: core.WindowsModeNormal}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
-		Coordinator: core.CoordinatorNever,
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationLocalContext),
+		Name:             providerName,
+		Family:           "local-vm",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetWindows, WindowsMode: core.WindowsModeNormal}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -48,14 +46,21 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	return newBackend(p.Spec(), cfg, rt), nil
 }
 
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
+func (Provider) ConfigDefaultsTargetFinalization() core.ProviderConfigDefaultsTargetFinalization {
+	return core.ProviderConfigDefaultsCallerFinalizes
+}
+
+func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
+	if !core.IsTargetExplicit(cfg) {
+		cfg.TargetOS = core.TargetWindows
 	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
+	cfg.SSHFallbackPorts = nil
+	if cfg.HyperV.User != "" {
+		cfg.SSHUser = cfg.HyperV.User
 	}
-	return doctor, nil
+	if cfg.HyperV.WorkRoot != "" {
+		cfg.WorkRoot = cfg.HyperV.WorkRoot
+	}
+	cfg.SSHPort = "22"
+	return nil
 }

@@ -3,7 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -19,14 +21,110 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestGCPMachineTypeCandidatesForClass(t *testing.T) {
-	got := gcpMachineTypeCandidatesForClass("standard")
-	want := []string{"c4-standard-32", "c3-standard-22", "n2-standard-32", "n2d-standard-32"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("standard=%v want %v", got, want)
+func TestGCPBootDiskType(t *testing.T) {
+	for _, test := range []struct{ machineType, want string }{
+		{"c4-standard-32", "hyperdisk-balanced"},
+		{"C4A-highcpu-8", "hyperdisk-balanced"},
+		{"zones/z/machineTypes/c4-standard-4", "hyperdisk-balanced"},
+		{"n4d-standard-8", "hyperdisk-balanced"},
+		{"h4d-standard-192", "hyperdisk-balanced"},
+		{"a4x-highgpu-4g", "hyperdisk-balanced"},
+		{"c4n-standard-4", "hyperdisk-balanced"},
+		{"m4n-megamem-28", "hyperdisk-balanced"},
+		{"x5-688-12t-metal", "hyperdisk-balanced"},
+		{"a3-ultragpu-8g", "hyperdisk-balanced"},
+		{"a3-megagpu-8g", "pd-balanced"},
+		{"a3-highgpu-8g", "pd-balanced"},
+		{"a3-edgegpu-8g", "pd-balanced"},
+		{"n2d-standard-4", "pd-balanced"},
+		{"n2-standard-4", "pd-balanced"},
+		{"c3-standard-4", "pd-balanced"},
+		{"c4unknown-standard-4", "pd-balanced"},
+		{"", "pd-balanced"},
+	} {
+		t.Run(test.machineType, func(t *testing.T) {
+			if got := gcpBootDiskType(test.machineType); got != test.want {
+				t.Fatalf("gcpBootDiskType(%q)=%q, want %q", test.machineType, got, test.want)
+			}
+		})
 	}
-	if got := serverTypeForProviderClass("gcp", "beast"); got != "c4-standard-192" {
-		t.Fatalf("gcp beast=%q", got)
+}
+
+func TestGCPCreateServerBootDiskType(t *testing.T) {
+	for _, test := range []struct{ machineType, diskType string }{
+		{"c4-standard-32", "hyperdisk-balanced"},
+		{"c3-standard-22", "pd-balanced"},
+		{"n2-standard-32", "pd-balanced"},
+		{"n2d-standard-32", "pd-balanced"},
+	} {
+		t.Run(test.machineType, func(t *testing.T) {
+			var inserted struct {
+				Disks []struct {
+					InitializeParams struct{ DiskType string }
+				}
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.Contains(r.URL.Path, "/firewalls"):
+					if r.Method == http.MethodGet {
+						w.WriteHeader(http.StatusNotFound)
+						_, _ = io.WriteString(w, `{"error":{"code":404}}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"name":"firewall-op","status":"DONE"}`)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/instances"):
+					if err := json.NewDecoder(r.Body).Decode(&inserted); err != nil {
+						t.Error(err)
+					}
+					_, _ = io.WriteString(w, `{"name":"insert-op","status":"DONE"}`)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/operations/firewall-op"):
+					_, _ = io.WriteString(w, `{"name":"firewall-op","status":"DONE"}`)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/operations/insert-op"):
+					_, _ = io.WriteString(w, `{"name":"insert-op","status":"DONE"}`)
+				case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/instances/"):
+					_, _ = io.WriteString(w, `{"id":"123","name":"runner","status":"RUNNING","networkInterfaces":[{"accessConfigs":[{"natIP":"192.0.2.10"}]}]}`)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			}))
+			defer server.Close()
+			cfg := Config{TargetOS: targetLinux, ServerType: test.machineType, SSHUser: "ubuntu", GCP: GCPConfig{Project: "project", Zone: "europe-west2-a", RootGB: 400}}
+			client, err := newGCPClientWithOptions(context.Background(), cfg, option.WithoutAuthentication(), option.WithEndpoint(server.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.instances.Close()
+			defer client.firewalls.Close()
+			if _, err := client.createServer(context.Background(), cfg, "ssh-ed25519 test", "cbx_abcdef123456", "runner", false); err != nil {
+				t.Fatal(err)
+			}
+			want := "zones/europe-west2-a/diskTypes/" + test.diskType
+			if len(inserted.Disks) != 1 || inserted.Disks[0].InitializeParams.DiskType != want {
+				t.Fatalf("inserted disks=%+v, want %s", inserted.Disks, want)
+			}
+		})
+	}
+}
+
+func TestGCPDiskMachineIncompatibilityFallback(t *testing.T) {
+	for _, test := range []struct {
+		message string
+		want    bool
+	}{
+		{"pd-balanced disk type cannot be used by c4-standard-32 machine type.", true},
+		{"disk type pd-balanced is not supported for machine type c4-standard-32", true},
+		{"diskTypes/pd-balanced is unsupported by machineTypes/c4-standard-32", true},
+		{"machine type c4-standard-32 does not support diskType pd-balanced", true},
+		{"invalid source image", false},
+		{"invalid network", false},
+		{"invalid metadata", false},
+		{"diskType pd-balanced is invalid", false},
+	} {
+		if got := isGCPFallbackProvisioningError(&googleapi.Error{Code: 400, Message: test.message}); got != test.want {
+			t.Errorf("fallback(%q)=%v, want %v", test.message, got, test.want)
+		}
 	}
 }
 
@@ -87,7 +185,7 @@ func TestIsCanonicalGCPServer(t *testing.T) {
 	leaseID := "cbx_123456abcdef"
 	slug := "blue-box"
 	canonical := Server{
-		Name: leaseProviderName(leaseID, slug),
+		Name: LeaseProviderName(leaseID, slug),
 		Labels: map[string]string{
 			"crabbox":    "true",
 			"created_by": "crabbox",
@@ -155,9 +253,7 @@ func TestGCPFirewallNameForPolicy(t *testing.T) {
 
 func TestGCPClientDefaultsBlankTags(t *testing.T) {
 	client, err := newGCPClientWithOptions(context.Background(), Config{
-		GCPProject: "project",
-		GCPZone:    "europe-west2-a",
-		GCPTags:    []string{"  "},
+		GCP: GCPConfig{Project: "project", Zone: "europe-west2-a", Tags: []string{"  "}},
 	}, option.WithoutAuthentication(), option.WithEndpoint("http://127.0.0.1"))
 	if err != nil {
 		t.Fatal(err)
@@ -187,16 +283,87 @@ func TestGCPSchedulingAppliesTTLDelete(t *testing.T) {
 	}
 }
 
+func TestGCPGetServerCancellationReachesHTTPTransport(t *testing.T) {
+	received := make(chan string, 1)
+	requestCanceled := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case received <- r.Method + " " + r.URL.Path:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			select {
+			case requestCanceled <- struct{}{}:
+			default:
+			}
+			// Keep the response incomplete until cancellation assertions finish.
+			<-release
+		case <-release:
+			_, _ = io.WriteString(w, `{"name":"readiness-instance","status":"RUNNING"}`)
+		}
+	}))
+	defer server.Close()
+	instances, err := gcpcompute.NewInstancesRESTClient(context.Background(), option.WithoutAuthentication(), option.WithEndpoint(server.URL), option.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instances.Close()
+	client := &GCPClient{Project: "project", Zone: "us-central1-b", instances: instances}
+	ctx, cancel := context.WithCancel(context.Background())
+	var got Server
+	var gotErr error
+	done := make(chan struct{})
+	go func() {
+		got, gotErr = client.GetServer(ctx, "readiness-instance")
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("GCP observation did not return during cleanup")
+		}
+	}()
+	select {
+	case request := <-received:
+		if request != "GET /compute/v1/projects/project/zones/us-central1-b/instances/readiness-instance" {
+			t.Fatalf("unexpected request: %s", request)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GCP observation did not reach the local HTTPS server")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GCP observation did not return after caller cancellation")
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("local HTTPS request did not observe cancellation")
+	}
+	if !errors.Is(gotErr, context.Canceled) || !reflect.DeepEqual(got, Server{}) {
+		t.Fatalf("server=%+v error=%v, want zero server and cancellation", got, gotErr)
+	}
+	t.Logf("real Google SDK HTTPS request observed cancellation and returned in %s", time.Since(started))
+}
+
 func TestGCPListCrabboxServersAggregatesZones(t *testing.T) {
 	var gotPath string
 	var gotFilter string
 	var gotPartialSuccess string
 	fallbackLeaseID := "cbx_333333333333"
 	fallbackSlug := "fallback-zone"
-	fallbackName := leaseProviderName(fallbackLeaseID, fallbackSlug)
+	fallbackName := LeaseProviderName(fallbackLeaseID, fallbackSlug)
 	otherLeaseID := "cbx_444444444444"
 	otherSlug := "other-zone"
-	otherName := leaseProviderName(otherLeaseID, otherSlug)
+	otherName := LeaseProviderName(otherLeaseID, otherSlug)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotFilter = r.URL.Query().Get("filter")

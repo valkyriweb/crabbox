@@ -20,8 +20,8 @@ A deployment needs one canonical HTTPS origin:
 https://broker.example.com                       # public CLI + browser-login route
 ```
 
-For Code portal origin isolation, the same coordinator can also receive a
-wildcard route configured through:
+Browser Code requires the same coordinator to receive an isolated wildcard
+route configured through:
 
 ```text
 CRABBOX_CODE_ORIGIN_TEMPLATE=https://{lease}.code.example.com
@@ -45,7 +45,7 @@ https://fallback.example.com                       # additional fallback
 complete a browser GitHub OAuth flow. The coordinator still requires Crabbox
 auth on every API route; the unauthenticated
 exceptions are `GET /v1/health`, the GitHub login/OAuth routes (`/v1/auth/*`,
-`/portal/login`, `/portal/logout`), and the per-lease websocket agent upgrades that
+`/portal/login`), and the per-lease websocket agent upgrades that
 authenticate via short-lived bridge tickets instead.
 
 `https://broker-access.example.com` is the **same** Worker fronted by a Cloudflare Access
@@ -74,6 +74,16 @@ headers; the coordinator strips the secret before routing the request.
 
 ## How The Coordinator Authenticates A Request
 
+[`GET /v1/capacity`](../commands/capacity.md) uses this same normal authentication
+path, and `crabbox capacity` uses the normal coordinator client and token. It
+has no admin-client routing or credential retry. It accepts no query parameters
+and always uses the resolved request owner, even for admins. Only the self-owner
+admission count spans all months and orgs; monthly usage and lease visibility
+remain unchanged. Both runtimes hold their existing lifecycle request queue
+across reservation selection and the complete canonical record scan, matching
+the admission boundary without nesting another lock. Capacity dispatch bypasses
+bridge maintenance so reading it cannot trigger reconciliation or cleanup.
+
 Every authenticated route normally requires an `Authorization: Bearer <token>`
 header. The coordinator
 matches the token in this precedence (`worker/src/auth.ts`):
@@ -82,10 +92,17 @@ matches the token in this precedence (`worker/src/auth.ts`):
 2. **Shared token** — equals `CRABBOX_SHARED_TOKEN`. Authorized but not admin; this is
    normal trusted automation.
 3. **Signed user token** — a token with the `cbxu_` prefix, an HMAC-SHA256 signature over a
-   base64url payload, verified with `CRABBOX_SESSION_SECRET` (falling back to
-   `CRABBOX_SHARED_TOKEN`). Minted by `crabbox login`, with a default 180-day expiry.
-   User tokens are non-admin unless their GitHub email or login matches
-   `CRABBOX_GITHUB_ADMIN_OWNERS` or `CRABBOX_GITHUB_ADMIN_LOGINS`.
+   base64url payload, verified only with `CRABBOX_SESSION_SECRET`. The session
+   secret must be configured and distinct from `CRABBOX_SHARED_TOKEN`. Minted by
+   `crabbox login` only after GitHub returns a stable numeric account ID and at
+   least one verified email, with a default 180-day expiry. The payload records
+   the immutable `github:<numeric-id>` owner and an encrypted GitHub OAuth
+   credential. The credential's account ID and current allowed-org/team
+   membership are revalidated on requests, with positive checks cached for five
+   minutes and GitHub errors failing closed after cache expiry. Legacy
+   email-owned sessions are rejected and require a fresh login.
+   User tokens are non-admin unless their immutable owner matches
+   `CRABBOX_GITHUB_ADMIN_OWNERS`.
 
 Anything else returns `401 unauthorized`.
 
@@ -122,8 +139,8 @@ callers. Raw, unverified Cloudflare Access email headers are stripped and never 
 
 The Node-specific alternative is trusted reverse-proxy identity. Requests from
 configured proxy CIDRs may use `CRABBOX_TRUSTED_USER_HEADER` without a Crabbox
-bearer token. The resulting identity is non-admin; admin routes still require
-`CRABBOX_ADMIN_TOKEN`.
+bearer token. The resulting identity is non-admin; admin routes require a
+separate admin token or an authorized GitHub admin session.
 
 ## GitHub browser login
 
@@ -138,7 +155,29 @@ https://broker.example.com/v1/auth/github/callback
 The OAuth app requests the scopes `read:user user:email read:org`. A self-hosted coordinator
 needs its own OAuth app: the callback URL must exactly match the public origin, and the
 `CRABBOX_PUBLIC_URL` must use that same origin (it is used to build the callback and
-to canonicalize portal redirects).
+to canonicalize portal redirects). GitHub OAuth refuses to start without this setting,
+and callbacks from another origin are rejected before code exchange or session issuance.
+
+For CLI login, the public callback redirects completion to a one-use
+`http://127.0.0.1:<random-port>/crabbox/oauth/<random-path>` listener created by
+the initiating CLI. The coordinator releases the token only when polling proves
+both the terminal-held polling secret and the browser-delivered confirmation.
+This makes copied authorization URLs non-transferable to another terminal.
+
+The CLI treats that callback origin as a credential destination. If a login response
+from one broker points at a different callback origin, `crabbox login` fails before
+opening the browser unless the alternate origin appears in trusted operator config:
+
+```yaml
+broker:
+  url: https://broker-access.example.com
+  loginRedirectOrigins:
+    - https://broker.example.com
+```
+
+Use `broker.loginRedirectOrigins` or `CRABBOX_BROKER_LOGIN_REDIRECT_ORIGINS` only for
+known same-deployment aliases during a planned migration. Project config cannot grant
+this exception.
 
 Login is gated by GitHub org membership before a user token is minted:
 
@@ -149,6 +188,15 @@ Login is gated by GitHub org membership before a user token is minted:
 - If `CRABBOX_GITHUB_ALLOWED_TEAMS` (or `CRABBOX_GITHUB_ALLOWED_TEAM`) is set, the user must
   also belong to at least one listed team after org membership passes. Entries are team
   slugs: use `team-slug` for the resolved org, or `org/team-slug` to qualify the org.
+- The team check is **scoped to the org being authorized**: only entries that resolve to that
+  org can satisfy it, so a team in a different configured org never grants access. If teams are
+  configured but none resolve to the org being authorized, that org is **rejected** — list at
+  least one team per allowed org, or leave the setting unset to gate on org membership alone.
+- Every nonblank selector must be exactly `team-slug` or `org/team-slug`, using GitHub-style
+  letters, numbers, and hyphens. Missing components, extra slashes, invalid tokens, comma-only
+  values, and empty entries mixed into a list fail GitHub authorization closed. A nonblank
+  plural value takes precedence over the legacy singular alias; an unset, empty, or
+  whitespace-only plural value may fall back to the singular value.
 
 ### Coordinator secrets for login
 
@@ -157,9 +205,10 @@ CRABBOX_GITHUB_CLIENT_ID
 CRABBOX_GITHUB_CLIENT_SECRET
 CRABBOX_GITHUB_ALLOWED_ORG       # or CRABBOX_GITHUB_ALLOWED_ORGS (comma-separated)
 CRABBOX_GITHUB_ALLOWED_TEAMS     # optional; comma-separated team slugs
-CRABBOX_GITHUB_ADMIN_OWNERS      # optional; comma-separated GitHub verified emails with admin
-CRABBOX_GITHUB_ADMIN_LOGINS      # optional; comma-separated GitHub logins with admin
-CRABBOX_SESSION_SECRET           # signs user tokens; falls back to CRABBOX_SHARED_TOKEN
+CRABBOX_GITHUB_ADMIN_OWNERS      # optional; comma-separated github:<numeric-id> owners with admin
+CRABBOX_GITHUB_REVOKED_USERS     # optional; comma-separated github:<numeric-id> owners denied immediately
+CRABBOX_GITHUB_MEMBERSHIP_CACHE_SECONDS # optional; default 300, range 0-3600
+CRABBOX_SESSION_SECRET           # required for user tokens; must differ from CRABBOX_SHARED_TOKEN
 CRABBOX_USER_TOKEN_TTL_SECONDS   # optional; default 15552000 (180 days), clamped to 1h-365d
 ```
 
@@ -177,6 +226,10 @@ pre-minted JWT:
 (`CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`, and `CF_ACCESS_TOKEN` are accepted as
 fallbacks.) These credentials satisfy Cloudflare Access only — the Worker still requires the
 Crabbox bearer or signed user token.
+
+Coordinator HTTP requests follow redirects only when the scheme, host, and effective port
+remain unchanged. The curl transport fallback does not follow redirects, preventing bearer,
+Access, and local identity headers from being replayed to a different origin.
 
 For coordinators behind an upstream identity proxy that consumes the `Authorization` header,
 set `CRABBOX_COORDINATOR_TOKEN_COMMAND` to a JSON argv array. Crabbox executes it directly,
@@ -244,8 +297,8 @@ smoke additionally proves the same route can lease, run, and release a real mach
   routes; Node may use any TLS/WebSocket-capable ingress.
 - The Access service token only clears Cloudflare Access; it is not a Crabbox admin token.
 - Trusted proxy identity is Node-only, CIDR-gated, and never grants admin.
-- Signed GitHub user tokens are never admin tokens — admin routes require the separate admin
-  token.
+- Signed GitHub user tokens grant admin access only when their immutable owner
+  matches the coordinator's `CRABBOX_GITHUB_ADMIN_OWNERS` grant.
 
 ## Related docs
 

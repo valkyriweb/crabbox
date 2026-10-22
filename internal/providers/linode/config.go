@@ -8,10 +8,9 @@ import (
 )
 
 const (
-	defaultRegion = "us-ord"
-	defaultImage  = "linode/ubuntu24.04"
-	defaultType   = "g6-standard-1"
-	tokenEnv      = "LINODE_TOKEN"
+	// Class selection remains independent of configured defaults.
+	defaultType = "g6-standard-1"
+	tokenEnv    = "LINODE_TOKEN"
 )
 
 func tokenFromEnv() string {
@@ -30,33 +29,39 @@ func linodeRegionForConfig(cfg core.Config) string {
 	if strings.TrimSpace(cfg.Linode.Region) != "" {
 		return strings.TrimSpace(cfg.Linode.Region)
 	}
-	return defaultRegion
+	return core.LinodeConfiguredRegionDefault
 }
 
 func linodeImageForConfig(cfg core.Config) string {
 	if strings.TrimSpace(cfg.Linode.Image) != "" {
 		return strings.TrimSpace(cfg.Linode.Image)
 	}
-	return defaultImage
+	return core.LinodeImageFallback
 }
 
 func linodeServerTypeForConfig(cfg core.Config) string {
 	if cfg.ServerTypeExplicit && strings.TrimSpace(cfg.ServerType) != "" {
 		return strings.TrimSpace(cfg.ServerType)
 	}
-	if strings.TrimSpace(cfg.Linode.Type) != "" {
+	if strings.TrimSpace(cfg.Linode.Type) != "" && linodeTypeOverridesClass(cfg) {
 		return strings.TrimSpace(cfg.Linode.Type)
 	}
 	return linodeServerTypeForClass(cfg.Class)
 }
 
+func linodeTypeOverridesClass(cfg core.Config) bool {
+	return !core.ClassWasExplicit(cfg) || core.LinodeTypeWasExplicit(cfg) ||
+		strings.TrimSpace(cfg.Linode.Type) != core.LinodeConfiguredTypeDefault
+}
+
 func linodeServerTypeForClass(class string) string {
-	switch strings.ToLower(strings.TrimSpace(class)) {
-	case "standard", "fast", "large", "beast":
-		return defaultType
-	default:
-		return defaultType
+	normalized := strings.ToLower(strings.TrimSpace(class))
+	for _, profile := range classProfiles {
+		if profile.Class == normalized {
+			return profile.Primary.Type
+		}
 	}
+	return defaultType
 }
 
 func validateFoundationConfig(cfg core.Config) error {

@@ -15,7 +15,11 @@ each check decides its status and how to add a new one.
 The command is fast (under a second on a healthy machine), non-destructive, and
 never calls billable provider create APIs. When a coordinator is configured it
 performs cheap broker checks such as health, identity, and provider secret
-readiness. The provider readiness probe is bounded to a 10s timeout.
+readiness. The provider readiness probe is bounded to a 10s timeout. Bare doctor
+is provider-neutral: it reports no selected provider, preserves
+`source=compiled_default selected=false` as compatibility metadata, and skips
+provider-specific tool and credential probes. All explicit or configured
+provider selections remain strict.
 
 ## Output Model
 
@@ -38,6 +42,7 @@ Check names you can see, roughly in emission order:
 ```text
 run        --from-run context summary (provider/target/lease/phase)
 config     writable config file exists with safe permissions (0600)
+provider-selection resolved provider and its winning selection source
 git        git is on PATH
 ssh        ssh is on PATH (SSH-backed providers)
 ssh-keygen ssh-keygen is on PATH (SSH-backed providers)
@@ -98,19 +103,35 @@ coordinator, doctor falls through to the direct provider check below.
 
 Provider readiness validates the selected provider without creating a lease.
 
+Before local tool checks, `provider-selection` reports whether a provider is
+selected and the winning source: `compiled_default`, `user_config`, `repo_config`,
+`environment`, `flag`, `recorded_run`, or `lease_context`. This provenance is
+resolved while configuration and command context are applied; doctor does not
+infer it from the provider name.
+
+When the source is `compiled_default`, doctor reports `no provider selected`,
+sets selected=false, and skips provider-specific tools plus brokered and direct
+provider credential readiness. JSON keeps its top-level provider empty. Other
+provider-neutral checks still run and can fail the command. A provider
+selected from any higher-precedence source remains strict, including an
+explicit flag that happens to select the same provider as the compiled default.
+
 **Brokered path (coordinator configured).** For providers whose coordinator
-support is `supported` (`aws`, `azure`, `gcp`, `hetzner`), doctor asks the broker
-for secret readiness. Missing coordinator secret names are reported without exposing
-values, for example `missing=AZURE_TENANT_ID,AZURE_SUBSCRIPTION_ID`. The broker
+support is `supported` (`aws`, `azure`, `daytona`, `gcp`, `hetzner`), doctor asks
+the broker for secret readiness. Missing coordinator secret names are reported
+without exposing values, for example
+`missing=AZURE_TENANT_ID,AZURE_SUBSCRIPTION_ID`. The broker
 may attach additional non-mutating checks; AWS broker readiness can include EC2
 vCPU quota checks via Service Quotas. Low quotas emit advisory `warning capacity`
 lines (quota code, applied limit, default type, required vCPUs, recommended
 class/type); if quotas cannot be inspected the capacity check is skipped rather
-than warning about unproven pressure. When the coordinator path runs, doctor
+than warning about unproven pressure. A sufficient quota ceiling reports `ok`
+with `capacity=unknown quota_limit=sufficient usage=unchecked`: regional usage
+and available headroom remain unverified. When the coordinator path runs, doctor
 returns immediately after the SSH-key check — it does not also run the direct
 provider check.
 
-**Direct path (no coordinator).** Providers that implement `DoctorProvider` run
+**Direct path (no coordinator).** Providers whose configured backend implements `DoctorBackend` run
 their own non-mutating check (cheapest list or readiness API), bounded to the 10s
 provider timeout. Examples:
 
@@ -121,6 +142,11 @@ provider timeout. Examples:
   proof of runner readiness.
 - Blacksmith Testbox reports runtime as provider-hydrated because GitHub Actions
   hydration is owned by Testbox.
+- Firecracker validates the local Linux KVM contract instead of starting a
+  microVM: host OS, openable `/dev/kvm`, the configured Firecracker binary,
+  unset jailer, kernel/rootfs paths, CNI directories, and the named CNI config.
+  The provider checks report `mutation=false` and fail with explicit check names
+  such as `host`, `kvm`, `binary`, `jailer`, `kernel`, `rootfs`, and `network`.
 - XCP-ng opens a XAPI session, resolves configured placement resources
   (template, storage repository, network, and host), lists Crabbox-managed
   leases, and reports `mutation=false`; incomplete `xcpNg.*` config fails
@@ -135,7 +161,7 @@ socket/address/remote path through the official Go client, reports
 operators can distinguish config/auth drift from guest reachability issues
 before running a live smoke.
 
-**No direct doctor.** Providers without a `DoctorProvider` implementation print
+**No direct doctor.** Providers whose backend has no `DoctorBackend` capability print
 `skip provider provider=<name> direct_doctor=unsupported`.
 
 Failures add a `class` and a remediation `hint`. The class is one of `timeout`,
@@ -175,7 +201,8 @@ erroring.
 `crabbox doctor --from-run <run-id>` triages a recorded failure. Doctor fetches
 the run record and applies its provider, target, class, server type, lease, and
 phase before running diagnostics; it requires a configured coordinator (exit `2`
-otherwise). Older run records may omit fields — doctor then prints a
+otherwise). An explicit `--provider` keeps normal flag precedence over the
+recorded provider. Older run records may omit fields — doctor then prints a
 `warning run` line listing `missing=...` and skips checks that cannot be tied to
 the run, such as the remote probe when no lease ID was recorded.
 
@@ -235,7 +262,7 @@ lifted from the message, plus provider-supplied detail fields).
 ## Adding A Check
 
 Doctor orchestration lives in `internal/cli/doctor.go`; the pond check lives in
-`internal/cli/doctor_pond.go`. Prefer provider-owned `DoctorProvider`
+`internal/cli/doctor_pond.go`. Prefer provider-owned `DoctorBackend`
 implementations for direct provider checks rather than provider-specific branches
 in core. Keep each check explicit and cheap, and emit stable `ok`, `failed`,
 `missing`, `skip`, or `warning` lines that stay easy to scan in terminal logs.

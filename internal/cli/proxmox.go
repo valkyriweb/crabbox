@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,6 +26,9 @@ type ProxmoxClient struct {
 	TokenSecret string
 	Node        string
 	Client      *http.Client
+	// GuestBootstrap extends the base SSH bootstrap with provider-owned setup
+	// and readiness checks for an explicitly selected prepared template.
+	GuestBootstrap func(Config) (setup, readyChecks string)
 }
 
 type ProxmoxReadinessCheck struct {
@@ -35,8 +40,8 @@ type ProxmoxReadinessCheck struct {
 
 var (
 	proxmoxRunSSHQuietWithOptions = runSSHQuietWithOptions
-	proxmoxRunSSHInputQuiet       = runSSHInputQuiet
-	proxmoxAPITokenPattern        = regexp.MustCompile(`PVEAPIToken=[^[:space:]]+`)
+	proxmoxRunSSHInput            = runSSHInput
+	proxmoxAPITokenPattern        = regexp.MustCompile(`PVEAPIToken=[A-Za-z0-9@._!%+=:/~-]+`)
 )
 
 type ProxmoxError struct {
@@ -44,6 +49,8 @@ type ProxmoxError struct {
 	Path       string
 	StatusCode int
 	Body       string
+	// NativeAuthRejection excludes gateway errors and replies carrying task data.
+	NativeAuthRejection bool
 }
 
 func (e *ProxmoxError) Error() string {
@@ -74,19 +81,22 @@ func (e *proxmoxTaskWaitError) Unwrap() error { return e.err }
 func NewProxmoxClient(cfg Config) (*ProxmoxClient, error) {
 	apiURL := strings.TrimSpace(cfg.Proxmox.APIURL)
 	if apiURL == "" {
-		return nil, exit(3, "proxmox apiUrl is required (set proxmox.apiUrl or CRABBOX_PROXMOX_API_URL)")
+		return nil, Exit(3, "proxmox apiUrl is required (set proxmox.apiUrl or CRABBOX_PROXMOX_API_URL)")
 	}
 	apiURL = strings.TrimRight(apiURL, "/")
 	apiURL = strings.TrimSuffix(apiURL, "/api2/json")
 	if cfg.Proxmox.TokenID == "" || cfg.Proxmox.TokenSecret == "" {
-		return nil, exit(3, "proxmox tokenId/tokenSecret are required (set proxmox.tokenId/tokenSecret or CRABBOX_PROXMOX_TOKEN_ID/CRABBOX_PROXMOX_TOKEN_SECRET)")
+		return nil, Exit(3, "proxmox tokenId/tokenSecret are required (set proxmox.tokenId/tokenSecret or CRABBOX_PROXMOX_TOKEN_ID/CRABBOX_PROXMOX_TOKEN_SECRET)")
 	}
 	if cfg.Proxmox.Node == "" {
-		return nil, exit(3, "proxmox node is required (set proxmox.node or CRABBOX_PROXMOX_NODE)")
+		return nil, Exit(3, "proxmox node is required (set proxmox.node or CRABBOX_PROXMOX_NODE)")
 	}
 	client := &http.Client{Timeout: 60 * time.Second}
 	if cfg.Proxmox.InsecureTLS {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport, err := CloneDefaultTransport()
+		if err != nil {
+			return nil, fmt.Errorf("proxmox HTTP client setup: %w", err)
+		}
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // User opt-in for self-signed private Proxmox clusters.
 		client.Transport = transport
 	}
@@ -130,7 +140,7 @@ func (c *ProxmoxClient) doEnvelope(ctx context.Context, method, path string, for
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &ProxmoxError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: summarizeJSON(data)}
+		return &ProxmoxError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: summarizeJSON([]byte(c.redactErrorBody(string(data)))), NativeAuthRejection: proxmoxNativeAuthRejection(resp, data)}
 	}
 	if out == nil {
 		return nil
@@ -148,6 +158,36 @@ func (c *ProxmoxClient) doEnvelope(ctx context.Context, method, path string, for
 		return fmt.Errorf("proxmox %s %s: missing required data in response", method, path)
 	}
 	return json.Unmarshal(envelope.Data, out)
+}
+
+func proxmoxNativeAuthRejection(resp *http.Response, data []byte) bool {
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" || !strings.HasPrefix(resp.Header.Get("Server"), "pve-api-daemon/") {
+		return false
+	}
+	var envelope struct {
+		Data    json.RawMessage `json:"data"`
+		Message string          `json:"message"`
+	}
+	// Native JSON authorization failures return null data and an error message.
+	// An HTTP status alone cannot disprove allocation behind a reverse proxy.
+	return json.Unmarshal(data, &envelope) == nil && bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) && strings.TrimSpace(envelope.Message) != ""
+}
+
+func (c *ProxmoxClient) redactErrorBody(body string) string {
+	redacted := body
+	if strings.TrimSpace(c.TokenID) != "" && strings.TrimSpace(c.TokenSecret) != "" {
+		redacted = strings.ReplaceAll(redacted, "PVEAPIToken="+c.TokenID+"="+c.TokenSecret, "PVEAPIToken=<redacted>")
+	}
+	for _, secret := range []string{c.TokenID, c.TokenSecret} {
+		if strings.TrimSpace(secret) != "" {
+			redacted = strings.ReplaceAll(redacted, secret, "<redacted>")
+		}
+	}
+	return proxmoxAPITokenPattern.ReplaceAllString(redacted, "PVEAPIToken=<redacted>")
 }
 
 type proxmoxStorage struct {
@@ -822,6 +862,30 @@ func (c *ProxmoxClient) nextID(ctx context.Context) (int, error) {
 	}
 }
 
+func (c *ProxmoxClient) NextVMID(ctx context.Context) (int, error) {
+	return c.nextID(ctx)
+}
+
+// ListVMIDsInCluster includes templates, unlabelled VMs, and containers: all
+// guest types share the VMID namespace. Filtered inventory cannot prove a gap.
+func (c *ProxmoxClient) ListVMIDsInCluster(ctx context.Context) ([]int, error) {
+	if err := c.requirePropagatedVMAudit(ctx, "/vms"); err != nil {
+		return nil, err
+	}
+	vms, err := c.listClusterVMs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int, 0, len(vms))
+	for _, vm := range vms {
+		if vm.VMID <= 0 {
+			return nil, fmt.Errorf("Proxmox inventory contains an invalid VMID")
+		}
+		ids = append(ids, int(vm.VMID))
+	}
+	return ids, nil
+}
+
 type proxmoxVM struct {
 	VMID     int    `json:"vmid"`
 	Name     string `json:"name"`
@@ -962,6 +1026,43 @@ func (c *ProxmoxClient) GetServerOnNode(ctx context.Context, node, id string) (S
 }
 
 func (c *ProxmoxClient) VMExistsInCluster(ctx context.Context, id string) (bool, error) {
+	return c.vmIdentityExistsInCluster(ctx, id, "")
+}
+
+// VMIdentityExistsInCluster includes unlabelled VMs and other guest types.
+// Complete visibility is required: a filtered list is not absence evidence.
+func (c *ProxmoxClient) VMIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
+	if strings.TrimSpace(name) == "" {
+		return false, fmt.Errorf("Proxmox VM name is required for identity absence")
+	}
+	if err := c.requirePropagatedVMAudit(ctx, "/vms"); err != nil {
+		return false, err
+	}
+	return c.vmIdentityExistsInCluster(ctx, id, name)
+}
+
+// VerifyNoActiveCloneTasks fences absence recovery against a clone that has
+// been accepted but has not published its VM in cluster inventory yet.
+func (c *ProxmoxClient) VerifyNoActiveCloneTasks(ctx context.Context) error {
+	path := "/nodes/" + c.Node
+	var permissions map[string]map[string]proxmoxInt
+	if err := c.doRequired(ctx, http.MethodGet, "/access/permissions?path="+url.QueryEscape(path), nil, &permissions); err != nil {
+		return err
+	}
+	if _, ok := permissions[path]["Sys.Audit"]; !ok {
+		return fmt.Errorf("permission denied: Proxmox prepared-claim recovery requires Sys.Audit on %s to inspect all active clone tasks", path)
+	}
+	var tasks []json.RawMessage
+	if err := c.doRequired(ctx, http.MethodGet, "/nodes/"+url.PathEscape(c.Node)+"/tasks?source=active&typefilter=qmclone&limit=1", nil, &tasks); err != nil {
+		return err
+	}
+	if len(tasks) != 0 {
+		return fmt.Errorf("Proxmox clone task is still active on %s; wait for completion before prepared-claim recovery", c.Node)
+	}
+	return nil
+}
+
+func (c *ProxmoxClient) vmIdentityExistsInCluster(ctx context.Context, id, name string) (bool, error) {
 	vmid, err := strconv.Atoi(strings.TrimSpace(id))
 	if err != nil || vmid <= 0 {
 		return false, fmt.Errorf("invalid Proxmox VM identity %q", id)
@@ -974,7 +1075,7 @@ func (c *ProxmoxClient) VMExistsInCluster(ctx context.Context, id string) (bool,
 		return false, err
 	}
 	for _, vm := range vms {
-		if int(vm.VMID) == vmid {
+		if int(vm.VMID) == vmid || name != "" && vm.Name == name {
 			return true, nil
 		}
 	}
@@ -983,16 +1084,29 @@ func (c *ProxmoxClient) VMExistsInCluster(ctx context.Context, id string) (bool,
 
 func (c *ProxmoxClient) CreateServer(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool) (Server, error) {
 	if cfg.TargetOS != targetLinux {
-		return Server{}, exit(2, "proxmox provider currently supports target=linux only")
+		return Server{}, Exit(2, "proxmox provider currently supports target=linux only")
 	}
 	if cfg.Proxmox.TemplateID <= 0 {
-		return Server{}, exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
+		return Server{}, Exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
 	}
 	vmid, err := c.nextID(ctx)
 	if err != nil {
 		return Server{}, err
 	}
-	name := leaseProviderName(leaseID, slug)
+	return c.CreateServerWithVMID(ctx, cfg, publicKey, leaseID, slug, keep, vmid, nil, nil)
+}
+
+func (c *ProxmoxClient) CreateServerWithVMID(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, vmid int, extraLabels map[string]string, bind func(Server) error) (Server, error) {
+	if cfg.TargetOS != targetLinux {
+		return Server{}, Exit(2, "proxmox provider currently supports target=linux only")
+	}
+	if cfg.Proxmox.TemplateID <= 0 {
+		return Server{}, Exit(3, "proxmox templateId is required (set proxmox.templateId or CRABBOX_PROXMOX_TEMPLATE_ID)")
+	}
+	if vmid <= 0 {
+		return Server{}, Exit(2, "proxmox VMID must be positive")
+	}
+	name := LeaseProviderName(leaseID, slug)
 	full := "1"
 	if !cfg.Proxmox.FullClone {
 		full = "0"
@@ -1008,12 +1122,28 @@ func (c *ProxmoxClient) CreateServer(ctx context.Context, cfg Config, publicKey,
 	if cfg.Proxmox.Pool != "" {
 		clone.Set("pool", cfg.Proxmox.Pool)
 	}
+	labels := DirectLeaseLabels(cfg, leaseID, slug, "proxmox", "", keep, time.Now().UTC())
+	for key, value := range extraLabels {
+		labels[key] = value
+	}
+	labels["node"], labels["template_id"] = cfg.Proxmox.Node, strconv.Itoa(cfg.Proxmox.TemplateID)
+	fixed := extraLabels["fixed_intent_sha256"] != ""
+	if fixed {
+		if bind == nil {
+			return Server{}, fmt.Errorf("fixed Proxmox clone requires durable generation binding")
+		}
+		clone.Set("description", proxmoxDescription(labels))
+	}
 	var upid string
 	if err := c.doRequired(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/qemu/%d/clone", url.PathEscape(c.Node), cfg.Proxmox.TemplateID), clone, &upid); err != nil {
 		return Server{}, err
 	}
 	clonedVMID := strconv.Itoa(vmid)
 	cleanupClone := func() {
+		// An uncertain fixed attempt remains in custody for checked release.
+		if fixed {
+			return
+		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		_ = c.DeleteServer(cleanupCtx, clonedVMID)
@@ -1023,10 +1153,15 @@ func (c *ProxmoxClient) CreateServer(ctx context.Context, cfg Config, publicKey,
 		return Server{}, err
 	}
 
-	now := time.Now().UTC()
-	labels := directLeaseLabels(cfg, leaseID, slug, "proxmox", "", keep, now)
-	labels["node"] = cfg.Proxmox.Node
-	labels["template_id"] = strconv.Itoa(cfg.Proxmox.TemplateID)
+	if fixed {
+		server, err := c.getServer(ctx, clonedVMID, true)
+		if err != nil {
+			return Server{}, err
+		}
+		if err := bind(server); err != nil {
+			return Server{}, err
+		}
+	}
 	description := proxmoxDescription(labels)
 	config := url.Values{
 		"ciuser":      {cfg.SSHUser},
@@ -1085,12 +1220,49 @@ func (c *ProxmoxClient) waitServerIP(ctx context.Context, vmid int) (Server, err
 	}
 }
 
+const proxmoxBootstrapDiagnosticLimit = 16 << 10
+
+// Display only the safe diagnostic; keep the native cause without promoting its
+// status to the CLI's separate ExitError contract.
+type proxmoxBootstrapError struct {
+	message string
+	cause   error
+}
+
+func (e *proxmoxBootstrapError) Error() string { return e.message }
+func (e *proxmoxBootstrapError) Unwrap() error { return e.cause }
+
 func (c *ProxmoxClient) bootstrapSSH(ctx context.Context, host string, cfg Config) error {
 	target := SSHTargetFromConfig(cfg, host)
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
 		if proxmoxRunSSHQuietWithOptions(ctx, target, sshTransportProbeCommand(target), "5", "1") == nil {
-			return proxmoxRunSSHInputQuiet(ctx, target, "sudo /bin/bash -s", proxmoxBootstrapScript(cfg))
+			out := newSynchronizedBuffer(proxmoxBootstrapDiagnosticLimit)
+			var setup, checks string
+			if c.GuestBootstrap != nil {
+				setup, checks = c.GuestBootstrap(cfg)
+			}
+			err := proxmoxRunSSHInput(ctx, target, "sudo /bin/bash -s", strings.NewReader(proxmoxBootstrapScriptWithChecks(cfg, setup, checks)), &out, &out)
+			if err == nil {
+				return nil
+			}
+			status := "unknown"
+			var native *exec.ExitError
+			if errors.As(err, &native) && native.ExitCode() >= 0 {
+				status = strconv.Itoa(native.ExitCode())
+			}
+			diagnostic, truncated := out.boundedString()
+			if truncated {
+				// A cut credential cannot be reliably redacted from a partial capture.
+				diagnostic = "diagnostics truncated; captured output omitted"
+			}
+			message := fmt.Sprintf("proxmox guest bootstrap exit=%s: %v", status, err)
+			if diagnostic = strings.TrimSpace(diagnostic); diagnostic != "" {
+				message += ": " + diagnostic
+			}
+			message = RedactDiagnosticSecrets(message, c.TokenID, c.TokenSecret, cfg.Proxmox.TokenID, cfg.Proxmox.TokenSecret)
+			message = proxmoxAPITokenPattern.ReplaceAllString(message, "PVEAPIToken=<redacted>")
+			return &proxmoxBootstrapError{message: message, cause: err}
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout waiting for proxmox ssh bootstrap transport")
@@ -1141,6 +1313,10 @@ func (c *ProxmoxClient) DeleteServer(ctx context.Context, id string) error {
 		vmid = int(server.ID)
 	}
 	_ = c.stopVM(ctx, vmid)
+	return c.purgeVM(ctx, vmid)
+}
+
+func (c *ProxmoxClient) purgeVM(ctx context.Context, vmid int) error {
 	q := url.Values{}
 	q.Set("purge", "1")
 	var upid string
@@ -1168,6 +1344,34 @@ func (c *ProxmoxClient) DeleteServerOnNode(ctx context.Context, node, id string)
 	scoped := *c
 	scoped.Node = node
 	return scoped.DeleteServer(ctx, id)
+}
+
+// DeleteServerOnNodeChecked lets the provider adapter authorize both destructive
+// steps against freshly read VM configuration, including after stop completes.
+func (c *ProxmoxClient) DeleteServerOnNodeChecked(ctx context.Context, node, id string, check func(Server) error) error {
+	vmid, err := strconv.Atoi(id)
+	if err != nil || vmid <= 0 || strconv.Itoa(vmid) != id || node == "" || check == nil {
+		return fmt.Errorf("checked Proxmox deletion requires an exact node, VMID, and authorization check")
+	}
+	scoped := *c
+	scoped.Node = node
+	validate := func() error {
+		server, err := scoped.getServer(ctx, id, true)
+		if err != nil {
+			return err
+		}
+		return check(server)
+	}
+	if err := validate(); err != nil {
+		return err
+	}
+	if err := scoped.stopVM(ctx, vmid); err != nil {
+		return err
+	}
+	if err := validate(); err != nil {
+		return err
+	}
+	return scoped.purgeVM(ctx, vmid)
 }
 
 func (c *ProxmoxClient) GetServer(ctx context.Context, id string) (Server, error) {
@@ -1206,10 +1410,36 @@ func (c *ProxmoxClient) getServer(ctx context.Context, id string, requireConfig 
 	}
 	ip, _ := c.guestIPv4(ctx, vmid)
 	server := proxmoxVMToServer(c.Node, status, labels, ip)
+	if generation, ok := config["vmgenid"].(string); ok {
+		server.ImmutableID = proxmoxGenerationID(generation)
+	}
 	if server.Name == "" {
 		server.Name = "vm-" + strconv.Itoa(vmid)
 	}
 	return server, nil
+}
+
+func proxmoxGenerationID(value string) string {
+	if len(value) != 36 {
+		return ""
+	}
+	nonzero := false
+	for i, c := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return ""
+			}
+			continue
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return ""
+		}
+		nonzero = nonzero || c != '0'
+	}
+	if !nonzero {
+		return ""
+	}
+	return strings.ToLower(value)
 }
 
 func (c *ProxmoxClient) getServerByName(ctx context.Context, name string) (Server, error) {
@@ -1290,19 +1520,6 @@ func (c *ProxmoxClient) waitTask(ctx context.Context, upid string) error {
 	}
 }
 
-type proxmoxAgentExecStart struct {
-	PID int `json:"pid"`
-}
-
-type proxmoxAgentExecStatus struct {
-	Exited   proxmoxBool `json:"exited"`
-	ExitCode int         `json:"exitcode"`
-	OutData  string      `json:"out-data"`
-	ErrData  string      `json:"err-data"`
-}
-
-type proxmoxBool bool
-
 type proxmoxAgentInterface struct {
 	Name        string `json:"name"`
 	IPAddresses []struct {
@@ -1339,7 +1556,7 @@ func proxmoxVMToServer(node string, vm proxmoxVM, labels map[string]string, ip s
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	if labels["node"] == "" {
+	if labels["node"] == "" && labels["fixed_intent_sha256"] == "" {
 		labels["node"] = node
 	}
 	server := Server{
@@ -1428,6 +1645,10 @@ func sortedLabelKeys(labels map[string]string) []string {
 }
 
 func proxmoxBootstrapScript(cfg Config) string {
+	return proxmoxBootstrapScriptWithChecks(cfg, "", "")
+}
+
+func proxmoxBootstrapScriptWithChecks(cfg Config, setup, checks string) string {
 	return fmt.Sprintf(`set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p %[1]s /var/cache/crabbox/pnpm /var/cache/crabbox/npm /var/lib/crabbox
@@ -1449,6 +1670,7 @@ retry() {
 retry apt-get update
 retry apt-get install -y --no-install-recommends openssh-server ca-certificates curl git rsync jq
 chown -R %[2]s:%[2]s %[1]s /var/cache/crabbox || true
+%[3]s
 cat >/usr/local/bin/crabbox-ready <<'READY'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1457,11 +1679,12 @@ rsync --version >/dev/null
 curl --version >/dev/null
 jq --version >/dev/null
 test -w %[1]s
+%[4]s
 READY
 chmod 0755 /usr/local/bin/crabbox-ready
 systemctl enable ssh || true
 systemctl restart ssh || systemctl restart ssh.socket || true
 touch /var/lib/crabbox/bootstrapped
 /usr/local/bin/crabbox-ready
-`, shellQuote(cfg.WorkRoot), shellQuote(cfg.SSHUser))
+`, shellQuote(cfg.WorkRoot), shellQuote(cfg.SSHUser), setup, checks)
 }

@@ -1,0 +1,149 @@
+package boxd
+
+import (
+	"encoding/json"
+	"flag"
+	"os"
+	"path"
+	"strings"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func init() {
+	core.RegisterProvider(Provider{})
+}
+
+// Provider uses the TLS gRPC API for lifecycle and authenticated guest
+// bootstrap; the HTTPS console is used only for the API-key exchange.
+type Provider struct{}
+
+func (Provider) Spec() core.ProviderSpec {
+	return core.ProviderSpec{
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIKey),
+		Name:             providerName,
+		Family:           providerName,
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+	}
+}
+
+func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return registerFlags(fs, defaults)
+}
+
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	return applyFlags(cfg, fs, values)
+}
+
+func (Provider) ValidateConfig(cfg core.Config) error {
+	if _, err := consoleURL(cfg.Boxd.APIURL); err != nil {
+		return err
+	}
+	if _, err := grpcTarget(cfg.Boxd.GRPCURL); err != nil {
+		return err
+	}
+	workRoot := cfg.Boxd.WorkRoot
+	if workRoot != strings.TrimSpace(workRoot) {
+		return core.Exit(2, "boxd.workRoot must be a canonical absolute Linux path")
+	}
+	cleanWorkRoot := path.Clean(workRoot)
+	if workRoot == "" || !strings.HasPrefix(cleanWorkRoot, "/") || cleanWorkRoot != workRoot {
+		return core.Exit(2, "boxd.workRoot must be a canonical absolute Linux path")
+	}
+	switch cleanWorkRoot {
+	case "/", "/bin", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin", "/sys", "/tmp", "/usr", "/var":
+		return core.Exit(2, "boxd.workRoot %q is too broad; choose a dedicated subdirectory", cleanWorkRoot)
+	}
+	return nil
+}
+
+func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
+		return nil, core.Exit(2, "provider=%s supports target=linux only", providerName)
+	}
+	if cfg.Tailscale.Enabled || string(cfg.Network) == "tailscale" {
+		return nil, core.Exit(2, "--tailscale is not supported for provider=%s; boxd machines are reached through the boxd edge proxy", providerName)
+	}
+	if cfg.Network != "" && cfg.Network != core.NetworkAuto && cfg.Network != core.NetworkPublic {
+		return nil, core.Exit(2, "provider=%s supports only public networking; refusing requested network=%s", providerName, cfg.Network)
+	}
+	applyDefaults(&cfg)
+	if err := p.ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
+	return newBackend(p.Spec(), cfg, rt), nil
+}
+
+// ClaimScope binds routing; the authenticated user is independently fenced in each claim.
+func (Provider) ClaimScope(cfg core.Config) string {
+	u, err := consoleURL(cfg.Boxd.APIURL)
+	if err != nil {
+		return "invalid-boxd-origin"
+	}
+	target, err := grpcTarget(cfg.Boxd.GRPCURL)
+	if err != nil {
+		return "invalid-boxd-origin"
+	}
+	data, _ := json.Marshal([]string{u.String(), target, cfg.Boxd.Org})
+	return string(data)
+}
+
+// legacyClaimScope is the exact scope serialization the earlier console-based
+// provider wrote: origin and organization, without the gRPC endpoint. Claims
+// carrying it stay visible for status, stop, and cleanup so retained or
+// failed-cleanup machines from before the migration can still be found and
+// destroyed; new acquisitions always write the current scope.
+func legacyClaimScope(cfg core.Config) string {
+	u, err := consoleURL(cfg.Boxd.APIURL)
+	if err != nil {
+		return "invalid-boxd-origin"
+	}
+	data, _ := json.Marshal([]string{u.String(), cfg.Boxd.Org})
+	return string(data)
+}
+
+func (Provider) DiagnosticSecrets(core.Config) []string {
+	return []string{os.Getenv("CRABBOX_BOXD_API_KEY"), os.Getenv("BOXD_API_KEY")}
+}
+
+// ServerTypeForConfig: boxd machine sizing follows the account/org quota, not
+// a caller-chosen instance type.
+func (Provider) ServerTypeForConfig(cfg core.Config) string {
+	if cfg.ServerTypeExplicit && cfg.ServerType != "" {
+		return cfg.ServerType
+	}
+	return "machine"
+}
+
+func applyDefaults(cfg *core.Config) {
+	cfg.Provider = providerName
+	if strings.TrimSpace(cfg.TargetOS) == "" {
+		cfg.TargetOS = core.TargetLinux
+	}
+	if cfg.Boxd.APIURL == "" {
+		cfg.Boxd.APIURL = defaultConsoleURL
+	}
+	if strings.TrimSpace(cfg.Boxd.GRPCURL) == "" {
+		cfg.Boxd.GRPCURL = defaultGRPCTarget
+	}
+	if !core.IsBoxdWorkRootExplicit(cfg) && core.IsWorkRootExplicit(cfg) {
+		cfg.Boxd.WorkRoot = cfg.WorkRoot
+	} else if strings.TrimSpace(cfg.Boxd.WorkRoot) == "" {
+		if strings.TrimSpace(cfg.WorkRoot) == "" || core.IsDefaultWorkRoot(cfg.WorkRoot) {
+			cfg.Boxd.WorkRoot = defaultBoxdWorkRoot
+		} else {
+			cfg.Boxd.WorkRoot = cfg.WorkRoot
+		}
+	}
+	cfg.WorkRoot = cfg.Boxd.WorkRoot
+	if cfg.Network == "" || cfg.Network == core.NetworkAuto || cfg.Network == core.NetworkPublic {
+		cfg.Network = core.NetworkPublic
+	}
+	if !cfg.ServerTypeExplicit || strings.TrimSpace(cfg.ServerType) == "" {
+		cfg.ServerType = "machine"
+	}
+}

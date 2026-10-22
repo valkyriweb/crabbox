@@ -13,20 +13,17 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string {
-	return []string{"local-tart", "macos-vm"}
-}
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "local-vm",
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetMacOS}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureDesktop},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"local-tart", "macos-vm"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationLocalContext),
+		Name:             providerName,
+		Family:           "local-vm",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetMacOS}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureDesktop},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -64,16 +61,4 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 		return nil, core.Exit(2, "--tailscale is not supported for provider=%s; use a remote SSH provider when tailnet reachability is required", providerName)
 	}
 	return newBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
-	}
-	return doctor, nil
 }

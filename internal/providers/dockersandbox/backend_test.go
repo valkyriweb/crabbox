@@ -3,20 +3,59 @@ package dockersandbox
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
+
+func TestManualConfigInputFlags(t *testing.T) {
+	cfg := core.BaseConfig()
+	cfg.Provider = "fixture-other"
+	cfg.DockerSandbox.CPUs = 2
+	fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+	values := RegisterDockerSandboxProviderFlags(fs, cfg)
+	before := cfg
+	if err := ApplyDockerSandboxProviderFlags(&cfg, fs, struct{}{}); err != nil || !reflect.DeepEqual(cfg, before) {
+		t.Fatalf("foreign values changed configuration: %v", err)
+	}
+	if err := ApplyDockerSandboxProviderFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	want := cfg
+	core.RecordProviderFlagInputs(&want, true, "docker-sandbox")
+	if reflect.DeepEqual(cfg, want) {
+		t.Fatal("unvisited flags recorded input")
+	}
+	for repeat := 0; repeat < 2; repeat++ {
+		if err := fs.Set("docker-sandbox-clone", "false"); err != nil {
+			t.Fatal(err)
+		}
+		if err := ApplyDockerSandboxProviderFlags(&cfg, fs, values); err != nil {
+			t.Fatal(err)
+		}
+		want = cfg
+		core.RecordProviderFlagInputs(&want, true, "docker-sandbox")
+		if !reflect.DeepEqual(cfg, want) {
+			t.Fatal("accepted/equal flag value was not recorded")
+		}
+	}
+}
 
 func TestProviderSpecIsDelegatedLinuxAndAliasFree(t *testing.T) {
 	spec := Provider{}.Spec()
@@ -32,10 +71,13 @@ func TestProviderSpecIsDelegatedLinuxAndAliasFree(t *testing.T) {
 	if !spec.Features.Has(core.FeatureRunSession) {
 		t.Fatalf("features=%v want run-session", spec.Features)
 	}
+	if !spec.Features.Has(core.FeatureMCP) {
+		t.Fatalf("features=%v want mcp-attachments", spec.Features)
+	}
 	if len(spec.Targets) != 1 || spec.Targets[0].OS != core.TargetLinux {
 		t.Fatalf("targets=%#v want linux only", spec.Targets)
 	}
-	if aliases := (Provider{}).Aliases(); len(aliases) != 0 {
+	if aliases := (Provider{}).Spec().Aliases; len(aliases) != 0 {
 		t.Fatalf("aliases=%v want none", aliases)
 	}
 }
@@ -55,7 +97,7 @@ func TestProviderWrappersConfigureBackendAndDoctor(t *testing.T) {
 		t.Fatalf("cfg=%#v", cfg.DockerSandbox)
 	}
 
-	rt := Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: newRunner(nil, nil)}
+	rt := core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: newRunner(nil, nil)}
 	configured, err := provider.Configure(cfg, rt)
 	if err != nil {
 		t.Fatalf("Configure err=%v", err)
@@ -63,7 +105,7 @@ func TestProviderWrappersConfigureBackendAndDoctor(t *testing.T) {
 	if configured.Spec().Name != providerName {
 		t.Fatalf("backend spec=%#v", configured.Spec())
 	}
-	doctor, err := provider.ConfigureDoctor(cfg, rt)
+	doctor, err := core.ConfigureProviderDoctor(provider, cfg, rt)
 	if err != nil {
 		t.Fatalf("ConfigureDoctor err=%v", err)
 	}
@@ -169,6 +211,150 @@ func TestParseSandboxListCoercesFieldsAndRejectsInvalidShapes(t *testing.T) {
 	}
 }
 
+func TestManagedStateNativeDockerSandboxCreateScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		extra, clone, noSync bool
+	}{{name: "repo"}, {name: "clone", clone: true}, {name: "extra no-sync", extra: true, noSync: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := t.TempDir()
+			t.Setenv("XDG_STATE_HOME", filepath.Join(source, "state-base"))
+			cfg := newTestConfig()
+			cfg.DockerSandbox.Clone = tc.clone
+			repo := source
+			if tc.extra {
+				repo = t.TempDir()
+				cfg.DockerSandbox.ExtraWorkspaces = []string{source}
+			}
+			runner := newRunner(nil, nil)
+			_, err := newTestBackend(cfg, runner, io.Discard, io.Discard).Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: repo}, NoSync: tc.noSync, Command: []string{"true"}})
+			if err == nil || !strings.Contains(err.Error(), "docker-sandbox workspace mount") || len(runner.calls) != 0 {
+				t.Fatalf("err=%v calls=%v", err, callVerbs(runner))
+			}
+		})
+	}
+}
+
+func TestManagedStateNativeDockerSandboxRetainedScopes(t *testing.T) {
+	for _, stored := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stored=%t", stored), func(t *testing.T) {
+			state := t.TempDir()
+			t.Setenv("XDG_STATE_HOME", state)
+			repo := t.TempDir()
+			leaseID := leasePrefix + "fixture"
+			if err := core.ClaimLeaseForRepoProviderPond(leaseID, "fixture", providerName, "", repo, time.Hour, false); err != nil {
+				t.Fatal(err)
+			}
+			if stored {
+				claim, _, err := core.ResolveLeaseClaimForProvider(leaseID, providerName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				roots, _ := json.Marshal([]string{repo, state})
+				if _, err := core.UpdateLeaseClaimLabelsIfUnchangedAfter(leaseID, claim, map[string]string{dockerSandboxWorkspaceRootsLabel: string(roots)}, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := newTestConfig()
+			cfg.DockerSandbox.ExtraWorkspaces = []string{t.TempDir()}
+			runner := newRunner(map[string]scriptedReply{"rm": {}}, nil)
+			b := newTestBackend(cfg, runner, io.Discard, io.Discard)
+			_, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Root: repo}, ID: leaseID, NoSync: true, Command: []string{"true"}})
+			if err == nil || !strings.Contains(err.Error(), "workspace mount") || len(runner.calls) != 0 {
+				t.Fatalf("err=%v calls=%v", err, callVerbs(runner))
+			}
+			if err := b.Stop(t.Context(), core.StopRequest{ID: leaseID}); err != nil {
+				t.Fatalf("cleanup blocked by outgoing guard: %v", err)
+			}
+			if got := callVerbs(runner); !reflect.DeepEqual(got, []string{"rm"}) {
+				t.Fatalf("cleanup calls=%v", got)
+			}
+		})
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	if err := validateDockerSandboxStoredWorkspaces(leasePrefix + "legacy"); err != nil {
+		t.Fatalf("unset compatibility: %v", err)
+	}
+}
+
+func recordDockerSandboxTestWorkspaces(t *testing.T, leaseID string, roots ...string) {
+	t.Helper()
+	claim, exists, err := core.ResolveLeaseClaimForProvider(leaseID, providerName)
+	if err != nil || !exists {
+		t.Fatalf("workspace fixture claim missing: %v", err)
+	}
+	encoded, err := json.Marshal(roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := make(map[string]string, len(claim.Labels)+1)
+	for key, value := range claim.Labels {
+		labels[key] = value
+	}
+	labels[dockerSandboxWorkspaceRootsLabel] = string(encoded)
+	if _, err := core.UpdateLeaseClaimLabelsIfUnchangedAfter(leaseID, claim, labels, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagedStateNativeDockerSandboxPersistsCreatedScope(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	repo, extra := t.TempDir(), t.TempDir()
+	cfg := newTestConfig()
+	cfg.DockerSandbox.ExtraWorkspaces = []string{extra}
+	runner := newRunner(map[string]scriptedReply{"create": {}, "exec": {}, "rm": {}}, nil)
+	b := newTestBackend(cfg, runner, io.Discard, io.Discard)
+	result, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Name: "fixture", Root: repo}, NoSync: true, Keep: true, Command: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, exists, err := core.ResolveLeaseClaimForProvider(result.LeaseID, providerName)
+	if err != nil || !exists {
+		t.Fatalf("created claim missing: %v", err)
+	}
+	var stored []string
+	if err := json.Unmarshal([]byte(claim.Labels[dockerSandboxWorkspaceRootsLabel]), &stored); err != nil {
+		t.Fatal(err)
+	}
+	want, err := dockerSandboxWorkspaceRoots(cfg, repo)
+	if err != nil || !reflect.DeepEqual(stored, want) {
+		t.Fatalf("stored=%v want=%v err=%v", stored, want, err)
+	}
+	b.cfg.DockerSandbox.ExtraWorkspaces = nil
+	if err := validateDockerSandboxStoredWorkspaces(result.LeaseID); err != nil {
+		t.Fatalf("stored nonoverlapping scope lost after config change: %v", err)
+	}
+	if err := b.Stop(t.Context(), core.StopRequest{ID: result.LeaseID}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagedStateNativeDockerSandboxUnsetScopeIsOptional(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", "")
+	cfg := newTestConfig()
+	// With no selection, legacy native argument acceptance remains the CLI's decision.
+	cfg.DockerSandbox.ExtraWorkspaces = []string{""}
+	runner := newRunner(map[string]scriptedReply{"create": {}, "exec": {}, "rm": {}}, nil)
+	var stderr bytes.Buffer
+	b := newTestBackend(cfg, runner, io.Discard, &stderr)
+	result, err := b.Run(t.Context(), core.RunRequest{Repo: core.Repo{Name: "fixture", Root: t.TempDir()}, Keep: true, Command: []string{"true"}})
+	if err != nil || !reflect.DeepEqual(callVerbs(runner), []string{"create", "exec"}) {
+		t.Fatalf("optional metadata changed native result: %v calls=%v", err, callVerbs(runner))
+	}
+	if !strings.Contains(stderr.String(), "scope persistence is unconfirmed") {
+		t.Fatalf("missing qualification warning: %q", stderr.String())
+	}
+	claim, exists, err := core.ResolveLeaseClaimForProvider(result.LeaseID, providerName)
+	if err != nil || !exists || claim.Labels[dockerSandboxWorkspaceRootsLabel] != "" {
+		t.Fatalf("unqualified scope was fabricated: %+v %v", claim, err)
+	}
+	if err := b.Stop(t.Context(), core.StopRequest{ID: result.LeaseID}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunCreatesExecsAndRemovesEphemeralSandbox(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	runner := newRunner(map[string]scriptedReply{
@@ -176,11 +362,17 @@ func TestRunCreatesExecsAndRemovesEphemeralSandbox(t *testing.T) {
 		"exec":   {stdout: "ok\n"},
 		"rm":     {stdout: ""},
 	}, nil)
+	cleanupDeadlineSet := false
+	runner.onRequest = func(ctx context.Context, req core.LocalCommandRequest) {
+		if scriptKey(req.Args) == "rm" {
+			_, cleanupDeadlineSet = ctx.Deadline()
+		}
+	}
 	repoRoot := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	backend := newTestBackend(newTestConfig(), runner, &stdout, &stderr)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "my-app", Root: repoRoot},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: repoRoot},
 		Command: []string{"echo", "ok"},
 	})
 	if err != nil {
@@ -225,8 +417,53 @@ func TestRunCreatesExecsAndRemovesEphemeralSandbox(t *testing.T) {
 	if rm == nil || !containsArg(rm.Args, "--force") {
 		t.Fatalf("rm call=%#v missing --force", rm)
 	}
-	if claim, ok, err := resolveLeaseClaimForProvider(result.LeaseID, providerName); err != nil || ok || claim.LeaseID != "" {
+	if claim, ok, err := core.ResolveLeaseClaimForProvider(result.LeaseID, providerName); err != nil || ok || claim.LeaseID != "" {
 		t.Fatalf("ephemeral claim still resolved claim=%#v ok=%t err=%v", claim, ok, err)
+	}
+	if !cleanupDeadlineSet {
+		t.Fatal("ephemeral sandbox cleanup did not receive a deadline")
+	}
+}
+
+func TestRunCleanupPreservesReplacedClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	replacementRepo := t.TempDir()
+	var stderr bytes.Buffer
+	runner := newRunner(map[string]scriptedReply{
+		"create": {stdout: ""},
+		"exec":   {stdout: "ok\n"},
+		"rm":     {stdout: ""},
+	}, nil)
+	runner.onRequest = func(_ context.Context, req core.LocalCommandRequest) {
+		if scriptKey(req.Args) != "exec" {
+			return
+		}
+		claims, err := core.ListLeaseClaims()
+		if err != nil || len(claims) != 1 {
+			t.Fatalf("claims=%#v err=%v", claims, err)
+		}
+		claim := claims[0]
+		if err := core.ClaimLeaseForRepoProviderPond(claim.LeaseID, claim.Slug, providerName, claim.Pond, replacementRepo, time.Hour, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend := newTestBackend(newTestConfig(), runner, io.Discard, &stderr)
+	result, err := backend.Run(t.Context(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: t.TempDir()},
+		Command: []string{"echo", "ok"},
+	})
+	if err == nil || result.ExitCode != 1 || result.Status != core.RunStatusFailed || result.ErrorKind != core.RunErrorProvider || result.Session == nil || !result.Session.Kept {
+		t.Fatalf("changed claim cleanup result=%+v err=%v", result, err)
+	}
+	if findCall(runner, "rm") != nil {
+		t.Fatal("cleanup removed a sandbox after its local claim was replaced")
+	}
+	claim, ok, claimErr := core.ResolveLeaseClaimForProvider(result.LeaseID, providerName)
+	if claimErr != nil || !ok || claim.RepoRoot != replacementRepo {
+		t.Fatalf("replacement claim=%#v ok=%t err=%v", claim, ok, claimErr)
+	}
+	if !strings.Contains(err.Error(), "claim changed; retry") {
+		t.Fatalf("cleanup diagnostic=%v", err)
 	}
 }
 
@@ -243,8 +480,8 @@ func TestRunCloneModeKeepsSandboxAfterSuccess(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend := newTestBackend(cfg, runner, io.Discard, &stderr)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "my-app", Root: repoRoot},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: repoRoot},
 		Command: []string{"echo", "ok"},
 	})
 	if err != nil {
@@ -259,8 +496,203 @@ func TestRunCloneModeKeepsSandboxAfterSuccess(t *testing.T) {
 	if !strings.Contains(stderr.String(), "clone run kept sandbox") || !strings.Contains(stderr.String(), result.Session.CleanupCommand) {
 		t.Fatalf("stderr missing clone cleanup guidance: %s", stderr.String())
 	}
-	if claim, ok, err := resolveLeaseClaimForProvider(result.LeaseID, providerName); err != nil || !ok || claim.LeaseID == "" {
+	if claim, ok, err := core.ResolveLeaseClaimForProvider(result.LeaseID, providerName); err != nil || !ok || claim.LeaseID == "" {
 		t.Fatalf("kept clone claim claim=%#v ok=%t err=%v", claim, ok, err)
+	}
+}
+
+type terminalTimingWriter struct {
+	bytes.Buffer
+	cause error
+}
+
+func (w *terminalTimingWriter) Write(data []byte) (int, error) {
+	if len(data) > 0 && data[0] == '{' {
+		return 0, w.cause
+	}
+	return w.Buffer.Write(data)
+}
+
+func TestRunTerminalFailuresPreserveOutcomeAndDisposition(t *testing.T) {
+	for _, tc := range []struct {
+		name                                              string
+		code                                              int
+		cause                                             error
+		clone, cleanup, timing, keepFailure, badEnv, keep bool
+	}{
+		{name: "cleanup after success", cleanup: true},
+		{name: "command and cleanup", code: 23, cleanup: true},
+		{name: "command cleanup and timing", code: 23, cleanup: true, timing: true},
+		{name: "kept command and timing", code: 23, keepFailure: true, timing: true},
+		{name: "transport cleanup and timing", cause: io.ErrUnexpectedEOF, cleanup: true, timing: true},
+		{name: "cancellation cleanup and timing", cause: context.Canceled, cleanup: true, timing: true},
+		{name: "deadline cleanup and timing", cause: context.DeadlineExceeded, cleanup: true, timing: true},
+		{name: "clone success then timing", clone: true, timing: true},
+		{name: "clone failure then timing", clone: true, code: 23, timing: true},
+		{name: "ordinary success then timing", timing: true, keepFailure: true},
+		{name: "environment failure and cleanup", badEnv: true, cleanup: true},
+		{name: "kept environment failure", badEnv: true, keep: true},
+		{name: "early environment failure retained", badEnv: true, keepFailure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			cleanupErr, writerErr := errors.New("synthetic remove failure"), errors.New("synthetic timing failure")
+			replies := map[string]scriptedReply{"create": {}, "exec": {exitCode: tc.code, err: tc.cause}, "rm": {}}
+			if tc.cleanup {
+				replies["rm"] = scriptedReply{err: cleanupErr}
+			}
+			runner := newRunner(replies, nil)
+			var stderr bytes.Buffer
+			var diagnostics io.Writer = &stderr
+			if tc.timing {
+				diagnostics = &terminalTimingWriter{cause: writerErr}
+			}
+			cfg := newTestConfig()
+			cfg.DockerSandbox.Clone = tc.clone
+			repoRoot := t.TempDir()
+			if tc.clone {
+				runGit(t, repoRoot, "init", "-q")
+			}
+			req := core.RunRequest{Repo: core.Repo{Name: "fixture", Root: repoRoot}, Command: []string{"true"}, TimingJSON: true, KeepOnFailure: tc.keepFailure, Keep: tc.keep}
+			if tc.badEnv {
+				req.Env = map[string]string{"INVALID-NAME": "synthetic"}
+			}
+			backend := newTestBackend(cfg, runner, io.Discard, diagnostics)
+			result, err := backend.Run(t.Context(), req)
+			wantCode, wantStatus, wantKind := tc.code, core.RunStatusFailed, core.RunErrorCommandExit
+			if tc.cause != nil {
+				wantCode = 1
+				wantKind = core.RunErrorProvider
+				if tc.cause == context.Canceled {
+					wantStatus = core.RunStatusCanceled
+					wantKind = core.RunErrorCanceled
+				}
+				if tc.cause == context.DeadlineExceeded {
+					wantStatus = core.RunStatusTimedOut
+					wantKind = core.RunErrorTimeout
+				}
+			}
+			if tc.badEnv {
+				wantCode = 2
+				wantKind = core.RunErrorProvider
+			}
+			if wantCode == 0 {
+				wantCode = 1
+				wantKind = core.RunErrorProvider
+			}
+			var public core.ExitError
+			if !errors.As(err, &public) || public.Code != wantCode || result.ExitCode != wantCode || result.Status != wantStatus || result.ErrorKind != wantKind {
+				t.Errorf("primary outcome result=%+v err=%v public=%+v", result, err, public)
+			}
+			for _, cause := range []error{tc.cause, replies["rm"].err} {
+				if cause != nil && !errors.Is(err, cause) {
+					t.Errorf("cause %v lost: %v", cause, err)
+				}
+			}
+			if tc.cleanup && !strings.Contains(public.Message, cleanupErr.Error()) {
+				t.Errorf("cleanup diagnostic missing: %q", public.Message)
+			}
+			if tc.timing && (!errors.Is(err, writerErr) || !strings.Contains(public.Message, writerErr.Error())) {
+				t.Errorf("timing cause/diagnostic lost: %v", err)
+			}
+			commandFailed := tc.code != 0 || tc.cause != nil
+			wantStop := !tc.keep && !(tc.keepFailure && (commandFailed || tc.badEnv)) && !(tc.clone && !commandFailed && !tc.badEnv)
+			wantKept := !wantStop || tc.cleanup
+			if result.Session == nil || result.Session.Kept != wantKept || result.Session.Reused || result.Session.LeaseID != result.LeaseID {
+				t.Errorf("disposition session=%+v want kept=%t", result.Session, wantKept)
+			}
+			if (findCall(runner, "rm") != nil) != wantStop {
+				t.Errorf("remove calls=%v want stop=%t", callVerbs(runner), wantStop)
+			}
+			if claim, ok, claimErr := core.ResolveLeaseClaimForProvider(result.LeaseID, providerName); claimErr != nil || ok != wantKept || ok && claim.RepoRoot != repoRoot {
+				t.Errorf("claim=%+v exists=%t want=%t err=%v", claim, ok, wantKept, claimErr)
+			}
+			if tc.badEnv && findCall(runner, "exec") != nil {
+				t.Error("invalid environment reached workload")
+			}
+			if tc.clone && !commandFailed && !strings.Contains(diagnostics.(*terminalTimingWriter).String(), "clone run kept sandbox") {
+				t.Error("clone preservation guidance missing")
+			}
+			if !tc.timing {
+				assertTerminalTiming(t, stderr.String(), result, err)
+			}
+		})
+	}
+}
+
+func assertTerminalTiming(t *testing.T, diagnostics string, result core.RunResult, err error) {
+	t.Helper()
+	var reports []core.TimingReport
+	for _, line := range strings.Split(strings.TrimSpace(diagnostics), "\n") {
+		if strings.HasPrefix(line, "{") {
+			var report core.TimingReport
+			if err := json.Unmarshal([]byte(line), &report); err != nil {
+				t.Fatal(err)
+			}
+			reports = append(reports, report)
+		}
+	}
+	if len(reports) != 1 {
+		t.Fatalf("timing records=%d diagnostics=%s", len(reports), diagnostics)
+	}
+	report := reports[0]
+	result = core.FinalizeRunResult(result, err)
+	if report.ExitCode != result.ExitCode || report.RunStatus != result.Status || report.ErrorKind != result.ErrorKind || report.LeaseID != result.LeaseID || report.Slug != result.Slug || !report.SyncDelegated || !report.SyncSkipped || !reflect.DeepEqual(report.SyncPhases, []core.TimingPhase{{Name: "sync", Skipped: true, Reason: "provider-delegated workspace"}}) {
+		t.Fatalf("timing=%+v result=%+v", report, result)
+	}
+}
+
+func TestRunCloneFailureAndNativeWorkspaceControls(t *testing.T) {
+	for _, tc := range []struct {
+		name                                            string
+		clone, keep, keepFailure, reuse, noSync, badEnv bool
+		code                                            int
+	}{
+		{name: "clone success", clone: true},
+		{name: "clone command failure", clone: true, code: 23},
+		{name: "clone kept failure", clone: true, code: 23, keepFailure: true},
+		{name: "clone explicit keep", clone: true, code: 23, keep: true},
+		{name: "native workspace"},
+		{name: "explicit no sync", noSync: true},
+		{name: "reused failure", reuse: true, code: 23},
+		{name: "early failure cleanup", badEnv: true},
+		{name: "unexecuted clone cleanup", clone: true, badEnv: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			cfg := newTestConfig()
+			cfg.DockerSandbox.Clone = tc.clone
+			repoRoot := t.TempDir()
+			if tc.clone {
+				runGit(t, repoRoot, "init", "-q")
+			}
+			runner := newRunner(map[string]scriptedReply{"create": {}, "exec": {exitCode: tc.code}, "rm": {}}, nil)
+			var stderr bytes.Buffer
+			backend := newTestBackend(cfg, runner, io.Discard, &stderr)
+			req := core.RunRequest{Repo: core.Repo{Name: "fixture", Root: repoRoot}, Command: []string{"true"}, TimingJSON: true, Keep: tc.keep, KeepOnFailure: tc.keepFailure, NoSync: tc.noSync}
+			if tc.reuse {
+				req.ID = "dsbx_crabbox-fixture-123456"
+				if err := core.ClaimLeaseForRepoProviderPond(req.ID, "fixture", providerName, "", repoRoot, time.Hour, false); err != nil {
+					t.Fatal(err)
+				}
+				recordDockerSandboxTestWorkspaces(t, req.ID, repoRoot)
+			}
+			if tc.badEnv {
+				req.Env = map[string]string{"INVALID-NAME": "synthetic"}
+			}
+			result, err := backend.Run(t.Context(), req)
+			wantKept := tc.keep || tc.reuse || tc.clone && tc.code == 0 && !tc.badEnv || tc.keepFailure && tc.code != 0
+			if (err != nil) != (tc.code != 0 || tc.badEnv) || (findCall(runner, "rm") != nil) == wantKept {
+				t.Fatalf("err=%v calls=%v", err, callVerbs(runner))
+			}
+			if tc.badEnv {
+				return
+			}
+			if result.ExitCode != tc.code || result.Session == nil || result.Session.Kept != wantKept || result.Session.Reused != tc.reuse {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			assertTerminalTiming(t, stderr.String(), result, err)
+		})
 	}
 }
 
@@ -283,8 +715,8 @@ func TestRunBuildsConfiguredCreateCommandAndExec(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend := newTestBackend(cfg, runner, io.Discard, io.Discard)
-	_, err := backend.Run(context.Background(), RunRequest{
-		Repo:      Repo{Name: "my-app", Root: repoRoot},
+	_, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:      core.Repo{Name: "my-app", Root: repoRoot},
 		Command:   []string{"echo", "hello"},
 		ShellMode: true,
 	})
@@ -323,8 +755,8 @@ func TestRunForwardsEnvViaSBXEnvFile(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, &stderr)
-	_, err := backend.Run(context.Background(), RunRequest{
-		Repo:       Repo{Name: "my-app", Root: t.TempDir()},
+	_, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:       core.Repo{Name: "my-app", Root: t.TempDir()},
 		Command:    []string{"printenv", "SECRET_TOKEN"},
 		Env:        map[string]string{"SECRET_TOKEN": "secret-token-value"},
 		EnvSummary: true,
@@ -365,8 +797,8 @@ func TestRunCleansUpEnvFileAfterExecFailure(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	_, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "my-app", Root: t.TempDir()},
+	_, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: t.TempDir()},
 		Command: []string{"printenv", "SECRET_TOKEN"},
 		Env:     map[string]string{"SECRET_TOKEN": "secret-token-value"},
 	})
@@ -413,9 +845,6 @@ func TestFormatDockerSandboxEnvFile(t *testing.T) {
 	if _, err := formatDockerSandboxEnvFile(map[string]string{"SECRET_TOKEN": "carriage\rreturn"}); err == nil || !strings.Contains(err.Error(), "newlines") {
 		t.Fatalf("carriage return err=%v", err)
 	}
-	if !validDockerSandboxEnvName("_OK_1") || validDockerSandboxEnvName("1_BAD") || validDockerSandboxEnvName("BAD.NAME") || validDockerSandboxEnvName("") {
-		t.Fatal("validDockerSandboxEnvName accepted or rejected the wrong names")
-	}
 }
 
 func TestWriteDockerSandboxEnvFileCreatesAndCleansUpFile(t *testing.T) {
@@ -445,8 +874,8 @@ func TestRunEnvSummaryTimingAndNoEnvBranches(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, &stderr)
-	_, err := backend.Run(context.Background(), RunRequest{
-		Repo:       Repo{Name: "my-app", Root: t.TempDir()},
+	_, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:       core.Repo{Name: "my-app", Root: t.TempDir()},
 		Command:    []string{"true"},
 		EnvSummary: true,
 		TimingJSON: true,
@@ -456,6 +885,17 @@ func TestRunEnvSummaryTimingAndNoEnvBranches(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "env forwarding") || !strings.Contains(stderr.String(), `"provider":"docker-sandbox"`) {
 		t.Fatalf("stderr=%s missing env summary or timing JSON", stderr.String())
+	}
+	var report struct {
+		RunStatus string `json:"runStatus"`
+		ErrorKind string `json:"errorKind"`
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil {
+		t.Fatalf("timing json: %v\nstderr=%s", err, stderr.String())
+	}
+	if report.RunStatus != "succeeded" || report.ErrorKind != "" {
+		t.Fatalf("timing outcome status=%q kind=%q", report.RunStatus, report.ErrorKind)
 	}
 	execCall := findCall(runner, "exec")
 	if execCall == nil {
@@ -476,8 +916,8 @@ func TestRunEnvSummaryTimingAndNoEnvBranches(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend = newTestBackend(newTestConfig(), runner, io.Discard, &stderr)
-	_, err = backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "my-app", Root: t.TempDir()},
+	_, err = backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: t.TempDir()},
 		Command: []string{"true"},
 	})
 	if err != nil {
@@ -493,8 +933,8 @@ func TestRunEnvSummaryTimingAndNoEnvBranches(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend = newTestBackend(newTestConfig(), runner, io.Discard, errWriter{})
-	_, err = backend.Run(context.Background(), RunRequest{
-		Repo:       Repo{Name: "my-app", Root: t.TempDir()},
+	_, err = backend.Run(context.Background(), core.RunRequest{
+		Repo:       core.Repo{Name: "my-app", Root: t.TempDir()},
 		Command:    []string{"true"},
 		TimingJSON: true,
 	})
@@ -507,13 +947,14 @@ func TestRunWithExistingIDReusesClaimedSandbox(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repoRoot := t.TempDir()
 	leaseID := leasePrefix + "crabbox-my-app-abc123"
-	if err := claimLeaseForRepoProviderPond(leaseID, "blue-box", providerName, "", repoRoot, time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leaseID, "blue-box", providerName, "", repoRoot, time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
+	recordDockerSandboxTestWorkspaces(t, leaseID, repoRoot)
 	runner := newRunner(map[string]scriptedReply{"exec": {stdout: "pwd\n"}}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "my-app", Root: repoRoot},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: repoRoot},
 		ID:      "blue-box",
 		Command: []string{"pwd"},
 	})
@@ -532,15 +973,16 @@ func TestRunWithExistingIDClassifiesMissingSBXCLI(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repoRoot := t.TempDir()
 	leaseID := leasePrefix + "crabbox-my-app-missing-cli"
-	if err := claimLeaseForRepoProviderPond(leaseID, "missing-cli", providerName, "", repoRoot, time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leaseID, "missing-cli", providerName, "", repoRoot, time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
+	recordDockerSandboxTestWorkspaces(t, leaseID, repoRoot)
 	runner := newRunner(map[string]scriptedReply{
 		"exec": {stderr: "not found", exitCode: 1, err: os.ErrNotExist},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	_, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "my-app", Root: repoRoot},
+	_, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: repoRoot},
 		ID:      "missing-cli",
 		Command: []string{"pwd"},
 	})
@@ -557,21 +999,21 @@ func TestRunKeepsClaimOnKeepAndCleansUpAfterCommandBuildFailure(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:    Repo{Name: "my-app", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:    core.Repo{Name: "my-app", Root: t.TempDir()},
 		Command: []string{"true"},
 		Keep:    true,
 	})
 	if err != nil {
 		t.Fatalf("Run keep err=%v", err)
 	}
-	if _, ok, err := resolveLeaseClaimForProvider(result.LeaseID, providerName); err != nil || !ok {
+	if _, ok, err := core.ResolveLeaseClaimForProvider(result.LeaseID, providerName); err != nil || !ok {
 		t.Fatalf("kept claim missing ok=%t err=%v", ok, err)
 	}
 
 	runner = newRunner(map[string]scriptedReply{"create": {stdout: ""}, "rm": {stdout: ""}}, nil)
 	backend = newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	_, err = backend.Run(context.Background(), RunRequest{Repo: Repo{Name: "my-app", Root: t.TempDir()}})
+	_, err = backend.Run(context.Background(), core.RunRequest{Repo: core.Repo{Name: "my-app", Root: t.TempDir()}})
 	if err == nil || !strings.Contains(err.Error(), "missing command") {
 		t.Fatalf("Run empty command err=%v", err)
 	}
@@ -604,11 +1046,14 @@ func TestCreateSandboxRemovesSandboxWhenClaimSetupFails(t *testing.T) {
 			name:          "slug allocation",
 			requestedSlug: "wanted",
 			setupState: func(t *testing.T) {
-				stateFile := filepathJoin(t.TempDir(), "state-file")
-				if err := os.WriteFile(stateFile, []byte("not a directory"), 0o600); err != nil {
+				stateDir := t.TempDir()
+				if err := os.Mkdir(filepathJoin(stateDir, "crabbox"), 0o700); err != nil {
 					t.Fatal(err)
 				}
-				t.Setenv("XDG_STATE_HOME", stateFile)
+				if err := os.WriteFile(filepathJoin(stateDir, "crabbox", "claims"), []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("XDG_STATE_HOME", stateDir)
 			},
 			want: "read claims directory",
 		},
@@ -663,7 +1108,7 @@ func TestCreateSandboxRemovesSandboxWhenClaimSetupFails(t *testing.T) {
 			var stderr bytes.Buffer
 			backend := newTestBackend(newTestConfig(), runner, io.Discard, &stderr)
 			cli := &sbxCLI{cfg: backend.cfg, rt: backend.rt}
-			_, _, _, err := backend.createSandbox(context.Background(), cli, Repo{Name: "my-app", Root: repoRoot}, false, tt.requestedSlug)
+			_, _, _, err := backend.createSandbox(context.Background(), cli, core.Repo{Name: "my-app", Root: repoRoot}, false, tt.requestedSlug)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("createSandbox err=%v want %q", err, tt.want)
 			}
@@ -690,10 +1135,10 @@ func TestListFiltersToCrabboxOwnedDockerSandboxes(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	repoRoot := t.TempDir()
 	owned := "crabbox-my-app-owned"
-	if err := claimLeaseForRepoProviderPond(leasePrefix+owned, "owned", providerName, "", repoRoot, time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leasePrefix+owned, "owned", providerName, "", repoRoot, time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := claimLeaseForRepoProviderPond(leasePrefix+"crabbox-other-provider", "other", "tensorlake", "", repoRoot, time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leasePrefix+"crabbox-other-provider", "other", "tensorlake", "", repoRoot, time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	runner := newRunner(map[string]scriptedReply{
@@ -705,7 +1150,7 @@ func TestListFiltersToCrabboxOwnedDockerSandboxes(t *testing.T) {
 		]`},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	leases, err := backend.List(context.Background(), ListRequest{})
+	leases, err := backend.List(context.Background(), core.ListRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -718,119 +1163,123 @@ func TestListFiltersToCrabboxOwnedDockerSandboxes(t *testing.T) {
 }
 
 func TestStatusReadyMissingWaitAndTimeout(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	leaseID := leasePrefix + "crabbox-my-app-status"
-	if err := claimLeaseForRepoProviderPond(leaseID, "status", providerName, "", t.TempDir(), time.Hour, false); err != nil {
-		t.Fatal(err)
-	}
-	readyRunner := newRunner(map[string]scriptedReply{
-		"ls": {stdout: `[{"name":"crabbox-my-app-status","status":"running","agent":"shell","workspace":"/repo"}]`},
-	}, nil)
-	view, err := newTestBackend(newTestConfig(), readyRunner, io.Discard, io.Discard).Status(context.Background(), StatusRequest{ID: "status"})
-	if err != nil {
-		t.Fatalf("Status ready err=%v", err)
-	}
-	if !view.Ready || view.ServerType != providerName || view.Labels["workspace"] != "/repo" {
-		t.Fatalf("view=%#v", view)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		leaseID := leasePrefix + "crabbox-my-app-status"
+		if err := core.ClaimLeaseForRepoProviderPond(leaseID, "status", providerName, "", t.TempDir(), time.Hour, false); err != nil {
+			t.Fatal(err)
+		}
+		readyRunner := newRunner(map[string]scriptedReply{
+			"ls": {stdout: `[{"name":"crabbox-my-app-status","status":"running","agent":"shell","workspace":"/repo"}]`},
+		}, nil)
+		view, err := newTestBackend(newTestConfig(), readyRunner, io.Discard, io.Discard).Status(context.Background(), core.StatusRequest{ID: "status"})
+		if err != nil {
+			t.Fatalf("Status ready err=%v", err)
+		}
+		if !view.Ready || view.ServerType != providerName || view.Labels["workspace"] != "/repo" {
+			t.Fatalf("view=%#v", view)
+		}
 
-	missingRunner := newRunner(map[string]scriptedReply{"ls": {stdout: `[]`}}, nil)
-	_, err = newTestBackend(newTestConfig(), missingRunner, io.Discard, io.Discard).Status(context.Background(), StatusRequest{ID: "status"})
-	if err == nil || !strings.Contains(err.Error(), "not present") {
-		t.Fatalf("missing status err=%v", err)
-	}
+		missingRunner := newRunner(map[string]scriptedReply{"ls": {stdout: `[]`}}, nil)
+		_, err = newTestBackend(newTestConfig(), missingRunner, io.Discard, io.Discard).Status(context.Background(), core.StatusRequest{ID: "status"})
+		if err == nil || !strings.Contains(err.Error(), "not present") {
+			t.Fatalf("missing status err=%v", err)
+		}
 
-	terminalRunner := newRunner(map[string]scriptedReply{
-		"ls": {stdout: `[{"name":"crabbox-my-app-status","status":"stopped"}]`},
-	}, nil)
-	view, err = newTestBackend(newTestConfig(), terminalRunner, io.Discard, io.Discard).Status(context.Background(), StatusRequest{
-		ID:          "status",
-		Wait:        true,
-		WaitTimeout: time.Nanosecond,
-	})
-	if err != nil || view.Ready || view.State != "stopped" {
-		t.Fatalf("terminal stopped status view=%#v err=%v", view, err)
-	}
+		terminalRunner := newRunner(map[string]scriptedReply{
+			"ls": {stdout: `[{"name":"crabbox-my-app-status","status":"stopped"}]`},
+		}, nil)
+		view, err = newTestBackend(newTestConfig(), terminalRunner, io.Discard, io.Discard).Status(context.Background(), core.StatusRequest{
+			ID:          "status",
+			Wait:        true,
+			WaitTimeout: time.Nanosecond,
+		})
+		if err != nil || view.Ready || view.State != "stopped" {
+			t.Fatalf("terminal stopped status view=%#v err=%v", view, err)
+		}
 
-	oldPoll := statusPollInterval
-	statusPollInterval = time.Nanosecond
-	defer func() { statusPollInterval = oldPoll }()
-	waitRunner := newRunner(nil, map[string][]scriptedReply{
-		"ls": {
-			{stdout: `[{"name":"crabbox-my-app-status","status":"provisioning"}]`},
-			{stdout: `[{"name":"crabbox-my-app-status","status":"running"}]`},
-		},
-	})
-	view, err = newTestBackend(newTestConfig(), waitRunner, io.Discard, io.Discard).Status(context.Background(), StatusRequest{
-		ID:          "status",
-		Wait:        true,
-		WaitTimeout: time.Second,
-	})
-	if err != nil || !view.Ready {
-		t.Fatalf("wait ready view=%#v err=%v", view, err)
-	}
+		oldPoll := statusPollInterval
+		statusPollInterval = 100 * time.Microsecond
+		defer func() { statusPollInterval = oldPoll }()
+		waitRunner := newRunner(nil, map[string][]scriptedReply{
+			"ls": {
+				{stdout: `[{"name":"crabbox-my-app-status","status":"provisioning"}]`},
+				{stdout: `[{"name":"crabbox-my-app-status","status":"running"}]`},
+			},
+		})
+		view, err = newTestBackend(newTestConfig(), waitRunner, io.Discard, io.Discard).Status(context.Background(), core.StatusRequest{
+			ID:          "status",
+			Wait:        true,
+			WaitTimeout: time.Second,
+		})
+		if err != nil || !view.Ready {
+			t.Fatalf("wait ready view=%#v err=%v", view, err)
+		}
 
-	timeoutRunner := newRunner(map[string]scriptedReply{
-		"ls": {stdout: `[{"name":"crabbox-my-app-status","status":"provisioning"}]`},
-	}, nil)
-	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer timeoutCancel()
-	_, err = newTestBackend(newTestConfig(), timeoutRunner, io.Discard, io.Discard).Status(timeoutCtx, StatusRequest{
-		ID:          "status",
-		Wait:        true,
-		WaitTimeout: time.Nanosecond,
-	})
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting") {
-		t.Fatalf("timeout status err=%v", err)
-	}
+		timeoutRunner := newRunner(map[string]scriptedReply{
+			"ls": {stdout: `[{"name":"crabbox-my-app-status","status":"provisioning"}]`},
+		}, nil)
+		timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), time.Millisecond)
+		defer timeoutCancel()
+		_, err = newTestBackend(newTestConfig(), timeoutRunner, io.Discard, io.Discard).Status(timeoutCtx, core.StatusRequest{
+			ID:          "status",
+			Wait:        true,
+			WaitTimeout: time.Nanosecond,
+		})
+		if err == nil || !strings.Contains(err.Error(), "timed out waiting") {
+			t.Fatalf("timeout status err=%v", err)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer cancel()
-	_, err = newTestBackend(newTestConfig(), timeoutRunner, io.Discard, io.Discard).Status(ctx, StatusRequest{
-		ID:   "status",
-		Wait: true,
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		defer cancel()
+		_, err = newTestBackend(newTestConfig(), timeoutRunner, io.Discard, io.Discard).Status(ctx, core.StatusRequest{
+			ID:   "status",
+			Wait: true,
+		})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("default wait context err=%v", err)
+		}
 	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("default wait context err=%v", err)
-	}
 }
 
 func TestStatusWaitTimeoutDoesNotSleepPastDeadline(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	leaseID := leasePrefix + "crabbox-my-app-short-timeout"
-	if err := claimLeaseForRepoProviderPond(leaseID, "short-timeout", providerName, "", t.TempDir(), time.Hour, false); err != nil {
-		t.Fatal(err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		leaseID := leasePrefix + "crabbox-my-app-short-timeout"
+		if err := core.ClaimLeaseForRepoProviderPond(leaseID, "short-timeout", providerName, "", t.TempDir(), time.Hour, false); err != nil {
+			t.Fatal(err)
+		}
 
-	oldPoll := statusPollInterval
-	statusPollInterval = 200 * time.Millisecond
-	defer func() { statusPollInterval = oldPoll }()
+		oldPoll := statusPollInterval
+		statusPollInterval = 2 * time.Second
+		defer func() { statusPollInterval = oldPoll }()
 
-	runner := newRunner(map[string]scriptedReply{
-		"ls": {stdout: `[{"name":"crabbox-my-app-short-timeout","status":"provisioning"}]`},
-	}, nil)
-	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
+		runner := newRunner(map[string]scriptedReply{
+			"ls": {stdout: `[{"name":"crabbox-my-app-short-timeout","status":"provisioning"}]`},
+		}, nil)
+		backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
 
-	start := time.Now()
-	_, err := backend.Status(context.Background(), StatusRequest{
-		ID:          "short-timeout",
-		Wait:        true,
-		WaitTimeout: 20 * time.Millisecond,
+		start := time.Now()
+		_, err := backend.Status(context.Background(), core.StatusRequest{
+			ID:          "short-timeout",
+			Wait:        true,
+			WaitTimeout: 20 * time.Millisecond,
+		})
+		elapsed := time.Since(start)
+		if err == nil || !strings.Contains(err.Error(), "timed out waiting") {
+			t.Fatalf("Status err=%v want timeout", err)
+		}
+		if elapsed >= statusPollInterval/2 {
+			t.Fatalf("status wait elapsed=%s, want it bounded by the 20ms wait timeout rather than the 2s poll interval", elapsed)
+		}
 	})
-	elapsed := time.Since(start)
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting") {
-		t.Fatalf("Status err=%v want timeout", err)
-	}
-	if elapsed >= statusPollInterval/2 {
-		t.Fatalf("status wait elapsed=%s, want it bounded by the 20ms wait timeout rather than the 200ms poll interval", elapsed)
-	}
 }
 
 func TestStopRejectsUnclaimedIDBeforeCallingRM(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	runner := newRunner(map[string]scriptedReply{"rm": {stdout: ""}}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	err := backend.Stop(context.Background(), StopRequest{ID: "user-owned-sandbox"})
+	err := backend.Stop(context.Background(), core.StopRequest{ID: "user-owned-sandbox"})
 	if err == nil || !strings.Contains(err.Error(), "not claimed by Crabbox") {
 		t.Fatalf("err=%v want unclaimed rejection", err)
 	}
@@ -842,26 +1291,26 @@ func TestStopRejectsUnclaimedIDBeforeCallingRM(t *testing.T) {
 func TestStopRemovesClaimedSandboxWithForce(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := leasePrefix + "crabbox-my-app-stopme"
-	if err := claimLeaseForRepoProviderPond(leaseID, "stopme", providerName, "", t.TempDir(), time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leaseID, "stopme", providerName, "", t.TempDir(), time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	runner := newRunner(map[string]scriptedReply{"rm": {stdout: ""}}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	if err := backend.Stop(context.Background(), StopRequest{ID: "stopme"}); err != nil {
+	if err := backend.Stop(context.Background(), core.StopRequest{ID: "stopme"}); err != nil {
 		t.Fatalf("Stop err=%v", err)
 	}
 	rm := findCall(runner, "rm")
 	if rm == nil || !reflect.DeepEqual(rm.Args, []string{"rm", "--force", "crabbox-my-app-stopme"}) {
 		t.Fatalf("rm args=%v", rm.Args)
 	}
-	if _, ok, err := resolveLeaseClaimForProvider(leaseID, providerName); err != nil || ok {
+	if _, ok, err := core.ResolveLeaseClaimForProvider(leaseID, providerName); err != nil || ok {
 		t.Fatalf("claim resolved after stop ok=%t err=%v", ok, err)
 	}
 }
 
 func TestWarmupRejectsActionsRunnerAndEmitsTiming(t *testing.T) {
 	backend := newTestBackend(newTestConfig(), newRunner(nil, nil), io.Discard, io.Discard)
-	if err := backend.Warmup(context.Background(), WarmupRequest{ActionsRunner: true}); err == nil || !strings.Contains(err.Error(), "--actions-runner") {
+	if err := backend.Warmup(context.Background(), core.WarmupRequest{ActionsRunner: true}); err == nil || !strings.Contains(err.Error(), "--actions-runner") {
 		t.Fatalf("actions runner err=%v", err)
 	}
 
@@ -869,7 +1318,7 @@ func TestWarmupRejectsActionsRunnerAndEmitsTiming(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	runner := newRunner(map[string]scriptedReply{"create": {stdout: ""}}, nil)
 	backend = newTestBackend(newTestConfig(), runner, &stdout, &stderr)
-	if err := backend.Warmup(context.Background(), WarmupRequest{Repo: Repo{Name: "my-app", Root: t.TempDir()}, TimingJSON: true}); err != nil {
+	if err := backend.Warmup(context.Background(), core.WarmupRequest{Repo: core.Repo{Name: "my-app", Root: t.TempDir()}, TimingJSON: true}); err != nil {
 		t.Fatalf("Warmup timing err=%v", err)
 	}
 	if !strings.Contains(stdout.String(), "warmup complete") || !strings.Contains(stderr.String(), `"provider":"docker-sandbox"`) {
@@ -883,7 +1332,7 @@ func TestDoctorSuccessAndErrorGuidance(t *testing.T) {
 		"ls":       {stdout: `[]`},
 		"diagnose": {stdout: `{}`},
 	}, nil)
-	okResult, err := newTestBackend(newTestConfig(), success, io.Discard, io.Discard).Doctor(context.Background(), DoctorRequest{})
+	okResult, err := newTestBackend(newTestConfig(), success, io.Discard, io.Discard).Doctor(context.Background(), core.DoctorRequest{})
 	if err != nil {
 		t.Fatalf("Doctor success err=%v", err)
 	}
@@ -897,7 +1346,7 @@ func TestDoctorSuccessAndErrorGuidance(t *testing.T) {
 	missing := newRunner(map[string]scriptedReply{
 		"version": {stderr: "not found", err: os.ErrNotExist},
 	}, nil)
-	_, err = newTestBackend(newTestConfig(), missing, io.Discard, io.Discard).Doctor(context.Background(), DoctorRequest{})
+	_, err = newTestBackend(newTestConfig(), missing, io.Discard, io.Discard).Doctor(context.Background(), core.DoctorRequest{})
 	if err == nil || !strings.Contains(err.Error(), "install the Docker Sandbox sbx CLI") {
 		t.Fatalf("missing cli err=%v", err)
 	}
@@ -905,7 +1354,7 @@ func TestDoctorSuccessAndErrorGuidance(t *testing.T) {
 		"version": {stdout: "sbx version 0.1.0\n"},
 		"ls":      {stderr: "not logged in", exitCode: 1},
 	}, nil)
-	_, err = newTestBackend(newTestConfig(), auth, io.Discard, io.Discard).Doctor(context.Background(), DoctorRequest{})
+	_, err = newTestBackend(newTestConfig(), auth, io.Discard, io.Discard).Doctor(context.Background(), core.DoctorRequest{})
 	if err == nil || !strings.Contains(err.Error(), "run sbx login") {
 		t.Fatalf("auth err=%v", err)
 	}
@@ -917,7 +1366,7 @@ func TestDoctorWarnsWhenOptionalDiagnoseFailsAndReportsListParse(t *testing.T) {
 		"ls":       {stdout: `[]`},
 		"diagnose": {stderr: "diagnose unavailable", exitCode: 1},
 	}, nil)
-	result, err := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard).Doctor(context.Background(), DoctorRequest{})
+	result, err := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard).Doctor(context.Background(), core.DoctorRequest{})
 	if err != nil {
 		t.Fatalf("Doctor optional diagnose err=%v", err)
 	}
@@ -929,7 +1378,7 @@ func TestDoctorWarnsWhenOptionalDiagnoseFailsAndReportsListParse(t *testing.T) {
 		"version": {stdout: "sbx version 0.1.0\n"},
 		"ls":      {stdout: `42`},
 	}, nil)
-	_, err = newTestBackend(newTestConfig(), badList, io.Discard, io.Discard).Doctor(context.Background(), DoctorRequest{})
+	_, err = newTestBackend(newTestConfig(), badList, io.Discard, io.Discard).Doctor(context.Background(), core.DoctorRequest{})
 	if err == nil || !strings.Contains(err.Error(), "expected array or object") {
 		t.Fatalf("bad list err=%v", err)
 	}
@@ -938,14 +1387,14 @@ func TestDoctorWarnsWhenOptionalDiagnoseFailsAndReportsListParse(t *testing.T) {
 func TestUnsupportedAgentAndTailscaleOptionsRejectClearly(t *testing.T) {
 	cfg := newTestConfig()
 	cfg.DockerSandbox.Agent = "codex"
-	if _, err := (Provider{}).Configure(cfg, Runtime{Exec: newRunner(nil, nil)}); err == nil || !strings.Contains(err.Error(), "v1 supports shell only") {
+	if _, err := (Provider{}).Configure(cfg, core.Runtime{Exec: newRunner(nil, nil)}); err == nil || !strings.Contains(err.Error(), "v1 supports shell only") {
 		t.Fatalf("Configure err=%v, want unsupported agent rejection", err)
 	}
-	err := rejectRunOptions(Provider{}.Spec(), RunRequest{Repo: Repo{Root: t.TempDir()}, Options: core.LeaseOptions{Tailscale: core.TailscaleConfig{Enabled: true}}})
+	err := rejectRunOptions(Provider{}.Spec(), core.RunRequest{Repo: core.Repo{Root: t.TempDir()}, Options: core.LeaseOptions{Tailscale: core.TailscaleConfig{Enabled: true}}})
 	if err == nil || !strings.Contains(err.Error(), "Tailscale") {
 		t.Fatalf("rejectRunOptions err=%v, want Tailscale rejection", err)
 	}
-	err = rejectRunOptions(Provider{}.Spec(), RunRequest{Repo: Repo{Root: t.TempDir()}, Options: core.LeaseOptions{SSHUser: "root", SSHPort: "2222", SSHKey: "/tmp/key"}})
+	err = rejectRunOptions(Provider{}.Spec(), core.RunRequest{Repo: core.Repo{Root: t.TempDir()}, Options: core.LeaseOptions{SSHUser: "root", SSHPort: "2222", SSHKey: "/tmp/key"}})
 	if err != nil {
 		t.Fatalf("inherited SSH config should be ignored for delegated sbx provider, got %v", err)
 	}
@@ -953,28 +1402,28 @@ func TestUnsupportedAgentAndTailscaleOptionsRejectClearly(t *testing.T) {
 
 func TestRejectRunOptionsAndCreateRepoValidation(t *testing.T) {
 	spec := Provider{}.Spec()
-	for name, req := range map[string]RunRequest{
-		"desktop":   {Repo: Repo{Root: t.TempDir()}, Options: core.LeaseOptions{Desktop: true}},
-		"tailscale": {Repo: Repo{Root: t.TempDir()}, Options: core.LeaseOptions{Tailscale: core.TailscaleConfig{Enabled: true}}},
+	for name, req := range map[string]core.RunRequest{
+		"desktop":   {Repo: core.Repo{Root: t.TempDir()}, Options: core.LeaseOptions{Desktop: true}},
+		"tailscale": {Repo: core.Repo{Root: t.TempDir()}, Options: core.LeaseOptions{Tailscale: core.TailscaleConfig{Enabled: true}}},
 		"no-root":   {},
 	} {
 		if err := rejectRunOptions(spec, req); err == nil {
 			t.Fatalf("%s: expected rejection", name)
 		}
 	}
-	if err := validateCreateRepo(newTestConfig(), Repo{}); err == nil || !strings.Contains(err.Error(), "requires a local workspace") {
+	if err := validateCreateRepo(newTestConfig(), core.Repo{}); err == nil || !strings.Contains(err.Error(), "requires a local workspace") {
 		t.Fatalf("empty repo err=%v", err)
 	}
 	cfg := newTestConfig()
 	cfg.DockerSandbox.Clone = true
-	if err := validateCreateRepo(cfg, Repo{Root: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "--clone requires") {
+	if err := validateCreateRepo(cfg, core.Repo{Root: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "--clone requires") {
 		t.Fatalf("clone validation err=%v", err)
 	}
 	worktreeRoot := t.TempDir()
 	if err := os.WriteFile(filepathJoin(worktreeRoot, ".git"), []byte("gitdir: ../.git/worktrees/example\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateCreateRepo(cfg, Repo{Root: worktreeRoot}); err == nil || !strings.Contains(err.Error(), "--clone requires") {
+	if err := validateCreateRepo(cfg, core.Repo{Root: worktreeRoot}); err == nil || !strings.Contains(err.Error(), "--clone requires") {
 		t.Fatalf("fake worktree validation err=%v", err)
 	}
 }
@@ -999,10 +1448,10 @@ func TestValidateCreateRepoCloneRejectsGitWorktree(t *testing.T) {
 	runGit(t, repoRoot, "commit", "-q", "-m", "init")
 	runGit(t, repoRoot, "worktree", "add", "-q", worktreeRoot)
 
-	if err := validateCreateRepo(cfg, Repo{Root: repoRoot}); err != nil {
+	if err := validateCreateRepo(cfg, core.Repo{Root: repoRoot}); err != nil {
 		t.Fatalf("validateCreateRepo rejected main Git checkout: %v", err)
 	}
-	if err := validateCreateRepo(cfg, Repo{Root: worktreeRoot}); err == nil || !strings.Contains(err.Error(), "linked Git worktrees are not supported") {
+	if err := validateCreateRepo(cfg, core.Repo{Root: worktreeRoot}); err == nil || !strings.Contains(err.Error(), "linked Git worktrees are not supported") {
 		t.Fatalf("validateCreateRepo err=%v, want linked worktree rejection", err)
 	}
 }
@@ -1032,16 +1481,16 @@ func TestDockerSandboxWorkdirAndNameHelpers(t *testing.T) {
 		}
 		return len(b), nil
 	}
-	name := newSandboxName(Repo{Name: namePrefix + strings.Repeat("a", 100)})
+	name := newSandboxName(core.Repo{Name: namePrefix + strings.Repeat("a", 100)})
 	if len(name) > maxSandboxNameLen || !strings.HasPrefix(name, namePrefix) || !strings.HasSuffix(name, "-010203") || strings.Contains(name, namePrefix+namePrefix) {
 		t.Fatalf("sandbox name=%q len=%d", name, len(name))
 	}
 	exactBase := strings.Repeat("b", maxSandboxNameLen-len(namePrefix)-1-sandboxNameSuffixLen)
-	exactName := newSandboxName(Repo{Name: exactBase})
+	exactName := newSandboxName(core.Repo{Name: exactBase})
 	if !strings.Contains(exactName, namePrefix+exactBase+"-") || len(exactName) != maxSandboxNameLen {
 		t.Fatalf("exact sandbox name=%q len=%d", exactName, len(exactName))
 	}
-	oversizedName := newSandboxName(Repo{Name: exactBase + "c"})
+	oversizedName := newSandboxName(core.Repo{Name: exactBase + "c"})
 	if strings.Contains(oversizedName, exactBase+"c") || len(oversizedName) != maxSandboxNameLen {
 		t.Fatalf("oversized sandbox name=%q len=%d", oversizedName, len(oversizedName))
 	}
@@ -1086,39 +1535,6 @@ func TestDockerSandboxSmallHelpers(t *testing.T) {
 	}
 	if !sbxVersionMatchesBaseline("Client Version:  v0.31.3 fake") || !sbxVersionMatchesBaseline("sbx version 0.31.3") || sbxVersionMatchesBaseline("sbx version 0.31.4") || sbxVersionMatchesBaseline("") {
 		t.Fatal("sbxVersionMatchesBaseline accepted or rejected wrong versions")
-	}
-}
-
-func TestBuildCommandShellModePreservesShellScript(t *testing.T) {
-	got, err := buildCommand([]string{"echo one && echo two"}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"sh", "-lc", "echo one && echo two"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("command=%#v want %#v", got, want)
-	}
-}
-
-func TestBuildCommandSingleShellStringStaysRaw(t *testing.T) {
-	got, err := buildCommand([]string{"echo one && echo two"}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"sh", "-lc", "echo one && echo two"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("command=%#v want %#v", got, want)
-	}
-}
-
-func TestBuildCommandLeadingEnvAssignmentQuotesArgv(t *testing.T) {
-	got, err := buildCommand([]string{"GREETING=hello world", "printf", "%s\n", "$GREETING"}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"sh", "-lc", "GREETING='hello world' 'printf' '%s\n' '$GREETING'"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("command=%#v want %#v", got, want)
 	}
 }
 
@@ -1240,15 +1656,15 @@ func TestFlagApplicationAndValidation(t *testing.T) {
 func TestStopRemovesStaleClaimWhenSandboxIsAlreadyGone(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := leasePrefix + "crabbox-my-app-gone"
-	if err := claimLeaseForRepoProviderPond(leaseID, "gone", providerName, "", t.TempDir(), time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leaseID, "gone", providerName, "", t.TempDir(), time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	runner := newRunner(map[string]scriptedReply{"rm": {stderr: "sandbox not found", exitCode: 1}}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	if err := backend.Stop(context.Background(), StopRequest{ID: "gone"}); err != nil {
+	if err := backend.Stop(context.Background(), core.StopRequest{ID: "gone"}); err != nil {
 		t.Fatalf("Stop stale claim err=%v", err)
 	}
-	if _, ok, err := resolveLeaseClaimForProvider(leaseID, providerName); err != nil || ok {
+	if _, ok, err := core.ResolveLeaseClaimForProvider(leaseID, providerName); err != nil || ok {
 		t.Fatalf("stale claim resolved after stop ok=%t err=%v", ok, err)
 	}
 }
@@ -1256,14 +1672,14 @@ func TestStopRemovesStaleClaimWhenSandboxIsAlreadyGone(t *testing.T) {
 func TestDockerSandboxPorts(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := leasePrefix + "crabbox-my-app-ports"
-	if err := claimLeaseForRepoProviderPond(leaseID, "ports", providerName, "", t.TempDir(), time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leaseID, "ports", providerName, "", t.TempDir(), time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	runner := newRunner(map[string]scriptedReply{
 		"ports": {stdout: "127.0.0.1:41000->3000/tcp\n"},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	out, err := backend.Ports(context.Background(), PortsRequest{ID: "ports", Publish: []string{"3000"}})
+	out, err := backend.Ports(context.Background(), core.PortsRequest{ID: "ports", Publish: []string{"3000"}})
 	if err != nil {
 		t.Fatalf("Ports err=%v", err)
 	}
@@ -1279,7 +1695,7 @@ func TestDockerSandboxPorts(t *testing.T) {
 		"ports": {stdout: "[]\n"},
 	}, nil)
 	backend = newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	_, err = backend.Ports(context.Background(), PortsRequest{ID: leaseID, JSON: true, Unpublish: []string{"41000:3000"}})
+	_, err = backend.Ports(context.Background(), core.PortsRequest{ID: leaseID, JSON: true, Unpublish: []string{"41000:3000"}})
 	if err != nil {
 		t.Fatalf("Ports json err=%v", err)
 	}
@@ -1288,7 +1704,7 @@ func TestDockerSandboxPorts(t *testing.T) {
 		t.Fatalf("ports json call=%#v", call)
 	}
 
-	_, err = backend.Ports(context.Background(), PortsRequest{ID: "user-owned"})
+	_, err = backend.Ports(context.Background(), core.PortsRequest{ID: "user-owned"})
 	if err == nil || !strings.Contains(err.Error(), "not claimed by Crabbox") {
 		t.Fatalf("unclaimed ports err=%v", err)
 	}
@@ -1297,14 +1713,14 @@ func TestDockerSandboxPorts(t *testing.T) {
 func TestDockerSandboxCopy(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := leasePrefix + "crabbox-my-app-copy"
-	if err := claimLeaseForRepoProviderPond(leaseID, "copy", providerName, "", t.TempDir(), time.Hour, false); err != nil {
+	if err := core.ClaimLeaseForRepoProviderPond(leaseID, "copy", providerName, "", t.TempDir(), time.Hour, false); err != nil {
 		t.Fatal(err)
 	}
 	runner := newRunner(map[string]scriptedReply{
 		"cp": {stdout: ""},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	err := backend.Copy(context.Background(), CopyRequest{ID: "copy", Source: "./coverage.xml", Destination: "SANDBOX:/tmp/coverage.xml", FollowLink: true})
+	err := backend.Copy(context.Background(), core.CopyRequest{ID: "copy", Source: "./coverage.xml", Destination: "SANDBOX:/tmp/coverage.xml", FollowLink: true})
 	if err != nil {
 		t.Fatalf("Copy err=%v", err)
 	}
@@ -1317,7 +1733,7 @@ func TestDockerSandboxCopy(t *testing.T) {
 		"cp": {stdout: ""},
 	}, nil)
 	backend = newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	err = backend.Copy(context.Background(), CopyRequest{ID: leaseID, Source: "SANDBOX:/tmp/output.log", Destination: "./output.log"})
+	err = backend.Copy(context.Background(), core.CopyRequest{ID: leaseID, Source: "SANDBOX:/tmp/output.log", Destination: "./output.log"})
 	if err != nil {
 		t.Fatalf("Copy download err=%v", err)
 	}
@@ -1330,7 +1746,7 @@ func TestDockerSandboxCopy(t *testing.T) {
 		"cp": {stdout: ""},
 	}, nil)
 	backend = newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	err = backend.Copy(context.Background(), CopyRequest{ID: leaseID, Source: "C:\\tmp\\output.log", Destination: "SANDBOX:/tmp/output.log"})
+	err = backend.Copy(context.Background(), core.CopyRequest{ID: leaseID, Source: "C:\\tmp\\output.log", Destination: "SANDBOX:/tmp/output.log"})
 	if err != nil {
 		t.Fatalf("Copy windows path err=%v", err)
 	}
@@ -1339,15 +1755,15 @@ func TestDockerSandboxCopy(t *testing.T) {
 		t.Fatalf("copy windows path call=%#v", call)
 	}
 
-	err = backend.Copy(context.Background(), CopyRequest{ID: leaseID, Source: "./a", Destination: "./b"})
+	err = backend.Copy(context.Background(), core.CopyRequest{ID: leaseID, Source: "./a", Destination: "./b"})
 	if err == nil || !strings.Contains(err.Error(), "requires one side to use SANDBOX:PATH") {
 		t.Fatalf("missing sandbox path err=%v", err)
 	}
-	err = backend.Copy(context.Background(), CopyRequest{ID: leaseID, Source: "SANDBOX:/a", Destination: "SANDBOX:/b"})
+	err = backend.Copy(context.Background(), core.CopyRequest{ID: leaseID, Source: "SANDBOX:/a", Destination: "SANDBOX:/b"})
 	if err == nil || !strings.Contains(err.Error(), "sandbox-to-sandbox") {
 		t.Fatalf("double sandbox err=%v", err)
 	}
-	err = backend.Copy(context.Background(), CopyRequest{ID: leaseID, Source: "OTHER:/a", Destination: "./b"})
+	err = backend.Copy(context.Background(), core.CopyRequest{ID: leaseID, Source: "OTHER:/a", Destination: "./b"})
 	if err == nil || !strings.Contains(err.Error(), "requires one side to use SANDBOX:PATH") {
 		t.Fatalf("bad source err=%v", err)
 	}
@@ -1356,7 +1772,7 @@ func TestDockerSandboxCopy(t *testing.T) {
 func TestConfigureDoctorRejectsInvalidConfig(t *testing.T) {
 	cfg := newTestConfig()
 	cfg.DockerSandbox.Agent = "codex"
-	if _, err := (Provider{}).ConfigureDoctor(cfg, Runtime{Exec: newRunner(nil, nil)}); err == nil || !strings.Contains(err.Error(), "v1 supports shell only") {
+	if _, err := core.ConfigureProviderDoctor((Provider{}), cfg, core.Runtime{Exec: newRunner(nil, nil)}); err == nil || !strings.Contains(err.Error(), "v1 supports shell only") {
 		t.Fatalf("ConfigureDoctor err=%v, want invalid config rejection", err)
 	}
 }
@@ -1368,10 +1784,11 @@ func (errWriter) Write([]byte) (int, error) {
 }
 
 type recordingCommandRunner struct {
-	mu       sync.Mutex
-	calls    []core.LocalCommandRequest
-	defaults map[string]scriptedReply
-	scripts  map[string][]scriptedReply
+	mu        sync.Mutex
+	calls     []core.LocalCommandRequest
+	defaults  map[string]scriptedReply
+	scripts   map[string][]scriptedReply
+	onRequest func(context.Context, core.LocalCommandRequest)
 }
 
 type scriptedReply struct {
@@ -1381,7 +1798,7 @@ type scriptedReply struct {
 	err      error
 }
 
-func (r *recordingCommandRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+func (r *recordingCommandRunner) Run(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 	r.mu.Lock()
 	r.calls = append(r.calls, req)
 	key := scriptKey(req.Args)
@@ -1393,6 +1810,9 @@ func (r *recordingCommandRunner) Run(_ context.Context, req core.LocalCommandReq
 		reply = def
 	}
 	r.mu.Unlock()
+	if r.onRequest != nil {
+		r.onRequest(ctx, req)
+	}
 	if req.Stdout != nil && reply.stdout != "" {
 		_, _ = io.WriteString(req.Stdout, reply.stdout)
 	}
@@ -1413,7 +1833,7 @@ func newRunner(defaults map[string]scriptedReply, sequenced map[string][]scripte
 	return &recordingCommandRunner{defaults: defaults, scripts: sequenced}
 }
 
-func newTestConfig() Config {
+func newTestConfig() core.Config {
 	cfg := core.BaseConfig()
 	cfg.Provider = providerName
 	cfg.DockerSandbox.CLIPath = "sbx"
@@ -1421,8 +1841,8 @@ func newTestConfig() Config {
 	return cfg
 }
 
-func newTestBackend(cfg Config, runner *recordingCommandRunner, stdout, stderr io.Writer) *backend {
-	rt := Runtime{Stdout: stdout, Stderr: stderr, Exec: runner}
+func newTestBackend(cfg core.Config, runner *recordingCommandRunner, stdout, stderr io.Writer) *backend {
+	rt := core.Runtime{Stdout: stdout, Stderr: stderr, Exec: runner}
 	return NewBackend(Provider{}.Spec(), cfg, rt).(*backend)
 }
 
@@ -1490,7 +1910,7 @@ func TestSBXErrorClassifiesTimeoutAndStreamedErrors(t *testing.T) {
 	runner := newRunner(map[string]scriptedReply{
 		"exec": {err: errors.New("broken pipe")},
 	}, nil)
-	cli, err := newSBXCLI(newTestConfig(), Runtime{Exec: runner})
+	cli, err := newSBXCLI(newTestConfig(), core.Runtime{Exec: runner})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1499,9 +1919,9 @@ func TestSBXErrorClassifiesTimeoutAndStreamedErrors(t *testing.T) {
 		t.Fatalf("streamed err code=%d err=%v", code, err)
 	}
 	runner = newRunner(map[string]scriptedReply{
-		"exec": {exitCode: 4, err: errors.New("exit status 4")},
+		"exec": {exitCode: 4},
 	}, nil)
-	cli, err = newSBXCLI(newTestConfig(), Runtime{Exec: runner})
+	cli, err = newSBXCLI(newTestConfig(), core.Runtime{Exec: runner})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1512,7 +1932,7 @@ func TestSBXErrorClassifiesTimeoutAndStreamedErrors(t *testing.T) {
 	runner = newRunner(map[string]scriptedReply{
 		"exec": {exitCode: 4, err: errors.New("process failed")},
 	}, nil)
-	cli, err = newSBXCLI(newTestConfig(), Runtime{Exec: runner})
+	cli, err = newSBXCLI(newTestConfig(), core.Runtime{Exec: runner})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1529,10 +1949,10 @@ func TestRunPropagatesCommandExit(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	runner := newRunner(map[string]scriptedReply{
 		"create": {stdout: ""},
-		"exec":   {exitCode: 7, stderr: "failed\n", err: errors.New("exit status 7")},
+		"exec":   {exitCode: 7, stderr: "failed\n"},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	_, err := backend.Run(context.Background(), RunRequest{Repo: Repo{Name: "my-app", Root: t.TempDir()}, Command: []string{"deploy", "--token", "secret-token"}, Keep: true})
+	_, err := backend.Run(context.Background(), core.RunRequest{Repo: core.Repo{Name: "my-app", Root: t.TempDir()}, Command: []string{"deploy", "--token", "secret-token"}, Keep: true})
 	var exitErr core.ExitError
 	if !errors.As(err, &exitErr) || exitErr.Code != 7 {
 		t.Fatalf("err=%v want exit 7", err)
@@ -1543,25 +1963,40 @@ func TestRunPropagatesCommandExit(t *testing.T) {
 }
 
 func TestRunPropagatesStreamRuntimeErrorWithCommandExit(t *testing.T) {
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	runner := newRunner(map[string]scriptedReply{
-		"create": {stdout: ""},
-		"exec":   {exitCode: 7, stderr: "failed\n", err: errors.New("stream transport failed")},
-	}, nil)
-	backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
-	result, err := backend.Run(context.Background(), RunRequest{Repo: Repo{Name: "my-app", Root: t.TempDir()}, Command: []string{"deploy", "--token", "secret-token"}, Keep: true})
-	var exitErr core.ExitError
-	if !errors.As(err, &exitErr) || exitErr.Code != 7 {
-		t.Fatalf("err=%v want exit 7", err)
-	}
-	if !strings.Contains(err.Error(), "stream transport failed") {
-		t.Fatalf("err=%v missing runtime diagnostic", err)
-	}
-	if strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "deploy --token") {
-		t.Fatalf("err=%v leaked command arguments", err)
-	}
-	if result.ExitCode != 7 {
-		t.Fatalf("result.ExitCode=%d want 7", result.ExitCode)
+	for _, tc := range []struct {
+		cause  error
+		status core.RunStatus
+		kind   core.RunErrorKind
+	}{
+		{errors.New("stream transport failed"), core.RunStatusFailed, core.RunErrorProvider},
+		{context.Canceled, core.RunStatusCanceled, core.RunErrorCanceled},
+		{context.DeadlineExceeded, core.RunStatusTimedOut, core.RunErrorTimeout},
+	} {
+		t.Run(tc.cause.Error(), func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			runner := newRunner(map[string]scriptedReply{
+				"create": {stdout: ""},
+				"exec":   {exitCode: 7, stderr: "failed\n", err: tc.cause},
+			}, nil)
+			var stderr bytes.Buffer
+			backend := newTestBackend(newTestConfig(), runner, io.Discard, &stderr)
+			result, err := backend.Run(t.Context(), core.RunRequest{Repo: core.Repo{Name: "my-app", Root: t.TempDir()}, Command: []string{"deploy", "--token", "secret-token"}, Keep: true, TimingJSON: true})
+			var exitErr core.ExitError
+			if !errors.As(err, &exitErr) || exitErr.Code != 1 || !errors.Is(err, tc.cause) {
+				t.Fatalf("err=%v want transport exit 1 and original cause", err)
+			}
+			if strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "deploy --token") {
+				t.Fatalf("err=%v leaked command arguments", err)
+			}
+			if result.ExitCode != 1 || result.Status != tc.status || result.ErrorKind != tc.kind || result.Session == nil || !result.Session.Kept {
+				t.Fatalf("result=%#v want normalized transport failure with kept session", result)
+			}
+			lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+			var report core.TimingReport
+			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &report); err != nil || report.ExitCode != 1 || report.RunStatus != tc.status || report.ErrorKind != tc.kind {
+				t.Fatalf("timing=%#v err=%v", report, err)
+			}
+		})
 	}
 }
 
@@ -1574,8 +2009,8 @@ func TestRunKeepOnFailureMarksSessionKept(t *testing.T) {
 		"rm":     {stdout: ""},
 	}, nil)
 	backend := newTestBackend(newTestConfig(), runner, io.Discard, &stderr)
-	result, err := backend.Run(context.Background(), RunRequest{
-		Repo:          Repo{Name: "my-app", Root: t.TempDir()},
+	result, err := backend.Run(context.Background(), core.RunRequest{
+		Repo:          core.Repo{Name: "my-app", Root: t.TempDir()},
 		Command:       []string{"false"},
 		KeepOnFailure: true,
 	})
@@ -1592,4 +2027,282 @@ func TestRunKeepOnFailureMarksSessionKept(t *testing.T) {
 	if !strings.Contains(stderr.String(), "keep-on-failure: kept lease=") {
 		t.Fatalf("stderr missing keep-on-failure hint: %s", stderr.String())
 	}
+}
+
+func TestRunTimingFailureDoesNotReportSuccess(t *testing.T) {
+	for _, commandExit := range []int{0, 7} {
+		t.Run(strconv.Itoa(commandExit), func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			runner := newRunner(map[string]scriptedReply{"create": {}, "exec": {exitCode: commandExit}}, nil)
+			backend := newTestBackend(newTestConfig(), runner, io.Discard, errWriter{})
+			result, err := backend.Run(t.Context(), core.RunRequest{Repo: core.Repo{Name: "my-app", Root: t.TempDir()}, Command: []string{"true"}, Keep: true, TimingJSON: true})
+			if err == nil || !strings.Contains(err.Error(), "write failed") {
+				t.Fatalf("timing error=%v", err)
+			}
+			result = core.FinalizeRunResult(result, err)
+			code, kind := commandExit, core.RunErrorCommandExit
+			if code == 0 {
+				code, kind = 1, core.RunErrorProvider
+			}
+			if result.ExitCode != code || result.Status != core.RunStatusFailed || result.ErrorKind != kind {
+				t.Fatalf("timing failure outcome=%#v, want failed code=%d kind=%s", result, code, kind)
+			}
+		})
+	}
+}
+
+func TestRunCommandIntentReachesNativeRequest(t *testing.T) {
+	testutil.VerifyNativeCommandIntent(t, "sh", true, func(t *testing.T, intent testutil.CommandIntent) []string {
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		runner := newRunner(nil, nil)
+		backend := newTestBackend(newTestConfig(), runner, io.Discard, io.Discard)
+		_, err := backend.Run(t.Context(), core.RunRequest{
+			Repo:               core.Repo{Name: "my-app", Root: t.TempDir()},
+			Command:            intent.Command,
+			ShellMode:          intent.ShellMode,
+			CommandLiteralArgs: intent.LiteralArgs,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		call := findCall(runner, "exec")
+		if call == nil || len(call.Args) < 5 || call.Args[1] != "--workdir" {
+			t.Fatalf("exec=%#v", call)
+		}
+		return call.Args[4:]
+	})
+}
+
+func TestDockerSandboxConfigShowSection(t *testing.T) {
+	projector, ok := any(Provider{}).(core.ProviderConfigShowProjector)
+	if !ok {
+		t.Fatal("real provider is missing passive config-show ownership")
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  core.DockerSandboxConfig
+		want map[string]any
+		text string
+	}{
+		{name: "nil lists", cfg: core.DockerSandboxConfig{CLIPath: "", Agent: "", Template: "", CPUs: float64(0), Memory: "", Clone: false, Workdir: "", ExtraWorkspaces: []string(nil), MCP: []string(nil), Kit: []string(nil)}, want: map[string]any{"cliPath": "", "agent": "", "template": "", "cpus": float64(0), "memory": "", "clone": false, "workdir": "", "extraWorkspaces": []string(nil), "mcp": []string(nil), "kit": []string(nil)}, text: "docker_sandbox cli= agent= template=- cpus=0 memory=- clone=false workdir=- extra_workspaces=- mcp=- kit=-\n"},
+		{name: "empty lists", cfg: core.DockerSandboxConfig{CLIPath: "", Agent: "", Template: "", CPUs: float64(0), Memory: "", Clone: false, Workdir: "", ExtraWorkspaces: []string{}, MCP: []string{}, Kit: []string{}}, want: map[string]any{"cliPath": "", "agent": "", "template": "", "cpus": float64(0), "memory": "", "clone": false, "workdir": "", "extraWorkspaces": []string{}, "mcp": []string{}, "kit": []string{}}, text: "docker_sandbox cli= agent= template=- cpus=0 memory=- clone=false workdir=- extra_workspaces=- mcp=- kit=-\n"},
+		{name: "fractional raw ordered", cfg: core.DockerSandboxConfig{CLIPath: " raw-cli ", Agent: " raw-agent ", Template: "", CPUs: float64(2.5), Memory: "   ", Clone: true, Workdir: "", ExtraWorkspaces: []string{"/example/a", " /example/b ", "/example/a"}, MCP: []string{"one", "one", " two "}, Kit: []string{""}}, want: map[string]any{"cliPath": " raw-cli ", "agent": " raw-agent ", "template": "", "cpus": float64(2.5), "memory": "   ", "clone": true, "workdir": "", "extraWorkspaces": []string{"/example/a", " /example/b ", "/example/a"}, "mcp": []string{"one", "one", " two "}, "kit": []string{""}}, text: "docker_sandbox cli= raw-cli  agent= raw-agent  template=- cpus=2.5 memory=    clone=true workdir=- extra_workspaces=/example/a, /example/b ,/example/a mcp=one,one, two  kit=-\n"},
+		{name: "large float", cfg: core.DockerSandboxConfig{CLIPath: "", Agent: "", Template: "", CPUs: float64(1e+20), Memory: "", Clone: false, Workdir: "", ExtraWorkspaces: []string(nil), MCP: []string(nil), Kit: []string(nil)}, want: map[string]any{"cliPath": "", "agent": "", "template": "", "cpus": float64(1e+20), "memory": "", "clone": false, "workdir": "", "extraWorkspaces": []string(nil), "mcp": []string(nil), "kit": []string(nil)}, text: "docker_sandbox cli= agent= template=- cpus=1e+20 memory=- clone=false workdir=- extra_workspaces=- mcp=- kit=-\n"},
+		{name: "small float", cfg: core.DockerSandboxConfig{CLIPath: "", Agent: "", Template: "", CPUs: float64(1e-09), Memory: "", Clone: false, Workdir: "", ExtraWorkspaces: []string(nil), MCP: []string(nil), Kit: []string(nil)}, want: map[string]any{"cliPath": "", "agent": "", "template": "", "cpus": float64(1e-09), "memory": "", "clone": false, "workdir": "", "extraWorkspaces": []string(nil), "mcp": []string(nil), "kit": []string(nil)}, text: "docker_sandbox cli= agent= template=- cpus=1e-09 memory=- clone=false workdir=- extra_workspaces=- mcp=- kit=-\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := core.Config{Provider: "unselected-display-test", DockerSandbox: tc.cfg}
+			before, err := json.Marshal(cfg.DockerSandbox)
+			if err != nil {
+				t.Fatal(err)
+			}
+			section := projector.ConfigShowSection(cfg)
+			got := map[string]any{}
+			var fields []string
+			for _, field := range section.Fields {
+				got[field.JSONName] = field.JSONValue
+				fields = append(fields, field.TextName+"="+field.TextValue)
+			}
+			if section.JSONKey != "dockerSandbox" || section.TextLabel != "docker_sandbox" || !reflect.DeepEqual(section.Providers, []string{"docker-sandbox"}) || len(section.Fields) != 10 {
+				t.Fatalf("section metadata=%#v", section)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("public fields=%#v want %#v", got, tc.want)
+			}
+			if line := section.TextLabel + " " + strings.Join(fields, " ") + "\n"; line != tc.text {
+				t.Fatalf("text=%q want %q", line, tc.text)
+			}
+			after, err := json.Marshal(cfg.DockerSandbox)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("projection mutated original config or slice contents")
+			}
+		})
+	}
+}
+
+func TestDockerSandboxBindingRepeatedFlagStorage(t *testing.T) {
+	for _, prior := range [][]string{nil, {}, {" prior ", "dup"}} {
+		for _, args := range [][]string{{}, {""}, {"  "}, {" a,b ", "", " dup ", "dup"}} {
+			cfg := newTestConfig()
+			cfg.DockerSandbox.ExtraWorkspaces, cfg.DockerSandbox.MCP, cfg.DockerSandbox.Kit = prior, prior, prior
+			before := cfg
+			fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+			values := RegisterDockerSandboxProviderFlags(fs, cfg)
+			wantList := append([]string(nil), prior...)
+			for _, name := range []string{"docker-sandbox-extra-workspace", "docker-sandbox-mcp", "docker-sandbox-kit"} {
+				getter := fs.Lookup(name).Value.(flag.Getter)
+				if getter.Get().([]string) == nil || fs.Lookup(name).DefValue != strings.Join(prior, ",") {
+					t.Fatal("registration/Get shape changed")
+				}
+				if len(prior) > 0 {
+					copy := getter.Get().([]string)
+					copy[0] = "changed"
+					if getter.Get().([]string)[0] != " prior " {
+						t.Fatal("Get shares storage")
+					}
+				}
+				for _, raw := range args {
+					if err := fs.Set(name, raw); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			for _, raw := range args {
+				if value := strings.TrimSpace(raw); value != "" {
+					wantList = append(wantList, value)
+				}
+			}
+			want := before
+			if len(args) > 0 {
+				want.DockerSandbox.ExtraWorkspaces, want.DockerSandbox.MCP, want.DockerSandbox.Kit = wantList, wantList, wantList
+				core.RecordProviderFlagInputs(&want, true, "docker-sandbox")
+			}
+			if err := ApplyDockerSandboxProviderFlags(&cfg, fs, values); err != nil || !reflect.DeepEqual(cfg, want) {
+				t.Fatalf("repeat contract changed: %v", err)
+			}
+			if len(args) > 0 && len(wantList) > 0 {
+				cfg.DockerSandbox.ExtraWorkspaces[0] = "changed"
+				if fs.Lookup("docker-sandbox-extra-workspace").Value.(flag.Getter).Get().([]string)[0] != wantList[0] || cfg.DockerSandbox.MCP[0] != wantList[0] {
+					t.Fatal("application shares list storage")
+				}
+			}
+		}
+	}
+	cfg := newTestConfig()
+	prior := []string{"prior"}
+	cfg.DockerSandbox.MCP = prior
+	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	values := RegisterDockerSandboxProviderFlags(fs, cfg)
+	prior[0] = "later"
+	if err := ApplyDockerSandboxProviderFlags(&cfg, fs, values); err != nil || cfg.DockerSandbox.MCP[0] != "later" || fs.Lookup("docker-sandbox-mcp").Value.String() != "prior" {
+		t.Fatal("unvisited snapshot changed")
+	}
+	if err := fs.Set("docker-sandbox-mcp", " "); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyDockerSandboxProviderFlags(&cfg, fs, values); err != nil || cfg.DockerSandbox.MCP[0] != "prior" {
+		t.Fatal("visited blank did not apply inherited snapshot")
+	}
+}
+
+func TestDockerSandboxBindingListsRegisterBeforeScalars(t *testing.T) {
+	fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.String("docker-sandbox-cli", "", "")
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		RegisterDockerSandboxProviderFlags(fs, newTestConfig())
+	}()
+	if recovered == nil {
+		t.Fatal("expected duplicate scalar registration")
+	}
+	for _, name := range []string{"docker-sandbox-extra-workspace", "docker-sandbox-mcp", "docker-sandbox-kit"} {
+		if fs.Lookup(name) == nil {
+			t.Fatal("repeated lists registered after scalars")
+		}
+	}
+	if fs.Lookup("docker-sandbox-agent") != nil {
+		t.Fatal("ordinary scalar ordering changed")
+	}
+}
+
+func TestDockerSandboxBindingFloatFlagsAndPhases(t *testing.T) {
+	for _, provider := range []string{providerName, " Docker-Sandbox ", "fixture-other"} {
+		for _, raw := range []string{"0", "-0", "-1", "1.5", "2", "NaN", "+Inf", "-Inf", "1e999", " ", "invalid"} {
+			cfg := newTestConfig()
+			cfg.Provider, cfg.DockerSandbox.CPUs = provider, 7
+			before := cfg
+			fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			values := RegisterDockerSandboxProviderFlags(fs, cfg)
+			parsed, parseErr := strconv.ParseFloat(raw, 64)
+			err := fs.Parse([]string{"--docker-sandbox-cli=fixture", "--docker-sandbox-cpus=" + raw, "--docker-sandbox-memory=fixture", "--docker-sandbox-clone=true", "--docker-sandbox-mcp=fixture"})
+			if parseErr != nil {
+				if err == nil || !reflect.DeepEqual(cfg, before) {
+					t.Fatal("malformed float flag parse changed")
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ApplyDockerSandboxProviderFlags(&cfg, fs, struct{}{}); err != nil || !reflect.DeepEqual(cfg, before) {
+				t.Fatal("foreign values changed config")
+			}
+			want := before
+			want.DockerSandbox.CLIPath, want.DockerSandbox.CPUs, want.DockerSandbox.Memory, want.DockerSandbox.Clone, want.DockerSandbox.MCP = "fixture", parsed, "fixture", true, []string{"fixture"}
+			core.RecordProviderFlagInputs(&want, true, "docker-sandbox")
+			err = ApplyDockerSandboxProviderFlags(&cfg, fs, values)
+			message := ""
+			if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+				message = "finite"
+			} else if parsed < 0 {
+				message = "greater than zero"
+			} else if parsed != math.Trunc(parsed) {
+				message = "whole number"
+			}
+			if (err != nil) != (message != "") || err != nil && !strings.Contains(err.Error(), message) {
+				t.Fatalf("raw=%q validation changed: %v", raw, err)
+			}
+			if !(math.IsNaN(cfg.DockerSandbox.CPUs) && math.IsNaN(parsed)) && math.Float64bits(cfg.DockerSandbox.CPUs) != math.Float64bits(parsed) {
+				t.Fatal("flag CPU value changed")
+			}
+			cfg.DockerSandbox.CPUs, want.DockerSandbox.CPUs = 0, 0
+			if !reflect.DeepEqual(cfg, want) {
+				t.Fatal("final validation moved before later assignments or facts")
+			}
+		}
+		for _, generic := range []string{"class", "type"} {
+			cfg := newTestConfig()
+			cfg.Provider = provider
+			cfg.DockerSandbox.CPUs = -1
+			fs := flag.NewFlagSet("guard", flag.ContinueOnError)
+			fs.String(generic, "", "")
+			values := RegisterDockerSandboxProviderFlags(fs, cfg)
+			if err := ApplyDockerSandboxProviderFlags(&cfg, fs, values); err == nil {
+				t.Fatal("typed absent values skipped validation")
+			}
+			if err := fs.Set(generic, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			err := ApplyDockerSandboxProviderFlags(&cfg, fs, struct{}{})
+			if provider == providerName {
+				if err == nil || !strings.Contains(err.Error(), "--"+generic) {
+					t.Fatal("exact selected guard moved after type assertion")
+				}
+			} else if err != nil {
+				t.Fatal("guard gained provider normalization")
+			}
+		}
+	}
+}
+
+func TestDockerSandboxBindingHelpSurface(t *testing.T) {
+	cfg := newTestConfig()
+	fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+	var help bytes.Buffer
+	fs.SetOutput(&help)
+	values := RegisterDockerSandboxProviderFlags(fs, cfg)
+	fs.PrintDefaults()
+	t.Logf("help=%q", help.String())
+	args := []string{"--docker-sandbox-cli=fixture", "--docker-sandbox-agent=shell", "--docker-sandbox-template=fixture", "--docker-sandbox-cpus=2", "--docker-sandbox-memory=6g", "--docker-sandbox-clone=true", "--docker-sandbox-workdir=/workspace/fixture", "--docker-sandbox-extra-workspace= a,b ", "--docker-sandbox-mcp= mcp ", "--docker-sandbox-kit= kit "}
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyDockerSandboxProviderFlags(&cfg, fs, values); err != nil {
+		t.Fatal(err)
+	}
+	want := core.DockerSandboxConfig{CLIPath: "fixture", Agent: "shell", Template: "fixture", CPUs: 2, Memory: "6g", Clone: true, Workdir: "/workspace/fixture", ExtraWorkspaces: []string{"a,b"}, MCP: []string{"mcp"}, Kit: []string{"kit"}}
+	if !reflect.DeepEqual(cfg.DockerSandbox, want) {
+		t.Fatalf("all flag fields: %#v", cfg.DockerSandbox)
+	}
+	output, err := json.Marshal(cfg.DockerSandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("config=%s", output)
 }

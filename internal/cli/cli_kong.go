@@ -11,58 +11,74 @@ import (
 type crabboxKongCLI struct {
 	Version kong.VersionFlag `name:"version" short:"v" help:"Print version."`
 
-	VersionCmd versionKongCmd    `cmd:"" name:"version" help:"Print version."`
-	Init       initKongCmd       `cmd:"" passthrough:"" help:"Onboard the current repo for Crabbox."`
-	Login      loginKongCmd      `cmd:"" passthrough:"" help:"Open GitHub login, store broker credentials, verify access."`
-	Logout     logoutKongCmd     `cmd:"" passthrough:"" help:"Remove the stored broker token."`
-	Whoami     whoamiKongCmd     `cmd:"" passthrough:"" help:"Show broker identity."`
-	Doctor     doctorKongCmd     `cmd:"" passthrough:"" help:"Check local and broker/provider readiness."`
-	Warmup     warmupKongCmd     `cmd:"" passthrough:"" help:"Lease a box and wait until it is ready."`
-	Prewarm    prewarmKongCmd    `cmd:"" passthrough:"" help:"Lease and hydrate a reusable test-ready box."`
-	Run        runKongCmd        `cmd:"" passthrough:"" help:"Sync the repo, run a remote command, stream output."`
-	Job        jobKongCmd        `cmd:"" help:"Run named repo-local Crabbox jobs."`
-	Desktop    desktopKongCmd    `cmd:"" help:"Launch apps into a visible desktop session."`
-	Media      mediaKongCmd      `cmd:"" help:"Create preview artifacts from recorded desktop videos."`
-	Artifacts  artifactsKongCmd  `cmd:"" help:"Collect, transform, and publish QA artifacts."`
-	SyncPlan   syncPlanKongCmd   `cmd:"" name:"sync-plan" passthrough:"" help:"Show local sync manifest size hotspots."`
-	Providers  providersKongCmd  `cmd:"" passthrough:"" help:"Show provider capabilities."`
-	History    historyKongCmd    `cmd:"" passthrough:"" help:"List recorded remote runs."`
-	Logs       logsKongCmd       `cmd:"" passthrough:"" help:"Print recorded run logs."`
-	Events     eventsKongCmd     `cmd:"" passthrough:"" help:"Print recorded run events."`
-	Attach     attachKongCmd     `cmd:"" passthrough:"" help:"Follow recorded events for an active run."`
-	Results    resultsKongCmd    `cmd:"" passthrough:"" help:"Show recorded test result summaries."`
-	Cache      cacheKongCmd      `cmd:"" help:"Inspect, purge, or warm remote caches."`
-	Status     statusKongCmd     `cmd:"" passthrough:"" help:"Show lease state; add --wait to block until ready."`
-	List       listKongCmd       `cmd:"" passthrough:"" help:"List Crabbox machines."`
-	Ports      portsKongCmd      `cmd:"" passthrough:"" help:"Publish, list, or unpublish provider-native ports."`
-	Cp         cpKongCmd         `cmd:"" name:"cp" passthrough:"" help:"Copy files between host and a delegated sandbox."`
-	Share      shareKongCmd      `cmd:"" passthrough:"" help:"Share a lease with users or the owning org."`
-	Unshare    unshareKongCmd    `cmd:"" passthrough:"" help:"Remove lease sharing."`
-	Image      imageKongCmd      `cmd:"" help:"Create provider images and promote brokered AWS runner images."`
-	Usage      usageKongCmd      `cmd:"" passthrough:"" help:"Show cost and usage estimates by user, org, or fleet."`
-	Admin      adminKongCmd      `cmd:"" help:"Lease admin controls for trusted operators."`
-	Actions    actionsKongCmd    `cmd:"" help:"Register GitHub Actions runners or dispatch workflows."`
-	Capsule    capsuleKongCmd    `cmd:"" help:"Capture and replay lightweight failure capsules."`
-	Checkpoint checkpointKongCmd `cmd:"" help:"Create, restore, and fork VM or workspace checkpoints."`
-	Ssh        sshKongCmd        `cmd:"" name:"ssh" passthrough:"" help:"Print the SSH command for a lease."`
-	Connect    connectKongCmd    `cmd:"" passthrough:"" help:"Open an interactive SSH session to a lease."`
-	Vnc        vncKongCmd        `cmd:"" name:"vnc" passthrough:"" help:"Print or open VNC connection details for a desktop lease."`
-	Webvnc     webvncKongCmd     `cmd:"" name:"webvnc" passthrough:"" help:"Open a desktop lease or local VNC tunnel in a browser."`
-	Code       codeKongCmd       `cmd:"" passthrough:"" help:"Bridge a code lease into the authenticated web portal."`
-	Egress     egressKongCmd     `cmd:"" passthrough:"" help:"Bridge lease browser/app traffic through this machine."`
-	Screenshot screenshotKongCmd `cmd:"" passthrough:"" help:"Capture a PNG from a desktop lease."`
-	Inspect    inspectKongCmd    `cmd:"" passthrough:"" help:"Print lease/provider details; add --json for scripts."`
-	Stop       stopKongCmd       `cmd:"" passthrough:"" help:"Release a lease or delete a direct-provider machine."`
-	Release    releaseKongCmd    `cmd:"" passthrough:"" help:"Alias for stop."`
-	Pause      pauseKongCmd      `cmd:"" passthrough:"" help:"Pause a lease, freeing remote compute while preserving state (provider-dependent)."`
-	Resume     resumeKongCmd     `cmd:"" passthrough:"" help:"Resume a previously paused lease."`
-	Cleanup    cleanupKongCmd    `cmd:"" passthrough:"" help:"Sweep expired direct-provider machines or local provider state."`
-	Azure      azureKongCmd      `cmd:"" help:"Azure provider setup and login."`
-	Config     configKongCmd     `cmd:"" help:"Show or update user config."`
-	Adapter    adapterKongCmd    `cmd:"" help:"Serve or connect the Crabfleet runtime adapter."`
-	Pool       poolKongCmd       `cmd:"" help:"Alias commands for machine pools."`
-	Machine    machineKongCmd    `cmd:"" help:"Alias commands for direct-provider machines."`
-	Pond       pondKongCmd       `cmd:"" help:"Pond bridge plane: peer discovery for delegated providers."`
+	Serve          serveKongCmd          `cmd:"" passthrough:"" help:"Donate trusted container capacity to the coordinator."`
+	VersionCmd     versionKongCmd        `cmd:"" name:"version" help:"Print version."`
+	Init           initKongCmd           `cmd:"" passthrough:"" help:"Onboard the current repo for Crabbox."`
+	Login          loginKongCmd          `cmd:"" passthrough:"" help:"Open GitHub login, store broker credentials, verify access."`
+	Logout         logoutKongCmd         `cmd:"" passthrough:"" help:"Remove the stored broker token."`
+	Whoami         whoamiKongCmd         `cmd:"" passthrough:"" help:"Show broker identity."`
+	Doctor         doctorKongCmd         `cmd:"" passthrough:"" help:"Check local and broker/provider readiness."`
+	Warmup         warmupKongCmd         `cmd:"" passthrough:"" help:"Lease a box and wait until it is ready."`
+	Prewarm        prewarmKongCmd        `cmd:"" passthrough:"" help:"Lease and hydrate a reusable test-ready box."`
+	Run            runKongCmd            `cmd:"" passthrough:"" help:"Sync the repo, run a remote command, stream output."`
+	Watch          watchKongCmd          `cmd:"" passthrough:"" help:"Re-run a command on a warm lease when local files change."`
+	Shard          shardKongCmd          `cmd:"" passthrough:"" help:"Fork a checkpoint into parallel shards and merge their test results."`
+	Bench          benchKongCmd          `cmd:"" help:"Record and report local benchmark timings."`
+	Job            jobKongCmd            `cmd:"" help:"Run named repo-local Crabbox jobs."`
+	Desktop        desktopKongCmd        `cmd:"" help:"Launch apps into a visible desktop session."`
+	Media          mediaKongCmd          `cmd:"" help:"Create preview artifacts from recorded desktop videos."`
+	Artifacts      artifactsKongCmd      `cmd:"" help:"Collect, transform, and publish QA artifacts."`
+	SyncPlan       syncPlanKongCmd       `cmd:"" name:"sync-plan" passthrough:"" help:"Show local sync manifest size hotspots."`
+	Providers      providersKongCmd      `cmd:"" passthrough:"" help:"Show provider capabilities and recommendations."`
+	PreflightTools preflightToolsKongCmd `cmd:"" name:"preflight-tools" passthrough:"" help:"List accepted preflight names and target support offline."`
+	History        historyKongCmd        `cmd:"" passthrough:"" help:"List recorded remote runs."`
+	Logs           logsKongCmd           `cmd:"" passthrough:"" help:"Print recorded run logs."`
+	Events         eventsKongCmd         `cmd:"" passthrough:"" help:"Print recorded run events."`
+	Attach         attachKongCmd         `cmd:"" passthrough:"" help:"Follow recorded events for an active run."`
+	Results        resultsKongCmd        `cmd:"" passthrough:"" help:"Show recorded test result summaries."`
+	Receipt        receiptKongCmd        `cmd:"" passthrough:"" help:"Retrieve and verify a signed terminal run receipt."`
+	Verify         verifyKongCmd         `cmd:"" passthrough:"" help:"Verify a signed run receipt."`
+	Cache          cacheKongCmd          `cmd:"" help:"Inspect, purge, or warm remote caches."`
+	Status         statusKongCmd         `cmd:"" passthrough:"" help:"Show lease state; add --wait to block until ready."`
+	Heartbeat      heartbeatKongCmd      `cmd:"" passthrough:"" help:"Refresh a lease idle deadline and print its state."`
+	Extend         extendKongCmd         `cmd:"" passthrough:"" help:"Extend a lease within its lifetime policy."`
+	Claims         claimsKongCmd         `cmd:"" help:"Inspect unverified local lease claims without loading providers."`
+	List           listKongCmd           `cmd:"" passthrough:"" help:"List Crabbox machines."`
+	Ports          portsKongCmd          `cmd:"" passthrough:"" help:"Publish, list, or unpublish provider-native ports."`
+	Cp             cpKongCmd             `cmd:"" name:"cp" passthrough:"" help:"Copy files between the host and a lease."`
+	Tunnel         tunnelKongCmd         `cmd:"" passthrough:"" help:"Forward a lease loopback port to this machine."`
+	Share          shareKongCmd          `cmd:"" passthrough:"" help:"Share a lease with users or the owning org."`
+	Unshare        unshareKongCmd        `cmd:"" passthrough:"" help:"Remove lease sharing."`
+	Image          imageKongCmd          `cmd:"" help:"Create provider images and promote brokered AWS runner images."`
+	Usage          usageKongCmd          `cmd:"" passthrough:"" help:"Show cost and usage estimates by user, org, or fleet."`
+	Capacity       capacityKongCmd       `cmd:"" passthrough:"" help:"Show fleet, org, and owner lease headroom."`
+	Marketplace    marketplaceKongCmd    `cmd:"" help:"Preview the Crabbox credits gateway and smart routing quotes."`
+	Admin          adminKongCmd          `cmd:"" help:"Lease admin controls for trusted operators."`
+	Actions        actionsKongCmd        `cmd:"" help:"Register GitHub Actions runners or dispatch workflows."`
+	Capsule        capsuleKongCmd        `cmd:"" help:"Capture and replay lightweight failure capsules."`
+	Checkpoint     checkpointKongCmd     `cmd:"" help:"Create, restore, and fork VM or workspace checkpoints."`
+	Ssh            sshKongCmd            `cmd:"" name:"ssh" passthrough:"" help:"Print the SSH command for a lease."`
+	Connect        connectKongCmd        `cmd:"" passthrough:"" help:"Open an interactive SSH session to a lease."`
+	Exec           execKongCmd           `cmd:"" passthrough:"" help:"Execute a command under the current lease claim without syncing."`
+	Open           openKongCmd           `cmd:"" passthrough:"" help:"Prepare an editor handoff for a lease."`
+	Vnc            vncKongCmd            `cmd:"" name:"vnc" passthrough:"" help:"Print or open VNC connection details for a desktop lease."`
+	Webvnc         webvncKongCmd         `cmd:"" name:"webvnc" passthrough:"" help:"Open a desktop lease or local VNC tunnel in a browser."`
+	Code           codeKongCmd           `cmd:"" passthrough:"" help:"Bridge a code lease into the authenticated web portal."`
+	Egress         egressKongCmd         `cmd:"" passthrough:"" help:"Bridge lease browser/app traffic through this machine."`
+	Screenshot     screenshotKongCmd     `cmd:"" passthrough:"" help:"Capture a PNG from a desktop lease."`
+	Inspect        inspectKongCmd        `cmd:"" passthrough:"" help:"Print lease/provider details; add --json for scripts."`
+	Stop           stopKongCmd           `cmd:"" passthrough:"" help:"Release a lease or delete a direct-provider machine."`
+	Release        releaseKongCmd        `cmd:"" passthrough:"" help:"Alias for stop."`
+	Pause          pauseKongCmd          `cmd:"" passthrough:"" help:"Pause a lease, freeing remote compute while preserving state (provider-dependent)."`
+	Hold           holdKongCmd           `cmd:"" passthrough:"" help:"Retain an exact failed lease and its resources for salvage."`
+	Resume         resumeKongCmd         `cmd:"" passthrough:"" help:"Resume a previously paused lease."`
+	Cleanup        cleanupKongCmd        `cmd:"" passthrough:"" help:"Sweep expired direct-provider machines or local provider state."`
+	Azure          azureKongCmd          `cmd:"" help:"Azure provider setup and login."`
+	Config         configKongCmd         `cmd:"" help:"Show or update user config."`
+	Adapter        adapterKongCmd        `cmd:"" help:"Serve or connect the Crabfleet runtime adapter."`
+	Pool           poolKongCmd           `cmd:"" help:"Alias commands for machine pools."`
+	Machine        machineKongCmd        `cmd:"" help:"Alias commands for direct-provider machines."`
+	Pond           pondKongCmd           `cmd:"" help:"Pond bridge plane: peer discovery for delegated providers."`
 }
 
 type kongExit struct {
@@ -103,7 +119,7 @@ func (a App) runKong(ctx context.Context, args []string) (err error) {
 	if err != nil {
 		var parseErr *kong.ParseError
 		if errors.As(err, &parseErr) {
-			return exit(2, "%v", parseErr)
+			return Exit(2, "%v", parseErr)
 		}
 		return err
 	}
@@ -125,7 +141,7 @@ func normalizeKongHelpArgs(args []string) []string {
 
 func isKongCommandGroup(command string) bool {
 	switch command {
-	case "actions", "adapter", "admin", "artifacts", "azure", "cache", "capsule", "checkpoint", "config", "pond", "desktop", "image", "job", "machine", "media", "pool":
+	case "actions", "adapter", "admin", "artifacts", "azure", "bench", "cache", "capsule", "checkpoint", "claims", "config", "pond", "desktop", "image", "job", "machine", "marketplace", "media", "pool":
 		return true
 	default:
 		return false
@@ -156,6 +172,30 @@ type prewarmKongCmd struct {
 type runKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type watchKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type shardKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type benchKongCmd struct {
+	Run    benchRunKongCmd    `cmd:"" passthrough:"" help:"Run a workload across providers and record benchmark timings."`
+	Record benchRecordKongCmd `cmd:"" passthrough:"" help:"Append a TimingReport JSON object to the local benchmark ledger."`
+	Report benchReportKongCmd `cmd:"" passthrough:"" help:"Aggregate local benchmark timing observations."`
+	Check  benchCheckKongCmd  `cmd:"" passthrough:"" help:"Enforce a local runner timing policy across benchmark groups."`
+}
+type benchRunKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type benchRecordKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type benchReportKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type benchCheckKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
 type jobKongCmd struct {
 	List jobListKongCmd `cmd:"" passthrough:"" help:"List configured jobs."`
 	Run  jobRunKongCmd  `cmd:"" passthrough:"" help:"Run a configured job."`
@@ -170,6 +210,9 @@ type syncPlanKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type providersKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type preflightToolsKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type historyKongCmd struct {
@@ -187,13 +230,39 @@ type attachKongCmd struct {
 type resultsKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type receiptKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type verifyKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
 type portsKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type cpKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type tunnelKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
 type statusKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type extendKongCmd struct {
+	Args []string `arg:"" optional:"" passthrough:""`
+}
+
+type heartbeatKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type claimsKongCmd struct {
+	Prune claimsPruneKongCmd `cmd:"" passthrough:"" help:"Prune old local claims for remotely bounded leases."`
+	List  claimsListKongCmd  `cmd:"" passthrough:"" help:"List unverified local lease claims without loading providers."`
+}
+type claimsPruneKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type claimsListKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type listKongCmd struct {
@@ -208,10 +277,29 @@ type unshareKongCmd struct {
 type usageKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type capacityKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type marketplaceKongCmd struct {
+	Status marketplaceStatusKongCmd `cmd:"" passthrough:"" help:"Show credits gateway status."`
+	Quote  marketplaceQuoteKongCmd  `cmd:"" passthrough:"" help:"Preview smart-routing provider quotes."`
+}
+type marketplaceStatusKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type marketplaceQuoteKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
 type sshKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type connectKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type execKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type openKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type vncKongCmd struct {
@@ -239,6 +327,9 @@ type releaseKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type pauseKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type holdKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type resumeKongCmd struct {
@@ -368,17 +459,29 @@ type imageDeleteKongCmd struct {
 }
 
 type adminKongCmd struct {
-	Leases      adminLeasesKongCmd      `cmd:"" passthrough:"" help:"List coordinator lease records."`
-	LeaseAudit  adminLeaseAuditKongCmd  `cmd:"" name:"lease-audit" passthrough:"" help:"Check expired coordinator leases against cloud provider state."`
-	Providers   adminProvidersKongCmd   `cmd:"" passthrough:"" help:"Inspect provider identities and policies."`
-	Hosts       adminHostsKongCmd       `cmd:"" passthrough:"" help:"List, allocate, or release provider hosts."`
-	AWSIdentity adminAWSIdentityKongCmd `cmd:"" name:"aws-identity" passthrough:"" help:"Show the coordinator AWS caller identity."`
-	AWSPolicy   adminAWSPolicyKongCmd   `cmd:"" name:"aws-policy" passthrough:"" help:"Print the baseline brokered AWS IAM policy."`
-	MacHosts    adminMacHostsKongCmd    `cmd:"" name:"mac-hosts" passthrough:"" help:"List, allocate, or release AWS EC2 Mac Dedicated Hosts."`
-	Release     adminReleaseKongCmd     `cmd:"" passthrough:"" help:"Mark a lease released."`
-	Delete      adminDeleteKongCmd      `cmd:"" passthrough:"" help:"Delete the backing server and mark the lease released."`
+	ExtendLifetime    adminExtendLifetimeKongCmd    `cmd:"" name:"extend-lifetime" passthrough:"" help:"Extend an enrolled lease deadline before stopping starts."`
+	RetainedReconcile adminRetainedReconcileKongCmd `cmd:"" name:"retained-reconcile" passthrough:"" help:"Inspect retained lease reconciliation progress."`
+	LifetimeReadback  adminLifetimeReadbackKongCmd  `cmd:"" name:"lifetime-readback" passthrough:"" help:"Read coordinator-observed instance and root volume state."`
+	Leases            adminLeasesKongCmd            `cmd:"" passthrough:"" help:"List coordinator lease records."`
+	LeaseAudit        adminLeaseAuditKongCmd        `cmd:"" name:"lease-audit" passthrough:"" help:"Check expired coordinator leases against cloud provider state."`
+	Providers         adminProvidersKongCmd         `cmd:"" passthrough:"" help:"Inspect provider identities and policies."`
+	Hosts             adminHostsKongCmd             `cmd:"" passthrough:"" help:"List, allocate, or release provider hosts."`
+	AWSIdentity       adminAWSIdentityKongCmd       `cmd:"" name:"aws-identity" passthrough:"" help:"Show the coordinator AWS caller identity."`
+	AWSPolicy         adminAWSPolicyKongCmd         `cmd:"" name:"aws-policy" passthrough:"" help:"Print the baseline brokered AWS IAM policy."`
+	MacHosts          adminMacHostsKongCmd          `cmd:"" name:"mac-hosts" passthrough:"" help:"List, allocate, or release AWS EC2 Mac Dedicated Hosts."`
+	Release           adminReleaseKongCmd           `cmd:"" passthrough:"" help:"Mark a lease released."`
+	Delete            adminDeleteKongCmd            `cmd:"" passthrough:"" help:"Delete the backing server and mark the lease released."`
 }
 type adminLeasesKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type adminExtendLifetimeKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type adminRetainedReconcileKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type adminLifetimeReadbackKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type adminLeaseAuditKongCmd struct {
@@ -442,8 +545,10 @@ type capsulePromoteKongCmd struct {
 
 type checkpointKongCmd struct {
 	Create  checkpointCreateKongCmd  `cmd:"" passthrough:"" help:"Create a VM or workspace checkpoint from a lease."`
-	List    checkpointListKongCmd    `cmd:"" passthrough:"" help:"List local checkpoints."`
+	Abandon checkpointAbandonKongCmd `cmd:"" passthrough:"" help:"Dispose of an exact source while retaining an unresolved checkpoint."`
+	List    checkpointListKongCmd    `cmd:"" passthrough:"" help:"List coordinator-owned and local checkpoints."`
 	Inspect checkpointInspectKongCmd `cmd:"" passthrough:"" help:"Inspect checkpoint metadata."`
+	Policy  checkpointPolicyKongCmd  `cmd:"" passthrough:"" help:"Update coordinator-managed checkpoint retention."`
 	Restore checkpointRestoreKongCmd `cmd:"" passthrough:"" help:"Restore a checkpoint onto an existing lease."`
 	Fork    checkpointForkKongCmd    `cmd:"" passthrough:"" help:"Lease a new box from a checkpoint."`
 	Delete  checkpointDeleteKongCmd  `cmd:"" passthrough:"" help:"Delete a checkpoint and provider snapshot."`
@@ -452,10 +557,16 @@ type checkpointKongCmd struct {
 type checkpointCreateKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type checkpointAbandonKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
 type checkpointListKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type checkpointInspectKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type checkpointPolicyKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type checkpointRestoreKongCmd struct {
@@ -514,12 +625,14 @@ type controllerStateValidateKongCmd struct {
 }
 
 type poolKongCmd struct {
-	List     poolListKongCmd     `cmd:"" passthrough:"" help:"List machine inventory."`
-	Ready    poolReadyKongCmd    `cmd:"" passthrough:"" help:"List ready-pool leases."`
-	Register poolRegisterKongCmd `cmd:"" passthrough:"" help:"Register a hydrated lease in a ready pool."`
-	Borrow   poolBorrowKongCmd   `cmd:"" passthrough:"" help:"Borrow a ready-pool lease."`
-	Return   poolReturnKongCmd   `cmd:"" passthrough:"" help:"Return or drain a ready-pool lease."`
-	Ensure   poolEnsureKongCmd   `cmd:"" passthrough:"" help:"Ensure ready-pool capacity."`
+	List      poolListKongCmd      `cmd:"" passthrough:"" help:"List machine inventory."`
+	Ready     poolReadyKongCmd     `cmd:"" passthrough:"" help:"List ready-pool leases."`
+	Identity  poolIdentityKongCmd  `cmd:"" passthrough:"" help:"Generate a typed ready-pool identity from an existing lease."`
+	Register  poolRegisterKongCmd  `cmd:"" passthrough:"" help:"Register a hydrated lease in a ready pool."`
+	Borrow    poolBorrowKongCmd    `cmd:"" passthrough:"" help:"Borrow a ready-pool lease."`
+	Heartbeat poolHeartbeatKongCmd `cmd:"" passthrough:"" help:"Refresh a ready-pool borrow deadline."`
+	Return    poolReturnKongCmd    `cmd:"" passthrough:"" help:"Return or drain a ready-pool lease."`
+	Ensure    poolEnsureKongCmd    `cmd:"" passthrough:"" help:"Ensure ready-pool capacity."`
 }
 type poolListKongCmd struct {
 	Args []string `arg:"" optional:""`
@@ -527,10 +640,16 @@ type poolListKongCmd struct {
 type poolReadyKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type poolIdentityKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
 type poolRegisterKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type poolBorrowKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type poolHeartbeatKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type poolReturnKongCmd struct {
@@ -568,36 +687,72 @@ type pondReleaseKongCmd struct {
 
 type versionKongCmd struct{}
 
-func (c *initKongCmd) Run(ctx context.Context, app App) error      { return app.initProject(ctx, c.Args) }
-func (c *loginKongCmd) Run(ctx context.Context, app App) error     { return app.login(ctx, c.Args) }
-func (c *logoutKongCmd) Run(ctx context.Context, app App) error    { return app.logout(ctx, c.Args) }
-func (c *whoamiKongCmd) Run(ctx context.Context, app App) error    { return app.whoami(ctx, c.Args) }
-func (c *doctorKongCmd) Run(ctx context.Context, app App) error    { return app.doctor(ctx, c.Args) }
-func (c *warmupKongCmd) Run(ctx context.Context, app App) error    { return app.warmup(ctx, c.Args) }
-func (c *prewarmKongCmd) Run(ctx context.Context, app App) error   { return app.prewarm(ctx, c.Args) }
-func (c *runKongCmd) Run(ctx context.Context, app App) error       { return app.runCommand(ctx, c.Args) }
+func (c *initKongCmd) Run(ctx context.Context, app App) error    { return app.initProject(ctx, c.Args) }
+func (c *loginKongCmd) Run(ctx context.Context, app App) error   { return app.login(ctx, c.Args) }
+func (c *logoutKongCmd) Run(ctx context.Context, app App) error  { return app.logout(ctx, c.Args) }
+func (c *whoamiKongCmd) Run(ctx context.Context, app App) error  { return app.whoami(ctx, c.Args) }
+func (c *doctorKongCmd) Run(ctx context.Context, app App) error  { return app.doctor(ctx, c.Args) }
+func (c *warmupKongCmd) Run(ctx context.Context, app App) error  { return app.warmup(ctx, c.Args) }
+func (c *prewarmKongCmd) Run(ctx context.Context, app App) error { return app.prewarm(ctx, c.Args) }
+func (c *runKongCmd) Run(ctx context.Context, app App) error     { return app.runCommand(ctx, c.Args) }
+func (c *watchKongCmd) Run(ctx context.Context, app App) error   { return app.watch(ctx, c.Args) }
+func (c *shardKongCmd) Run(ctx context.Context, app App) error   { return app.shard(ctx, c.Args) }
+func (c *benchRunKongCmd) Run(ctx context.Context, app App) error {
+	return app.benchRun(ctx, c.Args)
+}
+func (c *benchRecordKongCmd) Run(ctx context.Context, app App) error {
+	return app.benchRecord(ctx, c.Args)
+}
+func (c *benchReportKongCmd) Run(ctx context.Context, app App) error {
+	return app.benchReport(ctx, c.Args)
+}
+func (c *benchCheckKongCmd) Run(ctx context.Context, app App) error {
+	return app.benchCheck(ctx, c.Args)
+}
 func (c *jobListKongCmd) Run(ctx context.Context, app App) error   { return app.jobList(ctx, c.Args) }
 func (c *jobRunKongCmd) Run(ctx context.Context, app App) error    { return app.jobRun(ctx, c.Args) }
 func (c *syncPlanKongCmd) Run(ctx context.Context, app App) error  { return app.syncPlan(ctx, c.Args) }
 func (c *providersKongCmd) Run(ctx context.Context, app App) error { return app.providers(ctx, c.Args) }
+func (c *preflightToolsKongCmd) Run(_ context.Context, app App) error {
+	return app.preflightTools(c.Args)
+}
 func (c *historyKongCmd) Run(ctx context.Context, app App) error   { return app.history(ctx, c.Args) }
 func (c *logsKongCmd) Run(ctx context.Context, app App) error      { return app.logs(ctx, c.Args) }
 func (c *eventsKongCmd) Run(ctx context.Context, app App) error    { return app.events(ctx, c.Args) }
 func (c *attachKongCmd) Run(ctx context.Context, app App) error    { return app.attach(ctx, c.Args) }
 func (c *resultsKongCmd) Run(ctx context.Context, app App) error   { return app.results(ctx, c.Args) }
+func (c *receiptKongCmd) Run(ctx context.Context, app App) error   { return app.receipt(ctx, c.Args) }
+func (c *verifyKongCmd) Run(ctx context.Context, app App) error    { return app.verify(ctx, c.Args) }
 func (c *portsKongCmd) Run(ctx context.Context, app App) error     { return app.ports(ctx, c.Args) }
 func (c *cpKongCmd) Run(ctx context.Context, app App) error        { return app.copyCommand(ctx, c.Args) }
+func (c *tunnelKongCmd) Run(ctx context.Context, app App) error    { return app.tunnel(ctx, c.Args) }
 func (c *statusKongCmd) Run(ctx context.Context, app App) error    { return app.status(ctx, c.Args) }
-func (c *listKongCmd) Run(ctx context.Context, app App) error      { return app.list(ctx, c.Args) }
-func (c *shareKongCmd) Run(ctx context.Context, app App) error     { return app.share(ctx, c.Args) }
-func (c *unshareKongCmd) Run(ctx context.Context, app App) error   { return app.unshare(ctx, c.Args) }
-func (c *usageKongCmd) Run(ctx context.Context, app App) error     { return app.usage(ctx, c.Args) }
-func (c *sshKongCmd) Run(ctx context.Context, app App) error       { return app.ssh(ctx, c.Args) }
-func (c *connectKongCmd) Run(ctx context.Context, app App) error   { return app.connect(ctx, c.Args) }
-func (c *vncKongCmd) Run(ctx context.Context, app App) error       { return app.vnc(ctx, c.Args) }
-func (c *webvncKongCmd) Run(ctx context.Context, app App) error    { return app.webvnc(ctx, c.Args) }
-func (c *codeKongCmd) Run(ctx context.Context, app App) error      { return app.webCode(ctx, c.Args) }
-func (c *egressKongCmd) Run(ctx context.Context, app App) error    { return app.egress(ctx, c.Args) }
+func (c *heartbeatKongCmd) Run(ctx context.Context, app App) error { return app.heartbeat(ctx, c.Args) }
+func (c *claimsPruneKongCmd) Run(ctx context.Context, app App) error {
+	return app.claimsPrune(ctx, stripKongCommandPath(c.Args, "claims", "prune"))
+}
+func (c *claimsListKongCmd) Run(ctx context.Context, app App) error {
+	return app.claimsList(ctx, stripKongCommandPath(c.Args, "claims", "list"))
+}
+func (c *listKongCmd) Run(ctx context.Context, app App) error     { return app.list(ctx, c.Args) }
+func (c *shareKongCmd) Run(ctx context.Context, app App) error    { return app.share(ctx, c.Args) }
+func (c *unshareKongCmd) Run(ctx context.Context, app App) error  { return app.unshare(ctx, c.Args) }
+func (c *usageKongCmd) Run(ctx context.Context, app App) error    { return app.usage(ctx, c.Args) }
+func (c *capacityKongCmd) Run(ctx context.Context, app App) error { return app.capacity(ctx, c.Args) }
+func (c *marketplaceStatusKongCmd) Run(ctx context.Context, app App) error {
+	return app.marketplaceStatus(ctx, c.Args)
+}
+func (c *marketplaceQuoteKongCmd) Run(ctx context.Context, app App) error {
+	return app.marketplaceQuote(ctx, c.Args)
+}
+func (c *sshKongCmd) Run(ctx context.Context, app App) error     { return app.ssh(ctx, c.Args) }
+func (c *connectKongCmd) Run(ctx context.Context, app App) error { return app.connect(ctx, c.Args) }
+func (c *execKongCmd) Run(ctx context.Context, app App) error    { return app.execCommand(ctx, c.Args) }
+func (c *openKongCmd) Run(ctx context.Context, app App) error    { return app.open(ctx, c.Args) }
+func (c *vncKongCmd) Run(ctx context.Context, app App) error     { return app.vnc(ctx, c.Args) }
+func (c *webvncKongCmd) Run(ctx context.Context, app App) error  { return app.webvnc(ctx, c.Args) }
+func (c *codeKongCmd) Run(ctx context.Context, app App) error    { return app.webCode(ctx, c.Args) }
+func (c *egressKongCmd) Run(ctx context.Context, app App) error  { return app.egress(ctx, c.Args) }
 func (c *screenshotKongCmd) Run(ctx context.Context, app App) error {
 	return app.screenshot(ctx, c.Args)
 }
@@ -605,16 +760,17 @@ func (c *inspectKongCmd) Run(ctx context.Context, app App) error { return app.in
 func (c *stopKongCmd) Run(ctx context.Context, app App) error    { return app.stop(ctx, c.Args) }
 func (c *releaseKongCmd) Run(ctx context.Context, app App) error { return app.stop(ctx, c.Args) }
 func (c *pauseKongCmd) Run(ctx context.Context, app App) error   { return app.pause(ctx, c.Args) }
+func (c *holdKongCmd) Run(ctx context.Context, app App) error    { return app.hold(ctx, c.Args) }
 func (c *resumeKongCmd) Run(ctx context.Context, app App) error  { return app.resume(ctx, c.Args) }
 func (c *cleanupKongCmd) Run(ctx context.Context, app App) error { return app.cleanup(ctx, c.Args) }
 func (c *pondConnectKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondConnect(ctx, stripKongCommandPath(c.Args, "pond", "connect"))
+	return app.pondConnect(ctx, c.Args)
 }
 func (c *pondDisconnectKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondDisconnect(ctx, stripKongCommandPath(c.Args, "pond", "disconnect"))
+	return app.pondDisconnect(ctx, c.Args)
 }
 func (c *pondReleaseKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondRelease(ctx, stripKongCommandPath(c.Args, "pond", "release"))
+	return app.pondRelease(ctx, c.Args)
 }
 
 func (c *desktopLaunchKongCmd) Run(ctx context.Context, app App) error {
@@ -701,6 +857,12 @@ func (c *imageDeleteKongCmd) Run(ctx context.Context, app App) error {
 func (c *adminLeasesKongCmd) Run(ctx context.Context, app App) error {
 	return app.adminLeases(ctx, c.Args)
 }
+func (c *adminExtendLifetimeKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminExtendLifetime(ctx, c.Args)
+}
+func (c *adminLifetimeReadbackKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminLifetimeReadback(ctx, c.Args)
+}
 func (c *adminLeaseAuditKongCmd) Run(ctx context.Context, app App) error {
 	return app.adminLeaseAudit(ctx, c.Args)
 }
@@ -752,11 +914,17 @@ func (c *capsulePromoteKongCmd) Run(ctx context.Context, app App) error {
 func (c *checkpointCreateKongCmd) Run(ctx context.Context, app App) error {
 	return app.checkpointCreate(ctx, stripKongCommandPath(c.Args, "checkpoint", "create"))
 }
+func (c *checkpointAbandonKongCmd) Run(ctx context.Context, app App) error {
+	return app.checkpointAbandon(ctx, stripKongCommandPath(c.Args, "checkpoint", "abandon"))
+}
 func (c *checkpointListKongCmd) Run(ctx context.Context, app App) error {
 	return app.checkpointList(ctx, stripKongCommandPath(c.Args, "checkpoint", "list"))
 }
 func (c *checkpointInspectKongCmd) Run(ctx context.Context, app App) error {
 	return app.checkpointInspect(ctx, stripKongCommandPath(c.Args, "checkpoint", "inspect"))
+}
+func (c *checkpointPolicyKongCmd) Run(ctx context.Context, app App) error {
+	return app.checkpointPolicy(ctx, stripKongCommandPath(c.Args, "checkpoint", "policy"))
 }
 func (c *checkpointRestoreKongCmd) Run(ctx context.Context, app App) error {
 	return app.checkpointRestore(ctx, stripKongCommandPath(c.Args, "checkpoint", "restore"))
@@ -772,9 +940,9 @@ func (c *checkpointPruneKongCmd) Run(ctx context.Context, app App) error {
 }
 
 func (c *configPathKongCmd) Run(ctx context.Context, app App) error {
-	path := userConfigPath()
+	path := writableConfigPath()
 	if path == "" {
-		return exit(2, "user config directory is unavailable")
+		return Exit(2, "user config directory is unavailable")
 	}
 	fmt.Fprintln(app.Stdout, path)
 	return nil
@@ -811,11 +979,17 @@ func (c *poolListKongCmd) Run(ctx context.Context, app App) error {
 func (c *poolReadyKongCmd) Run(ctx context.Context, app App) error {
 	return app.readyPoolList(ctx, stripKongCommandPath(c.Args, "pool", "ready"))
 }
+func (c *poolIdentityKongCmd) Run(ctx context.Context, app App) error {
+	return app.readyPoolIdentity(ctx, stripKongCommandPath(c.Args, "pool", "identity"))
+}
 func (c *poolRegisterKongCmd) Run(ctx context.Context, app App) error {
 	return app.readyPoolRegister(ctx, stripKongCommandPath(c.Args, "pool", "register"))
 }
 func (c *poolBorrowKongCmd) Run(ctx context.Context, app App) error {
 	return app.readyPoolBorrow(ctx, stripKongCommandPath(c.Args, "pool", "borrow"))
+}
+func (c *poolHeartbeatKongCmd) Run(ctx context.Context, app App) error {
+	return app.readyPoolHeartbeat(ctx, stripKongCommandPath(c.Args, "pool", "heartbeat"))
 }
 func (c *poolReturnKongCmd) Run(ctx context.Context, app App) error {
 	return app.readyPoolReturn(ctx, stripKongCommandPath(c.Args, "pool", "return"))
@@ -828,7 +1002,7 @@ func (c *machineCleanupKongCmd) Run(ctx context.Context, app App) error {
 }
 
 func (c *pondPeersKongCmd) Run(ctx context.Context, app App) error {
-	return app.pondPeers(ctx, stripKongCommandPath(c.Args, "pond", "peers"))
+	return app.pondPeers(ctx, c.Args)
 }
 
 func (c *versionKongCmd) Run(app App) error {
@@ -845,4 +1019,9 @@ func stripKongCommandPath(args []string, path ...string) []string {
 		out = out[1:]
 	}
 	return out
+}
+
+func (c *extendKongCmd) Run(ctx context.Context, app App) error { return app.extend(ctx, c.Args) }
+func (c *adminRetainedReconcileKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminRetainedReconcile(ctx, c.Args)
 }

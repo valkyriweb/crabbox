@@ -4,14 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 func TestSpritesSSHTargetUsesSpriteProxy(t *testing.T) {
@@ -35,6 +40,63 @@ func TestSpritesLabelsRoundTripLeaseAndSlug(t *testing.T) {
 	}
 	if got := spritesSlug("cbx_abcdef123456", sprite); got != "blue-lobster" {
 		t.Fatalf("slug=%q", got)
+	}
+}
+
+func TestSpritesObservationOmitsUnavailableHistory(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	cfg := core.BaseConfig()
+	cfg.Provider, cfg.TTL, cfg.IdleTimeout = spritesProvider, 2*time.Hour, 45*time.Minute
+	cfg.Sprites.WorkRoot = "/home/sprite/crabbox"
+	b := &spritesBackend{cfg: cfg}
+	sprite := spritesInfo{
+		ID: "sprite-observed", Name: "crabbox-observed", Organization: "example-org", Status: "cold",
+		URL: "https://sprite.example.test", Labels: spritesAPILabels("cbx_abcdef123456", "observed"),
+	}
+	server := b.spriteToServer(sprite, nil)
+	if server.CloudID != sprite.Name || server.Status != "cold" || server.Labels["sprites_resource_id"] != sprite.ID || server.Labels["url"] != sprite.URL {
+		t.Fatalf("native facts changed: %#v", server)
+	}
+	for _, key := range []string{"created_at", "updated_at", "last_touched_at", "expires_at", "ttl_secs", "idle_timeout", "idle_timeout_secs", "keep"} {
+		if value, exists := server.Labels[key]; exists {
+			t.Errorf("observation invented %s=%q from reader configuration", key, value)
+		}
+	}
+}
+
+func TestSpritesObservationAndClaimPublicationUseRecordedPolicy(t *testing.T) {
+	cfg := core.BaseConfig()
+	cfg.Provider, cfg.TTL, cfg.IdleTimeout = spritesProvider, 2*time.Hour, 45*time.Minute
+	cfg.Sprites.WorkRoot = "/home/sprite/crabbox"
+	b := &spritesBackend{cfg: cfg}
+	sprite := spritesInfo{ID: "sprite-observed", Name: "crabbox-observed", Status: "cold", Labels: spritesAPILabels("cbx_abcdef123456", "observed")}
+	history := core.LeaseClaim{
+		IdleTimeoutSeconds: 300, LastUsedAt: "2026-01-02T03:04:05Z",
+		Labels: map[string]string{
+			"created_at": "1767320000", "last_touched_at": "1767320100", "expires_at": "1767320400",
+			"idle_timeout": "300", "idle_timeout_secs": "300", "ttl_secs": "600", "keep": "false",
+		},
+	}
+	before, _ := json.Marshal(history)
+	observed := b.spriteToServer(sprite, &history)
+	if observed.Labels["idle_timeout_secs"] != "300" || observed.Labels["ttl_secs"] != "600" || observed.Labels["keep"] != "false" || observed.Labels["last_touched_at"] != core.LeaseLabelTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("observation did not use recorded history: %v", observed.Labels)
+	}
+	for _, key := range []string{"created_at", "expires_at"} {
+		if _, exists := observed.Labels[key]; exists {
+			t.Errorf("local policy %s was presented as native history", key)
+		}
+	}
+	prepared := b.claimServer(sprite, history.Labels)
+	for key, want := range history.Labels {
+		if got := prepared.Labels[key]; got != want {
+			t.Errorf("endpoint publication changed %s=%q, want %q", key, got, want)
+		}
+	}
+	prepared.Labels["keep"] = "true"
+	after, _ := json.Marshal(history)
+	if string(before) != string(after) {
+		t.Fatal("projection mutated recorded history")
 	}
 }
 
@@ -97,7 +159,7 @@ func TestResolveSpriteNameAcceptsPrefixOnlyWithReclaim(t *testing.T) {
 
 func TestResolveSpriteNameUsesAdoptedSpriteNameFromClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := claimLeaseForRepoProvider("spr_handmade-sprite", "adopted", spritesProvider, t.TempDir(), 0, true); err != nil {
+	if err := core.ClaimLeaseForRepoProvider("spr_handmade-sprite", "adopted", spritesProvider, t.TempDir(), 0, true); err != nil {
 		t.Fatal(err)
 	}
 	backend := &spritesBackend{client: &fakeSpritesAPI{}}
@@ -112,7 +174,7 @@ func TestResolveSpriteNameUsesAdoptedSpriteNameFromClaim(t *testing.T) {
 
 func TestResolveSpriteNameAcceptsProviderlessCrabboxClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := claimLeaseForRepoProvider("cbx_abcdef123456", "blue-lobster", "", t.TempDir(), 0, true); err != nil {
+	if err := core.ClaimLeaseForRepoProvider("cbx_abcdef123456", "blue-lobster", "", t.TempDir(), 0, true); err != nil {
 		t.Fatal(err)
 	}
 	backend := &spritesBackend{client: &fakeSpritesAPI{}}
@@ -127,7 +189,7 @@ func TestResolveSpriteNameAcceptsProviderlessCrabboxClaim(t *testing.T) {
 
 func TestResolveSpriteNameRejectsOtherProviderClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	if err := claimLeaseForRepoProvider("cbx_abcdef123456", "blue-lobster", "aws", t.TempDir(), 0, true); err != nil {
+	if err := core.ClaimLeaseForRepoProvider("cbx_abcdef123456", "blue-lobster", "aws", t.TempDir(), 0, true); err != nil {
 		t.Fatal(err)
 	}
 	backend := &spritesBackend{client: &fakeSpritesAPI{}}
@@ -141,17 +203,22 @@ func TestResolveReleaseOnlySkipsSpriteCLIAndBootstrap(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", stateDir)
 	repoRoot := t.TempDir()
-	if err := claimLeaseForRepoProvider("spr_unhealthy-sprite", "unhealthy", spritesProvider, repoRoot, 0, true); err != nil {
+	cfg := core.Config{Provider: spritesProvider, Sprites: core.SpritesConfig{WorkRoot: "/home/sprite/crabbox"}}
+	server := core.Server{Provider: spritesProvider, CloudID: "unhealthy-sprite", Name: "unhealthy-sprite", Labels: map[string]string{
+		"provider": spritesProvider, "lease": "spr_unhealthy-sprite", "slug": "unhealthy", "name": "unhealthy-sprite",
+		"sprites_ownership": "adopted", "sprites_resource_id": "sprite-immutable-1",
+	}}
+	if err := core.ClaimLeaseTargetForRepoConfig("spr_unhealthy-sprite", "unhealthy", cfg, server, core.SSHTarget{}, repoRoot, 0, true); err != nil {
 		t.Fatal(err)
 	}
-	api := &fakeSpritesAPI{}
+	api := &fakeSpritesAPI{get: spritesInfo{ID: "sprite-immutable-1", Name: "unhealthy-sprite"}}
 	runner := &recordingRunner{}
 	backend := &spritesBackend{
-		cfg:    Config{Sprites: SpritesConfig{WorkRoot: "/home/sprite/crabbox"}},
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner},
+		cfg:    cfg,
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner},
 		client: api,
 	}
-	lease, err := backend.Resolve(context.Background(), ResolveRequest{ID: "unhealthy", ReleaseOnly: true})
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: "unhealthy", ReleaseOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,13 +228,13 @@ func TestResolveReleaseOnlySkipsSpriteCLIAndBootstrap(t *testing.T) {
 	if lease.LeaseID != "spr_unhealthy-sprite" || lease.Server.Name != "unhealthy-sprite" {
 		t.Fatalf("lease=%#v", lease)
 	}
-	if err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{Lease: lease, Force: true}); err != nil {
+	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease, Force: true}); err != nil {
 		t.Fatal(err)
 	}
 	if api.deleted != "unhealthy-sprite" {
 		t.Fatalf("deleted=%q", api.deleted)
 	}
-	if _, ok, err := resolveLeaseClaim("unhealthy"); err != nil || ok {
+	if _, ok, err := core.ResolveLeaseClaim("unhealthy"); err != nil || ok {
 		t.Fatalf("claim still resolves ok=%t err=%v", ok, err)
 	}
 }
@@ -176,18 +243,108 @@ func TestReleaseLeaseRejectsUnclaimedPrefixOnlySprite(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	api := &fakeSpritesAPI{get: spritesInfo{Name: "crabbox-handmade"}}
 	backend := &spritesBackend{client: api}
-	err := backend.ReleaseLease(context.Background(), ReleaseLeaseRequest{
-		Lease: LeaseTarget{
+	err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{
+		Lease: core.LeaseTarget{
 			LeaseID: "spr_crabbox-handmade",
-			Server:  Server{Name: "crabbox-handmade"},
+			Server:  core.Server{Name: "crabbox-handmade"},
 		},
 		Force: true,
 	})
-	if err == nil || !strings.Contains(err.Error(), "not Crabbox-managed") {
-		t.Fatalf("ReleaseLease err=%v, want unmanaged sprite error", err)
+	if err == nil || !strings.Contains(err.Error(), "no exact local ownership claim") {
+		t.Fatalf("ReleaseLease err=%v, want missing exact ownership claim", err)
 	}
 	if api.deleted != "" {
 		t.Fatalf("deleted prefix-only sprite %q", api.deleted)
+	}
+}
+
+func TestSpritesReleaseRequiresExactScopedClaimAndLiveOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		claimedName   string
+		claimedAPIURL string
+		live          spritesInfo
+		deleteErr     error
+		wantErr       string
+		wantDeleted   bool
+	}{
+		{name: "exact claim", claimedName: "sprite-owned", live: spritesInfo{Name: "sprite-owned", Labels: spritesAPILabels("cbx_abcdef123456", "owned")}, wantDeleted: true},
+		{name: "wrong resource", claimedName: "sprite-other", live: spritesInfo{Name: "sprite-owned"}, wantErr: "cloud ID mismatch"},
+		{name: "wrong endpoint", claimedName: "sprite-owned", claimedAPIURL: "https://other.sprites.test", live: spritesInfo{Name: "sprite-owned"}, wantErr: "provider scope mismatch"},
+		{name: "live identity mismatch", claimedName: "sprite-owned", live: spritesInfo{Name: "sprite-other"}, wantErr: "live sprite identity"},
+		{name: "live lease mismatch", claimedName: "sprite-owned", live: spritesInfo{Name: "sprite-owned", Labels: spritesAPILabels("cbx_999999999999", "other")}, wantErr: "live lease"},
+		{name: "missing live ownership", claimedName: "sprite-owned", live: spritesInfo{Name: "sprite-owned"}, wantErr: "without exact Crabbox ownership labels"},
+		{name: "failed deletion retains claim", claimedName: "sprite-owned", live: spritesInfo{Name: "sprite-owned", Labels: spritesAPILabels("cbx_abcdef123456", "owned")}, deleteErr: errors.New("provider unavailable"), wantErr: "provider unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			cfg := core.Config{Provider: spritesProvider, Sprites: core.SpritesConfig{WorkRoot: "/home/sprite/crabbox"}}
+			claimCfg := cfg
+			claimCfg.Sprites.APIURL = tc.claimedAPIURL
+			claimedServer := core.Server{Provider: spritesProvider, CloudID: tc.claimedName, Name: tc.claimedName, Labels: map[string]string{
+				"provider": spritesProvider, "lease": "cbx_abcdef123456", "slug": "owned", "name": tc.claimedName,
+			}}
+			if err := core.ClaimLeaseTargetForRepoConfig("cbx_abcdef123456", "owned", claimCfg, claimedServer, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			api := &fakeSpritesAPI{get: tc.live, deleteErr: tc.deleteErr}
+			backend := &spritesBackend{cfg: cfg, client: api, rt: core.Runtime{Stderr: io.Discard}}
+			err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{
+				LeaseID: "cbx_abcdef123456", Server: core.Server{Name: "sprite-owned", Labels: map[string]string{"slug": "owned"}},
+			}})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v, want %q", err, tc.wantErr)
+				}
+				if _, exists, claimErr := core.ReadLeaseClaimWithPresence("cbx_abcdef123456"); claimErr != nil || !exists {
+					t.Fatalf("claim exists=%t err=%v", exists, claimErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if got := api.deleted != ""; got != tc.wantDeleted {
+				t.Fatalf("deleted=%q wantDeleted=%t", api.deleted, tc.wantDeleted)
+			}
+		})
+	}
+}
+
+func TestSpritesLegacyReleaseRequiresExplicitImmutableAdoption(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		adopted    bool
+		claimID    string
+		liveID     string
+		wantDelete bool
+	}{
+		{name: "legacy claim without adoption", claimID: "sprite-id-1", liveID: "sprite-id-1"},
+		{name: "adopted without immutable identity", adopted: true},
+		{name: "adopted identity changed", adopted: true, claimID: "sprite-id-1", liveID: "sprite-id-2"},
+		{name: "explicit immutable adoption", adopted: true, claimID: "sprite-id-1", liveID: "sprite-id-1", wantDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			cfg := core.Config{Provider: spritesProvider}
+			labels := map[string]string{"provider": spritesProvider, "lease": "spr_legacy", "slug": "legacy", "name": "legacy"}
+			if tc.adopted {
+				labels["sprites_ownership"] = "adopted"
+			}
+			if tc.claimID != "" {
+				labels["sprites_resource_id"] = tc.claimID
+			}
+			server := core.Server{Provider: spritesProvider, CloudID: "legacy", Name: "legacy", Labels: labels}
+			if err := core.ClaimLeaseTargetForRepoConfig("spr_legacy", "legacy", cfg, server, core.SSHTarget{}, t.TempDir(), time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			api := &fakeSpritesAPI{get: spritesInfo{ID: tc.liveID, Name: "legacy"}}
+			backend := &spritesBackend{cfg: cfg, client: api, rt: core.Runtime{Stderr: io.Discard}}
+			err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{
+				LeaseID: "spr_legacy", Server: core.Server{Name: "legacy", Labels: map[string]string{"slug": "legacy"}},
+			}})
+			if tc.wantDelete != (err == nil) || tc.wantDelete != (api.deleted == "legacy") {
+				t.Fatalf("err=%v deleted=%q wantDelete=%t", err, api.deleted, tc.wantDelete)
+			}
+		})
 	}
 }
 
@@ -197,12 +354,12 @@ func TestAcquireKeepFailurePreservesRetainedSpriteKey(t *testing.T) {
 	api := &fakeSpritesAPI{}
 	runner := &recordingRunner{failContains: "exec -s", err: errors.New("bootstrap failed")}
 	backend := &spritesBackend{
-		cfg:    Config{Sprites: SpritesConfig{WorkRoot: "/home/sprite/crabbox"}},
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner},
+		cfg:    core.Config{Sprites: core.SpritesConfig{WorkRoot: "/home/sprite/crabbox"}},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner},
 		client: api,
 	}
 
-	_, err := backend.Acquire(context.Background(), AcquireRequest{Keep: true, Repo: core.Repo{Root: t.TempDir()}})
+	_, err := backend.Acquire(context.Background(), core.AcquireRequest{Keep: true, Repo: core.Repo{Root: t.TempDir()}})
 	if err == nil || !strings.Contains(err.Error(), "bootstrap failed") {
 		t.Fatalf("Acquire err=%v, want bootstrap failure", err)
 	}
@@ -226,12 +383,12 @@ func TestAcquireFailureDeletesReturnedSpriteName(t *testing.T) {
 	api := &fakeSpritesAPI{create: spritesInfo{Name: "canonical-sprite"}}
 	runner := &recordingRunner{failContains: "exec -s", err: errors.New("bootstrap failed")}
 	backend := &spritesBackend{
-		cfg:    Config{Sprites: SpritesConfig{WorkRoot: "/home/sprite/crabbox"}},
-		rt:     Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner},
+		cfg:    core.Config{Sprites: core.SpritesConfig{WorkRoot: "/home/sprite/crabbox"}},
+		rt:     core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner},
 		client: api,
 	}
 
-	_, err := backend.Acquire(context.Background(), AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
+	_, err := backend.Acquire(context.Background(), core.AcquireRequest{Repo: core.Repo{Root: t.TempDir()}})
 	if err == nil || !strings.Contains(err.Error(), "bootstrap failed") {
 		t.Fatalf("Acquire err=%v, want bootstrap failure", err)
 	}
@@ -244,19 +401,183 @@ func TestAcquireFailureDeletesReturnedSpriteName(t *testing.T) {
 }
 
 func TestSpritesRejectsTailscale(t *testing.T) {
-	cfg := Config{Sprites: SpritesConfig{Token: "test-token"}}
+	cfg := core.Config{Sprites: core.SpritesConfig{Token: "test-token"}}
 	cfg.Tailscale.Enabled = true
-	_, err := NewSpritesBackend(Provider{}.Spec(), cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: &recordingRunner{}})
+	_, err := NewSpritesBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: &recordingRunner{}})
 	if err == nil || !strings.Contains(err.Error(), "--tailscale is not supported for provider=sprites") {
 		t.Fatalf("err=%v", err)
 	}
 }
 
 func TestSpritesRejectsUnsafeWorkRootBeforeBackend(t *testing.T) {
-	cfg := Config{Sprites: SpritesConfig{Token: "test-token", WorkRoot: "/tmp"}}
-	_, err := NewSpritesBackend(Provider{}.Spec(), cfg, Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: &recordingRunner{}})
+	cfg := core.Config{Sprites: core.SpritesConfig{Token: "test-token", WorkRoot: "/tmp"}}
+	_, err := NewSpritesBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: &recordingRunner{}})
 	if err == nil || !strings.Contains(err.Error(), "too broad") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSpritesRejectsUnsafeAPIURLBeforeBackend(t *testing.T) {
+	cfg := core.Config{Sprites: core.SpritesConfig{
+		Token:    "test-token",
+		APIURL:   "http://api.sprites.dev",
+		WorkRoot: "/home/sprite/crabbox",
+	}}
+	_, err := NewSpritesBackend(Provider{}.Spec(), cfg, core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: &recordingRunner{}})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSpritesAPIURLValidation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "canonical https", raw: "HTTPS://API.SPRITES.DEV:443/tenant/", want: "https://api.sprites.dev/tenant"},
+		{name: "escaped path", raw: "https://api.sprites.dev/tenant%2F/", want: "https://api.sprites.dev/tenant%2F"},
+		{name: "localhost", raw: "http://localhost:8080/", want: "http://localhost:8080"},
+		{name: "ipv4 loopback", raw: "http://127.0.0.2:8080/api", want: "http://127.0.0.2:8080/api"},
+		{name: "ipv6 loopback", raw: "http://[::1]:80/", want: "http://[::1]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, _, err := validateSpritesAPIURL(test.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("url=%q want %q", got, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "public http", raw: "http://api.sprites.dev"},
+		{name: "relative", raw: "/v1/sprites"},
+		{name: "schemeless", raw: "api.sprites.dev"},
+		{name: "missing host", raw: "https:///v1/sprites"},
+		{name: "opaque", raw: "https:api.sprites.dev"},
+		{name: "other scheme", raw: "ftp://api.sprites.dev"},
+		{name: "userinfo", raw: "https://token@api.sprites.dev"},
+		{name: "query", raw: "https://api.sprites.dev?region=us"},
+		{name: "bare query", raw: "https://api.sprites.dev?"},
+		{name: "fragment", raw: "https://api.sprites.dev#fragment"},
+		{name: "malformed port", raw: "https://api.sprites.dev:bad"},
+		{name: "loopback lookalike", raw: "http://localhost.example.com"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := validateSpritesAPIURL(test.raw); err == nil {
+				t.Fatalf("expected %q to be rejected", test.raw)
+			}
+		})
+	}
+}
+
+func TestSpritesClientDefaultsAPIURL(t *testing.T) {
+	client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: "test-token"}}, core.Runtime{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.(*spritesClient).apiURL; got != "https://api.sprites.dev" {
+		t.Fatalf("apiURL=%q", got)
+	}
+}
+
+func TestSpritesClientRejectsCrossOriginRedirect(t *testing.T) {
+	targetRequests := 0
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetRequests++
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/capture", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: "test-token", APIURL: origin.URL}}, core.Runtime{HTTP: origin.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ListSprites(context.Background(), "")
+	if err == nil || !strings.Contains(err.Error(), "redirect changed API origin") {
+		t.Fatalf("err=%v", err)
+	}
+	if targetRequests != 0 {
+		t.Fatalf("target requests=%d", targetRequests)
+	}
+}
+
+func TestSpritesClientPreservesAuthOnSameOriginRedirect(t *testing.T) {
+	var redirected bool
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/sprites" {
+			http.Redirect(w, r, srv.URL+"/redirected", http.StatusTemporaryRedirect)
+			return
+		}
+		redirected = true
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("auth=%q", got)
+		}
+		_ = json.NewEncoder(w).Encode(spritesListResponse{})
+	}))
+	defer srv.Close()
+
+	client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: "test-token", APIURL: srv.URL}}, core.Runtime{HTTP: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ListSprites(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if !redirected {
+		t.Fatal("same-origin redirect was not followed")
+	}
+}
+
+func TestSpritesClientPreservesCustomRedirectPolicy(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/redirected", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	source := srv.Client()
+	source.Timeout = 3 * time.Second
+	source.CheckRedirect = func(*http.Request, []*http.Request) error {
+		called = true
+		return errors.New("custom redirect stop")
+	}
+
+	client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: "test-token", APIURL: srv.URL}}, core.Runtime{HTTP: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ListSprites(context.Background(), "")
+	if err == nil || !strings.Contains(err.Error(), "custom redirect stop") {
+		t.Fatalf("err=%v", err)
+	}
+	if !called {
+		t.Fatal("custom redirect policy was not called")
+	}
+	secured := client.(*spritesClient).httpClient
+	if secured == source || secured.Timeout != source.Timeout || secured.Transport != source.Transport {
+		t.Fatal("HTTP client settings were not preserved in a clone")
+	}
+}
+
+func TestSpritesSameOriginUsesEffectiveDefaultPorts(t *testing.T) {
+	a, _ := url.Parse("https://api.sprites.dev/path")
+	b, _ := url.Parse("https://API.SPRITES.DEV:443/other")
+	c, _ := url.Parse("http://api.sprites.dev:443/other")
+	if !sameSpritesOrigin(a, b) {
+		t.Fatal("default HTTPS port should be the same origin")
+	}
+	if sameSpritesOrigin(a, c) {
+		t.Fatal("scheme change should not be the same origin")
 	}
 }
 
@@ -295,7 +616,10 @@ func TestSpritesClientLifecycleRequests(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := newSpritesClient(Config{Sprites: SpritesConfig{Token: "test-token", APIURL: srv.URL}}, Runtime{HTTP: srv.Client()})
+	client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: "test-token", APIURL: srv.URL}}, core.Runtime{HTTP: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sprite, err := client.CreateSprite(context.Background(), "crabbox-blue-lobster-12345678", []string{"crabbox"})
 	if err != nil {
 		t.Fatal(err)
@@ -318,6 +642,66 @@ func TestSpritesClientLifecycleRequests(t *testing.T) {
 	}
 }
 
+func TestSpritesClientRedactsErrorResponseCredentials(t *testing.T) {
+	const token = "sprites-provider-secret"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Fatalf("auth=%q", got)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"message":"request denied","authorization":"Bearer `+token+`","clientSecret":"secondary-secret","url":"https://user:pass@example.test/?token=query-secret"}`)
+	}))
+	defer srv.Close()
+
+	client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: token, APIURL: srv.URL}}, core.Runtime{HTTP: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ListSprites(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected Sprites API error")
+	}
+	text := err.Error()
+	for _, leaked := range []string{token, "secondary-secret", "user", "pass", "query-secret"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("Sprites error leaked %q: %s", leaked, text)
+		}
+	}
+	if !strings.Contains(text, "request denied") || !strings.Contains(text, "[redacted]") {
+		t.Fatalf("Sprites error lost useful diagnostic context: %s", text)
+	}
+}
+
+func TestSpritesClientRedactsErrorStatusText(t *testing.T) {
+	const token = "sprites-provider-secret"
+	httpClient := &http.Client{Transport: spritesRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Fatalf("auth=%q", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Status:     "401 Bearer " + token,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"message":"denied"}`)),
+			Request:    r,
+		}, nil
+	})}
+	client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: token}}, core.Runtime{HTTP: httpClient})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ListSprites(context.Background(), "")
+	if err == nil || strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "[redacted]") {
+		t.Fatalf("Sprites status redaction err=%v", err)
+	}
+}
+
+type spritesRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f spritesRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 func TestSpritesClientRejectsBadPagination(t *testing.T) {
 	for name, response := range map[string]spritesListResponse{
 		"missing token": {HasMore: true},
@@ -337,8 +721,11 @@ func TestSpritesClientRejectsBadPagination(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			client := newSpritesClient(Config{Sprites: SpritesConfig{Token: "test-token", APIURL: srv.URL}}, Runtime{HTTP: srv.Client()})
-			_, err := client.ListSprites(context.Background(), "crabbox-")
+			client, err := newSpritesClient(core.Config{Sprites: core.SpritesConfig{Token: "test-token", APIURL: srv.URL}}, core.Runtime{HTTP: srv.Client()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.ListSprites(context.Background(), "crabbox-")
 			if err == nil {
 				t.Fatal("expected pagination error")
 			}
@@ -354,7 +741,7 @@ func TestSpritesClientRejectsBadPagination(t *testing.T) {
 
 func TestSpritesEnsureCLIUsesSpriteBinary(t *testing.T) {
 	runner := &recordingRunner{}
-	backend := &spritesBackend{rt: Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner}}
+	backend := &spritesBackend{rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner}}
 	if err := backend.ensureCLI(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +752,7 @@ func TestSpritesEnsureCLIUsesSpriteBinary(t *testing.T) {
 
 func TestSpritesBootstrapInstallsFullSyncToolchain(t *testing.T) {
 	runner := &recordingRunner{}
-	backend := &spritesBackend{rt: Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner}}
+	backend := &spritesBackend{rt: core.Runtime{Stdout: io.Discard, Stderr: io.Discard, Exec: runner}}
 	if err := backend.bootstrapSSH(context.Background(), "crabbox-blue-lobster-12345678", "ssh-ed25519 AAAAtest"); err != nil {
 		t.Fatal(err)
 	}
@@ -382,29 +769,39 @@ func TestSpritesBootstrapInstallsFullSyncToolchain(t *testing.T) {
 
 type recordingRunner struct {
 	calls        []string
+	requests     []core.LocalCommandRequest
 	failContains string
 	err          error
 }
 
-func (r *recordingRunner) Run(_ context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+func (r *recordingRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 	call := strings.Join(append([]string{req.Name}, req.Args...), " ")
 	r.calls = append(r.calls, call)
+	r.requests = append(r.requests, req)
 	if r.failContains != "" && strings.Contains(call, r.failContains) {
 		err := r.err
 		if err == nil {
 			err = errors.New("command failed")
 		}
-		return LocalCommandResult{ExitCode: 1, Stderr: err.Error()}, err
+		return core.LocalCommandResult{ExitCode: 1, Stderr: err.Error()}, err
 	}
-	return LocalCommandResult{}, nil
+	return core.LocalCommandResult{}, nil
 }
 
 type fakeSpritesAPI struct {
-	create        spritesInfo
-	get           spritesInfo
-	createdName   string
-	createdLabels []string
-	deleted       string
+	organization    string
+	organizationErr error
+	create          spritesInfo
+	get             spritesInfo
+	list            []spritesInfo
+	createdName     string
+	createdLabels   []string
+	deleted         string
+	deleteErr       error
+}
+
+func (f *fakeSpritesAPI) GetOrganization(context.Context) (string, error) {
+	return f.organization, f.organizationErr
 }
 
 func (f *fakeSpritesAPI) CreateSprite(_ context.Context, name string, labels []string) (spritesInfo, error) {
@@ -425,10 +822,142 @@ func (f *fakeSpritesAPI) GetSprite(context.Context, string) (spritesInfo, error)
 }
 
 func (f *fakeSpritesAPI) ListSprites(context.Context, string) ([]spritesInfo, error) {
-	return nil, nil
+	return f.list, nil
 }
 
 func (f *fakeSpritesAPI) DeleteSprite(_ context.Context, name string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	f.deleted = name
 	return nil
+}
+
+func TestJSONRequestAdoptionEnvelope(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "capture")
+	var typedNil *struct{ Value string }
+	const base = "https://api.example.test/base"
+	sentinel := errors.New("synthetic captured transport stop")
+	for _, tc := range []struct {
+		name        string
+		body        any
+		want        string
+		query, fail bool
+	}{
+		{name: "nil"},
+		{name: "typed nil", body: typedNil, want: "null\n"},
+		{name: "JSON bytes", body: map[string]string{"message": "<&>"}, want: "{\"message\":\"\\u003c\\u0026\\u003e\"}\n"},
+		{name: "query without body", query: true},
+		{name: "transport error", fail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			endpoint := "/records"
+			if tc.query {
+				endpoint += "?limit=2&prefix=two+words"
+			}
+			var query url.Values
+			if tc.query {
+				query = url.Values{"limit": []string{"2"}, "prefix": []string{"two words"}}
+			}
+			headers := http.Header{"Authorization": []string{"Bearer synthetic-token"}}
+			headers.Set("Accept", "application/json")
+			if tc.body != nil {
+				headers.Set("Content-Type", "application/json")
+			}
+			transport := &http.Client{Transport: testutil.RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				testutil.RequireRequestEnvelope(t, req, ctx, http.MethodPost, base+endpoint, tc.want, headers)
+				if tc.fail {
+					return nil, sentinel
+				}
+				return &http.Response{StatusCode: 204, Header: http.Header{"X-Capture": []string{"yes"}}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			})}
+			c := &spritesClient{apiURL: base, token: "synthetic-token", httpClient: transport}
+			var gotHeaders http.Header
+			err := c.doJSON(ctx, http.MethodPost, "/records", query, tc.body, nil)
+			if tc.fail {
+				if !errors.Is(err, sentinel) || gotHeaders != nil {
+					t.Fatalf("error/headers=%v %v", err, gotHeaders)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+
+			if calls != 1 {
+				t.Fatalf("calls=%d", calls)
+			}
+		})
+	}
+}
+
+func TestSpritesBindingFlagsAndPrevalidation(t *testing.T) {
+	for _, provider := range []string{spritesProvider, "fixture-other", " Sprites "} {
+		for _, raw := range []string{"", "  ", "fixture"} {
+			cfg := core.BaseConfig()
+			cfg.Provider = provider
+			before := cfg
+			fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+			values := RegisterSpritesProviderFlags(fs, cfg)
+			count := 0
+			fs.VisitAll(func(*flag.Flag) { count++ })
+			if count != 2 || fs.Lookup("sprites-token") != nil {
+				t.Fatal("flag surface changed")
+			}
+			if err := ApplySpritesProviderFlags(&cfg, fs, values); err != nil || !reflect.DeepEqual(cfg, before) {
+				t.Fatalf("unvisited flags changed configuration: %v", err)
+			}
+			if err := fs.Set("sprites-api-url", raw); err != nil {
+				t.Fatal(err)
+			}
+			if err := fs.Set("sprites-work-root", raw); err != nil {
+				t.Fatal(err)
+			}
+			if err := ApplySpritesProviderFlags(&cfg, fs, struct{}{}); err != nil || !reflect.DeepEqual(cfg, before) {
+				t.Fatal("foreign values changed configuration")
+			}
+			want := before
+			want.Sprites.APIURL, want.Sprites.WorkRoot = raw, raw
+			core.RecordProviderFlagInputs(&want, true, "sprites")
+			if err := ApplySpritesProviderFlags(&cfg, fs, values); err != nil || !reflect.DeepEqual(cfg, want) {
+				t.Fatalf("provider=%q raw=%q: assignment or validation phase changed: %v", provider, raw, err)
+			}
+		}
+	}
+	for _, name := range []string{"class", "type", "target", "tailscale", "root"} {
+		for _, foreign := range []bool{false, true} {
+			cfg := core.BaseConfig()
+			cfg.Provider = spritesProvider
+			fs := flag.NewFlagSet("fixture", flag.ContinueOnError)
+			fs.String("class", "", "")
+			fs.String("type", "", "")
+			values := RegisterSpritesProviderFlags(fs, cfg)
+			wantError := ""
+			switch name {
+			case "class", "type":
+				if err := fs.Set(name, "fixture"); err != nil {
+					t.Fatal(err)
+				}
+				wantError = "--" + name + " is not supported for provider=sprites"
+			case "target":
+				cfg.TargetOS, wantError = "windows", "provider=sprites supports target=linux only"
+			case "tailscale":
+				cfg.Tailscale.Enabled, wantError = true, "--tailscale is not supported"
+			case "root":
+				cfg.Sprites.WorkRoot, wantError = "relative-fixture", "sprites.workRoot"
+			}
+			if err := fs.Set("sprites-work-root", "/home/sprite/fixture"); err != nil {
+				t.Fatal(err)
+			}
+			before := cfg
+			if foreign {
+				values = struct{}{}
+			}
+			err := ApplySpritesProviderFlags(&cfg, fs, values)
+			if err == nil || !strings.Contains(err.Error(), wantError) || !reflect.DeepEqual(cfg, before) {
+				t.Fatalf("%s foreign=%v: prevalidation changed: %v", name, foreign, err)
+			}
+		}
+	}
 }

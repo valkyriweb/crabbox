@@ -1,0 +1,369 @@
+//go:build !windows
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"text/tabwriter"
+
+	"github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
+)
+
+func TestBlacksmithStopReconciliationCLIExit255(t *testing.T) {
+	blacksmithCLIProcess(t, "run")
+}
+
+func TestBlacksmithStopDiagnosticsCLI(t *testing.T) {
+	if os.Getenv("CRABBOX_TEST_BLACKSMITH_CHILD") == "1" {
+		blacksmithCLIProcess(t, os.Getenv("CRABBOX_TEST_MODE"))
+		return
+	}
+	for _, mode := range []string{"preflight", "lookup", "missing-status", "late-status", "late-artifacts"} {
+		t.Run(mode, func(t *testing.T) { blacksmithCLIProcess(t, mode) })
+	}
+}
+
+func TestBlacksmithNeverAssignedCleanupCLI(t *testing.T) {
+	if os.Getenv("CRABBOX_TEST_BLACKSMITH_CHILD") == "1" {
+		blacksmithCLIProcess(t, os.Getenv("CRABBOX_TEST_MODE"))
+		return
+	}
+	for _, mode := range []string{"never-assigned-completed", "never-assigned-stop", "never-assigned-reconcile"} {
+		t.Run(mode, func(t *testing.T) { blacksmithCLIProcess(t, mode) })
+	}
+}
+
+func TestBlacksmithSnapshotCLI(t *testing.T) {
+	if os.Getenv("CRABBOX_TEST_BLACKSMITH_CHILD") == "1" {
+		blacksmithCLIProcess(t, os.Getenv("CRABBOX_TEST_MODE"))
+		return
+	}
+	for _, mode := range []string{"snapshot-queued", "snapshot-completed", "snapshot-wait-completed"} {
+		t.Run(mode, func(t *testing.T) { blacksmithCLIProcess(t, mode) })
+	}
+}
+
+func blacksmithCLIProcess(t *testing.T, mode string) {
+	t.Helper()
+	if os.Getenv("CRABBOX_TEST_BLACKSMITH_CHILD") == "1" {
+		os.Args = []string{"crabbox", "run", "--timing-json", "--", "test-runner"}
+		if mode != "run" {
+			os.Args = []string{"crabbox", "stop", "tbx_process123"}
+		}
+		if strings.HasPrefix(mode, "snapshot-") {
+			os.Args = []string{"crabbox", "status", "--id", "tbx_process123", "--json"}
+			if mode == "snapshot-wait-completed" {
+				os.Args = append(os.Args, "--wait")
+			}
+		}
+		main()
+		os.Exit(0)
+	}
+
+	dirs := testutil.IsolateUserDirs(t)
+	repo, bin := t.TempDir(), t.TempDir()
+	const id = "tbx_process123"
+	config := filepath.Join(repo, "crabbox.yaml")
+	if err := os.WriteFile(config, []byte("provider: blacksmith-testbox\nblacksmith:\n  org: example-org\n  workflow: .github/workflows/testbox.yml\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := cli.TestboxKeyPath(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimPath := filepath.Join(dirs.StateHome, "crabbox", "claims", id+".json")
+	callsPath := filepath.Join(bin, "calls")
+	var nativeStatus strings.Builder
+	neverAssigned := strings.HasPrefix(mode, "never-assigned-")
+	runURL := "https://github.com/example-org/my-app/actions/runs/123456789"
+	if neverAssigned {
+		runURL = ""
+	}
+	w := tabwriter.NewWriter(&nativeStatus, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tSTATUS\tIP\tWORKFLOW\tJOB\tREF\tCREATED\tRUN URL")
+	fmt.Fprintf(w, "%s\tcompleted\t\t.github/workflows/testbox.yml\tgo\tmain\t2026-09-02T13:54:37.000000Z\t%s\n", id, runURL)
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(bin, "native-status.txt")
+	if err := os.WriteFile(statusPath, []byte(nativeStatus.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initialState := "ready    "
+	if neverAssigned || mode == "snapshot-queued" {
+		initialState = "queued   "
+	}
+	if err := os.WriteFile(statusPath+".ready", []byte(strings.Replace(nativeStatus.String(), "completed", initialState, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := `#!/bin/sh
+set -eu
+case " $* " in *' --api-url https://backend.blacksmith.sh --org example-org '*) ;; *) exit 91;; esac
+if [ "$1" = '--org' ]; then [ "$2" = 'example-org' ] || exit 91; shift 2; fi
+printf '%s %s\n' "$1" "$2" >> "$CRABBOX_TEST_CALLS"
+case "$1 $2" in
+  'testbox warmup') printf 'tbx_process123\n' ;;
+  'testbox run')
+    [ "$3" = '--id' ] && [ "$4" = 'tbx_process123' ] || exit 92
+    [ -f "$CRABBOX_TEST_CLAIM" ] && [ -f "$CRABBOX_TEST_KEY" ] || exit 93
+    printf 'FAIL: synthetic assertion mismatch\n' >&2
+    exit 255 ;;
+  'testbox stop')
+    [ "$3" = '--id' ] && [ "$4" = 'tbx_process123' ] || exit 94
+    touch "$CRABBOX_TEST_STATUS.stopped"
+    if [ "$CRABBOX_TEST_MODE" = 'never-assigned-stop' ]; then
+      printf 'Testbox tbx_process123 stopped (completed)\n'
+      exit 0
+    fi
+    printf 'Error: stop failed: HTTP 409: testbox already stopped\n' >&2
+    exit 1 ;;
+  'testbox status')
+    [ "$3" = '--id' ] && [ "$4" = 'tbx_process123' ] || exit 95
+    n=0
+    if [ -f "$CRABBOX_TEST_STATUS.count" ]; then n=$(cat "$CRABBOX_TEST_STATUS.count"); fi
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$CRABBOX_TEST_STATUS.count"
+    case "$CRABBOX_TEST_MODE:$n" in
+      never-assigned-completed:*|snapshot-completed:*|snapshot-wait-completed:*) cat "$CRABBOX_TEST_STATUS"; exit 0 ;;
+      preflight:1|lookup:2|late-status:3)
+        cat "$CRABBOX_TEST_STATUS"
+        printf 'Error: authentication unavailable for synthetic status query\n' >&2
+        exit 7 ;;
+      missing-status:2)
+        printf 'Error: unknown command "status" for "blacksmith testbox"\n' >&2
+        exit 2 ;;
+    esac
+    if [ -f "$CRABBOX_TEST_STATUS.stopped" ]; then cat "$CRABBOX_TEST_STATUS"; else cat "$CRABBOX_TEST_STATUS.ready"; fi ;;
+  *) exit 96 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(bin, "blacksmith"), []byte(fake), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gh := `#!/bin/sh
+set -eu
+[ "$1" = api ] && [ "$2" = --hostname ] && [ "$3" = github.com ] && [ "$4" = --method ] && [ "$5" = GET ] || exit 97
+[ "$6" = repos/example-org/my-app/actions/runs/123456789 ] || exit 98
+case "$CRABBOX_TEST_MODE" in snapshot-*) printf 'github read\n' >> "$CRABBOX_TEST_CALLS" ;; esac
+printf '%s\n' '{"id":123456789,"html_url":"https://github.com/example-org/my-app/actions/runs/123456789","status":"completed","conclusion":"cancelled"}'
+`
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(gh), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The child receives only synthetic configuration and test-owned user state.
+	childEnv := []string{
+		"PATH=" + bin + ":/usr/bin:/bin",
+		"HOME=" + dirs.Home,
+		"XDG_CONFIG_HOME=" + dirs.ConfigHome,
+		"XDG_STATE_HOME=" + dirs.StateHome,
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"CRABBOX_CONFIG=" + config,
+		"CRABBOX_TEST_BLACKSMITH_CHILD=1",
+		"CRABBOX_TEST_CALLS=" + callsPath,
+		"CRABBOX_TEST_CLAIM=" + claimPath,
+		"CRABBOX_TEST_KEY=" + key,
+		"CRABBOX_TEST_STATUS=" + statusPath,
+		"CRABBOX_TEST_MODE=" + mode,
+	}
+	var originalClaim []byte
+	if mode != "run" {
+		claim := cli.LeaseClaim{LeaseID: id, CloudID: id, Slug: "process-krill", Provider: "blacksmith-testbox", RepoRoot: repo, ProviderScope: `{"api":"https://backend.blacksmith.sh","org":"example-org"}`, Labels: map[string]string{"provider": "blacksmith-testbox", "lease": id, "slug": "process-krill", "workflow": ".github/workflows/testbox.yml", "job": "go", "ref": "main"}}
+		if err := cli.WithDurableLeaseClaimLock(id, func(current *cli.LeaseClaim, exists bool, save func() error) error {
+			if exists {
+				t.Fatal("fixture claim exists")
+			}
+			*current = claim
+			return save()
+		}); err != nil {
+			t.Fatal(err)
+		}
+		originalClaim, err = os.ReadFile(claimPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(key), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(key, []byte("harmless marker"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if mode == "late-artifacts" {
+			target := filepath.Join(t.TempDir(), "original")
+			if err := os.Rename(filepath.Dir(key), target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Dir(key)); err != nil {
+				t.Skipf("directory symlink unavailable: %v", err)
+			}
+		}
+	}
+	git := exec.CommandContext(t.Context(), "/usr/bin/git", "init", "-q", repo)
+	git.Env = childEnv
+	if output, err := git.CombinedOutput(); err != nil {
+		t.Fatalf("init synthetic repo: %v: %s", err, output)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testName := "TestBlacksmithStopReconciliationCLIExit255"
+	if mode != "run" {
+		testName = "TestBlacksmithStopDiagnosticsCLI"
+	}
+	if neverAssigned {
+		testName = "TestBlacksmithNeverAssignedCleanupCLI"
+	}
+	if strings.HasPrefix(mode, "snapshot-") {
+		testName = "TestBlacksmithSnapshotCLI"
+	}
+	child := exec.CommandContext(t.Context(), binary, "-test.run=^"+testName+"$")
+	child.Env, child.Dir = childEnv, repo
+	var stdout, stderr bytes.Buffer
+	child.Stdout, child.Stderr = &stdout, &stderr
+	err = child.Run()
+	var exitErr *exec.ExitError
+	if strings.HasPrefix(mode, "snapshot-") {
+		if mode == "snapshot-wait-completed" {
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 5 || !strings.Contains(stderr.String(), "completed before ready") {
+				t.Fatalf("terminal readiness wait: %v stderr=%s", err, stderr.String())
+			}
+		} else {
+			var view cli.StatusView
+			if err != nil || json.Unmarshal(stdout.Bytes(), &view) != nil || view.ID != id || view.State != strings.TrimPrefix(mode, "snapshot-") || view.Ready {
+				t.Fatalf("snapshot: %v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+			}
+			wantSettlement := "pending"
+			if mode == "snapshot-completed" {
+				wantSettlement = "complete"
+			}
+			if view.ProviderMetadata["runURL"] != runURL || view.ProviderMetadata["remoteSettlement"] != wantSettlement || view.CleanupStatus != "" {
+				t.Fatalf("snapshot lost remote/local distinction: %+v", view)
+			}
+		}
+		calls, readErr := os.ReadFile(callsPath)
+		wantCalls := "testbox status\n"
+		if mode == "snapshot-completed" {
+			wantCalls += "github read\ntestbox status\n"
+		}
+		if readErr != nil || string(calls) != wantCalls {
+			t.Fatalf("snapshot called inventory or mutation: %q %v", calls, readErr)
+		}
+		after, readErr := os.ReadFile(claimPath)
+		if readErr != nil || !bytes.Equal(after, originalClaim) {
+			t.Fatal("snapshot changed claim")
+		}
+		return
+	}
+	if neverAssigned {
+		wantCode := 5
+		if mode == "never-assigned-reconcile" {
+			wantCode = 1
+		}
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != wantCode || !strings.Contains(stderr.String(), "GitHub settlement unresolved") {
+			t.Fatalf("never-assigned cleanup did not report uncertainty: %v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+		}
+		wantCalls := "testbox status\ntestbox stop\ntestbox status\n"
+		if mode == "never-assigned-completed" {
+			wantCalls = "testbox status\n"
+		}
+		calls, readErr := os.ReadFile(callsPath)
+		if readErr != nil || string(calls) != wantCalls {
+			t.Errorf("unexpected native calls: %q: %v", calls, readErr)
+		}
+		for _, path := range []string{claimPath, filepath.Dir(key)} {
+			if _, err := os.Stat(path); err != nil {
+				t.Errorf("uncertain cleanup removed %s: %v", path, err)
+			}
+		}
+		if strings.Contains(stderr.String(), "cleanup reconciled") {
+			t.Errorf("uncertainty reported reconciliation: %s", stderr.String())
+		}
+		after, readErr := os.ReadFile(claimPath)
+		if readErr != nil || !bytes.Equal(after, originalClaim) {
+			t.Error("uncertain cleanup changed the exact claim")
+		}
+		return
+	}
+	if mode != "run" {
+		wantCode, wantCalls, reason := 1, 3, "blacksmith testbox status exit=7 cause=exit"
+		phase := "reconciliation"
+		switch mode {
+		case "preflight":
+			wantCode, wantCalls = 7, 1
+		case "missing-status":
+			reason = "blacksmith testbox status exit=2 cause=exit"
+		case "late-status":
+			wantCalls = 4
+			phase = "final-verification"
+		case "late-artifacts":
+			wantCalls, reason = 4, "local connection artifacts"
+			phase = "connection-removal"
+		}
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != wantCode || strings.Count(stderr.String(), reason) != 1 {
+			t.Errorf("CLI diagnostic/code lost: err=%v stderr=%s", err, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "phase="+phase) || strings.Contains(stderr.String(), "authentication unavailable for synthetic status query") || strings.Contains(stderr.String(), `unknown command "status"`) {
+			t.Errorf("cleanup phase missing or raw status diagnostics leaked: %s", stderr.String())
+		}
+		if mode != "preflight" && (strings.Count(stderr.String(), "blacksmith testbox stop exit=1 cause=exit") != 1 || !strings.Contains(stderr.String(), "HTTP 409")) {
+			t.Errorf("native stop diagnostic lost or repeated: %s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "cleanup reconciled") {
+			t.Error("failed finalization reported successful reconciliation")
+		}
+		after, readErr := os.ReadFile(claimPath)
+		if readErr != nil || !bytes.Equal(after, originalClaim) {
+			t.Error("failed stop changed the original claim")
+		}
+		if _, err := os.Stat(key); err != nil {
+			t.Error("failed stop removed the key marker", err)
+		}
+		calls, readErr := os.ReadFile(callsPath)
+		if readErr != nil || len(strings.Split(strings.TrimSpace(string(calls)), "\n")) != wantCalls {
+			t.Errorf("unexpected provider calls: %s: %v", calls, readErr)
+		}
+		return
+	}
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 255 {
+		t.Fatalf("CLI process err=%v; stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	wantCalls := []string{"testbox warmup", "testbox status", "testbox status", "testbox run", "testbox status", "testbox stop", "testbox status", "testbox status"}
+	if strings.Join(lines, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("unexpected provider calls: %s", calls)
+	}
+	for _, path := range []string{claimPath, key} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("cleanup left %s: %v", path, err)
+		}
+	}
+	for _, want := range []string{
+		"FAIL: synthetic assertion mismatch",
+		"native exit 255; workload exit unconfirmed",
+		"blacksmith failed: exit status 255",
+		`"exitCode":255`,
+		`"errorKind":"provider-error"`,
+		"cleanup reconciled lease=" + id + " state=completed",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q: %s", want, stderr.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "Error: stop failed") || strings.Contains(stderr.String(), "cleanup failed") {
+		t.Fatalf("reconciled cleanup printed an unqualified failure: %s", stderr.String())
+	}
+}

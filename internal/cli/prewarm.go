@@ -6,11 +6,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"strings"
 	"time"
 )
 
+const prewarmFailureCleanupTimeout = 2 * time.Minute
+
 func (a App) prewarm(ctx context.Context, args []string) error {
+	return a.prewarmWithPoolFillClaim(ctx, args, "")
+}
+
+func (a App) prewarmWithPoolFillClaim(ctx context.Context, args []string, poolFillClaim string) error {
 	started := time.Now()
 	defaults := defaultConfig()
 	fs := newFlagSet("prewarm", a.Stderr)
@@ -25,11 +32,39 @@ func (a App) prewarm(ctx context.Context, args []string) error {
 	keepAliveMinutes := fs.Int("keep-alive-minutes", 90, "minutes for workflow to keep a GitHub runner job alive")
 	probeCommand := fs.String("probe-command", "", "optional shell command to prove the hydrated box is test-ready")
 	poolKey := fs.String("pool", "", "register the hydrated lease in a broker ready pool")
+	poolCompatibilityKey := fs.String("pool-compatibility-key", "", "provider-neutral ready-pool capability and size key")
+	poolAccess := fs.Bool("pool-access", false, "enroll bounded portable access (requires typed identity and SSM)")
+	poolIdentityFile := fs.String("pool-identity-file", "", "generated typed ready-pool identity JSON")
+	poolCacheCompatibility := fs.String("pool-cache-compatibility", "", "derive typed identity using this operator-declared cache compatibility")
 	dryRun := fs.Bool("dry-run", false, "print the planned Crabbox commands without running them")
 	reclaim := fs.Bool("reclaim", false, "claim this lease for the current repo")
 	timingJSON := fs.Bool("timing-json", false, "print final timing as JSON")
 	if err := parseFlags(fs, args); err != nil {
 		return err
+	}
+	typedIdentityFile := flagWasSet(fs, "pool-identity-file")
+	typedCacheCompatibility := flagWasSet(fs, "pool-cache-compatibility")
+	if *poolAccess && !typedIdentityFile && !typedCacheCompatibility {
+		return Exit(2, "--pool-access requires typed pool identity")
+	}
+	if (typedIdentityFile || typedCacheCompatibility) && strings.TrimSpace(*poolKey) == "" {
+		return Exit(2, "typed ready-pool identity flags require --pool")
+	}
+	if typedIdentityFile && typedCacheCompatibility {
+		return Exit(2, "--pool-identity-file and --pool-cache-compatibility are mutually exclusive")
+	}
+	if typedCacheCompatibility && strings.TrimSpace(*poolCacheCompatibility) == "" {
+		return Exit(2, "--pool-cache-compatibility must not be empty")
+	}
+	var poolIdentity *CoordinatorReadyPoolIdentityV1
+	var poolIdentityErr error
+	if typedIdentityFile {
+		identity, identityErr := loadReadyPoolIdentity(*poolIdentityFile)
+		if identityErr != nil {
+			poolIdentityErr = identityErr
+		} else {
+			poolIdentity = &identity
+		}
 	}
 	_ = reclaim
 	requestedSlug, err := requestedLeaseSlug(*leaseFlags.Slug)
@@ -39,42 +74,89 @@ func (a App) prewarm(ctx context.Context, args []string) error {
 	if requestedSlug != "" {
 		*leaseFlags.Slug = requestedSlug
 	}
-	cfg, err := loadConfig()
+	cfg, err := loadConfigForFlags(fs)
 	if err != nil {
 		return err
 	}
-	mutateExternal := !*dryRun
-	if err := applyLeaseCreateFlagsForLeaseMode(&cfg, fs, leaseFlags, "", mutateExternal); err != nil {
+	if poolIdentity != nil {
+		if providerErr := bindReadyPoolIdentityProviderConfig(&cfg, fs, leaseFlags.Provider, *poolIdentity); providerErr != nil {
+			return providerErr
+		}
+	}
+	if err := applyLeaseCreateFlagsForLeaseMode(&cfg, fs, leaseFlags, "", false); err != nil {
 		return err
+	}
+	if poolIdentity != nil {
+		if providerErr := validateReadyPoolIdentityProviderConfig(cfg, *poolIdentity); providerErr != nil {
+			return providerErr
+		}
 	}
 	if *repoFlag != "" {
 		cfg.Actions.Repo = *repoFlag
+		recordConfigInput(&cfg, configInputGeneric, configInputFlag, true)
 	}
 	if *workflowFlag != "" {
 		cfg.Actions.Workflow = *workflowFlag
+		recordConfigInput(&cfg, configInputGeneric, configInputFlag, true)
 	}
 	if *jobFlag != "" {
 		cfg.Actions.Job = *jobFlag
+		recordConfigInput(&cfg, configInputGeneric, configInputFlag, true)
 	}
 	if *refFlag != "" {
 		cfg.Actions.Ref = *refFlag
+		recordConfigInput(&cfg, configInputGeneric, configInputFlag, true)
+	}
+	followupArgs := prewarmProviderPassthroughArgs(args, defaults)
+	if strings.TrimSpace(*probeCommand) != "" {
+		// Project the follow-up, not the creation request or the display placeholder.
+		if err := admitPrewarmProbe(prewarmProbeArgs(cfg, "", *probeCommand, followupArgs)); err != nil {
+			return err
+		}
+	}
+	provider, err := ProviderFor(cfg.Provider)
+	if err != nil {
+		return err
+	}
+	if !*noHydrate && cfg.Actions.Workflow != "" && provider.Spec().Kind == ProviderKindSSHLease {
+		if err := admitPrewarmHydration(cfg, followupArgs); err != nil {
+			return err
+		}
+	}
+	if poolIdentityErr != nil {
+		return poolIdentityErr
+	}
+	if err := validateDirectLeaseCreation(cfg); err != nil {
+		return err
 	}
 	backend, err := loadBackend(cfg, runtimeForApp(a))
 	if err != nil {
 		return err
 	}
 	if backend.Spec().Kind == ProviderKindServiceControl {
-		return exit(2, "prewarm is not supported for provider=%s; it does not provide a lease or run surface", backend.Spec().Name)
+		return Exit(2, "prewarm is not supported for provider=%s; it does not provide a lease or run surface", backend.Spec().Name)
 	}
 	readyPoolKey := strings.TrimSpace(*poolKey)
+	if strings.TrimSpace(poolFillClaim) != "" && readyPoolKey == "" {
+		return Exit(2, "ready-pool fill claim requires --pool")
+	}
 	if readyPoolKey != "" && backendCoordinator(backend) == nil {
-		return exit(2, "--pool requires a coordinator-backed SSH lease provider")
+		return Exit(2, "--pool requires a coordinator-backed SSH lease provider")
+	}
+	if typedIdentityFile || typedCacheCompatibility {
+		coord, coordinatorErr := readyPoolCoordinatorFromConfig(cfg)
+		if coordinatorErr != nil {
+			return coordinatorErr
+		}
+		coord.portablePool = *poolAccess
+		if supportErr := coord.CheckTypedReadyPoolSupport(ctx, readyPoolKey); supportErr != nil {
+			return supportErr
+		}
 	}
 	leaseArgs := prewarmWarmupArgs(args)
 	if backend.Spec().Kind == ProviderKindDelegatedRun && isBlacksmithProvider(cfg.Provider) {
 		leaseArgs = prewarmBlacksmithHydrationArgs(fs, leaseArgs, *workflowFlag, *jobFlag, *refFlag)
 	}
-	followupArgs := prewarmProviderPassthroughArgs(args, defaults)
 	hydrateArgs := prewarmHydrateArgs(cfg, "<lease>", *githubRunner, *waitTimeout, *keepAliveMinutes, followupArgs)
 	probeArgs := prewarmProbeArgs(cfg, "<lease>", *probeCommand, followupArgs)
 	if *dryRun {
@@ -88,14 +170,18 @@ func (a App) prewarm(ctx context.Context, args []string) error {
 		return nil
 	}
 	var out bytes.Buffer
+	var acquiredLease LeaseTarget
 	warmupStarted := time.Now()
-	warmupApp := App{Stdout: io.MultiWriter(a.Stdout, &out), Stderr: a.Stderr}
-	if err := warmupApp.warmup(ctx, leaseArgs); err != nil {
+	warmupApp := App{Stdout: io.MultiWriter(a.Stdout, &out), Stderr: a.Stderr, synthesizedFlagInputs: true}
+	if err := warmupApp.warmupWithLeaseObserver(ctx, leaseArgs, func(lease LeaseTarget) { acquiredLease = lease }); err != nil {
 		return err
 	}
 	leaseID := parseWarmupLeaseID(out.String())
 	if leaseID == "" {
-		return exit(2, "prewarm could not parse warmup lease id")
+		return Exit(2, "prewarm could not parse warmup lease id")
+	}
+	if backend.Spec().Kind != ProviderKindDelegatedRun && acquiredLease.LeaseID != leaseID {
+		return Exit(2, "prewarm warmup lease identity was not preserved")
 	}
 	warmupMs := time.Since(warmupStarted).Milliseconds()
 	hydration := "skipped"
@@ -107,7 +193,11 @@ func (a App) prewarm(ctx context.Context, args []string) error {
 		hydration = "actions"
 		hydrateStarted := time.Now()
 		hydrateArgs = prewarmHydrateArgs(cfg, leaseID, *githubRunner, *waitTimeout, *keepAliveMinutes, followupArgs)
-		if err := a.actionsHydrate(ctx, hydrateArgs); err != nil {
+		if err := a.runPrewarmPostWarmupStep(ctx, backend, cfg, acquiredLease, "actions hydration", func() error {
+			child := a
+			child.synthesizedFlagInputs = true
+			return child.actionsHydrate(ctx, hydrateArgs)
+		}); err != nil {
 			return err
 		}
 		hydrateMs = time.Since(hydrateStarted).Milliseconds()
@@ -117,14 +207,19 @@ func (a App) prewarm(ctx context.Context, args []string) error {
 	probeMs := int64(0)
 	if strings.TrimSpace(*probeCommand) != "" {
 		probeStarted := time.Now()
-		if err := a.runCommand(ctx, prewarmProbeArgs(cfg, leaseID, *probeCommand, followupArgs)); err != nil {
+		if err := a.runPrewarmPostWarmupStep(ctx, backend, cfg, acquiredLease, "probe", func() error {
+			child := a
+			child.synthesizedFlagInputs = true
+			return child.runCommand(ctx, prewarmProbeArgs(cfg, leaseID, *probeCommand, followupArgs))
+		}); err != nil {
 			return err
 		}
 		probeMs = time.Since(probeStarted).Milliseconds()
 	}
 	if readyPoolKey != "" {
-		if err := a.registerPrewarmedLeaseInReadyPool(ctx, cfg, leaseID, readyPoolKey, *githubRunner); err != nil {
-			a.releasePrewarmLeaseAfterPoolFailure(ctx, backend, cfg, leaseID, err)
+		if err := a.runPrewarmPostWarmupStep(ctx, backend, cfg, acquiredLease, "pool registration", func() error {
+			return a.registerPrewarmedLeaseInReadyPool(ctx, cfg, leaseID, readyPoolKey, *poolCompatibilityKey, poolFillClaim, *githubRunner, poolIdentity, *poolCacheCompatibility, *poolAccess)
+		}); err != nil {
 			return err
 		}
 	}
@@ -144,11 +239,7 @@ func (a App) prewarm(ctx context.Context, args []string) error {
 }
 
 func prewarmHydrateArgs(cfg Config, leaseID string, githubRunner bool, waitTimeout time.Duration, keepAliveMinutes int, passthrough []string) []string {
-	args := append([]string{}, passthrough...)
-	args = append(args, "--provider", cfg.Provider, "--target", cfg.TargetOS, "--network", string(cfg.Network), "--id", leaseID)
-	if cfg.TargetOS == targetWindows && cfg.WindowsMode != "" {
-		args = append(args, "--windows-mode", cfg.WindowsMode)
-	}
+	args := prewarmHydrateTargetArgs(cfg, leaseID, passthrough)
 	if githubRunner {
 		args = append(args, "--github-runner")
 	}
@@ -181,6 +272,7 @@ func prewarmWarmupArgs(args []string) []string {
 	valueFlags := map[string]struct{}{
 		"repo": {}, "workflow": {}, "job": {}, "ref": {},
 		"wait-timeout": {}, "keep-alive-minutes": {}, "probe-command": {}, "pool": {},
+		"pool-access": {}, "pool-compatibility-key": {}, "pool-identity-file": {}, "pool-cache-compatibility": {},
 	}
 	boolFlags := map[string]struct{}{
 		"no-hydrate": {}, "github-runner": {}, "dry-run": {}, "timing-json": {},
@@ -210,7 +302,7 @@ func prewarmWarmupArgs(args []string) []string {
 	return out
 }
 
-func (a App) registerPrewarmedLeaseInReadyPool(ctx context.Context, cfg Config, leaseID, poolKey string, githubRunner bool) error {
+func (a App) registerPrewarmedLeaseInReadyPool(ctx context.Context, cfg Config, leaseID, poolKey, compatibilityKey, fillClaim string, githubRunner bool, identity *CoordinatorReadyPoolIdentityV1, cacheCompatibility string, portable ...bool) error {
 	repo, _ := findRepo()
 	input := map[string]any{"leaseID": leaseID}
 	if repoValue := firstNonBlank(cfg.Actions.Repo, bestEffortGitHubRepoSlug(repo, cfg)); repoValue != "" {
@@ -222,6 +314,8 @@ func (a App) registerPrewarmedLeaseInReadyPool(ctx context.Context, cfg Config, 
 	if commit := prewarmReadyPoolCommit(cfg, repo, githubRunner); commit != "" {
 		input["commit"] = commit
 	}
+	addStringInput(input, "compatibilityKey", compatibilityKey)
+	addStringInput(input, "fillClaimToken", fillClaim)
 	addStringInput(input, "sshHost", readyPoolClaimSSHHost(leaseID))
 	addStringInput(input, "sshPort", readyPoolClaimSSHPort(leaseID))
 	addStringInput(input, "workRoot", readyPoolClaimWorkRoot(leaseID))
@@ -229,7 +323,29 @@ func (a App) registerPrewarmedLeaseInReadyPool(ctx context.Context, cfg Config, 
 	if err != nil {
 		return err
 	}
-	res, err := coord.RegisterReadyPoolLease(ctx, poolKey, input)
+	coord.portablePool = len(portable) > 0 && portable[0]
+	var res CoordinatorReadyPoolResponse
+	if strings.TrimSpace(cacheCompatibility) != "" {
+		generationInput := mapsCloneAny(input)
+		generationInput["cacheCompatibility"] = strings.TrimSpace(cacheCompatibility)
+		generated, generationErr := coord.GenerateReadyPoolIdentity(ctx, poolKey, generationInput)
+		if generationErr != nil {
+			return generationErr
+		}
+		identity = &generated
+	}
+	if identity != nil {
+		if err := validateReadyPoolSeedIdentity(*identity, input); err != nil {
+			return err
+		}
+		input["identity"] = *identity
+		res, err = coord.RegisterTypedReadyPoolLease(ctx, poolKey, input)
+		if err == nil {
+			err = validateTypedReadyPoolResponseIdentity(res, *identity)
+		}
+	} else {
+		res, err = coord.RegisterReadyPoolLease(ctx, poolKey, input)
+	}
 	if err != nil {
 		return err
 	}
@@ -237,24 +353,60 @@ func (a App) registerPrewarmedLeaseInReadyPool(ctx context.Context, cfg Config, 
 	return nil
 }
 
-func (a App) releasePrewarmLeaseAfterPoolFailure(ctx context.Context, backend Backend, cfg Config, leaseID string, cause error) {
+func (a App) runPrewarmPostWarmupStep(ctx context.Context, backend Backend, cfg Config, lease LeaseTarget, stage string, step func() error) error {
+	err := step()
+	if err == nil {
+		return nil
+	}
+	a.releasePrewarmLeaseAfterFailure(ctx, backend, cfg, lease, stage)
+	return err
+}
+
+func (a App) releasePrewarmLeaseAfterFailure(ctx context.Context, backend Backend, cfg Config, acquired LeaseTarget, stage string) {
 	sshBackend, ok := backend.(SSHLeaseBackend)
 	if !ok {
 		return
 	}
-	lease, err := sshBackend.Resolve(ctx, ResolveRequest{
+	leaseID := acquired.LeaseID
+	if _, guarded := backend.(ReleaseLeaseTargetRefresher); guarded {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prewarmFailureCleanupTimeout)
+		defer cancel()
+		fmt.Fprintf(a.Stderr, "prewarm cleanup: releasing id=%s after %s failure\n", leaseID, stage)
+		if err := a.releaseBackendLeaseBestEffort(releaseCtx, sshBackend, cfg, acquired); err != nil {
+			fmt.Fprintf(a.Stderr, "warning: prewarm %s failed; automatic release of %s failed: %v; next: crabbox stop --provider %s --id %s\n", stage, leaseID, err, cfg.Provider, leaseID)
+			return
+		}
+		fmt.Fprintf(a.Stderr, "prewarm cleanup: released id=%s after %s failure\n", leaseID, stage)
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prewarmFailureCleanupTimeout)
+	defer cancel()
+	lease, err := sshBackend.Resolve(cleanupCtx, ResolveRequest{
 		Repo:        Repo{},
 		Options:     leaseOptionsFromConfig(cfg),
 		ID:          leaseID,
 		ReleaseOnly: true,
 	})
 	if err != nil {
-		fmt.Fprintf(a.Stderr, "warning: pool registration failed for %s: %v; release skipped: %v\n", leaseID, cause, err)
+		if backendCoordinator(backend) == nil {
+			fmt.Fprintf(a.Stderr, "warning: prewarm %s failed; automatic release of %s skipped: %v; next: crabbox stop --provider %s --id %s\n", stage, leaseID, err, cfg.Provider, leaseID)
+			return
+		}
+		if isCoordinatorProviderIdentityError(err) {
+			fmt.Fprintf(a.Stderr, "warning: prewarm %s failed; automatic release of %s blocked: %v\n", stage, leaseID, err)
+			return
+		}
+		fmt.Fprintf(a.Stderr, "warning: could not inspect lease %s before prewarm cleanup: %v; releasing by lease ID\n", leaseID, err)
+		lease = LeaseTarget{LeaseID: leaseID, Server: Server{Provider: sshBackend.Spec().Name}}
+	}
+	fmt.Fprintf(a.Stderr, "prewarm cleanup: releasing id=%s after %s failure\n", leaseID, stage)
+	releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), prewarmFailureCleanupTimeout)
+	defer releaseCancel()
+	if err := a.releaseBackendLeaseBestEffort(releaseCtx, sshBackend, cfg, lease); err != nil {
+		fmt.Fprintf(a.Stderr, "warning: prewarm %s failed; automatic release of %s failed: %v; next: crabbox stop --provider %s --id %s\n", stage, leaseID, err, cfg.Provider, leaseID)
 		return
 	}
-	if err := a.releaseBackendLeaseBestEffort(ctx, sshBackend, cfg, lease); err != nil {
-		fmt.Fprintf(a.Stderr, "warning: pool registration failed for %s: %v; release failed: %v\n", leaseID, cause, err)
-	}
+	fmt.Fprintf(a.Stderr, "prewarm cleanup: released id=%s after %s failure\n", leaseID, stage)
 }
 
 func prewarmReadyPoolCommit(cfg Config, repo Repo, githubRunner bool) string {
@@ -309,6 +461,67 @@ func prewarmBlacksmithHydrationArgs(fs *flag.FlagSet, args []string, workflow, j
 	return args
 }
 
+func admitPrewarmProbe(args []string) error {
+	fs := newFlagSet("prewarm-probe", io.Discard)
+	flags := registerRunFlags(fs, defaultConfig(), ordinaryLeaseCreateFlagRegistrationOptions())
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	cfg, err := loadRunConfig(fs, flags, leaseFlagTarget{Reuse: true, SynthesizedInputs: true}, false, nil)
+	if err != nil {
+		return err
+	}
+	expansion, err := expandRunProfile(cfg, *flags.PresetName, *flags.Scenario, *flags.PresetVars, fs.Args(), *flags.ShellMode, *flags.Preflight, *flags.ArtifactGlobs, *flags.ProofTemplate)
+	if err != nil {
+		return err
+	}
+	req := runRequestFromFlags(cfg, flags, expansion.Command)
+	req.CommandLiteralArgs = maps.Clone(expansion.LiteralArgs)
+	req.ReuseLease = true
+	req.ShellMode = expansion.Shell
+	req.Preflight = expansion.Preflight
+	req.ArtifactGlobs = expansion.ArtifactGlobs
+	req.ProfileVariables = expansion.Variables
+	provider, err := ProviderFor(cfg.Provider)
+	if err != nil {
+		return err
+	}
+	if err := validateProviderRun(provider, req, *flags.ReadyPool, len(*flags.RequiredSchemas) > 0, expansion.Profile.Doctor.Enabled); err != nil {
+		return Exit(2, "prewarm --probe-command is not supported for provider=%s: %v; omit --probe-command or choose a provider that supports the probe options", provider.Spec().Name, err)
+	}
+	if err := validateProviderConfig(cfg); err != nil {
+		return Exit(2, "prewarm probe configuration is invalid: %v", err)
+	}
+	return nil
+}
+
+func prewarmHydrateTargetArgs(cfg Config, leaseID string, passthrough []string) []string {
+	args := append([]string{}, passthrough...)
+	args = append(args, "--provider", cfg.Provider, "--target", cfg.TargetOS, "--network", string(cfg.Network), "--id", leaseID)
+	if cfg.TargetOS == targetWindows && cfg.WindowsMode != "" {
+		args = append(args, "--windows-mode", cfg.WindowsMode)
+	}
+	return args
+}
+
+func admitPrewarmHydration(cfg Config, passthrough []string) error {
+	fs := newFlagSet("prewarm-hydration", io.Discard)
+	flags := registerActionsHydrateTargetFlags(fs, defaultConfig())
+	fs.String("id", "", "prospective lease")
+	if err := parseFlags(fs, prewarmHydrateTargetArgs(cfg, "", passthrough)); err != nil {
+		return err
+	}
+	// Use hydration's config loader, without a lease lookup or run-profile expansion.
+	projected, err := flags.loadConfig(fs, "", true)
+	if err != nil {
+		return err
+	}
+	if err := validateProviderConfig(projected); err != nil {
+		return Exit(2, "prewarm hydration configuration is invalid: %v", err)
+	}
+	return nil
+}
+
 func prewarmProbeArgs(cfg Config, leaseID, command string, passthrough []string) []string {
 	args := append([]string{}, passthrough...)
 	args = append(args, "--provider", cfg.Provider, "--target", cfg.TargetOS)
@@ -348,7 +561,6 @@ func prewarmProviderPassthroughFlags(defaults Config) map[string]bool {
 	fs := flag.NewFlagSet("prewarm-followup", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	_ = registerProviderFlags(fs, defaults)
-	fs.Bool("reclaim", false, "claim this lease for the current repo")
 	flags := map[string]bool{}
 	fs.VisitAll(func(f *flag.Flag) {
 		takesValue := true

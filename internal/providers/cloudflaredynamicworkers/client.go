@@ -11,6 +11,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type loaderAPI interface {
@@ -129,73 +132,65 @@ var defaultReadRetryDelays = []time.Duration{
 	2 * time.Second,
 }
 
-var newLoaderAPI = func(cfg Config, rt Runtime) (loaderAPI, error) {
+var newLoaderAPI = func(cfg core.Config, rt core.Runtime) (loaderAPI, error) {
 	baseURL, err := loaderURL(cfg)
 	if err != nil {
 		return nil, err
 	}
 	token := strings.TrimSpace(cfg.CloudflareDynamicWorkers.Token)
 	if token == "" {
-		return nil, exit(2, "%s requires cloudflareDynamicWorkers.token or CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_TOKEN", providerName)
+		return nil, core.Exit(2, "%s requires cloudflareDynamicWorkers.token or CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_TOKEN", providerName)
+	}
+	requestTimeout, err := responseHeaderTimeout(cfg)
+	if err != nil {
+		return nil, err
 	}
 	httpClient := rt.HTTP
 	if httpClient == nil {
-		httpClient = defaultHTTPClient(cfg)
+		httpClient, err = defaultHTTPClient(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("%s HTTP client setup: %w", providerName, err)
+		}
 	}
 	httpClient = noRedirectHTTPClient(httpClient)
 	return &client{
 		baseURL:             baseURL,
 		token:               token,
 		http:                httpClient,
-		responseBodyTimeout: responseHeaderTimeout(cfg),
+		responseBodyTimeout: requestTimeout,
 		readRetryDelays:     append([]time.Duration(nil), defaultReadRetryDelays...),
 	}, nil
 }
 
-func loaderURL(cfg Config) (string, error) {
+func loaderURL(cfg core.Config) (string, error) {
 	raw := strings.TrimSpace(cfg.CloudflareDynamicWorkers.LoaderURL)
 	if raw == "" {
-		return "", exit(2, "%s requires cloudflareDynamicWorkers.loaderUrl or CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_URL", providerName)
+		return "", core.Exit(2, "%s requires cloudflareDynamicWorkers.loaderUrl or CRABBOX_CLOUDFLARE_DYNAMIC_WORKERS_URL", providerName)
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", exit(2, "%s loader URL %q is invalid", providerName, loaderURLForError(raw))
+		return "", core.Exit(2, "%s loader URL %q is invalid", providerName, shared.EndpointURLForError(raw))
 	}
 	if parsed.User != nil {
-		return "", exit(2, "%s loader URL must not include userinfo", providerName)
+		return "", core.Exit(2, "%s loader URL must not include userinfo", providerName)
 	}
-	if parsed.Scheme != "https" && !isLoopbackHTTPURL(parsed) {
-		return "", exit(2, "%s loader URL %q must use https unless it targets localhost", providerName, loaderURLForError(raw))
+	if parsed.Scheme != "https" && !shared.IsLoopbackHTTPURL(parsed) {
+		return "", core.Exit(2, "%s loader URL %q must use https unless it targets localhost", providerName, shared.EndpointURLForError(raw))
 	}
 	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		return "", exit(2, "%s loader URL %q must not include query or fragment components", providerName, loaderURLForError(raw))
+		return "", core.Exit(2, "%s loader URL %q must not include query or fragment components", providerName, shared.EndpointURLForError(raw))
 	}
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-func loaderURLForError(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err == nil {
-		if parsed.Opaque != "" || parsed.Host == "" {
-			return "<redacted>"
-		}
-		parsed.User = nil
-		parsed.RawQuery = ""
-		parsed.ForceQuery = false
-		parsed.Fragment = ""
-		return parsed.String()
-	}
-	return "<redacted>"
-}
-
-func loaderClaimScope(cfg Config) (string, error) {
+func loaderClaimScope(cfg core.Config) (string, error) {
 	raw, err := loaderURL(cfg)
 	if err != nil {
 		return "", err
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" {
-		return "", exit(2, "%s loader URL is invalid", providerName)
+		return "", core.Exit(2, "%s loader URL is invalid", providerName)
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
 	host := strings.ToLower(parsed.Hostname())
@@ -213,7 +208,7 @@ func loaderClaimScope(cfg Config) (string, error) {
 	escapedPath := canonicalPercentEscapes(strings.TrimRight(parsed.EscapedPath(), "/"))
 	decodedPath, err := url.PathUnescape(escapedPath)
 	if err != nil {
-		return "", exit(2, "%s loader URL path is invalid", providerName)
+		return "", core.Exit(2, "%s loader URL path is invalid", providerName)
 	}
 	parsed.Path = decodedPath
 	if escapedPath == decodedPath {
@@ -282,18 +277,16 @@ func asciiUpperHex(value byte) byte {
 	return value
 }
 
-func isLoopbackHTTPURL(parsed *url.URL) bool {
-	if parsed.Scheme != "http" {
-		return false
+func defaultHTTPClient(cfg core.Config) (*http.Client, error) {
+	transport, err := core.CloneDefaultTransport()
+	if err != nil {
+		return nil, err
 	}
-	host := strings.ToLower(parsed.Hostname())
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
-}
-
-func defaultHTTPClient(cfg Config) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = responseHeaderTimeout(cfg)
-	return &http.Client{Transport: transport}
+	transport.ResponseHeaderTimeout, err = responseHeaderTimeout(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Transport: transport}, nil
 }
 
 func noRedirectHTTPClient(httpClient *http.Client) *http.Client {
@@ -304,16 +297,19 @@ func noRedirectHTTPClient(httpClient *http.Client) *http.Client {
 	return &cloned
 }
 
-func responseHeaderTimeout(cfg Config) time.Duration {
-	runTimeout := time.Duration(cfg.CloudflareDynamicWorkers.TimeoutSecs) * time.Second
-	if runTimeout <= 0 {
-		return 0
+func responseHeaderTimeout(cfg core.Config) (time.Duration, error) {
+	seconds := cfg.CloudflareDynamicWorkers.TimeoutSecs
+	if seconds < 0 {
+		return 0, core.Exit(2, "%s timeout-secs must be non-negative", providerName)
 	}
-	timeout := runTimeout + responseHeaderTimeoutOverhead
-	if timeout < defaultResponseHeaderTimeout {
-		return defaultResponseHeaderTimeout
+	if seconds == 0 {
+		return 0, nil
 	}
-	return timeout
+	timeout, ok := shared.SecondsWithGrace(int64(seconds), responseHeaderTimeoutOverhead)
+	if !ok {
+		return 0, core.Exit(2, "%s timeout-secs exceeds the supported request budget", providerName)
+	}
+	return max(timeout, defaultResponseHeaderTimeout), nil
 }
 
 func (c *client) Readiness(ctx context.Context) (readinessResponse, error) {
@@ -324,11 +320,7 @@ func (c *client) Readiness(ctx context.Context) (readinessResponse, error) {
 
 func (c *client) Run(ctx context.Context, req runRequest) (runResponse, error) {
 	var out runResponse
-	var body bytes.Buffer
-	if err := json.NewEncoder(&body).Encode(req); err != nil {
-		return out, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/runs", &body)
+	httpReq, err := shared.NewJSONRequest(ctx, http.MethodPost, c.baseURL+"/v1/runs", req)
 	if err != nil {
 		return out, err
 	}
@@ -538,15 +530,7 @@ func (c *client) DeleteAcknowledgedComplete(ctx context.Context, id string) erro
 
 func (c *client) doJSON(ctx context.Context, method, endpoint string, input any, output any) error {
 	for attempt := 0; ; attempt++ {
-		var body io.Reader
-		if input != nil {
-			var buf bytes.Buffer
-			if err := json.NewEncoder(&buf).Encode(input); err != nil {
-				return err
-			}
-			body = &buf
-		}
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+endpoint, body)
+		req, err := shared.NewJSONRequest(ctx, method, c.baseURL+endpoint, input)
 		if err != nil {
 			return err
 		}
@@ -560,7 +544,7 @@ func (c *client) doJSON(ctx context.Context, method, endpoint string, input any,
 		}
 		if method == http.MethodGet && retryableReadStatus(resp.StatusCode) && attempt < len(c.readRetryDelays) {
 			_ = resp.Body.Close()
-			if err := waitForRetry(ctx, c.readRetryDelays[attempt]); err != nil {
+			if err := core.SleepContext(ctx, c.readRetryDelays[attempt]); err != nil {
 				return err
 			}
 			continue
@@ -582,17 +566,6 @@ func retryableReadStatus(statusCode int) bool {
 		return true
 	default:
 		return false
-	}
-}
-
-func waitForRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
 	}
 }
 

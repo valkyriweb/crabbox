@@ -1,0 +1,109 @@
+package cloudrunsandbox
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+const archiveUploadChunkSize = 3 << 20
+
+func (b *backend) workspace(transport sandboxTransport, sandboxID string, req core.RunRequest, workdir string) core.ArchiveWorkspace {
+	workspace := core.NewArchiveWorkspace(b.cfg, b.rt, req, providerName, workdir)
+	workspace.RemoteArchiveDir = "/tmp"
+	workspace.RemoteArchivePrefix = "crabbox-sync-"
+	workspace.CleanupContext = b.cleanupContext
+	workspace.Upload = func(uploadCtx context.Context, remoteArchive string, body io.Reader) error {
+		return b.uploadArchive(uploadCtx, transport, sandboxID, remoteArchive, body)
+	}
+	workspace.Exec = func(execCtx context.Context, command string) error {
+		return b.execShell(execCtx, transport, sandboxID, command)
+	}
+	return workspace
+}
+
+func (b *backend) uploadArchive(ctx context.Context, transport sandboxTransport, sandboxID, remoteArchive string, body io.Reader) error {
+	// Gateway writeFile preserves UTF-8 strings. Ship binary archives as base64
+	// text in bounded chunks, then decode in-sandbox before extract. Chunking
+	// avoids retaining the archive, its base64 expansion, and a JSON copy in
+	// memory, while keeping every gateway request below ordinary HTTP limits.
+	b64Path := remoteArchive + ".b64"
+	chunks := &sandboxChunkWriter{
+		ctx:       ctx,
+		transport: transport,
+		sandboxID: sandboxID,
+		path:      b64Path,
+		buffer:    make([]byte, 0, archiveUploadChunkSize),
+	}
+	encoder := base64.NewEncoder(base64.StdEncoding, chunks)
+	_, copyErr := io.Copy(encoder, body)
+	encodeErr := encoder.Close()
+	flushErr := chunks.Close()
+	if err := errors.Join(copyErr, encodeErr, flushErr); err != nil {
+		return fmt.Errorf("cloud-run-sandbox upload archive: %w", err)
+	}
+	decode := fmt.Sprintf("base64 -d %s > %s && rm -f %s", core.ShellQuote(b64Path), core.ShellQuote(remoteArchive), core.ShellQuote(b64Path))
+	return b.execShell(ctx, transport, sandboxID, decode)
+}
+
+type sandboxChunkWriter struct {
+	ctx       context.Context
+	transport sandboxTransport
+	sandboxID string
+	path      string
+	buffer    []byte
+	append    bool
+}
+
+func (w *sandboxChunkWriter) Write(data []byte) (int, error) {
+	written := 0
+	for len(data) > 0 {
+		space := archiveUploadChunkSize - len(w.buffer)
+		if space > len(data) {
+			space = len(data)
+		}
+		w.buffer = append(w.buffer, data[:space]...)
+		data = data[space:]
+		written += space
+		if len(w.buffer) == archiveUploadChunkSize {
+			if err := w.flush(); err != nil {
+				return written, err
+			}
+		}
+	}
+	return written, nil
+}
+
+func (w *sandboxChunkWriter) Close() error {
+	if len(w.buffer) == 0 && w.append {
+		return nil
+	}
+	return w.flush()
+}
+
+func (w *sandboxChunkWriter) flush() error {
+	if err := w.transport.WriteFile(w.ctx, w.sandboxID, w.path, string(w.buffer), w.append); err != nil {
+		return err
+	}
+	w.buffer = w.buffer[:0]
+	w.append = true
+	return nil
+}
+
+func (b *backend) execShell(ctx context.Context, transport sandboxTransport, sandboxID, command string) error {
+	code, err := transport.Exec(ctx, sandboxID, command, execOptions{
+		Workdir: "/",
+		Timeout: defaultExecTimeout,
+	}, nil, nil)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return core.Exit(code, "cloud-run-sandbox exec %q exited %d", command, code)
+	}
+	return nil
+}

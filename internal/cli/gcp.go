@@ -12,6 +12,7 @@ import (
 
 	gcpcompute "cloud.google.com/go/compute/apiv1"
 	"cloud.google.com/go/compute/apiv1/computepb"
+	"github.com/openclaw/crabbox/internal/rootdisk"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -38,8 +39,9 @@ type GCPClient struct {
 	SSHPort        string
 	FallbackPorts  []string
 
-	instances *gcpcompute.InstancesClient
-	firewalls *gcpcompute.FirewallsClient
+	instances     *gcpcompute.InstancesClient
+	firewalls     *gcpcompute.FirewallsClient
+	clientOptions []option.ClientOption
 }
 
 func NewGCPClient(ctx context.Context, cfg Config) (*GCPClient, error) {
@@ -47,11 +49,11 @@ func NewGCPClient(ctx context.Context, cfg Config) (*GCPClient, error) {
 }
 
 func newGCPClientWithOptions(ctx context.Context, cfg Config, opts ...option.ClientOption) (*GCPClient, error) {
-	if cfg.GCPProject == "" {
-		return nil, exit(3, "gcp project is required (set gcp.project, CRABBOX_GCP_PROJECT, GOOGLE_CLOUD_PROJECT, or GCP_PROJECT_ID)")
+	if cfg.GCP.Project == "" {
+		return nil, Exit(3, "gcp project is required (set gcp.project, CRABBOX_GCP_PROJECT, GOOGLE_CLOUD_PROJECT, or GCP_PROJECT_ID)")
 	}
-	if cfg.GCPZone == "" {
-		return nil, exit(3, "gcp zone is required (set gcp.zone or CRABBOX_GCP_ZONE)")
+	if cfg.GCP.Zone == "" {
+		return nil, Exit(3, "gcp zone is required (set gcp.zone or CRABBOX_GCP_ZONE)")
 	}
 	instances, err := gcpcompute.NewInstancesRESTClient(ctx, opts...)
 	if err != nil {
@@ -62,101 +64,127 @@ func newGCPClientWithOptions(ctx context.Context, cfg Config, opts ...option.Cli
 		_ = instances.Close()
 		return nil, fmt.Errorf("gcp firewalls client: %w", err)
 	}
-	cidrs := cfg.GCPSSHCIDRs
+	cidrs := cfg.GCP.SSHCIDRs
 	if len(cidrs) == 0 {
 		cidrs = []string{"0.0.0.0/0"}
 	}
-	tags := uniqueStrings(cfg.GCPTags)
+	tags := uniqueStrings(cfg.GCP.Tags)
 	if len(tags) == 0 {
 		tags = []string{"crabbox-ssh"}
 	}
 	return &GCPClient{
-		Project:        cfg.GCPProject,
-		Zone:           cfg.GCPZone,
-		Zones:          uniqueStrings(append([]string{cfg.GCPZone}, cfg.Capacity.AvailabilityZones...)),
-		Image:          blank(cfg.GCPImage, defaultGCPLinuxImage),
-		Network:        blank(cfg.GCPNetwork, "default"),
-		Subnet:         cfg.GCPSubnet,
+		Project:        cfg.GCP.Project,
+		Zone:           cfg.GCP.Zone,
+		Zones:          uniqueStrings(append([]string{cfg.GCP.Zone}, cfg.Capacity.AvailabilityZones...)),
+		Image:          blank(cfg.GCP.Image, defaultGCPLinuxImage),
+		Network:        blank(cfg.GCP.Network, "default"),
+		Subnet:         cfg.GCP.Subnet,
 		Tags:           tags,
 		SSHCIDRs:       cidrs,
-		RootGB:         cfg.GCPRootGB,
-		ServiceAccount: cfg.GCPServiceAccount,
+		RootGB:         cfg.GCP.RootGB,
+		ServiceAccount: cfg.GCP.ServiceAccount,
 		SSHPort:        cfg.SSHPort,
 		FallbackPorts:  cfg.SSHFallbackPorts,
 		instances:      instances,
 		firewalls:      firewalls,
+		clientOptions:  opts,
 	}, nil
 }
 
-func gcpMachineTypeCandidatesForClass(class string) []string {
-	switch class {
-	case "standard":
-		return []string{"c4-standard-32", "c3-standard-22", "n2-standard-32", "n2d-standard-32"}
-	case "fast":
-		return []string{"c4-standard-64", "c3-standard-44", "n2-standard-64", "n2d-standard-64", "c4-standard-32"}
-	case "large":
-		return []string{"c4-standard-96", "c3-standard-88", "n2-standard-80", "n2d-standard-96", "c4-standard-64"}
-	case "beast":
-		return []string{"c4-standard-192", "c4-standard-96", "c3-standard-176", "c3-standard-88", "n2d-standard-224", "n2-standard-128"}
-	default:
-		return []string{class}
+// Hyperdisk-only series: https://docs.cloud.google.com/compute/docs/general-purpose-machines
+// https://docs.cloud.google.com/compute/docs/compute-optimized-machines
+// https://docs.cloud.google.com/compute/docs/memory-optimized-machines
+// https://docs.cloud.google.com/compute/docs/network-optimized-machines
+// https://docs.cloud.google.com/compute/docs/accelerator-optimized-machines
+// https://docs.cloud.google.com/compute/docs/storage-optimized-machines
+// Keep worker/src/config.ts in sync; its parity test reads this canonical set.
+var gcpHyperdiskOnlyFamilies = map[string]struct{}{
+	"a3-ultragpu": {}, "a4": {}, "a4x": {}, "c4": {}, "c4a": {}, "c4d": {}, "c4n": {},
+	"g4": {}, "h4d": {}, "m4": {}, "m4n": {}, "n4": {}, "n4a": {}, "n4d": {},
+	"x4": {}, "x5": {}, "z4d": {},
+}
+
+func gcpBootDiskType(machineType string) string {
+	name := machineType[strings.LastIndex(machineType, "/")+1:]
+	family, rest, _ := strings.Cut(strings.ToLower(name), "-")
+	variant, _, _ := strings.Cut(rest, "-")
+	_, familyOnly := gcpHyperdiskOnlyFamilies[family]
+	_, variantOnly := gcpHyperdiskOnlyFamilies[family+"-"+variant]
+	if familyOnly || variantOnly {
+		return "hyperdisk-balanced"
 	}
+	return "pd-balanced"
+}
+
+func gcpMachineTypeCandidatesForClass(class string) []string {
+	cfg := Config{Provider: "gcp", TargetOS: targetLinux, Architecture: ArchitectureAMD64, Class: class, architectureExplicit: true}
+	return GCPMachineTypeCandidatesForConfig(cfg)
+}
+
+func GCPMachineTypeCandidatesForConfig(cfg Config) []string {
+	if cfg.ServerTypeExplicit {
+		if strings.TrimSpace(cfg.ServerType) != "" {
+			return []string{cfg.ServerType}
+		}
+	}
+	if candidates, matched := providerClassCandidatesForConfig(cfg); matched {
+		return appendUniqueExactStrings([]string{concreteStoredServerType(cfg)}, candidates...)
+	}
+	if IsCanonicalProviderClass(cfg.Class) {
+		if storedType := concreteStoredServerType(cfg); storedType != "" {
+			return []string{storedType}
+		}
+		return nil
+	}
+	return appendUniqueExactStrings([]string{concreteStoredServerType(cfg)}, cfg.Class)
 }
 
 func (c *GCPClient) CreateServerWithFallback(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool, logf func(string, ...any)) (Server, Config, error) {
-	var candidates []string
-	if cfg.ServerTypeExplicit && cfg.ServerType != "" {
-		candidates = []string{cfg.ServerType}
-	} else {
-		candidates = gcpMachineTypeCandidatesForClass(cfg.Class)
-		if cfg.ServerType != "" && cfg.ServerType != candidates[0] {
-			candidates = append([]string{cfg.ServerType}, candidates...)
-		}
+	attempts, err := gcpProvisioningPlan(cfg)
+	if err != nil {
+		return Server{}, cfg, err
 	}
-	zones := uniqueStrings(append([]string{cfg.GCPZone}, cfg.Capacity.AvailabilityZones...))
-	var errs []error
-	for _, zone := range zones {
-		for i, machineType := range candidates {
-			next := cfg
-			next.GCPZone = zone
-			next.ServerType = machineType
-			if (i > 0 || zone != cfg.GCPZone) && logf != nil {
-				logf("fallback provisioning zone=%s type=%s after fallback-eligible provisioning error\n", zone, machineType)
-			}
-			server, err := c.withZone(zone).createServer(ctx, next, publicKey, leaseID, slug, keep)
+	return ProvisionServerCandidates(ctx, cfg, attempts, ServerProvisioner{
+		Create: func(ctx context.Context, next Config) (Server, error) {
+			server, err := c.withZone(next.GCP.Zone).createServer(ctx, next, publicKey, leaseID, slug, keep)
 			if err == nil {
-				c.Zone = zone
-				return server, next, nil
+				c.Zone = next.GCP.Zone
 			}
-			errs = append(errs, fmt.Errorf("%s/%s: %w", zone, machineType, err))
-			if !isGCPFallbackProvisioningError(err) {
-				return Server{}, next, joinErrors(errs)
-			}
-		}
+			return server, err
+		},
+		CanRetry: isGCPFallbackProvisioningError,
+	}, logf)
+}
+
+func gcpProvisioningPlan(cfg Config) ([]ProvisioningCandidate, error) {
+	candidates := []string{cfg.ServerType}
+	if !cfg.ServerTypeExplicit || cfg.ServerType == "" {
+		candidates = GCPMachineTypeCandidatesForConfig(cfg)
 	}
-	if strings.EqualFold(cfg.Capacity.Market, "spot") && strings.HasPrefix(cfg.Capacity.Fallback, "on-demand") {
+	if err := validateProvisioningCandidates(cfg, candidates); err != nil {
+		return nil, err
+	}
+	zones := uniqueStrings(append([]string{cfg.GCP.Zone}, cfg.Capacity.AvailabilityZones...))
+	var attempts []ProvisioningCandidate
+	for marketIndex, market := range provisioningMarkets(cfg) {
 		for _, zone := range zones {
-			for _, machineType := range candidates {
+			for i, machineType := range candidates {
 				next := cfg
-				next.GCPZone = zone
+				next.GCP.Zone = zone
 				next.ServerType = machineType
-				next.Capacity.Market = "on-demand"
-				if logf != nil {
-					logf("fallback provisioning zone=%s type=%s market=on-demand after spot rejection\n", zone, machineType)
+				next.Capacity.Market = market
+				attempt := ProvisioningCandidate{Config: next, FailureLabel: zone + "/" + machineType}
+				if marketIndex > 0 {
+					attempt.FailureLabel = "on-demand " + attempt.FailureLabel
+					attempt.FallbackMessage = fmt.Sprintf("fallback provisioning zone=%s type=%s market=on-demand after spot rejection\n", zone, machineType)
+				} else if i > 0 || zone != cfg.GCP.Zone {
+					attempt.FallbackMessage = fmt.Sprintf("fallback provisioning zone=%s type=%s after fallback-eligible provisioning error\n", zone, machineType)
 				}
-				server, err := c.withZone(zone).createServer(ctx, next, publicKey, leaseID, slug, keep)
-				if err == nil {
-					c.Zone = zone
-					return server, next, nil
-				}
-				errs = append(errs, fmt.Errorf("on-demand %s/%s: %w", zone, machineType, err))
-				if !isGCPFallbackProvisioningError(err) {
-					return Server{}, next, joinErrors(errs)
-				}
+				attempts = append(attempts, attempt)
 			}
 		}
 	}
-	return Server{}, cfg, joinErrors(errs)
+	return attempts, nil
 }
 
 func (c *GCPClient) withZone(zone string) *GCPClient {
@@ -167,18 +195,22 @@ func (c *GCPClient) withZone(zone string) *GCPClient {
 
 func (c *GCPClient) createServer(ctx context.Context, cfg Config, publicKey, leaseID, slug string, keep bool) (server Server, err error) {
 	if cfg.TargetOS != targetLinux {
-		return Server{}, exit(2, "gcp provider currently supports target=linux only")
+		return Server{}, Exit(2, "gcp provider currently supports target=linux only")
+	}
+	image, rootGB, err := c.resolveRootDisk(ctx, cfg.Class)
+	if err != nil {
+		return Server{}, err
 	}
 	if err := c.EnsureFirewall(ctx); err != nil {
 		return Server{}, err
 	}
-	name := leaseProviderName(leaseID, slug)
+	name := LeaseProviderName(leaseID, slug)
 	defer func() {
 		if err != nil {
 			_ = c.DeleteServer(context.Background(), name)
 		}
 	}()
-	labels := directLeaseLabels(cfg, leaseID, slug, "gcp", mapMarket(strings.EqualFold(cfg.Capacity.Market, "spot")), keep, time.Now().UTC())
+	labels := DirectLeaseLabels(cfg, leaseID, slug, "gcp", mapMarket(strings.EqualFold(cfg.Capacity.Market, "spot")), keep, time.Now().UTC())
 	metadata := &computepb.Metadata{Items: []*computepb.Items{
 		gcpMetadataItem("enable-oslogin", "FALSE"),
 		gcpMetadataItem("ssh-keys", fmt.Sprintf("%s:%s", cfg.SSHUser, publicKey)),
@@ -195,9 +227,9 @@ func (c *GCPClient) createServer(ctx context.Context, cfg Config, publicKey, lea
 			AutoDelete: proto.Bool(true),
 			Type:       proto.String("PERSISTENT"),
 			InitializeParams: &computepb.AttachedDiskInitializeParams{
-				SourceImage: proto.String(c.Image),
-				DiskSizeGb:  proto.Int64(c.RootGB),
-				DiskType:    proto.String(fmt.Sprintf("zones/%s/diskTypes/pd-balanced", c.Zone)),
+				SourceImage: proto.String(image),
+				DiskSizeGb:  proto.Int64(rootGB),
+				DiskType:    proto.String(fmt.Sprintf("zones/%s/diskTypes/%s", c.Zone, gcpBootDiskType(cfg.ServerType))),
 			},
 		}},
 		NetworkInterfaces: []*computepb.NetworkInterface{{
@@ -225,6 +257,39 @@ func (c *GCPClient) createServer(ctx context.Context, cfg Config, publicKey, lea
 		return Server{}, err
 	}
 	return c.GetServer(ctx, name)
+}
+
+func (c *GCPClient) resolveRootDisk(ctx context.Context, class string) (string, int64, error) {
+	if c.RootGB > 0 {
+		return c.Image, c.RootGB, nil
+	}
+	ref := strings.TrimPrefix(strings.TrimPrefix(c.Image, "https://www.googleapis.com/compute/v1/"), "https://compute.googleapis.com/compute/v1/")
+	if strings.HasPrefix(ref, "global/") {
+		ref = "projects/" + c.Project + "/" + ref
+	}
+	parts := strings.Split(ref, "/")
+	if len(parts) < 5 || parts[0] != "projects" || parts[2] != "global" || parts[3] != "images" || (len(parts) != 5 && (len(parts) != 6 || parts[4] != "family")) {
+		return "", 0, fmt.Errorf("resolve GCP root disk minimum: invalid image reference %q", c.Image)
+	}
+	images, err := gcpcompute.NewImagesRESTClient(ctx, c.clientOptions...)
+	if err != nil {
+		return "", 0, fmt.Errorf("gcp images client: %w", err)
+	}
+	defer images.Close()
+	var image *computepb.Image
+	if len(parts) == 6 {
+		image, err = images.GetFromFamily(ctx, &computepb.GetFromFamilyImageRequest{Project: parts[1], Family: parts[5]})
+	} else {
+		image, err = images.Get(ctx, &computepb.GetImageRequest{Project: parts[1], Image: parts[4]})
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("resolve GCP root disk minimum: %w", err)
+	}
+	if image.GetDiskSizeGb() <= 0 || image.GetName() == "" {
+		return "", 0, fmt.Errorf("resolve GCP root disk minimum: image %s has no name or disk size", c.Image)
+	}
+	// Pin family resolution to the image whose minimum we inspected.
+	return fmt.Sprintf("projects/%s/global/images/%s", parts[1], image.GetName()), max(rootdisk.DefaultGB(class), image.GetDiskSizeGb()), nil
 }
 
 func gcpScheduling(cfg Config) *computepb.Scheduling {
@@ -312,27 +377,6 @@ func (c *GCPClient) GetServer(ctx context.Context, name string) (Server, error) 
 	return gcpInstanceToServer(c.Zone, instance), nil
 }
 
-func (c *GCPClient) WaitForServerIP(ctx context.Context, name string) (Server, error) {
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		server, err := c.GetServer(ctx, name)
-		if err != nil {
-			return Server{}, err
-		}
-		if server.PublicNet.IPv4.IP != "" {
-			return server, nil
-		}
-		if time.Now().After(deadline) {
-			return Server{}, fmt.Errorf("timeout waiting for gcp public ip on %s", name)
-		}
-		select {
-		case <-ctx.Done():
-			return Server{}, ctx.Err()
-		case <-time.After(5 * time.Second):
-		}
-	}
-}
-
 func (c *GCPClient) ListCrabboxServers(ctx context.Context) ([]Server, error) {
 	return c.listCrabboxServers(ctx, true)
 }
@@ -393,9 +437,9 @@ func IsCanonicalGCPServer(server Server) bool {
 	}
 	leaseID := strings.TrimSpace(labels["lease"])
 	slug := strings.TrimSpace(labels["slug"])
-	return isCanonicalLeaseID(leaseID) &&
+	return IsCanonicalLeaseID(leaseID) &&
 		slug != "" &&
-		server.Name == leaseProviderName(leaseID, slug) &&
+		server.Name == LeaseProviderName(leaseID, slug) &&
 		labels["crabbox"] == "true" &&
 		labels["created_by"] == "crabbox" &&
 		labels["provider"] == "gcp"
@@ -655,7 +699,15 @@ func isGCPFallbackProvisioningError(err error) bool {
 	s := strings.ToLower(err.Error())
 	return isGCPQuotaOrCapacityMessage(s) ||
 		isGCPUnavailableMachineTypeMessage(s) ||
+		isGCPDiskMachineIncompatibilityMessage(s) ||
 		strings.Contains(s, "try again")
+}
+
+func isGCPDiskMachineIncompatibilityMessage(message string) bool {
+	s := strings.ToLower(message)
+	disk := strings.Contains(s, "disk type") || strings.Contains(s, "disktype") || strings.Contains(s, "disktypes/")
+	machine := strings.Contains(s, "machine type") || strings.Contains(s, "machinetype")
+	return disk && machine && (strings.Contains(s, "cannot be used") || strings.Contains(s, "not supported") || strings.Contains(s, "unsupported") || strings.Contains(s, "does not support"))
 }
 
 func isGCPQuotaOrCapacityError(apiErr *googleapi.Error) bool {

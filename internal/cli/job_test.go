@@ -3,11 +3,153 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestSynthesizedConfigFlagInputs(t *testing.T) {
+	// Ignored events remain no-ops without requiring a configuration snapshot.
+	RecordProviderFlagInputs(nil, false, "morph")
+	RecordProviderFlagIntents(nil, false, "morph")
+	for _, synthesized := range []bool{false, true} {
+		name := "direct"
+		if synthesized {
+			name = "derived"
+		}
+		t.Run(name, func(t *testing.T) {
+			var original Config
+			recordConfigInput(&original, configInputGeneric, configInputUser, true)
+			recordConfigInput(&original, "morph", configInputRepo, true)
+			original.inputProvenance = original.inputProvenance.withCoverage(configInputGeneric, true).withCoverage("morph", true)
+			cfg := original
+			markSynthesizedFlagInputs(&cfg, synthesized)
+			fs := newFlagSet("origin", io.Discard)
+			market := fs.String("market", "", "")
+			if err := fs.Parse([]string{"--market=spot"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyCapacityMarketFlag(&cfg, fs, *market); err != nil {
+				t.Fatal(err)
+			}
+			RecordProviderFlagInputs(&cfg, true, "morph")
+			RecordProviderFlagIntents(&cfg, true, "morph")
+			recordConfigInput(&cfg, configInputGeneric, configInputEnvironment, true)
+			generic := cfg.inputProvenance.summary(configInputGeneric)
+			provider := cfg.inputProvenance.summary("morph")
+			wantGeneric, wantProvider := []string{"user_config", "environment", "flag"}, []string{"repo_config", "flag"}
+			if synthesized {
+				wantGeneric, wantProvider = []string{"user_config", "environment"}, []string{"repo_config"}
+			}
+			if !reflect.DeepEqual(generic.sources, wantGeneric) || !reflect.DeepEqual(provider.sources, wantProvider) || generic.complete == synthesized || provider.complete == synthesized {
+				t.Fatalf("origin=%t generic=%#v provider=%#v", synthesized, generic, provider)
+			}
+			if !reflect.DeepEqual(original.inputProvenance.summary(configInputGeneric).sources, []string{"user_config"}) || !original.inputProvenance.summary(configInputGeneric).complete {
+				t.Fatal("derived copy mutated original source or coverage")
+			}
+			if cfg.Capacity.Market != "spot" {
+				t.Fatal("origin changed flag application")
+			}
+		})
+	}
+}
+
+func TestJobSynthesizedLeaseFlagInputs(t *testing.T) {
+	clearConfigEnv(t)
+	p := architectureCapabilityTestProvider{}
+	providerRegistry[p.Spec().Name] = p
+	t.Cleanup(func() { delete(providerRegistry, p.Spec().Name) })
+	cfg := baseConfig()
+	cfg.Provider = p.Spec().Name
+	recordConfigInput(&cfg, configInputGeneric, configInputRepo, true)
+	cfg.inputProvenance = cfg.inputProvenance.withCoverage(configInputGeneric, true)
+	job := JobConfig{Provider: p.Spec().Name, Target: targetLinux, Class: "standard"}
+	fs := newFlagSet("job projected flags", io.Discard)
+	values := registerLeaseCreateFlags(fs, cfg)
+	if err := fs.Parse(jobLeaseCreateArgsFor(cfg, job, false)); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLeaseCreateFlagsForTarget(&cfg, fs, values, leaseFlagTarget{SynthesizedInputs: true}, false); err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.inputProvenance.summary(configInputGeneric)
+	if !reflect.DeepEqual(got.sources, []string{"repo_config"}) || got.complete || !cfg.synthesizedFlagInputs {
+		t.Fatalf("synthesized job projection=%#v", got)
+	}
+}
+
+type jobNoConfigureProvider struct {
+	testHetznerProvider
+	t *testing.T
+}
+
+func (p jobNoConfigureProvider) Configure(Config, Runtime) (Backend, error) {
+	p.t.Fatal("job admission configured a backend")
+	return nil, nil
+}
+
+type jobOptionsTestProvider struct {
+	jobNoConfigureProvider
+	requests *[]RunRequest
+}
+
+func (p jobOptionsTestProvider) ValidateRunOptions(req RunRequest) error {
+	*p.requests = append(*p.requests, req)
+	return nil
+}
+
+func TestJobNoSyncDryRunProviderAdmission(t *testing.T) {
+	for _, mode := range []string{"optional", "validator", "unselected"} {
+		t.Run(mode, func(t *testing.T) {
+			clearConfigEnv(t)
+			dir := t.TempDir()
+			t.Setenv("HOME", dir)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+			t.Setenv("CRABBOX_CONFIG", filepath.Join(dir, "config.yaml"))
+			var requests []RunRequest
+			original := providerRegistry["hetzner"]
+			base := jobNoConfigureProvider{t: t}
+			var provider Provider = base
+			if mode != "optional" {
+				provider = jobOptionsTestProvider{jobNoConfigureProvider: base, requests: &requests}
+			}
+			providerRegistry["hetzner"] = provider
+			t.Cleanup(func() { providerRegistry["hetzner"] = original })
+			selection := "provider: hetzner\n"
+			if mode == "unselected" {
+				selection = ""
+			}
+			config := selection + "jobs:\n  check:\n    noSync: true\n    shell: true\n    command: echo ready\n"
+			if err := os.WriteFile(os.Getenv("CRABBOX_CONFIG"), []byte(config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			app := App{Stdout: &stdout, Stderr: &stderr}
+			if err := app.Run(context.Background(), []string{"job", "run", "--dry-run", "check"}); err != nil {
+				t.Fatalf("dry run: %v\nstderr=%s", err, &stderr)
+			}
+			var want []RunRequest
+			if mode == "validator" {
+				want = []RunRequest{{NoSync: true, ShellMode: true, Command: []string{"echo ready"}}}
+			}
+			if !reflect.DeepEqual(requests, want) {
+				t.Fatalf("validation requests=%+v, want %+v", requests, want)
+			}
+			if !strings.Contains(stdout.String(), "--no-sync --shell -- 'echo ready'") {
+				t.Fatalf("supported no-sync job missing from plan: %s", &stdout)
+			}
+			if mode == "unselected" {
+				if err := app.Run(context.Background(), []string{"job", "run", "check"}); err == nil || !strings.Contains(err.Error(), "no provider selected") {
+					t.Fatalf("job silently selected a default provider: %v", err)
+				}
+			}
+		})
+	}
+}
 
 func TestLoadConfigJobs(t *testing.T) {
 	clearConfigEnv(t)
@@ -137,6 +279,49 @@ func TestJobRunDryRunPropagatesArchitecture(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("dry-run output missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestJobRunInjectsReservedExecutionMetadata(t *testing.T) {
+	clearConfigEnv(t)
+	dir := t.TempDir()
+	isolateRunTestUserDirs(t, dir)
+	logPath := installRecordingSSH(t, dir)
+	t.Setenv("CRABBOX_FAKE_SSH_PORT", "22")
+	t.Setenv("CRABBOX_FAKE_SSH_PROXY", "1")
+	configPath := filepath.Join(dir, ".crabbox.yaml")
+	t.Setenv("CRABBOX_CONFIG", configPath)
+	if err := os.WriteFile(configPath, []byte(`jobs:
+  metadata:
+    provider: run-env-profile-test
+    noSync: true
+    command: env
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	if err := app.Run(context.Background(), []string{"job", "run", "--id", "cbx_env_profile_test", "metadata"}); err != nil {
+		t.Fatalf("job run failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(data)
+	for _, want := range []string{"CRABBOX_LEASE_ID=", "cbx_env_profile_test", "CRABBOX_SLUG="} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("job command missing %q:\n%s", want, logText)
+		}
+	}
+	if !regexp.MustCompile(`CRABBOX_RUN_ID=.*run_[a-f0-9]{12}`).MatchString(logText) {
+		t.Fatalf("job command missing run metadata:\n%s", logText)
+	}
+	invalidate := strings.Index(logText, `/bin/rm -f -- "$meta_dir/sync-fingerprint"`)
+	command := strings.Index(logText, "CRABBOX_LEASE_ID=")
+	if invalidate < 0 || command <= invalidate {
+		t.Fatalf("job command ran before fingerprint invalidation:\n%s", logText)
 	}
 }
 

@@ -1,62 +1,310 @@
 # Lifecycle and Cleanup
 
+## Durable provisioning ownership
+
+Eligible new Azure Windows creates can be admitted by the versioned durable
+controller described in [Coordinator](coordinator.md#durable-azure-provisioning).
+Their private operation owns all candidate resource identities until terminal
+publication or verified cleanup. Legacy interrupted-create recovery, expiry,
+deferred cleanup and orphan mutation must respect this ownership. Transactional
+legacy mutation fences prevent a new admission from overtaking cleanup that
+has already claimed its provider work. An unsuccessful legacy mutation retains
+its fence and existing cleanup evidence; a new job is never proof that old
+cleanup debt disappeared.
+
+Cancellation, including ordinary token cancellation with `keep=true`, stops
+forward provisioning and fallback. Already dispatched work must settle before
+the controller deletes verified resources. The journal retains immutable VM,
+NIC, public-IP and disk identities while deletion progress shrinks separately.
+An unexplained missing resource, identity replacement or unresolved dispatch
+remains cleanup debt. In particular, a network PUT with a lost acknowledgement
+followed by 404 is not permission to repeat allocation or move to another
+candidate. Completed machines retain their observed identity for the existing
+owned-deletion path.
+
+Explicit release with `{ "delete": false }` retains a provisioning resource and
+its private identity records. It stops forward provisioning and active
+publication, observes any dispatched work to settlement, and then removes the
+operation from the runnable queue. A later explicit release with `delete: true`
+resumes exact owned cleanup without decrypting the retired VM password/bootstrap.
+Ordinary token cancellation still requires cleanup,
+including when the original request used `keep=true`. A retention request cannot
+undo a deletion request that already owns cleanup.
+
+Healthy queued cleanup reports `cleanupStatus: pending` through release and GET.
+Verified final cleanup writes `cleanupCompletedAt`, clears transient metadata and
+remote access fields, and reports `complete`; identity conflicts, missing
+successful-deletion proof and observed errors report `failed`. Retention reports
+`retained`. These states preserve the existing client rule to keep local
+credentials until cleanup is verified complete.
+
+Durable Azure cleanup uses the same owned-delete claims, immutable identity and
+attachment validation as ordinary release. Each bounded tick removes at most one
+resource or polls one acknowledged deletion operation. Intent alone, a lost
+DELETE response, or a failed successful-progress write never authorizes removal
+of the remaining members. An accepted asynchronous DELETE is recorded separately
+from successful progress; the operation must report success before that progress
+can be persisted. Retryable in-use errors trigger fresh ownership checks on the
+next tick. Completed deletion claims remain as exact completion evidence so a
+lost provisioning-result commit cannot erase cleanup proof.
+
+Nonsecret plans, attempt histories and completed deletion claims currently have
+the same manual retention lifecycle as lease history; there is no automatic
+history-pruning job. Understood operations retire sealed replay material in the
+same transaction that durably disables forward work through cancellation,
+retention or expiry, even when settlement or cleanup remains unresolved. Pending
+forward operations still require valid bound material; unsupported/quarantined
+records are not blindly purged. Successful publication also purges material.
+A future history pruner must preserve unresolved ownership and consume
+completed claims together with their operation history, never as orphan cleanup.
+
 Read this when:
 
 - changing how leases are released or expired;
-- debugging leaked provider resources (instances, disks, Mac hosts);
+- debugging leaked provider resources (instances, NICs, public IPs, disks, Mac
+  hosts);
 - changing direct-provider cleanup behavior.
 
 A lease holds a remote box until it is released or expires. Two independent
 paths reclaim the underlying resources: the **brokered** path, owned by the
-coordinator, and the **direct** path, owned by the local CLI (and, for GCP, a
-guest-side guard). Which one applies depends on whether the provider runs
+coordinator, and the **direct** path, owned by the local CLI and supported Linux
+guest-side guards. Which one applies depends on whether the provider runs
 through a coordinator.
 
 ## Brokered lifecycle
 
-When a provider is brokered (only `aws`, `azure`, `gcp`, and `hetzner`, and only
-when a coordinator URL is configured), the coordinator owns the lease record
-and its lifecycle. A brokered lease record moves through four states
-(`worker/src/types.ts`):
+When a provider is brokered (only `aws`, `azure`, `daytona`, `gcp`, and
+`hetzner`, and only when a coordinator URL is configured), the coordinator owns
+the lease record and its lifecycle. The coordinator persists a `provisioning`
+reservation before calling the provider (`worker/src/types.ts`):
 
 ```text
-active -> released   (explicit release)
-active -> expired    (TTL or idle expiry reclaimed the box)
-active -> failed     (provisioning or cleanup failure)
+provisioning -> active    (readiness completed)
+provisioning -> failed    (creation or readiness failed)
+active       -> released  (explicit release)
+active       -> expired   (TTL or idle cleanup completed)
 ```
 
-A lease is created `active`. There is no separate `provisioning` state in the
-brokered record; provisioning happens inside lease creation and the record only
-persists once the box exists.
+Release can also end a provisioning lease. It records user intent; it does not
+cancel an already-dispatched provider request. Failed and released records can
+still carry unresolved cleanup responsibility. Their local state alone is not
+proof that the provider resource was deleted.
+
+Interrupted provisioning recovery describes an observed interruption, without
+attributing it to a deployment. It can reconcile settled calls in the same
+coordinator generation as well as attempts observed after reconstruction; the
+existing generation and settlement eligibility checks still apply.
+
+AWS recovery inventory is evidence only for the queried Region and existing
+tag/state filters. Both the coordinator's instance inventory and private
+workspace lookup read every `DescribeInstances` page, retaining duplicate
+matches for ambiguity checks. A repeated pagination token, more than 100 pages,
+or a later-page failure makes the inventory incomplete and rejects the entire
+lookup. Incomplete inventory retains cleanup debt and cannot confirm absence,
+even after the existing 30-minute absence confirmation window. Cleanup resolves
+one direct-provider credential snapshot, verifies its account through STS, and
+uses that same snapshot for instance observation, termination confirmation, and
+owned SSH-key deletion. The separate image-qualification transport instead
+enforces its enrolled account and Region policy with immediate STS checks around
+protected operations; it does not claim one immutable credential object.
+Absence is accepted only when the lease persisted the same exact account scope
+and Region. A complete empty inventory for a historical lease without account
+scope remains unresolved; a still-present historical instance may proceed only
+when its exact lease ownership labels match.
+
+For an exact Azure lease whose provisioning stops before VM creation, ordinary
+owned-resource release can clean the observed creation prefix: an unattached
+canonical public IP alone, or the exact canonical public IP and NIC together.
+A fresh NIC without its public IP is not a valid creation prefix and remains
+report-only; cleanup can resume past a missing public IP only when its exact
+durable claim already proves Crabbox deleted that public IP. A managed disk
+without its complete NIC/public-IP set, a managed-disk VM without that disk,
+foreign attachments, replacements, and missing immutable identities also fail
+closed. This narrow exact-lease release path does not relax the separate Azure
+orphan sweep's complete-set and quarantine requirements.
 
 ### Heartbeats and expiry
 
-While a command runs, the CLI heartbeats the active lease (`POST
-/v1/leases/{id}/heartbeat`). A heartbeat is a touch: it bumps `lastTouchedAt`,
-recomputes `expiresAt`, clears any pending cleanup metadata, and refreshes
-provider SSH access where the provider supports it.
+While a command runs, the CLI heartbeats the active lease over the coordinator
+control WebSocket, falling back to `POST /v1/leases/{id}/heartbeat` within the
+same 20-second request budget. An exhausted control request keeps its original
+failure diagnosis instead of attempting HTTP with an expired context; when both
+transports fail, the warning retains both causes. A heartbeat
+bumps `lastTouchedAt`, recomputes `expiresAt`, and clears stale cleanup metadata;
+the HTTP path also refreshes provider SSH access where supported. Heartbeats at
+or after `expiresAt` are
+rejected so they cannot revive a lease once expiry cleanup owns it.
 
 Expiry is the minimum of two clocks (`leaseExpiresAt` in `worker/src/fleet.ts`):
 
 - **idle expiry** — `lastTouchedAt + idleTimeout` (default idle timeout 1800s);
-- **max lifetime** — `createdAt + ttl` (default TTL 5400s, capped at 86400s).
+- **max lifetime** — `createdAt + min(ttl, current policy max)` (default TTL 1800s, default maximum 14400s).
 
-A heartbeat can only push idle expiry forward up to the max-lifetime cap, so a
-busy lease still expires at its TTL regardless of activity.
+Plain heartbeats only move idle expiry. While the user command executes, `run`
+sends `extendWhileRunning: true`: when fewer than 600 seconds remain in the total
+lifetime, the coordinator adds 1800 seconds, up to the current maximum, if both
+extension policies and the provider capability allow it. Setup, sync-only runs,
+manual heartbeat, SSH, connect, and desktop sessions do not request auto-extension.
+
+### Ordinary lifetime policy
+
+Every new lease defaults to a 30-minute TTL and a 30-minute idle timeout. The
+coordinator resolves global, organization, then owner policy; each owner field
+wins independently, falling through to organization and global values when omitted.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `CRABBOX_LEASE_DEFAULT_TTL_SECONDS` | `1800` | Initial total lifetime from creation |
+| `CRABBOX_LEASE_DEFAULT_IDLE_TIMEOUT_SECONDS` | `1800` | Initial inactivity window |
+| `CRABBOX_LEASE_MAX_TTL_SECONDS` | `14400` | Ceiling for ordinary TTL and idle timeout |
+| `CRABBOX_LEASE_EXTENSION` | `allow` | `allow` or `deny`: above-default create TTL, explicit extension, and auto-extension |
+| `CRABBOX_LEASE_AUTO_EXTEND` | `allow` | `allow` or `deny`: extension during command execution; also requires extension allowed |
+| `CRABBOX_LEASE_POLICY_OVERRIDES` | unset | JSON with `orgs` and `owners` maps |
+
+Duration settings are positive integer seconds, with an absolute bound of 86400
+seconds. Global durations above that bound are clamped; invalid overrides are
+ignored as one document and log one structured error per coordinator instance.
+Overrides use `defaultTTLSeconds`, `defaultIdleTimeoutSeconds`, `maxTTLSeconds`,
+`extension`, and `autoExtend`, for example:
+
+```json
+{"orgs":{"example-org":{"maxTTLSeconds":7200}},"owners":{"alice@example.com":{"autoExtend":"deny"}}}
+```
+
+Production source declares no lease policy overrides, so every owner uses the
+global defaults. The deploy guard compares the complete live override document
+with source, treating absent bindings and empty groups as equivalent. Differences
+require an explicit one-time replacement acknowledgment. Source must pass runtime
+validation, including during acknowledged repair of shape-valid but invalid live
+policies. Unreadable bindings, invalid document shapes, and API errors always stop
+deployment. See
+[Operations](../operations.md#cloudflare-worker) for the dispatch procedure.
+
+Create requests are clamped rather than rejected, including older clients asking
+for 24h TTL and 5h idle. Denied extension clamps create TTL to the effective
+default, and idle timeout never exceeds the effective TTL. Lease responses
+include `leasePolicy` and a `policyNotice` when clamped; the CLI prints that notice
+once on stderr. Workspace defaults follow the same policy; the provisioning
+minimum is 1800 seconds and matches the global default.
+
+Direct allocation commands also print a policy notice when configuration is
+clamped. Explicit heartbeat and run idle-timeout overrides report the effective
+timeout when it is shortened to fit the lease; the local claim records that
+effective timeout alongside the provider labels.
+
+Policy tightening also applies to live leases on reads, heartbeats, and the
+existing indexed alarm/expiry pass. **Active leases older than 4h expire at the
+next alarm after deploy** with the defaults. Heartbeats at or after expiry cannot
+revive them. No additional full lease-history walk is needed.
+
+Use [crabbox extend](../commands/extend.md) to request a new total TTL or add to it:
+`POST /v1/leases/{id}/extend` accepts exactly one of `ttlSeconds` or
+`extendBySeconds`, and an optional reason of at most 200 characters. Only the
+owner or an authenticated admin can extend. The coordinator caps the result,
+refuses ended or non-advancing leases, and records the last ten explicit
+extensions with timestamp, actor, old/new TTL, and reason. Extension changes total
+lifetime; it does not refresh the idle clock.
+
+Explicit and automatic extensions pass the same budget checks as creation, using
+the lease's recorded hourly estimate and the same cost rounding. The existing
+reservation is replaced atomically with the new TTL, so only additional cost is
+charged. An over-budget explicit request returns 403
+`lease_extension_budget_exceeded` with remaining headroom and changes nothing.
+An over-budget command heartbeat still refreshes activity but skips extension,
+returns a `policyNotice` with the expiry, and emits one structured log line. The
+CLI prints the notice once during the run. No partial extension is applied.
+Policy tightening can shorten expiry but does not release reserved cost.
+Registered external resources keep their renewable registration clock: their
+policy ceiling counts from the last heartbeat rather than resource creation.
+
+The provider lifetime capability `runtimeExtension` reports whether a native
+deadline can move after allocation. AWS, Azure, GCP, Hetzner, and served containers
+allow runtime extension; served agents receive current deadlines through polling.
+Daytona fixes its native deadline at allocation and declares `false`. Such leases
+accept longer TTLs at creation, reject explicit extension with HTTP 409
+`lease_extension_unsupported_provider` and a longer-`--ttl` hint, and silently skip
+auto-extension. Live policy tightening still shortens their coordinator deadline;
+normal expiry then deletes the provider resource.
+
+This policy is separate from the retained-compute maximum-age safety net below;
+`CRABBOX_LEASE_LIFETIME_MODE` is unchanged.
 
 ### Release vs expiry
 
 Both release and expiry call the same provider delete path:
 
-- **Release** (`POST /v1/leases/{id}/release`, e.g. `crabbox stop`) deletes the
-  cloud server when the lease is still active and sets state `released`. The
-  body defaults `delete` to `!keep`.
+- **Release** (`POST /v1/leases/{id}/release`, e.g. `crabbox stop`) records
+  state `released` and queues provider deletion when the lease is still active.
+  The body defaults `delete` to `!keep`; normal release does not synchronously
+  await provider cleanup.
 - **Expiry** is driven by the runtime scheduler. `expireLeases` deletes the
   cloud server for every active lease past `expiresAt`, then sets state
   `expired`.
 
+The cleanup pass schedules claim recovery before starting provider deletion and
+arms transient-failure retries immediately after persisting them. These wakeups
+do not depend on the rest of maintenance reaching its final alarm reconciliation.
+Unresolved provider identity still requires explicit resolution; retries never
+relax ownership checks or convert uncertainty into confirmed deletion.
+
+Release and expiry publish provider-cleanup completion only after the provider
+delete path succeeds and the exact cleanup claim is revalidated. The stored
+record then clears `host`, `tailscale`, `sshHostKey`, and
+`providerAccessExpiresAt`. It retains provider resource IDs, server identity,
+ownership labels, provider scope, network, exposed ports, and `workRoot` for
+orphan recovery, audit, and AWS ingress reconciliation.
+When provisioning has not dispatched, the reservation owner persists explicit
+no-resource evidence before publishing the same completion fact. Missing cloud
+identity without that evidence is a legacy or unresolved state and remains
+unconfirmed.
+
 `keep=true` only suppresses the automatic release when a `run` command exits; it
 does **not** exempt a lease from idle or TTL expiry.
+
+After one release mutation is accepted, an explicit CLI stop observes the lease
+with read-only requests until provider deletion is final or a bounded wait ends.
+The public `cleanupStatus` distinguishes normal pending creation or cleanup from
+an observed failure. Pending work uses that same observation loop and five-minute
+bound; the CLI does not send another release mutation after acceptance. Existing
+cleanup diagnostics remain intact for clients that predate this classification.
+New AWS instance IDs can be temporarily invisible. Cleanup observes visibility
+within the existing bound before verifying allocation ownership; unconfirmed
+visibility or termination retains cleanup debt rather than reporting deletion.
+Managed public AWS release uses the same confirmed termination path as private
+workspaces: `TerminateInstances` must acknowledge the exact instance, followed
+by a terminal `terminated` read or exact `InvalidInstanceID.NotFound`.
+New AWS allocation claims carry the prepared account scope and explicit Region.
+The coordinator persists each selected fallback Region before that regional
+provider path can mutate AWS, so interrupted recovery reads the same Region.
+Historical records missing either value are not upgraded during cleanup.
+Storage failures while publishing or checking an allocation preserve its cleanup
+claim without retrying creation.
+The CLI removes its local per-lease SSH connection directory only after final
+cleanup state, `cleanupCompletedAt`, and hostless public access are observed.
+Pending or retrying cleanup, observation timeout or cancellation, provider
+errors, ownership mismatches, and retained resources keep the local claim and
+credentials available for a safe retry. Acquisition rollback
+and automatic post-run release only queue cleanup and do not wait for provider
+deletion; they preserve local state while cleanup is pending. Local cleanup is
+scoped to `<user-config>/crabbox/testboxes/<lease-id>` and its private short SSH
+socket namespace; it never follows configured or shared SSH key paths. Cleanup
+closes and joins the lease's persistent OpenSSH masters before deleting local
+artifacts. Local failure preserves the confirmed remote outcome and local claim;
+a fresh confirmed-deletion lookup retries only local cleanup, not provider deletion.
+
+For public AWS leases, shared security-group writes remain serialized with release
+state changes and authoritative ingress reconciliation. Image selection, instance
+creation, network readiness and provider deletion do not hold that fence, so a
+slow instance or termination does not block another lease's ingress work. Cleanup
+still waits for its provider result, then reacquires the ingress fence and
+revalidates its exact claim before publishing success or failure. Every regional
+ingress attempt rechecks the creating lease and derives access from current lease
+records before writing.
+
+If a create attempt is canceled or its lease is released during AWS region
+preparation, the in-flight create returns `409 create_canceled` with the reason.
+It does not continue into another region or report an empty provider error.
+Cancellation does not confirm deletion; inspect the lease's cleanup status separately.
 
 ### Cleanup retries
 
@@ -68,18 +316,360 @@ delete is retried automatically. On success the cleanup metadata is cleared and
 the state becomes `expired`. You can inspect stuck cleanups with `crabbox admin
 lease-audit`.
 
+### Brokered native checkpoint retention
+
+New brokered native AWS, Azure, and GCP checkpoints have their own durable
+lifecycle, independent of the source lease. Retention is manual unless the
+owner explicitly requests `checkpoint create --expire-unused-after <duration>`
+or changes `checkpoint policy`. Coordinator alarms read a bounded, sorted due
+index and expire only those explicitly opted-in records; generic provider
+inventory, old image records, local files, and checkpoint-like names never
+grant cleanup ownership.
+
+Active renewable fork/shard use claims and AWS/Azure promotion pins prevent
+deletion. Manual and automatic deletion share the same generation-fenced
+provider cleanup: AWS confirms the exact AMI and every owned EBS snapshot are
+gone, Azure confirms its exact canonical managed snapshot, and GCP confirms
+its exact project-scoped machine image or disk snapshot. Ambiguous or failed
+provider calls retain ownership and retry with capped backoff; a durable
+provider-deleted phase makes final metadata cleanup restart-safe. Checkpoint
+admission charges creating, ready, failed, and deletion-pending records until
+deletion is confirmed; deleted audit tombstones no longer consume capacity.
+Expired available fork claims can be replaced, but provisioning claims remain
+charged until exact lifecycle reconciliation. Each checkpoint retains only its
+256 most recent ordered audit events, and eventual tombstone pruning removes
+that entire retained suffix. Direct, archive, recipe, and historical checkpoints
+remain operator-managed.
+### Brokered Hetzner cleanup confirmation
+
+The coordinator records version-1 `providerCleanup` evidence on the existing
+lease before dispatching an exact-server DELETE. It saves the validated delete
+action ID before waiting on `/servers/actions/{id}`. Completion requires action
+success followed by exact `/servers/{id}` GET absence. Hetzner can remove the
+server from account visibility while deletion is still running; GET 404 alone
+does not complete a known action. Observation is bounded to 60 seconds per
+attempt, with each request and body read bounded to 10 seconds or the remaining
+observation budget.
+
+An exact DELETE rejection with HTTP 400, 401, 403, 405, 409, 410, 412, 423, or
+429 retires only that rejected attempt's dispatch marker under the cleanup
+owner fence. These statuses describe rejected requests in Hetzner's
+[error contract](https://docs.hetzner.cloud/cloud.spec.json). The rejection
+remains a cleanup failure and uses the existing broker backoff. The next attempt
+freshly reads the exact server and revalidates ownership, then durably records
+a new dispatch before DELETE. A failed rejection write retains uncertainty.
+HTTP 408, 422 (which also covers service errors), 5xx, timeouts, malformed
+actions, and lost acknowledgements never authorize retiring that marker.
+
+An exact server already missing before any recorded dispatch has the distinct
+`already-absent` basis. DELETE 404 requires a subsequent exact GET 404 and has
+its own basis. Neither can replace an unresolved action or lost acknowledgement.
+Action errors, malformed or missing actions, uncertain dispatches, conflicting
+identity or ownership, and exhausted waits retain cleanup debt. An unknown
+numeric server identity is unresolved unless the recorded failure proves that
+only a newly created owned SSH key needs cleanup; an empty inventory is not
+deletion proof.
+Modern ownership requires canonical lease, provider, slug, and owner labels.
+The supported pre-slug contract still requires the canonical server name and
+legacy labels, and rejects an explicitly conflicting owner label.
+
+Evidence writes and final publication are fenced to the same cleanup claim,
+lease incarnation, and resource identity. Retries resume recorded actions without
+another DELETE. For provisioned servers, owned SSH-key cleanup follows durable
+server confirmation; key failures retain that evidence for retry, and shared
+keys remain retained.
+Definite key-only failure records retain `provisioningResourceMayExist=false`
+and the exact owned-created key ID, with no server identity, server cleanup
+journal, or outstanding provisioning request. Cleanup rechecks the current
+claim before deleting that key and creates no server-absence receipt. Explicit
+no-delete retention preserves this evidence for later deletion. Historical
+records that lost the definite no-resource flag require resolution; absence of
+request markers alone cannot authorize the key-only path.
+Ordinary authenticated GET and `crabbox inspect --json` expose the nonsecret
+journal. Its confirmation timestamp records the provider API contract observed
+then, not physical hardware inspection or a fresh probe. `cleanupStatus` still
+governs finality. Historical released leases without evidence are not passively
+backfilled.
+
+For recovery, the ordinary owner should inspect the exact lease with
+`crabbox inspect --id <lease-id> --json` and retain local credentials and recorded
+evidence. Historical host fields, `released` state, or missing flags do not prove
+absence. An explicit stop of a historical managed lease with stored provider
+identity re-enters the same exact-owner cleanup path and establishes
+`cleanupCompletedAt` only after provider deletion succeeds. A recorded action
+with a known ID resumes through the same lease owner and broker cleanup path.
+Missing no-resource evidence or dispatch acknowledgement authority requires
+operator reconciliation of the exact resource in its original provider project.
+Never manually clear cleanup flags or fabricate a receipt. There is no supported
+automatic population sweep.
+
+### Managed Daytona cleanup
+
+New brokered Daytona sandboxes receive native wall-clock TTL in the original
+allocation request: the requested lease TTL rounded up to whole minutes, with a
+one-minute minimum. This clock starts at provider creation, not coordinator
+reservation, and applies even when the sandbox is kept or explicitly retained.
+Its provider lifetime capability declares `runtimeExtension: false`: explicit
+extension is unsupported and command heartbeats never extend it. Request a longer
+`--ttl` at creation, subject to coordinator policy. The clamped TTL is sent to
+Daytona before allocation. A TTL-capable Daytona API is required; Crabbox never
+retries allocation without TTL. Before publishing access, a ready sandbox must
+report a future native destruction deadline no later than one requested TTL from
+the start of readiness observation. This bound does not move during polling or
+assume that the provider's creation and TTL timestamps share an exact clock tick.
+An API that silently ignores TTL is not accepted as ready. Organization, region,
+and sandbox-class lifespan limits still apply. This is a provider lifetime
+contract, not a teardown-latency SLA during provider failures.
+
+Before dispatch, the lease stores a nonsecret fingerprint of the normalized API
+URL, configured organization, and credential context. A returned sandbox UUID is
+recorded before readiness waits. Cleanup uses that exact UUID and original
+context, verifies current ownership before mutation, and observes a terminal
+provider state or exact-resource absence before reporting completion. Accepted
+DELETE requests alone are not completion.
+
+If no authoritative UUID arrives, cleanup remains explicitly unresolved. The
+coordinator preserves its original dispatch evidence, `failureError`, and
+`cleanupError`; it neither adopts name/label matches nor declares deletion after
+an empty inventory read or elapsed TTL. It does not repeatedly schedule a lookup
+that cannot establish identity. Inspect these records with `crabbox admin
+lease-audit` and resolve the resource in its original provider account. A release
+acknowledgment does not clear this responsibility.
+
+Missing historical scope or a changed API URL, organization, or API key blocks
+automatic cleanup and access refresh rather than adopting the current context.
+This deliberately includes same-organization key rotation: the fingerprint
+proves identical credential context, not upstream account continuity. Finish
+known-ID cleanup before rotating credentials, or restore the original context
+and repeat explicit stop. Legacy records without scope require operator
+resolution; never backfill them from current configuration.
+
+### Maximum-age safety net for retained compute
+
+The coordinator can cap newly admitted resources that would otherwise remain
+running after a retained release. This uses its existing alarm/cron, not a
+separate cleanup service. It does not replace the shorter ordinary idle/TTL
+expiry or explicit `crabbox stop` deletion contract described above. If ordinary
+TTL expiry is already due, it deletes the resource without adding lifetime disk
+retention. An explicit delete during an in-flight lifetime readiness or stop
+check returns `409 cleanup_in_progress`; retry after that operation finishes.
+It is not acknowledged as a queued deletion.
+
+Production defaults to `CRABBOX_LEASE_LIFETIME_MODE=off`. To enroll a default
+cohort, set `CRABBOX_LEASE_LIFETIME_MODE=report` first. Each new managed lease snapshots
+its mode, creation-time deadline and storage retention. Inspect `lifetimePolicy`
+on the lease API and CLI `status`, `inspect`, and `list` (human and JSON):
+`effectiveStopAt` includes any extension; `deleteAfterAt` is the actual deletion
+deadline once stopped, and `status`, `readiness`, and `warnings` expose progress.
+The coordinator logs
+one warning an hour before the deadline (or on its first overdue observation).
+Warnings are logs/API state, not email or messaging notifications.
+
+After qualifying report-only results, `CRABBOX_LEASE_LIFETIME_MODE=enforce`
+enrolls **subsequent creates** for enforcement. Previously report-only leases
+stay report-only; legacy records and registered external resources are never
+automatically enrolled. Setting the runtime mode back to `report` or `off`
+suppresses new default-cohort safety-net mutations; it does not cancel already-dispatched
+provider work or the existing ordinary TTL/cleanup paths.
+
+For a bounded rollout without enrolling other users, an **admin-authenticated**
+create can send `lifetimePolicy: {"mode":"enforce","maxAgeSeconds":360,"retainSeconds":300}`.
+Both durations must be integer seconds in the same 60-second–31-day range.
+The persisted `source: "admin-canary"` marker identifies these leases. Their
+policy remains enforced with global mode `off` or `report`; changing the global
+mode is not a canary kill switch. Non-admin enrollment is rejected by the server.
+Only new, on-demand AWS Linux/Windows EBS-root leases are eligible; fixed-ID
+replay preserves the policy and rejects a changed enrollment intent.
+
+```sh
+CRABBOX_AWS_REGION=eu-west-1 crabbox warmup --provider aws --class tiny --type t3.small \
+  --market on-demand --keep --ttl 45m --idle-timeout 10m \
+  --lifetime-canary 6m --lifetime-retention 5m
+crabbox admin lifetime-readback --id cbx_abcdef123456 --json
+```
+
+The first enforcement check verifies the exact owned instance and root disk,
+then calls `StopInstances` with `DryRun=true`. Only AWS `DryRunOperation` proves
+permission; denied or unproved readiness leaves compute untouched and records
+`status: failed`, `readiness.status: failed`, and an owner-visible warning.
+The coordinator retries rather than silently bypassing the policy. Install
+`ec2:StopInstances` with the same account, Region, and ownership-tag restrictions
+as termination, plus Region-scoped `ec2:DescribeVolumes`. Generate the scoped
+policy with `crabbox admin providers policy --provider aws --region eu-west-1`.
+No existing production principal's permission is assumed.
+
+After deployment, the operator can run `scripts/live-lease-lifetime-canary.sh`
+with `CRABBOX_LIVE_CONFIRM=lifetime-canary`, `CRABBOX_COORDINATOR`, and their admin
+configuration. It compares a short-lived canary with an unenrolled kept control,
+uses coordinator-owned AWS readbacks for stopped compute and root-disk presence
+then termination and absence, and cleans up both leases. It allows 35 minutes
+for proof, followed by an independent 11-minute cleanup budget (46 minutes
+combined). Both leases use a 45-minute TTL so ordinary expiry does not pre-empt
+the proof. Merging relevant Worker changes to `main` automatically deploys the
+coordinator through `.github/workflows/coordinator-deploy.yml`; it does not run
+this live canary or enable lifetime enrollment.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `CRABBOX_LEASE_LIFETIME_MODE` | `off` | `off`, `report`, or `enforce` |
+| `CRABBOX_BATCH_MAX_AGE_SECONDS` | `86400` | Creation-time cap for ordinary batch/CI leases |
+| `CRABBOX_INTERACTIVE_MAX_AGE_SECONDS` | `604800` | Cap for coordinator workspaces, desktop, and code leases |
+| `CRABBOX_STOPPED_RETENTION_SECONDS` | `604800` | Root-disk retention after the first confirmed stop |
+
+Duration settings accept integer seconds from 60 through 2678400 (31 days).
+`keep`, heartbeat activity, provider restart, and config changes cannot reset a
+persisted deadline. A plain CLI lease without workspace/desktop/code admission
+uses the batch cap even if an operator later attaches interactively.
+
+An authenticated admin can grant a bounded exception with
+`POST /v1/admin/leases/{id}/extend-lifetime` and JSON
+`{"owner":"alice@example.com","reason":"finish debugging","expiresAt":"2026-11-01T12:00:00Z"}` (use a future
+time within seven days of the request). The API records the responsible owner,
+authenticated grantor,
+reason, grant time, and expiry; it refuses non-advancing deadlines and extensions
+after stopping begins. This extends only the safety-net deadline, **not** the
+ordinary idle/TTL deadline. It cannot revive a stopped lease.
+
+Use `crabbox admin extend-lifetime --id cbx_abcdef123456 --owner alice@example.com
+--reason 'finish debugging' --expires-at <RFC3339>`. A failed or uncertain stop
+still blocks extensions once stop intent is durable. There is no post-stop disk
+retention extension or salvage hold. Copy needed files out before the stop
+deadline. Owners receive a distinct `DELETION:` warning before permanent root
+disk deletion; neither `keep` nor active sessions veto that deletion.
+
+Initial enforcement supports coordinator-owned, on-demand AWS Linux/Windows
+instances with exactly one owned EBS root disk, delete-on-termination enabled,
+and no instance-store storage. It requires the persisted account and Region,
+exact instance ownership, and matching disk identity/attachment. Other providers,
+Mac dedicated hosts, Spot instances, extra disks, image-qualification transports,
+and unresolved provisioning remain unsupported or failed with diagnostics. They
+are not silently terminated by this safety net. This is not a fleet-wide spend
+cap, and direct CLI allocations are outside this coordinator policy.
+
+Before stopping, the coordinator durably records the root disk identity and
+retained-release intent, then rechecks the cleanup owner immediately before
+`StopInstances`. Acceptance is not confirmation: retention starts only after an
+owned read observes `stopped`. The original disk deadline survives retries and
+manual restarts; subsequent observations stop restarted compute again. After
+retention expires, existing owned deletion verifies unchanged disk topology and
+instance termination, then separately confirms the root disk is absent. Stop
+never publishes `cleanupCompletedAt`. Errors retain retryable responsibility
+and do not publish deletion success.
+
+Stopping preserves that EBS workspace, not running processes or RAM. Storage
+continues billing during retention. Mac dedicated-host billing requires a
+separate host-release lifecycle and is deliberately not represented as stopped
+compute savings. Relevant Worker changes merged to `main` automatically deploy
+through `.github/workflows/coordinator-deploy.yml`. Deployment does not enable
+lifetime enforcement or enroll historical leases.
+
 ### AWS orphan sweep
 
-Independent of per-lease expiry, the Worker can sweep AWS resources that no
-longer map to an active lease — terminating untracked Crabbox instances and
-releasing idle Mac dedicated hosts. It runs from the same alarm/cron, in report
-or delete mode, gated by `CRABBOX_AWS_ORPHAN_SWEEP_*` environment variables.
+Independent of per-lease expiry, the Worker can report AWS resources that no
+longer map to an active lease. Delete mode terminates instances or releases idle
+Mac dedicated hosts only when retained coordinator state binds the exact
+resource; tag-only and legacy candidates stay report-only. It runs from the same
+alarm/cron, gated by `CRABBOX_AWS_ORPHAN_SWEEP_*` environment variables.
+
+### Azure orphan sweep
+
+The coordinator's Azure sweep uses a reconciliation-specific inventory of the
+configured resource group across canonical per-lease VMs, NICs, public IPs, and
+managed OS disks. The ordinary VM list/pool path remains VM-only. The sweep can
+group a complete exact-owned NIC, public IP, and managed-disk set even when an
+interrupted provisioning attempt left no VM.
+
+An exact group must retain consistent Crabbox ownership tags, location,
+canonical topology, and stable Azure resource identities. Mixed or incomplete
+groups remain report-only. VMs with any data disk are also report-only because
+VM deletion can cascade through data-disk delete options. VM managed-disk,
+VM-to-NIC, and NIC-to-public-IP cascade-delete options are likewise rejected and
+fingerprinted. A change to the member set, ownership labels, location, topology,
+or stable identity changes the reconciliation fingerprint and resets the grace
+quarantine. Ordinary release still supports a verified VM/NIC/public-IP set
+whose OS disk is explicitly ephemeral (`diffDiskSettings.option=Local`); the
+managed-disk orphan sweep keeps that non-managed shape report-only.
+
+Delete mode releases only a group bound to an exact retained coordinator lease
+after the same complete resource identity has survived the grace period and two
+successful authoritative inventories. The normal owned-resource delete path
+performs a fresh preflight before each deletion. Shared VNets, subnets, NSGs,
+and resource groups are not part of the inventory or deletion path. With all
+four Azure broker credentials configured, the sweep is enabled unless
+`CRABBOX_AZURE_ORPHAN_SWEEP_ENABLED=0`; set
+`CRABBOX_AZURE_ORPHAN_SWEEP_DELETE=1` to allow deletion. Its interval and grace
+default to 3600 and 900 seconds and are controlled by
+`CRABBOX_AZURE_ORPHAN_SWEEP_INTERVAL_SECONDS` and
+`CRABBOX_AZURE_ORPHAN_SWEEP_GRACE_SECONDS`.
+
+Durable owned-delete claims persist each successful member deletion with that
+member's stable resource identity before cleanup advances. A missing member is
+accepted on retry only when the same claim contains that exact ordered progress;
+an external disappearance or failed progress write stops the remaining cleanup.
+Progress updates transactionally merge the longest verified prefix so concurrent
+cleanup attempts cannot overwrite newer evidence. Fresh preflight also compares
+the quarantined ownership labels, including `keep` and expiry, on every survivor.
+New cleanup starts with a transactional version-2 preparing reservation, then
+binds the complete inspected identity before the first deletion. Every later
+claim transition and completed-claim clear is transactional, so a delayed
+preparation, replacement, or empty-set observer cannot overwrite or erase newer
+progress. Older workers reject version-2 claims rather than replaying them with
+version-1 semantics. Legacy version-1 claims still
+replay through the same scope and topology checks, but a
+legacy partial claim with an unexplained missing member fails closed because it
+cannot prove which cleanup deleted that member. A legacy claim can establish a
+new stable baseline only while the VM, NIC, public IP, and managed disk are all
+still present; an already-empty legacy claim can be cleared without mutation.
+
+Automatic cleanup does not relax that rule. For the specific expired, disk-only
+case with recorded VM/NIC deletion and an absent public IP, an owner or admin may
+use [audited cleanup recovery](../commands/inspect.md#audited-azure-cleanup-recovery)
+to explicitly accept original-scope public-IP absence. The resulting version-3
+claim retains its original baseline and actual DELETE receipts, records the
+operator acknowledgement separately, and requires the exact original owned disk
+to remain detached. Older workers reject this claim version. Normal release
+rechecks survivors before deleting the disk; it does not infer a historical
+public-IP DELETE receipt, and its separate audit survives claim cleanup.
+
+Azure polling distinguishes `Azure-AsyncOperation` status documents from
+`Location` completion responses. Location HTTP 202 remains pending; terminal
+200/204 completes only without an explicit pending/failure state. An empty
+Azure-AsyncOperation response never establishes success.
 
 ## Direct-provider lifecycle
 
 Without a coordinator, the CLI talks to the provider API directly and owns
 cleanup itself. Releasing a direct lease (`crabbox stop` / `crabbox release`)
 deletes the backing machine immediately.
+
+OpenSandbox, Vercel Sandbox, Crownest, and SuperServe honor cancellation while
+their explicit forget-missing cleanup waits to retire a local claim, releasing
+the provider operation lock and preserving that claim. Each adapter's existing
+missing-or-inaccessible classification and forget-missing opt-in remain in force;
+this is not stronger evidence of remote deletion. After a successful provider
+delete, claim retirement still completes despite caller cancellation.
+
+Ordinary direct AWS, Azure, GCP, and Hetzner acquisition can retry a bootstrap
+timeout with a fresh lease. If rollback reports a cleanup failure, acquisition
+stops instead: the original failure and cleanup diagnostics remain available,
+and no second allocation is attempted. This consumes each adapter's existing
+cleanup result; it does not give all providers the same deletion-confirmation
+guarantee. AWS termination acceptance and Hetzner DELETE success still differ
+from GCP operation completion and Azure's dependent-resource absence checks.
+GCP also stops retrying if its selected-scope cleanup client cannot be rebuilt,
+even if the existing best-effort fallback client returns success. That fallback
+does not establish that the selected project and zone were cleaned.
+
+RunPod and Hetzner bind readiness to the immutable resource ID and expected name
+returned or requested at creation, before using the SSH endpoint. Hetzner also
+checks the new allocation's lease, provider ownership, slug, and selected-key
+labels. A contradictory readiness response cannot replace the original rollback
+target or its key labels. If the creation response itself cannot be bound to the
+request, Hetzner refuses to delete the returned server and reports the unresolved
+allocation; only an independently created attempt key can be cleaned up. These
+checks do not establish generation-fenced deletion for providers addressed by
+reusable names. Existing provider-specific failed-acquisition keep and cleanup
+policies remain unchanged.
 
 `crabbox cleanup` (alias `crabbox machine cleanup`) sweeps expired
 direct-provider machines and stale local state. It refuses to run when a
@@ -95,42 +685,89 @@ Use `--dry-run` to print what would be deleted without touching anything. The
 sweep is conservative; for each candidate machine `shouldCleanupServer`
 (`internal/cli/pool.go`) decides from the machine's Crabbox labels:
 
-- skip machines with no labels, or labeled `keep=true`;
-- `running` / `provisioning`: delete only when stale — past `expires_at` plus a
-  12-hour safety window;
-- `leased` / `ready` / `active`: delete once past `expires_at`;
-- `failed` / `released` / `expired`: delete;
-- otherwise: delete once past `expires_at`, skip if `expires_at` is missing or
-  still in the future.
+- skip machines unless `crabbox=true`; unrelated or unlabeled machines are never reclaimed;
+- `running` / `provisioning`: reclaim only after `expires_at` plus **1 hour**;
+- `leased` / `ready` / `active`: reclaim after `expires_at`;
+- `failed` / `released` / `expired`: reclaim immediately;
+- other states: reclaim only after a valid expiry; missing or invalid expiry is left alone.
 
-For this to work, every direct-provider machine must carry Crabbox labels/tags
-(at least `crabbox`, `state`, and `expires_at`) so the sweep can identify owned
-resources without touching unrelated infrastructure.
+`keep=true` only suppresses automatic release after `run`. It does **not**
+exempt a direct lease from expiry, matching brokered leases. This changes the
+old direct sweep behavior, which skipped kept leases and allowed a 12-hour
+running/provisioning grace. Cleanup retains its legacy `ttl` expiry-label
+fallback. New bootstraps use `expires_at` (Unix seconds).
 
-### GCP guest-side expiry guard
+### Guest-side expiry guard
 
-A direct GCP lease can outlive the local CLI that created it — if `cleanup`
-never runs, the VM would leak. To guard against this, direct GCP leases install
-a self-deleting guard (`cloudInitGCPExpiryGuardFiles` in
-`internal/cli/bootstrap.go`): a systemd timer runs every 2 minutes, reads the
-instance's own labels via the GCP metadata server, and deletes the instance when
-it is clearly expired. It applies the same conservative logic as the CLI sweep:
+Direct Linux VMs on the shared cloud-init path install one root-owned script,
+`/usr/local/sbin/crabbox-expiry-guard`, and a systemd service/timer. The timer
+runs every two minutes, beginning two minutes after boot, before optional
+bootstrap work completes. It uses the same decision cases as the CLI sweep;
+tests execute these cases through both Go and the shell guard. No provider
+credentials are stored in guard files. Missing, ambiguous, or unavailable
+ownership metadata fails closed. Expiry-based decisions require a valid deadline;
+terminal `failed` / `released` / `expired` states remain immediately reclaimable.
 
-- exits unless `crabbox=true` and `keep != true`;
-- `failed` / `released` / `expired`: delete;
-- `running` / `provisioning`: delete only past `expires_at` plus 12 hours;
-- `leased` / `ready` / `active` (and unlabeled state): delete once past
-  `expires_at`.
+| Direct Linux provider | Deadline source | Reclaim action |
+| --- | --- | --- |
+| GCP | Current labels fetched through the metadata server's service-account token and Compute API (existing mechanism) | Delete this VM through the Compute API |
+| AWS | Instance tags via IMDSv2; new direct Linux launches enable instance metadata tags | Power off; `InstanceInitiatedShutdownBehavior=terminate` terminates the instance |
+| Azure | IMDS `compute/tagsList` | `systemctl poweroff` |
+| Hetzner | Root-owned `/etc/crabbox/lease-expiry` | `systemctl poweroff` |
+| DigitalOcean, Vultr, Linode | Root-owned `/etc/crabbox/lease-expiry` | `systemctl poweroff` |
+| OVHcloud, Scaleway, Nebius, Lambda, Tencent Cloud | Root-owned `/etc/crabbox/lease-expiry` | `systemctl poweroff` |
+| Incus, Multipass, Firecracker | Root-owned `/etc/crabbox/lease-expiry` | `systemctl poweroff` |
 
-So an expired GCP box can reclaim itself even if the operator's machine is gone.
+Powering off stops the workload; it does **not** guarantee that billing stops.
+Providers that bill stopped machines, including Hetzner, still require
+`crabbox cleanup` to delete them. Azure guest shutdown does not deallocate its
+VM. Provider disks and other retained resources can also remain billable.
+GCP retains its existing self-delete permissions requirement.
+
+File-backed bootstraps write exactly four nonsecret fields: `crabbox`, `state`,
+`keep`, and `expires_at`. `RefreshGuestLeaseExpiry(ctx, target, fields)` in
+`internal/cli/guest_expiry.go`
+is the hook for a file-backed provider's lease-lifetime update: it validates the
+fields and writes mode 0600 through the existing SSH transport, publishing by
+atomic rename in `/etc/crabbox`. Ordinary CLI state touches and heartbeats refresh this file as well as provider
+labels. The [extend command](../commands/extend.md) saves provider labels and the local
+claim before calling this hook. If SSH refresh fails, it retains the provider
+extension, exits nonzero with both deadlines, and records a pending refresh in
+the local claim. Rerunning the same extension retries only the guest write.
+Other deadline updates must use this hook as well.
+
+Brokered leases never install this guard; the coordinator owns their lifecycle.
+Windows and macOS targets do not install it. Providers using prepared templates,
+custom bootstrap, hosted sandboxes, delegated execution, or static hosts rather
+than the shared cloud-init path also do not install it. The explicit uncovered
+provider list is in [Providers](providers.md#direct-lease-expiry-coverage).
 
 ## Claims and `--reclaim`
 
 Independent of provider cleanup, the CLI keeps a local **claim** file per lease
 so repo-local wrappers do not need their own ledger. Commands that reuse a lease
 validate that the current repo matches the claim; deleting a lease removes its
-claim. Move a claim to a different repo deliberately with `--reclaim`. See
+claim, except provider-owned fixed terminal receipts that prevent ID reuse.
+Move a claim to a different repo deliberately with `--reclaim`. See
 [Identifiers](identifiers.md) for the claim file format and location.
+
+Providers may durably publish an exact-resource claim with the generic
+`state=provisioning` label before post-create readiness completes. Such a claim
+is recovery authority, not proof that the lease is ready: inventory and status
+must keep it non-ready until a fenced claim update records `state=ready`.
+Provider adapters own the immutable resource identity and routing scope needed
+to inspect or delete that pending resource. Cleanup must compare the unchanged
+claim under its lifecycle fence before mutation so an old readiness or cleanup
+attempt cannot overwrite or delete a newer claim.
+
+Runtime-adapter confirmed-absence cleanup normally removes the matching local
+claim after coordinator deregistration. A provider can instead validate and retain
+a fixed terminal receipt through the explicit terminal-receipt capability. Core
+requires the full expected lease, attempt, slug, resource and scope, checks the
+unchanged receipt under its durable claim lock before and after deregistration,
+and preserves its bytes and revision. A terminal-looking label alone is not
+completion evidence; missing required receipts and unsupported fixed claim kinds
+fail closed.
 
 ## Related docs
 
@@ -140,3 +777,158 @@ claim. Move a claim to a different repo deliberately with `--reclaim`. See
 - [inspect command](../commands/inspect.md)
 - [Identifiers](identifiers.md)
 - [Security](../security.md)
+
+### Direct Azure acquisition identity
+
+After successful VM creation, direct Azure acquisition binds the returned native
+VM ID to the requested VM name and ownership tags. A final readiness observation
+must retain that binding before bootstrap, ready tagging, or claim publication.
+An incomplete creation result or changed readiness identity reports unresolved
+cleanup and withholds VM deletion; a later matching read does not erase the
+contradiction.
+
+Ordinary failures after a valid creation use the same prepared owned-cleanup
+operations as release: re-read the original VM, capture companion identities,
+revalidate them, delete the VM first, then its surviving companions. Refusal or
+cleanup failure preserves the original acquisition error and prevents a fresh
+bootstrap retry. This in-process rollback has no persisted recovery claim and
+does not provide crash-resumable companion cleanup.
+
+Fixed-ID Azure preparation additionally persists the genuine companion snapshot
+in the exact claim under its acquisition fence before access waits and ready
+publication. The snapshot stays local; it is not published in VM tags. Replay
+checks the original companion identities, and release projects that retained
+binding into the ordinary owned deletion path, including when only the VM has
+subsequently disappeared. The deletion journal, not the presence of a preparation
+snapshot, records cleanup admission. Automatic cleanup validates the original
+binding and durably journals deletion before sending DELETEs. Initial admission
+requires a live VM during preparation; only already-admitted recovery accepts
+VM absence. The first full snapshot must also match any network identities
+recorded before VM creation. Lease touches omit these private bindings from
+Azure tags without discarding the local record. After VM loss cleanup
+resumes only admitted cleanup, not preparation snapshots, even if the lease has
+expired; use an explicit stop or hold for those resources. Both stop and automatic
+cleanup verify all companion slots are absent before publishing completion.
+NIC, public-IP, and quarantine-NSG cleanup also requires the original provider-key
+and fixed-attempt tags; changed or missing claim tags block every deletion even
+when the companion's immutable identity still matches.
+A failed or incomplete capture leaves the claim unresolved and cannot publish
+readiness. Legacy claims with no snapshot
+still require all exact resources absent; surviving companions are not adopted
+after VM loss.
+
+These are observed-identity checks, not an atomic generation-conditional Azure
+DELETE. Inner create-failure rollback and Windows setup performed during create,
+intermediate hidden readiness polls, and replacement races after the final
+validation remain separate boundaries. This does not change GCP cleanup or
+make name-addressed resources equivalent to immutable-ID deletion targets.
+
+### Retained record reconciliation
+
+The existing maintenance alarm and scheduled trigger continuously reconcile terminal
+members of `lease-current:`. There is no history scan or new service. A persisted
+cursor resumes across passes and runtime restarts; an unready current index delays
+reconciliation without falling back to `lease:`. Passes run only when due, using
+the persisted last-pass time, and share the provider-maintenance lock with orphan
+sweeps. Unexpected failures log one structured `coordinator.retained_reconcile`
+error and record `pass_failed` when storage is available; they never prevent alarm
+re-arming. Ordinary maintenance runs first;
+provider reads run outside the lifecycle mutex and discovery leaves the storage
+input gate open. Each pass hydrates at most 200 current-index entries and has a
+separate AWS request budget. AWS batches exact instance IDs by recorded account
+and Region using `instance-id` filters in chunks of at most 200 unique IDs.
+Missing IDs require no individual fallback reads. A paginated response is
+rejected rather than treating IDs omitted from its first page as absent or
+exceeding the reserved request budget. Each chunk and companion read consumes
+the shared AWS request budget. Connection/network failures, request deadlines,
+and AWS throttling discard that chunk's observations while preserving successful
+chunks and allowing other regional groups to proceed. The failed pass backs off
+once, honoring the longest Retry-After; authorization and identity failures remain
+fail-closed.
+Budget exhaustion resumes at the first unprocessed entry.
+
+Confirmation currently supports **AWS only**. Every observation verifies the
+recorded account through STS using one fixed credential snapshot. Missing or
+malformed original account/Region, uncertain provisioning, pending cleanup owners,
+unresolved provider actions, registered resources, and Mac dedicated-host leases
+remain unresolved. Historical scope is never inferred from current credentials.
+Dedicated hosts retain their separate ownership and billing lifecycle.
+
+A complete observation requires the exact instance to be absent or `terminated`
+(`shutting-down` is not complete), the original retained root volume to pass the
+ordinary release verifier when recorded, and any canonical lease-owned SSH key
+to be absent. Shared keys are retained as in ordinary release. Present companion
+resources leave the record unresolved; the default confirmation path deletes
+nothing. The first observation is timestamped after its provider checks; the confirming
+pass must start at least ten minutes later. Two complete observations, bound to the same
+lease record and credential fingerprint, are required before publishing the
+ordinary cleanup-completion fact through the lease-record write funnel. Publication
+scrubs the same remote-access fields as release/expiry and removes current-index
+membership. `cleanupConfirmedBy: retained-reconcile` and first/last observation
+timestamps remain on the historical record. A present instance interrupts the
+absence sequence; errors never count as absence. Changed credential fingerprints
+remain unresolved, including credential rotation between observations.
+
+With deletion explicitly enabled, an exact present AWS instance can enter the
+ordinary owned-delete path only after the terminal grace period, exact ownership
+label validation, a current-lease reread, and proof it has no live lease binding. At most one owned deletion runs per pass,
+with a separate 20-second provider deadline.
+The bounded live-binding scan defers deletion if the maintenance index is unready
+or exceeds 200 entries. Existing cleanup ownership is revalidated before provider
+mutation. Deletion does not itself publish completion: fresh complete observations
+must still satisfy the two-pass interval. Interrupted deletion retains a durable
+claim and resumes observation after its five-minute claim deadline. Provider
+errors back off, honoring `Retry-After`; logs do not include provider error bodies
+or credentials.
+
+Azure, Hetzner, GCP, Daytona and other providers are **classification-only**: this
+reconciler performs no provider calls or lease mutations for them. Counters include
+`missing_identity`, `missing_original_scope`, `unresolved_action`,
+`no_scoped_exact_read`, `dedicated_host`, and `unresolved_key`. Azure needs direct
+recorded-scope VM/NIC/public-IP/disk reads; Hetzner needs original project/credential
+evidence and its action journal; GCP needs immutable instance/project/zone checks;
+Daytona needs its original API/organization/credential context. Historical records
+without original scope remain unresolved unless eligible for the explicit legacy
+AWS attestation below; current credentials never supply missing historical scope.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `CRABBOX_RETAINED_RECONCILE` | `on` | `on` confirms complete AWS cleanup; `report` observes and logs without lease mutations; `off` disables passes. Unknown values disable it. |
+| `CRABBOX_RETAINED_RECONCILE_INTERVAL_SECONDS` | `120` | Minimum interval between pass starts, including recorded failures, integer 60–86400. A due pass runs on the next alarm or scheduled maintenance trigger. |
+| `CRABBOX_RETAINED_RECONCILE_DELETE` | `0` | Only exact `1` allows AWS owned deletion in `on` mode. |
+| `CRABBOX_RETAINED_RECONCILE_GRACE_SECONDS` | `3600` | Terminal age before deletion, integer 60–31536000. |
+| `CRABBOX_RETAINED_RECONCILE_BUDGET` | `200` | Maximum current-index entries hydrated per pass, integer 1–200. |
+| `CRABBOX_RETAINED_RECONCILE_LOOKUP_BUDGET` | `64` | AWS lookups per pass, including STS, exact-instance batches/fallbacks and companion reads, integer 5–256. |
+| `CRABBOX_RETAINED_RECONCILE_AWS_LEGACY_ACCOUNT` | unset | Operator-attested AWS account for eligible legacy records; exactly 12 digits. Invalid values are treated as unset and logged once per runtime, without the value. |
+
+Invalid numeric settings use their defaults. Use
+`crabbox admin retained-reconcile --json` to inspect cumulative outcomes, cursor
+progress and backoff. The first rollout processes the roughly 9,000 retained AWS
+records over repeated bounded passes; only records meeting all evidence
+requirements leave the current index. Deletion remains off until explicitly enabled.
+
+#### Attested legacy AWS scope
+
+An operator who has independently established the original AWS account may set
+`CRABBOX_RETAINED_RECONCILE_AWS_LEGACY_ACCOUNT` in coordinator runtime configuration.
+This permits reconciliation of AWS records created strictly before
+`2026-09-13T00:00:00Z`, the cutover following scope persistence in commit
+`1efb91002`. The account is not inferred from current credentials or stored in
+repository configuration. Admin status exposes `awsLegacyAccountConfigured` as a
+boolean and counts eligible records as `legacy_scope_attested`.
+
+Only records with an absent `providerScope`, a valid recorded AWS Region and an
+instance ID are eligible. Present scopes, including empty or malformed values,
+are never overridden; records at or after the cutover remain unresolved. All
+other ownership, action, dedicated-host, retained-identity and key checks still
+apply. STS must match the attested account, and the same fixed credentials,
+exact-ID reads, companion-resource checks and two observations at least ten
+minutes apart are required. The attested scope is persisted only together with
+cleanup completion through the lease-record write funnel, with
+`cleanupConfirmedBy: retained-reconcile-legacy-attested`.
+
+Attested records never enter the deletion path, even with
+`CRABBOX_RETAINED_RECONCILE_DELETE=1`; existing resources are reported as `present`.
+A wrong attestation can only incorrectly mark audit records as cleaned up; it
+cannot delete provider resources. Verify the historical account before enabling
+the setting.

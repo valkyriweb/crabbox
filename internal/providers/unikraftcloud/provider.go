@@ -1,0 +1,39 @@
+package unikraftcloud
+
+import (
+	"flag"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func init() {
+	core.RegisterProvider(Provider{})
+}
+
+type Provider struct{}
+
+func (Provider) Spec() core.ProviderSpec {
+	return core.ProviderSpec{
+		Aliases:          []string{"unikraftcloud", "ukc"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIKey),
+		Name:             providerName,
+		Family:           "unikraft-cloud",
+		Kind:             core.ProviderKindServiceControl,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureCleanup},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+	}
+}
+
+func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return registerUnikraftCloudProviderFlags(fs, defaults)
+}
+
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	return applyUnikraftCloudProviderFlags(cfg, fs, values)
+}
+
+func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	return newBackend(p.Spec(), cfg, rt), nil
+}

@@ -1,83 +1,310 @@
 package azure
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/testutil"
 )
 
 type fakeAzureClient struct {
-	deleted   []string
-	tagged    []string
-	servers   []Server
-	listErr   error
-	created   Server
-	createCfg Config
-	createErr error
-	waitErr   error
+	claimScope        string
+	deleted           []string
+	plainDeletes      []string
+	cleanupExpected   []core.Server
+	ownedExpected     []core.Server
+	prepareCleanup    []core.Server
+	prepareOwned      []core.Server
+	prepareFunc       func(core.Server) core.Server
+	prepareErr        error
+	deleteErr         error
+	createLeaseIDs    []string
+	deleteOwnedFunc   func(core.Server) error
+	deleteCleanupFunc func(core.Server) error
+	tagged            []string
+	taggedLabels      []map[string]string
+	tagErr            error
+	servers           []core.Server
+	listErr           error
+	created           core.Server
+	createCfg         core.Config
+	createErr         error
+	fixedReplyErr     error
+	fixedCapacityErr  error
+	fixedSettleErr    error
+	fixedSettled      []core.AzureFixedCompanions
+	createFunc        func(core.Server) core.Server
+	waitFunc          func(core.Server) (core.Server, error)
+	waitCalls         int
+	waitErr           error
+	getErr            error
+	get               map[string]core.Server
+	getErrs           map[string]error
+	getIDs            []string
+	setTagsFunc       func()
 }
 
-func (c *fakeAzureClient) ListCrabboxServers(context.Context) ([]Server, error) {
+const azureTestClaimScope = "subscription:test-sub|resource-group:rg"
+
+func (c *fakeAzureClient) LeaseClaimScope() string {
+	if c.claimScope != "" {
+		return c.claimScope
+	}
+	return azureTestClaimScope
+}
+
+func (c *fakeAzureClient) ListCrabboxServers(context.Context) ([]core.Server, error) {
 	if c.listErr != nil {
 		return nil, c.listErr
 	}
 	return c.servers, nil
 }
 
-func (c *fakeAzureClient) CreateServerWithFallback(context.Context, Config, string, string, string, bool, func(string, ...any)) (Server, Config, error) {
+func (c *fakeAzureClient) CreateServerWithFallback(_ context.Context, cfg core.Config, _ string, leaseID, slug string, keep bool, _ func(string, ...any)) (core.Server, core.Config, error) {
+	c.createLeaseIDs = append(c.createLeaseIDs, leaseID)
 	if c.createErr != nil {
-		return Server{}, Config{}, c.createErr
+		return core.Server{}, core.Config{}, c.createErr
 	}
-	if c.created.CloudID == "" {
-		c.created = Server{CloudID: "crabbox-created", Name: "crabbox-created", Labels: map[string]string{}}
+	c.created.CloudID = core.LeaseProviderName(leaseID, slug)
+	c.created.Name = c.created.CloudID
+	if c.created.ImmutableID == "" {
+		c.created.ImmutableID = "native-vm-" + leaseID
 	}
-	return c.created, c.createCfg, nil
+	c.created.Labels = core.DirectLeaseLabels(cfg, leaseID, slug, "azure", "on-demand", keep, time.Unix(1, 0))
+	if c.createFunc != nil {
+		c.created = c.createFunc(c.created)
+	}
+	return c.created, cfg, nil
 }
 
-func (c *fakeAzureClient) WaitForServerIP(context.Context, string) (Server, error) {
+func (c *fakeAzureClient) WaitForServerIP(context.Context, string) (core.Server, error) {
+	c.waitCalls++
+	if c.waitFunc != nil {
+		return c.waitFunc(c.created)
+	}
 	if c.waitErr != nil {
-		return Server{}, c.waitErr
+		return core.Server{}, c.waitErr
 	}
 	return c.created, nil
 }
 
-func (c *fakeAzureClient) GetServer(context.Context, string) (Server, error) {
-	return Server{}, nil
+func (c *fakeAzureClient) GetServer(_ context.Context, id string) (core.Server, error) {
+	c.getIDs = append(c.getIDs, id)
+	if err := c.getErrs[id]; err != nil {
+		return core.Server{}, err
+	}
+	if c.getErr != nil {
+		return core.Server{}, c.getErr
+	}
+	if c.get != nil {
+		if server, ok := c.get[id]; ok {
+			return server, nil
+		}
+	}
+	for _, server := range c.servers {
+		if server.CloudID == id || server.Name == id {
+			return server, nil
+		}
+	}
+	return core.Server{}, core.Exit(4, "azure vm not found: %s", id)
 }
 
 func (c *fakeAzureClient) DeleteServer(_ context.Context, name string) error {
+	c.plainDeletes = append(c.plainDeletes, name)
 	c.deleted = append(c.deleted, name)
+	return c.deleteErr
+}
+
+func (c *fakeAzureClient) PrepareOwnedServer(_ context.Context, server core.Server) (core.Server, error) {
+	c.prepareOwned = append(c.prepareOwned, server)
+	if c.prepareErr != nil {
+		return core.Server{}, c.prepareErr
+	}
+	if c.prepareFunc != nil {
+		server = c.prepareFunc(server)
+	}
+	return server, nil
+}
+
+func (c *fakeAzureClient) PrepareCleanupServer(_ context.Context, server core.Server, _ time.Time) (core.Server, error) {
+	c.prepareCleanup = append(c.prepareCleanup, server)
+	if c.prepareErr != nil {
+		return core.Server{}, c.prepareErr
+	}
+	if c.prepareFunc != nil {
+		server = c.prepareFunc(server)
+	}
+	return server, nil
+}
+
+func (c *fakeAzureClient) PrepareCleanupRecoveryServer(ctx context.Context, server core.Server, now time.Time) (core.Server, error) {
+	return c.PrepareCleanupServer(ctx, server, now)
+}
+
+func (c *fakeAzureClient) DeleteOwnedServer(_ context.Context, server core.Server) error {
+	c.ownedExpected = append(c.ownedExpected, server)
+	if c.deleteOwnedFunc != nil {
+		if err := c.deleteOwnedFunc(server); err != nil {
+			return err
+		}
+	}
+	c.deleted = append(c.deleted, server.CloudID)
 	return nil
 }
 
-func (c *fakeAzureClient) SetTags(_ context.Context, name string, _ map[string]string) error {
-	c.tagged = append(c.tagged, name)
+func (c *fakeAzureClient) DeleteCleanupServer(_ context.Context, server core.Server, _ time.Time) error {
+	c.cleanupExpected = append(c.cleanupExpected, server)
+	if c.deleteCleanupFunc != nil {
+		if err := c.deleteCleanupFunc(server); err != nil {
+			return err
+		}
+	}
+	c.deleted = append(c.deleted, server.CloudID)
 	return nil
+}
+
+func (c *fakeAzureClient) SetTags(_ context.Context, name string, labels map[string]string) error {
+	c.tagged = append(c.tagged, name)
+	c.taggedLabels = append(c.taggedLabels, maps.Clone(labels))
+	if c.setTagsFunc != nil {
+		c.setTagsFunc()
+	}
+	return c.tagErr
+}
+
+func TestAzureTouchUsesProviderClientBestEffort(t *testing.T) {
+	idleOverride := 90 * time.Minute
+	for _, tc := range []struct {
+		name      string
+		cloudID   string
+		clientErr bool
+		writeErr  bool
+		override  *time.Duration
+	}{
+		{name: "cloud ID", cloudID: "azure-vm"},
+		{name: "name fallback"},
+		{name: "AWS-shaped ID stays Azure", cloudID: "i-example"},
+		{name: "explicit idle timeout", cloudID: "azure-vm", override: &idleOverride},
+		{name: "client failure", cloudID: "azure-vm", clientErr: true},
+		{name: "write failure", cloudID: "azure-vm", writeErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failure := errors.New("synthetic touch failure")
+			fake := &fakeAzureClient{}
+			if tc.writeErr {
+				fake.tagErr = failure
+			}
+			oldClient := newAzureClient
+			newAzureClient = func(_ context.Context, cfg core.Config) (azureClient, error) {
+				if cfg.Provider != "azure" {
+					t.Fatalf("provider=%q", cfg.Provider)
+				}
+				if tc.clientErr {
+					return nil, failure
+				}
+				return fake, nil
+			}
+			t.Cleanup(func() { newAzureClient = oldClient })
+			var stderr bytes.Buffer
+			backend := NewAzureLeaseBackend(core.ProviderSpec{Name: "azure"}, core.Config{}, core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+			server := core.Server{CloudID: tc.cloudID, Name: "fallback-name", Provider: "azure", Labels: map[string]string{"idle_timeout_secs": "1800", "ttl_secs": "7200"}}
+			got, err := backend.Touch(context.Background(), core.TouchRequest{Lease: core.LeaseTarget{Server: server}, State: "ready", IdleTimeoutOverride: tc.override})
+			if err != nil || got.Labels["state"] != "ready" {
+				t.Fatalf("server=%+v err=%v", got, err)
+			}
+			wantIdle := "1800"
+			if tc.override != nil {
+				wantIdle = "5400"
+			}
+			if got.Labels["idle_timeout_secs"] != wantIdle {
+				t.Fatalf("idle_timeout_secs=%q want=%q", got.Labels["idle_timeout_secs"], wantIdle)
+			}
+			if tc.clientErr {
+				if len(fake.tagged) != 0 {
+					t.Fatal("wrote tags after client construction failed")
+				}
+			} else {
+				want := tc.cloudID
+				if want == "" {
+					want = server.Name
+				}
+				if !slices.Equal(fake.tagged, []string{want}) || !reflect.DeepEqual(fake.taggedLabels[0], got.Labels) {
+					t.Fatalf("tagged=%v labels=%v returned=%v", fake.tagged, fake.taggedLabels, got.Labels)
+				}
+			}
+			wantWarning := ""
+			if tc.clientErr || tc.writeErr {
+				wantWarning = "warning: direct touch state=ready: synthetic touch failure\n"
+			}
+			if stderr.String() != wantWarning {
+				t.Fatalf("warning=%q want=%q", stderr.String(), wantWarning)
+			}
+		})
+	}
 }
 
 func TestAzureAcquireCleansUpCreatedServerOnIPFailure(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	ipErr := errors.New("ip unavailable")
 	fake := &fakeAzureClient{
-		created:   Server{CloudID: "crabbox-created", Name: "crabbox-created", Labels: map[string]string{"lease": "cbx_created"}},
+		created:   core.Server{CloudID: "crabbox-created", Name: "crabbox-created", Labels: map[string]string{"lease": "cbx_created"}},
 		createCfg: azureAcquireTestConfig(),
 		waitErr:   ipErr,
 	}
 	oldClient := newAzureClient
-	newAzureClient = func(context.Context, Config) (azureClient, error) {
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) {
 		return fake, nil
 	}
 	t.Cleanup(func() { newAzureClient = oldClient })
 
-	backend := NewAzureLeaseBackend(ProviderSpec{}, azureAcquireTestConfig(), Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
 	_, err := backend.acquireOnce(context.Background(), false, "")
 	if !errors.Is(err, ipErr) {
 		t.Fatalf("err=%v, want IP failure", err)
 	}
-	if len(fake.deleted) != 1 || fake.deleted[0] != "crabbox-created" {
+	if len(fake.deleted) != 1 || fake.deleted[0] != fake.created.CloudID {
 		t.Fatalf("deleted=%v, want created server cleanup", fake.deleted)
+	}
+	key, err := core.TestboxKeyPath(fake.createLeaseIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Dir(key)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SSH artifacts remain after successful rollback: %v", err)
+	}
+}
+
+func TestAzureAcquireRejectsVMWithoutRequiredIdentityAtReadiness(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fake := &fakeAzureClient{}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+	cfg := azureAcquireTestConfig()
+	cfg.Azure.UserAssignedIdentityResourceID = "/subscriptions/sub/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/worker"
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	_, err := backend.acquireOnce(t.Context(), false, "")
+	if err == nil || !strings.Contains(err.Error(), "missing required user-assigned identity") {
+		t.Fatalf("readiness error=%v", err)
+	}
+	if len(fake.deleted) != 1 {
+		t.Fatalf("identity-less VM cleanup=%v, want one owned rollback", fake.deleted)
 	}
 }
 
@@ -88,17 +315,17 @@ func TestAzureAcquireValidatesSSHCIDRsBeforeClient(t *testing.T) {
 	fake := &fakeAzureClient{listErr: listErr}
 	oldValidate := validateAzureSSHCIDRsForAcquire
 	validated := false
-	validateAzureSSHCIDRsForAcquire = func(_ context.Context, cfg Config) error {
+	validateAzureSSHCIDRsForAcquire = func(_ context.Context, cfg core.Config) error {
 		validated = true
-		if len(cfg.AzureSSHCIDRs) != 0 {
-			t.Fatalf("AzureSSHCIDRs=%v before validation, want non-explicit empty config", cfg.AzureSSHCIDRs)
+		if len(cfg.Azure.SSHCIDRs) != 0 {
+			t.Fatalf("AzureSSHCIDRs=%v before validation, want non-explicit empty config", cfg.Azure.SSHCIDRs)
 		}
 		return nil
 	}
 	t.Cleanup(func() { validateAzureSSHCIDRsForAcquire = oldValidate })
-	var clientCfg Config
+	var clientCfg core.Config
 	oldClient := newAzureClient
-	newAzureClient = func(_ context.Context, cfg Config) (azureClient, error) {
+	newAzureClient = func(_ context.Context, cfg core.Config) (azureClient, error) {
 		if !validated {
 			t.Fatal("newAzureClient ran before SSH CIDR validation")
 		}
@@ -107,30 +334,30 @@ func TestAzureAcquireValidatesSSHCIDRsBeforeClient(t *testing.T) {
 	}
 	t.Cleanup(func() { newAzureClient = oldClient })
 
-	backend := NewAzureLeaseBackend(ProviderSpec{}, Config{Provider: "azure", AzureLocation: "eastus", AzureResourceGroup: "rg"}, Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, core.Config{Provider: "azure", Azure: core.AzureConfig{Location: "eastus", ResourceGroup: "rg"}}, core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
 	_, err := backend.acquireOnce(context.Background(), false, "")
 	if !errors.Is(err, listErr) {
 		t.Fatalf("err=%v, want list failure", err)
 	}
-	if len(clientCfg.AzureSSHCIDRs) != 0 {
-		t.Fatalf("AzureSSHCIDRs=%v, want detected CIDR provenance preserved as non-explicit", clientCfg.AzureSSHCIDRs)
+	if len(clientCfg.Azure.SSHCIDRs) != 0 {
+		t.Fatalf("AzureSSHCIDRs=%v, want detected CIDR provenance preserved as non-explicit", clientCfg.Azure.SSHCIDRs)
 	}
 }
 
 func TestAzureAcquireFailsClosedWhenSSHCIDRDetectionFails(t *testing.T) {
 	oldValidate := validateAzureSSHCIDRsForAcquire
-	validateAzureSSHCIDRsForAcquire = func(context.Context, Config) error {
+	validateAzureSSHCIDRsForAcquire = func(context.Context, core.Config) error {
 		return errors.New("offline")
 	}
 	t.Cleanup(func() { validateAzureSSHCIDRsForAcquire = oldValidate })
 	oldClient := newAzureClient
-	newAzureClient = func(context.Context, Config) (azureClient, error) {
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) {
 		t.Fatal("newAzureClient should not run when SSH CIDR detection fails")
 		return nil, nil
 	}
 	t.Cleanup(func() { newAzureClient = oldClient })
 
-	backend := NewAzureLeaseBackend(ProviderSpec{}, Config{Provider: "azure", AzureLocation: "eastus", AzureResourceGroup: "rg"}, Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, core.Config{Provider: "azure", Azure: core.AzureConfig{Location: "eastus", ResourceGroup: "rg"}}, core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
 	_, err := backend.acquireOnce(context.Background(), false, "")
 	if err == nil || err.Error() != "offline" {
 		t.Fatalf("err=%v, want detection failure", err)
@@ -140,48 +367,932 @@ func TestAzureAcquireFailsClosedWhenSSHCIDRDetectionFails(t *testing.T) {
 func TestAzureAcquireDoesNotRollbackReadyServer(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	created := Server{
-		CloudID: "crabbox-ready",
-		Name:    "crabbox-ready",
-		Labels:  map[string]string{"lease": "cbx_ready"},
-	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	created := azureTestServer("crabbox-ready", "cbx_123456abcdef", "ready")
 	created.PublicNet.IPv4.IP = "203.0.113.10"
 	fake := &fakeAzureClient{
 		created:   created,
 		createCfg: azureAcquireTestConfig(),
 	}
 	oldClient := newAzureClient
-	newAzureClient = func(context.Context, Config) (azureClient, error) {
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) {
 		return fake, nil
 	}
 	t.Cleanup(func() { newAzureClient = oldClient })
 	oldBootstrap := bootstrapManagedWindowsDesktop
-	bootstrapManagedWindowsDesktop = func(context.Context, Config, *SSHTarget, string, io.Writer) error {
+	bootstrapManagedWindowsDesktop = func(context.Context, core.Config, *core.SSHTarget, string, io.Writer) error {
 		return nil
 	}
 	t.Cleanup(func() { bootstrapManagedWindowsDesktop = oldBootstrap })
 
-	backend := NewAzureLeaseBackend(ProviderSpec{}, azureAcquireTestConfig(), Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
 	lease, err := backend.acquireOnce(context.Background(), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lease.Server.CloudID != "crabbox-ready" {
-		t.Fatalf("server=%s, want crabbox-ready", lease.Server.CloudID)
+	if lease.Server.CloudID != fake.created.CloudID {
+		t.Fatalf("server=%s, want created VM", lease.Server.CloudID)
 	}
 	if len(fake.deleted) != 0 {
 		t.Fatalf("deleted=%v, want no rollback on success", fake.deleted)
 	}
-	if len(fake.tagged) != 1 || fake.tagged[0] != "crabbox-ready" {
+	if len(fake.tagged) != 1 || fake.tagged[0] != fake.created.CloudID {
 		t.Fatalf("tagged=%v, want ready tag update", fake.tagged)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil || !exists {
+		t.Fatalf("claim exists=%v err=%v", exists, err)
+	}
+	if claim.ProviderScope != azureTestClaimScope || claim.CloudImmutableID != created.ImmutableID {
+		t.Fatalf("claim=%+v, want resolved Azure scope and immutable VM identity", claim)
+	}
+	if _, err := os.Stat(lease.SSH.Key); err != nil {
+		t.Fatalf("ready lease lost its SSH key: %v", err)
 	}
 }
 
-func azureAcquireTestConfig() Config {
-	return Config{
-		Provider:           "azure",
-		AzureLocation:      "eastus",
-		AzureResourceGroup: "rg",
-		AzureSSHCIDRs:      []string{"198.51.100.7/32"},
+func TestAzureAcquireRollsBackWhenExactClaimCannotPersist(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	blockedStateHome := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedStateHome, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	created := azureTestServer("crabbox-claim-failure", "cbx_123456abcdef", "claim-failure")
+	created.PublicNet.IPv4.IP = "203.0.113.10"
+	fake := &fakeAzureClient{
+		created:   created,
+		createCfg: azureAcquireTestConfig(),
+		setTagsFunc: func() {
+			if err := os.Setenv("XDG_STATE_HOME", blockedStateHome); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+	oldBootstrap := bootstrapManagedWindowsDesktop
+	bootstrapManagedWindowsDesktop = func(context.Context, core.Config, *core.SSHTarget, string, io.Writer) error { return nil }
+	t.Cleanup(func() { bootstrapManagedWindowsDesktop = oldBootstrap })
+
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	if _, err := backend.acquireOnce(context.Background(), false, ""); err == nil {
+		t.Fatal("expected exact-claim persistence failure")
+	}
+	if len(fake.deleted) != 1 || fake.deleted[0] != fake.created.CloudID {
+		t.Fatalf("deleted=%v, want funded VM rollback after claim failure", fake.deleted)
+	}
+}
+
+func azureAcquireTestConfig() core.Config {
+	return core.Config{
+		Provider: "azure",
+		Azure: core.AzureConfig{
+			Subscription:  "test-sub",
+			Location:      "eastus",
+			ResourceGroup: "rg",
+			SSHCIDRs:      []string{"198.51.100.7/32"},
+		},
+	}
+}
+
+func TestAzureResolveRawVMRejectsWeakTags(t *testing.T) {
+	weak := azureTestServer("crabbox-weak", "cbx_123456abcdef", "weak")
+	delete(weak.Labels, "created_by")
+	fake := &fakeAzureClient{servers: []core.Server{weak}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: weak.Name, ReleaseOnly: true})
+	if err == nil || !strings.Contains(err.Error(), "not Crabbox-managed") {
+		t.Fatalf("lease=%#v err=%v, want ownership rejection", lease, err)
+	}
+	if len(fake.deleted) != 0 {
+		t.Fatalf("deleted=%v, want no destructive call", fake.deleted)
+	}
+}
+
+func TestAzureListExcludesWeakTags(t *testing.T) {
+	owned := azureTestServer("crabbox-owned", "cbx_123456abcdef", "owned")
+	weak := azureTestServer("crabbox-weak", "cbx_fedcba654321", "weak")
+	delete(weak.Labels, "provider")
+	fake := &fakeAzureClient{servers: []core.Server{weak, owned}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	servers, err := backend.List(context.Background(), core.ListRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers[0].CloudID != owned.CloudID {
+		t.Fatalf("servers=%#v, want only canonical owned VM", servers)
+	}
+}
+
+func TestAzureReleaseRejectsForgedOrMismatchedOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*core.LeaseTarget)
+	}{
+		{
+			name: "missing created-by tag",
+			mutate: func(lease *core.LeaseTarget) {
+				delete(lease.Server.Labels, "created_by")
+			},
+		},
+		{
+			name: "mismatched lease tag",
+			mutate: func(lease *core.LeaseTarget) {
+				lease.LeaseID = "cbx_fedcba654321"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			server := azureTestServer("crabbox-owned", "cbx_123456abcdef", "owned")
+			storeAzureTestClaim(t, server)
+			fake := &fakeAzureClient{servers: []core.Server{server}}
+			oldClient := newAzureClient
+			newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+			t.Cleanup(func() { newAzureClient = oldClient })
+
+			lease := core.LeaseTarget{Server: server, LeaseID: "cbx_123456abcdef"}
+			test.mutate(&lease)
+			backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+			err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease})
+			if err == nil || !strings.Contains(err.Error(), "exact local claim") {
+				t.Fatalf("err=%v, want ownership rejection", err)
+			}
+			if len(fake.deleted) != 0 {
+				t.Fatalf("deleted=%v, want no destructive call", fake.deleted)
+			}
+		})
+	}
+}
+
+func TestAzureReleaseRemovesStoredLeaseKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	leaseID := "cbx_123456abcdef"
+	keyPath, _, err := core.EnsureTestboxKeyForConfig(core.Config{}, leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureTestServer("crabbox-owned", leaseID, "owned")
+	storeAzureTestClaim(t, server)
+	fake := &fakeAzureClient{servers: []core.Server{server}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	lease := core.LeaseTarget{Server: server, LeaseID: leaseID}
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(keyPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stored lease key directory still exists: %v", err)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
+		t.Fatalf("claim exists=%v err=%v, want removed after deletion", exists, err)
+	}
+	if len(fake.ownedExpected) != 1 || fake.ownedExpected[0].ImmutableID != server.ImmutableID {
+		t.Fatalf("release boundary=%+v, want exact live Azure identity", fake.ownedExpected)
+	}
+}
+
+func TestAzureReleasePersistsCleanupBindingBeforeDelete(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	server := azureTestServer("crabbox-owned", "cbx_123456abcdef", "owned")
+	storeAzureTestClaim(t, server)
+	deleteErr := errors.New("simulated interruption after durable binding")
+	fake := &fakeAzureClient{
+		servers: []core.Server{server},
+		prepareFunc: func(prepared core.Server) core.Server {
+			prepared.Labels = maps.Clone(prepared.Labels)
+			prepared.Labels[core.AzureCleanupBindingLabel] = "v1"
+			return prepared
+		},
+		deleteOwnedFunc: func(core.Server) error { return deleteErr },
+	}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{Server: server, LeaseID: server.Labels["lease"]}}); !errors.Is(err, deleteErr) {
+		t.Fatalf("err=%v, want simulated interruption", err)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(server.Labels["lease"])
+	if err != nil || !exists {
+		t.Fatalf("claim exists=%v err=%v after interrupted delete", exists, err)
+	}
+	if claim.Labels[core.AzureCleanupBindingLabel] != "v1" {
+		t.Fatalf("claim labels=%v, want durable cleanup binding", claim.Labels)
+	}
+}
+
+func TestAzureResolveAndReleaseResumeAfterVMDeletion(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	server := azureTestServer("crabbox-interrupted", "cbx_123456abcdef", "interrupted")
+	server.Labels[core.AzureCleanupBindingLabel] = "v1"
+	storeAzureTestClaim(t, server)
+	fake := &fakeAzureClient{
+		getErrs: map[string]error{server.CloudID: core.Exit(4, "azure vm not found: %s", server.CloudID)},
+	}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	lease, err := backend.Resolve(context.Background(), core.ResolveRequest{ID: server.CloudID, ReleaseOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID != server.Labels["lease"] || lease.Server.ImmutableID != server.ImmutableID {
+		t.Fatalf("lease=%+v, want claim-backed exact identity", lease)
+	}
+	if err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: lease}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.deleted) != 1 || fake.deleted[0] != server.CloudID {
+		t.Fatalf("deleted=%v, want resumed deletion", fake.deleted)
+	}
+}
+
+func TestAzureReleaseRequiresExactClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	server := azureTestServer("crabbox-owned", "cbx_123456abcdef", "owned")
+	fake := &fakeAzureClient{servers: []core.Server{server}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+	err := backend.ReleaseLease(context.Background(), core.ReleaseLeaseRequest{Lease: core.LeaseTarget{Server: server, LeaseID: server.Labels["lease"]}})
+	if err == nil || !strings.Contains(err.Error(), "no exact local claim") {
+		t.Fatalf("err=%v, want exact-claim rejection", err)
+	}
+	if len(fake.getIDs) != 0 || len(fake.deleted) != 0 {
+		t.Fatalf("get=%v deleted=%v, want no provider read or delete", fake.getIDs, fake.deleted)
+	}
+}
+
+func TestAzureCleanupSkipsWeakTagsAndDeletesCanonicalExpiredVM(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	owned := azureTestServer("crabbox-owned", "cbx_123456abcdef", "owned")
+	owned.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	storeAzureTestClaim(t, owned)
+	keyPath, _, err := core.EnsureTestboxKeyForConfig(core.Config{}, owned.Labels["lease"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	weak := azureTestServer("crabbox-weak", "cbx_fedcba654321", "weak")
+	delete(weak.Labels, "created_by")
+	weak.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	fake := &fakeAzureClient{servers: []core.Server{weak, owned}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "skip server id=crabbox-weak") || !strings.Contains(stderr.String(), "canonical Crabbox ownership tags missing") {
+		t.Fatalf("stderr=%q, want weak-tag skip diagnostic", stderr.String())
+	}
+	if len(fake.deleted) != 1 || fake.deleted[0] != owned.CloudID {
+		t.Fatalf("deleted=%v, want only canonical owned VM", fake.deleted)
+	}
+	if _, err := os.Stat(filepath.Dir(keyPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stored lease key directory still exists: %v", err)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(owned.Labels["lease"]); err != nil || exists {
+		t.Fatalf("claim exists=%v err=%v, want removed after deletion", exists, err)
+	}
+}
+
+func TestAzureCleanupRequiresExactClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	server := azureTestServer("crabbox-unclaimed", "cbx_123456abcdef", "unclaimed")
+	server.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	fake := &fakeAzureClient{servers: []core.Server{server}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.getIDs) != 0 || len(fake.deleted) != 0 {
+		t.Fatalf("get=%v deleted=%v, want no provider read or delete", fake.getIDs, fake.deleted)
+	}
+	if !strings.Contains(stderr.String(), "exact local claim missing or stale") {
+		t.Fatalf("stderr=%q, want exact-claim diagnostic", stderr.String())
+	}
+}
+
+func TestAzureCleanupDryRunRevalidatesExactClaim(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	server := azureTestServer("crabbox-dry-run", "cbx_123456abcdef", "dry-run")
+	server.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	storeAzureTestClaim(t, server)
+	fake := &fakeAzureClient{servers: []core.Server{server}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.getIDs) != 1 || len(fake.deleted) != 0 {
+		t.Fatalf("get=%v deleted=%v, want one revalidation and no delete", fake.getIDs, fake.deleted)
+	}
+	if len(fake.prepareCleanup) != 0 {
+		t.Fatalf("dry-run prepared=%v, want no mutating preparation", fake.prepareCleanup)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(server.Labels["lease"]); err != nil || !exists {
+		t.Fatalf("dry-run claim exists=%v err=%v, want retained claim", exists, err)
+	}
+	if !strings.Contains(stderr.String(), "delete server id=crabbox-dry-run") {
+		t.Fatalf("stderr=%q, want dry-run deletion plan", stderr.String())
+	}
+}
+
+func TestAzureCleanupRevalidatesLiveOwnershipBeforeDelete(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	snapshot := azureTestServer("crabbox-stale", "cbx_123456abcdef", "stale")
+	snapshot.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	storeAzureTestClaim(t, snapshot)
+	live := snapshot
+	live.Labels = maps.Clone(snapshot.Labels)
+	live.Labels["lease"] = "cbx_fedcba654321"
+	fake := &fakeAzureClient{
+		servers: []core.Server{snapshot},
+		get:     map[string]core.Server{snapshot.CloudID: live},
+	}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.getIDs) != 1 || fake.getIDs[0] != snapshot.CloudID {
+		t.Fatalf("live lookups=%v, want %s", fake.getIDs, snapshot.CloudID)
+	}
+	if len(fake.deleted) != 0 {
+		t.Fatalf("cleanup crossed changed ownership: deleted=%v", fake.deleted)
+	}
+	if !strings.Contains(stderr.String(), "does not match cleanup candidate lease") {
+		t.Fatalf("stderr=%q, want changed-lease skip", stderr.String())
+	}
+}
+
+func TestAzureCleanupRevalidatesLiveEligibilityBeforeDelete(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	snapshot := azureTestServer("crabbox-renewed", "cbx_123456abcdef", "renewed")
+	snapshot.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	storeAzureTestClaim(t, snapshot)
+	live := snapshot
+	live.Labels = maps.Clone(snapshot.Labels)
+	live.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(time.Hour))
+	fake := &fakeAzureClient{servers: []core.Server{snapshot}, get: map[string]core.Server{snapshot.CloudID: live}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.deleted) != 0 {
+		t.Fatalf("cleanup deleted renewed VM: %v", fake.deleted)
+	}
+	if !strings.Contains(stderr.String(), "reason=live VM") {
+		t.Fatalf("stderr=%q, want renewed-live skip", stderr.String())
+	}
+}
+
+func TestAzureCleanupRejectsSameNameReplacementVM(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	snapshot := azureTestServer("crabbox-replaced", "cbx_123456abcdef", "replaced")
+	snapshot.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	storeAzureTestClaim(t, snapshot)
+	live := snapshot
+	live.ImmutableID = "vmid-replacement"
+	fake := &fakeAzureClient{servers: []core.Server{snapshot}, get: map[string]core.Server{snapshot.CloudID: live}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.deleted) != 0 {
+		t.Fatalf("cleanup deleted replacement VM: %v", fake.deleted)
+	}
+	if !strings.Contains(stderr.String(), "VM identity") {
+		t.Fatalf("stderr=%q, want replacement identity skip", stderr.String())
+	}
+}
+
+func TestAzureCleanupRejectsChangedLiveSlug(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	snapshot := azureTestServer("candidate", "cbx_111111111111", "original")
+	snapshot.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	storeAzureTestClaim(t, snapshot)
+	live := snapshot
+	live.Labels = maps.Clone(snapshot.Labels)
+	live.Labels["slug"] = "changed"
+	fake := &fakeAzureClient{servers: []core.Server{snapshot}, get: map[string]core.Server{snapshot.CloudID: live}}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.cleanupExpected) != 0 || len(fake.deleted) != 0 {
+		t.Fatalf("cleanup crossed changed slug: expected=%v deleted=%v", fake.cleanupExpected, fake.deleted)
+	}
+	if !strings.Contains(stderr.String(), "Azure VM slug") {
+		t.Fatalf("stderr=%q, want changed-slug diagnostic", stderr.String())
+	}
+}
+
+func TestAzureCleanupContinuesWhenLiveCandidateAlreadyGone(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	missing := azureTestServer("missing", "cbx_111111111111", "missing")
+	remaining := azureTestServer("remaining", "cbx_222222222222", "remaining")
+	for _, server := range []*core.Server{&missing, &remaining} {
+		server.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+		storeAzureTestClaim(t, *server)
+	}
+	keyPath, _, err := core.EnsureTestboxKeyForConfig(core.Config{}, missing.Labels["lease"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeAzureClient{
+		servers: []core.Server{missing, remaining},
+		get:     map[string]core.Server{remaining.CloudID: remaining},
+		getErrs: map[string]error{missing.CloudID: core.Exit(4, "azure vm not found: %s", missing.CloudID)},
+	}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.deleted) != 1 || fake.deleted[0] != remaining.CloudID {
+		t.Fatalf("deleted=%v, want only remaining candidate", fake.deleted)
+	}
+	if !strings.Contains(stderr.String(), "reason=live VM no longer exists") {
+		t.Fatalf("stderr=%q, want already-gone skip", stderr.String())
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("stored lease key was not retained for recovery: %v", err)
+	}
+}
+
+func TestAzureCleanupResumesDurablyBoundCompanionsAfterVMDeletion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	server := azureTestServer("crabbox-interrupted", "cbx_123456abcdef", "interrupted")
+	server.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+	server.Labels[core.AzureCleanupBindingLabel] = "v1"
+	storeAzureTestClaim(t, server)
+	fake := &fakeAzureClient{}
+	oldClient := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = oldClient })
+
+	var stderr strings.Builder
+	backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.prepareCleanup) != 0 || len(fake.cleanupExpected) != 0 {
+		t.Fatalf("dry-run prepared=%v cleanup=%v, want no recovery mutation", fake.prepareCleanup, fake.cleanupExpected)
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(server.Labels["lease"]); err != nil || !exists {
+		t.Fatalf("dry-run recovery claim exists=%v err=%v, want retained claim", exists, err)
+	}
+	stderr.Reset()
+	if err := backend.Cleanup(context.Background(), core.CleanupRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.cleanupExpected) != 1 || fake.cleanupExpected[0].CloudID != server.CloudID {
+		t.Fatalf("cleanup=%v, want interrupted exact claim recovery", fake.cleanupExpected)
+	}
+	if !strings.Contains(stderr.String(), "resume cleanup server") {
+		t.Fatalf("stderr=%q, want recovery diagnostic", stderr.String())
+	}
+	if _, exists, err := core.ReadLeaseClaimWithPresence(server.Labels["lease"]); err != nil || exists {
+		t.Fatalf("claim exists=%v err=%v, want removed after recovery", exists, err)
+	}
+}
+
+func TestAzureCleanupMissingResourcePolicyByPhase(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		for _, preparation := range []bool{false, true} {
+			t.Run(fmt.Sprintf("recovery=%v/preparation=%v", recovery, preparation), func(t *testing.T) {
+				t.Setenv("XDG_STATE_HOME", t.TempDir())
+				server := azureTestServer("crabbox-cleanup", "cbx_123456abcdef", "cleanup")
+				server.Labels["expires_at"] = core.LeaseLabelTime(time.Now().Add(-time.Hour))
+				if recovery {
+					server.Labels[core.AzureCleanupBindingLabel] = "v1"
+				}
+				storeAzureTestClaim(t, server)
+				missing := core.Exit(4, "azure vm not found")
+				fake := &fakeAzureClient{}
+				if !recovery {
+					fake.servers = []core.Server{server}
+				}
+				if preparation {
+					fake.prepareErr = missing
+				} else {
+					fake.deleteCleanupFunc = func(core.Server) error { return missing }
+				}
+				oldClient := newAzureClient
+				newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+				t.Cleanup(func() { newAzureClient = oldClient })
+
+				var stderr strings.Builder
+				backend := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+				err := backend.Cleanup(context.Background(), core.CleanupRequest{})
+				if recovery || preparation {
+					if !errors.Is(err, missing) {
+						t.Fatalf("err=%v, want missing-resource error", err)
+					}
+				} else if err != nil || !strings.Contains(stderr.String(), "skip server id=crabbox-cleanup name=crabbox-cleanup reason=live VM no longer exists at delete boundary") {
+					t.Fatalf("err=%v stderr=%q, want live delete-boundary skip", err, stderr.String())
+				}
+				if len(fake.prepareCleanup) != 1 || (preparation && len(fake.cleanupExpected) != 0) || (!preparation && len(fake.cleanupExpected) != 1) {
+					t.Fatalf("prepared=%v cleanup=%v, unexpected mutation phase", fake.prepareCleanup, fake.cleanupExpected)
+				}
+				if _, exists, err := core.ReadLeaseClaimWithPresence(server.Labels["lease"]); err != nil || !exists {
+					t.Fatalf("claim exists=%v err=%v, want retained recovery state", exists, err)
+				}
+			})
+		}
+	}
+}
+
+func azureTestServer(id, leaseID, slug string) core.Server {
+	return core.Server{
+		CloudID:     id,
+		Name:        id,
+		Provider:    "azure",
+		ImmutableID: "vmid-" + id,
+		Labels: map[string]string{
+			"crabbox":      "true",
+			"created_by":   "crabbox",
+			"provider":     "azure",
+			"lease":        leaseID,
+			"slug":         slug,
+			"provider_key": core.ProviderKeyForLease(leaseID),
+		},
+	}
+}
+
+func TestValidateExactAzureClaimRejectsScopeAndResourceMismatch(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	server := azureTestServer("crabbox-owned", "cbx_123456abcdef", "owned")
+	claim := storeAzureTestClaim(t, server)
+	for _, test := range []struct {
+		name   string
+		mutate func(*core.LeaseClaim, *core.Server, *string)
+	}{
+		{name: "scope", mutate: func(_ *core.LeaseClaim, _ *core.Server, scope *string) {
+			*scope = "subscription:other|resource-group:rg"
+		}},
+		{name: "name", mutate: func(_ *core.LeaseClaim, server *core.Server, _ *string) { server.CloudID = "replacement" }},
+		{name: "immutable id", mutate: func(_ *core.LeaseClaim, server *core.Server, _ *string) { server.ImmutableID = "vmid-replacement" }},
+		{name: "slug", mutate: func(_ *core.LeaseClaim, server *core.Server, _ *string) { server.Labels["slug"] = "replacement" }},
+		{name: "provider key", mutate: func(_ *core.LeaseClaim, server *core.Server, _ *string) {
+			server.Labels["provider_key"] = "replacement"
+		}},
+		{name: "legacy claim", mutate: func(claim *core.LeaseClaim, _ *core.Server, _ *string) { claim.CloudImmutableID = "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testClaim := claim
+			testClaim.Labels = maps.Clone(claim.Labels)
+			testServer := server
+			testServer.Labels = maps.Clone(server.Labels)
+			scope := azureTestClaimScope
+			test.mutate(&testClaim, &testServer, &scope)
+			if err := validateExactAzureClaim(testClaim, testServer, server.Labels["lease"], scope); err == nil {
+				t.Fatal("expected exact Azure claim mismatch")
+			}
+		})
+	}
+}
+
+func storeAzureTestClaim(t *testing.T, server core.Server) core.LeaseClaim {
+	t.Helper()
+	cfg := azureAcquireTestConfig()
+	if err := core.ClaimLeaseTargetForConfig(server.Labels["lease"], server.Labels["slug"], cfg, server, core.SSHTarget{}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(server.Labels["lease"])
+	if err != nil || !exists {
+		t.Fatalf("claim exists=%v err=%v", exists, err)
+	}
+	return claim
+}
+
+func TestAzureAcquireStopsFreshRetryAfterRollbackFailure(t *testing.T) {
+	for _, failure := range []string{"", "provider", "artifacts"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			primary := core.Exit(5, "timed out waiting for SSH: fixture")
+			fake := &fakeAzureClient{createCfg: azureAcquireTestConfig()}
+			cleanupErr := errors.New("delete unavailable")
+			if failure == "provider" {
+				fake.deleteOwnedFunc = func(core.Server) error { return cleanupErr }
+			}
+			oldClient, oldBootstrap := newAzureClient, bootstrapManagedWindowsDesktop
+			newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+			bootstrapManagedWindowsDesktop = func(context.Context, core.Config, *core.SSHTarget, string, io.Writer) error {
+				key, err := core.TestboxKeyPath(fake.createLeaseIDs[len(fake.createLeaseIDs)-1])
+				if err != nil {
+					t.Fatal(err)
+				}
+				dir := filepath.Dir(key)
+				if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("synthetic host trust\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if failure == "artifacts" {
+					if err := os.RemoveAll(dir); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return primary
+			}
+			t.Cleanup(func() { newAzureClient = oldClient; bootstrapManagedWindowsDesktop = oldBootstrap })
+			var stderr bytes.Buffer
+			b := NewAzureLeaseBackend(core.ProviderSpec{}, fake.createCfg, core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
+			_, err := b.Acquire(context.Background(), core.AcquireRequest{})
+			want := 2
+			if failure != "" {
+				want = 1
+			}
+			if len(fake.createLeaseIDs) != want || len(fake.ownedExpected) != want || len(fake.plainDeletes) != 0 || !errors.Is(err, primary) {
+				t.Fatalf("creates=%v deletes=%v error=%v", fake.createLeaseIDs, fake.deleted, err)
+			}
+			if failure == "" && fake.createLeaseIDs[0] == fake.createLeaseIDs[1] {
+				t.Fatal("retry reused lease identity")
+			}
+			if failure == "provider" && !errors.Is(err, cleanupErr) {
+				t.Fatalf("cleanup debt lost: error=%v stderr=%s", err, stderr.String())
+			}
+			if failure != "" && strings.Contains(stderr.String(), "retrying with fresh lease") {
+				t.Fatalf("retried with cleanup debt: %v", err)
+			}
+			if failure == "artifacts" && !strings.Contains(err.Error(), "SSH connection artifacts") {
+				t.Fatalf("lost artifact cleanup error: %v", err)
+			}
+			for _, leaseID := range fake.createLeaseIDs {
+				key, pathErr := core.TestboxKeyPath(leaseID)
+				if pathErr != nil {
+					t.Fatal(pathErr)
+				}
+				_, statErr := os.Lstat(filepath.Dir(key))
+				if failure == "" && !errors.Is(statErr, os.ErrNotExist) || failure != "" && statErr != nil {
+					t.Fatalf("rollback artifact state: %v, failure=%q", statErr, failure)
+				}
+			}
+		})
+	}
+}
+
+func TestAzureAcquireRejectsChangedReadinessGenerationWithoutMutation(t *testing.T) {
+	mutations := []struct {
+		name   string
+		change func(*core.Server)
+	}{
+		{"generation", func(s *core.Server) { s.ImmutableID = "replacement-vm" }},
+		{"missing-generation", func(s *core.Server) { s.ImmutableID = "" }},
+		{"cloud-name", func(s *core.Server) { s.CloudID = "replacement-name" }},
+		{"name", func(s *core.Server) { s.Name = "replacement-name" }},
+		{"owner", func(s *core.Server) { s.Labels["created_by"] = "other" }},
+		{"provider", func(s *core.Server) { s.Labels["provider"] = "gcp" }},
+		{"lease", func(s *core.Server) { s.Labels["lease"] = "cbx_111111111111" }},
+		{"slug", func(s *core.Server) { s.Labels["slug"] = "replacement" }},
+		{"key", func(s *core.Server) { s.Labels["provider_key"] = "replacement" }},
+	}
+	for _, creation := range []bool{false, true} {
+		for _, tc := range mutations {
+			// A nonempty generation at creation is the initial anchor.
+			if creation && tc.name == "generation" {
+				continue
+			}
+			t.Run(fmt.Sprintf("creation=%v/%s", creation, tc.name), func(t *testing.T) {
+				t.Setenv("HOME", t.TempDir())
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				t.Setenv("XDG_STATE_HOME", t.TempDir())
+				fake := &fakeAzureClient{}
+				if creation {
+					fake.createFunc = func(s core.Server) core.Server { tc.change(&s); return s }
+				} else {
+					// Deliberately mutate the aliased labels returned by creation.
+					fake.waitFunc = func(s core.Server) (core.Server, error) { tc.change(&s); return s, nil }
+				}
+				oldClient, oldBootstrap := newAzureClient, bootstrapManagedWindowsDesktop
+				newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+				bootstrapCalls := 0
+				bootstrapManagedWindowsDesktop = func(context.Context, core.Config, *core.SSHTarget, string, io.Writer) error {
+					bootstrapCalls++
+					return nil
+				}
+				t.Cleanup(func() { newAzureClient = oldClient; bootstrapManagedWindowsDesktop = oldBootstrap })
+				b := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+				_, err := b.Acquire(t.Context(), core.AcquireRequest{})
+				if err == nil || bootstrapCalls != 0 || len(fake.tagged) != 0 || len(fake.deleted) != 0 || len(fake.prepareOwned) != 0 || len(fake.createLeaseIDs) != 1 {
+					t.Fatalf("err=%v bootstrap=%d tags=%v deletes=%v prepared=%d creates=%v", err, bootstrapCalls, fake.tagged, fake.deleted, len(fake.prepareOwned), fake.createLeaseIDs)
+				}
+				if creation && fake.waitCalls != 0 {
+					t.Fatal("invalid creation reached waiter")
+				}
+				if _, exists, e := core.ReadLeaseClaimWithPresence(fake.createLeaseIDs[0]); e != nil || exists {
+					t.Fatalf("unexpected claim: exists=%v err=%v", exists, e)
+				}
+				key, pathErr := core.TestboxKeyPath(fake.createLeaseIDs[0])
+				if pathErr != nil {
+					t.Fatal(pathErr)
+				}
+				if _, err := os.Stat(key); err != nil {
+					t.Fatalf("uncertain identity lost its SSH key: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestAzureAcquireRollbackKeepsOriginalBindingAndRefusesUnpreparedDelete(t *testing.T) {
+	for _, failure := range []string{"", "prepare", "changed-preparation"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			primary := errors.New("readiness unavailable")
+			fake := &fakeAzureClient{waitErr: primary}
+			fake.prepareFunc = func(s core.Server) core.Server {
+				s.Labels = maps.Clone(s.Labels)
+				s.Labels["fixture_cleanup_binding"] = "captured"
+				return s
+			}
+			if failure == "prepare" {
+				fake.prepareErr = errors.New("cannot verify resources")
+			}
+			if failure == "changed-preparation" {
+				fake.prepareFunc = func(s core.Server) core.Server { s.ImmutableID = "replacement"; return s }
+			}
+			oldClient := newAzureClient
+			newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+			t.Cleanup(func() { newAzureClient = oldClient })
+			b := NewAzureLeaseBackend(core.ProviderSpec{}, azureAcquireTestConfig(), core.Runtime{Stderr: io.Discard}).(*azureLeaseBackend)
+			_, err := b.Acquire(t.Context(), core.AcquireRequest{})
+			if !errors.Is(err, primary) || len(fake.prepareOwned) != 1 || len(fake.plainDeletes) != 0 {
+				t.Fatalf("err=%v prepare=%v plain=%v", err, fake.prepareOwned, fake.plainDeletes)
+			}
+			if fake.prepareOwned[0].ImmutableID != fake.created.ImmutableID {
+				t.Fatal("original binding lost")
+			}
+			wantDelete := 0
+			if failure == "" {
+				wantDelete = 1
+			}
+			if len(fake.ownedExpected) != wantDelete {
+				t.Fatalf("deletion calls=%d", len(fake.ownedExpected))
+			}
+			if wantDelete == 1 && fake.ownedExpected[0].Labels["fixture_cleanup_binding"] != "captured" {
+				t.Fatal("prepared companion evidence lost")
+			}
+		})
+	}
+}
+
+func TestAzureConfigShowCompletePassiveSection(t *testing.T) {
+	projector, ok := any(Provider{}).(core.ProviderConfigShowProjector)
+	if !ok {
+		t.Fatal("actual provider has no passive config-show projector")
+	}
+	for _, tc := range []struct {
+		name  string
+		input core.Config
+		want  map[string]any
+		text  string
+	}{
+		{name: "nil", input: core.Config{}, want: map[string]any{"location": "", "resourceGroup": "", "image": "", "osDisk": "", "snapshotSKU": "", "osDiskSKU": "", "network": "", "sshCIDRs": []string(nil)}, text: "azure location= resource_group= os_disk= snapshot_sku=- os_disk_sku=- network=- ssh_cidrs=-\n"},
+		{name: "empty", input: core.Config{Azure: core.AzureConfig{SSHCIDRs: []string{}}}, want: map[string]any{"location": "", "resourceGroup": "", "image": "", "osDisk": "", "snapshotSKU": "", "osDiskSKU": "", "network": "", "sshCIDRs": []string{}}, text: "azure location= resource_group= os_disk= snapshot_sku=- os_disk_sku=- network=- ssh_cidrs=-\n"},
+		{name: "raw-references-list", input: core.Config{Azure: core.AzureConfig{Location: "raw-location", ResourceGroup: "group-reference", Image: "image-reference", OSDisk: "raw-disk", SnapshotSKU: "raw-snapshot-sku", OSDiskSKU: "raw-disk-sku", Network: "network-reference", SSHCIDRs: []string{"second", "first", "second", " "}}}, want: map[string]any{"location": "raw-location", "resourceGroup": "group-reference", "image": "image-reference", "osDisk": "raw-disk", "snapshotSKU": "raw-snapshot-sku", "osDiskSKU": "raw-disk-sku", "network": "network-reference", "sshCIDRs": []string{"second", "first", "second", " "}}, text: "azure location=raw-location resource_group=group-reference os_disk=raw-disk snapshot_sku=raw-snapshot-sku os_disk_sku=raw-disk-sku network=network-reference ssh_cidrs=second,first,second, \n"},
+		{name: "whitespace-empty-elements", input: core.Config{Azure: core.AzureConfig{Location: " ", ResourceGroup: " ", Image: " ", OSDisk: " ", SnapshotSKU: " ", OSDiskSKU: " ", Network: " ", SSHCIDRs: []string{"", ""}}}, want: map[string]any{"location": " ", "resourceGroup": " ", "image": " ", "osDisk": " ", "snapshotSKU": " ", "osDiskSKU": " ", "network": " ", "sshCIDRs": []string{"", ""}}, text: "azure location=  resource_group=  os_disk=  snapshot_sku=  os_disk_sku=  network=  ssh_cidrs=,\n"},
+	} {
+		tc.want["userAssignedIdentityResourceId"] = ""
+		tc.text = strings.TrimSuffix(tc.text, "\n") + " user_assigned_identity_resource_id=-\n"
+		for _, selected := range []string{"azure", "static"} {
+			t.Run(tc.name+"/"+selected, func(t *testing.T) {
+				cfg := tc.input
+				cfg.Provider = selected
+				before := cfg
+				before.Azure.SSHCIDRs = slices.Clone(cfg.Azure.SSHCIDRs)
+				section := projector.ConfigShowSection(cfg)
+				if section.JSONKey != "azure" || section.TextLabel != "azure" || !reflect.DeepEqual(section.Providers, []string{"azure"}) {
+					t.Fatalf("section metadata=%#v", section)
+				}
+				wantOrder := []string{"location", "resourceGroup", "image", "osDisk", "snapshotSKU", "osDiskSKU", "network", "sshCIDRs", "userAssignedIdentityResourceId"}
+				if len(section.Fields) != len(wantOrder) {
+					t.Fatalf("field count=%d want %d", len(section.Fields), len(wantOrder))
+				}
+				got := map[string]any{}
+				line := section.TextLabel
+				for i, field := range section.Fields {
+					if field.JSONName != wantOrder[i] {
+						t.Fatalf("field %d name=%q want %q", i, field.JSONName, wantOrder[i])
+					}
+					got[field.JSONName] = field.JSONValue
+					if field.TextName != "" {
+						line += " " + field.TextName + "=" + field.TextValue
+					}
+				}
+				line += "\n"
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("public fields=%#v want %#v", got, tc.want)
+				}
+				if line != tc.text {
+					t.Fatalf("text=%q want %q", line, tc.text)
+				}
+				if !reflect.DeepEqual(cfg, before) {
+					t.Fatal("projection mutated supplied configuration")
+				}
+			})
+		}
+	}
+}
+
+func TestAzureResolvedEndpointDirectAndAlias(t *testing.T) {
+	testutil.IsolateUserDirs(t)
+	server := azureTestServer("crabbox-example", "cbx_123456abcdef", "example")
+	server.PublicNet.IPv4.IP = "192.0.2.10"
+	server.PrivateNet.IPv4.IP = "10.0.0.10"
+	fake := &fakeAzureClient{servers: []core.Server{server}, get: map[string]core.Server{server.CloudID: server}}
+	old := newAzureClient
+	newAzureClient = func(context.Context, core.Config) (azureClient, error) { return fake, nil }
+	t.Cleanup(func() { newAzureClient = old })
+	for _, network := range []string{"public", "private"} {
+		for _, id := range []string{server.CloudID, "example"} {
+			for _, releaseOnly := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/release=%t", network, id, releaseOnly), func(t *testing.T) {
+					cfg := core.Config{SSHUser: "alice", SSHPort: "2222", SSHKey: "configured-key", TargetOS: "linux", Azure: core.AzureConfig{Network: network}}
+					backend := NewAzureLeaseBackend(core.ProviderSpec{}, cfg, core.Runtime{}).(*azureLeaseBackend)
+					got, err := backend.Resolve(t.Context(), core.ResolveRequest{ID: id, ReleaseOnly: releaseOnly})
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantHost := "192.0.2.10"
+					if network == "private" {
+						wantHost = "10.0.0.10"
+					}
+					if got.Server.CloudID != server.CloudID || got.LeaseID != "cbx_123456abcdef" || got.SSH.Host != wantHost || got.SSH.User != "alice" || got.SSH.Port != "2222" || got.SSH.Key != "configured-key" {
+						t.Fatalf("resolved target: %#v", got)
+					}
+				})
+			}
+		}
 	}
 }

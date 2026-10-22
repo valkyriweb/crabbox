@@ -6,11 +6,12 @@ Read this when you are:
 - configuring Daytona API auth, snapshots, or SSH access;
 - changing `internal/providers/daytona`.
 
-Daytona is an SSH-lease provider with a delegated execution path. `run` and
-`warmup` create the sandbox from a Daytona snapshot and drive sync and command
-execution through the Daytona SDK/toolbox APIs (archive upload, extraction, and
-process execution) — they do not run over SSH. `crabbox ssh` mints a short-lived
-Daytona SSH access token, then connects through the normal Crabbox SSH client.
+Daytona is an SSH-lease provider with two data planes. Direct ordinary `run` and
+`warmup` use the Daytona SDK/toolbox APIs. Explicit `--script` and `--script-stdin`
+runs use Crabbox's SSH runner, including script upload and optional rsync.
+Both paths create new sandboxes from a Daytona snapshot. With a coordinator configured, the Worker
+creates the sandbox and mints an expiring SSH access token; the CLI then uses
+normal SSH and rsync without receiving the Daytona API key.
 
 ## When to use
 
@@ -19,15 +20,96 @@ execution should stay inside Daytona's toolbox APIs. Reach for AWS, Hetzner, or
 the static `ssh` provider instead when you need a normal long-lived SSH lease for
 Actions hydration, desktop/VNC, or `code` workflows.
 
+Use brokered Daytona when clients should share centrally managed Daytona
+capacity without receiving the API key. Brokered Daytona supports normal
+SSH/sync/run, but not workspaces, ready pools, Actions hydration,
+desktop/browser/code, or Tailscale.
+
 ## Commands
 
 ```sh
+crabbox warmup --provider daytona --class standard
 crabbox warmup --provider daytona --daytona-snapshot crabbox-ready
 crabbox run --provider daytona --daytona-snapshot crabbox-ready -- pnpm test
 crabbox run --provider daytona --id swift-crab -- pnpm test:changed
+crabbox run --provider daytona --id swift-crab --no-sync --script ./check.sh -- "literal argument"
+printf 'printf "script ready\\n"\n' | crabbox run --provider daytona --id swift-crab --no-sync --script-stdin
 crabbox ssh --provider daytona --id swift-crab
 crabbox stop --provider daytona swift-crab
 ```
+
+## Native snapshots and forks
+
+Direct Daytona leases support filesystem snapshots through `checkpoint`:
+
+```sh
+crabbox checkpoint create --provider daytona --id swift-crab \
+  --mode native --name after-install --no-reboot=false
+crabbox checkpoint inspect chk_<id> --verify
+crabbox checkpoint fork chk_<id> --slug snapshot-fork
+crabbox run --provider daytona --id snapshot-fork -- pnpm test
+crabbox checkpoint delete chk_<id>
+```
+
+Capture flushes and stops a running source, waits for the snapshot to become
+active, then restarts the source. A stopped source stays stopped. The default
+`--no-reboot=true` refuses to stop a running source; explicitly allow the
+interruption with `--no-reboot=false`. The snapshot barrier applies even with
+`--wait=false`, bounded by `--wait-timeout`. Memory and running processes are
+not captured. Forks start independent sandboxes and relocate the saved workspace
+into the new lease's workdir.
+
+An explicit fork `--class` validates the captured snapshot's resources and keeps
+its exact ID; it never substitutes a default snapshot or resizes the capture.
+Configured YAML/environment classes do not constrain an already selected snapshot.
+See [Daytona classes](../features/daytona.md#config) for the three container
+tiers and their six canonical class labels.
+
+The local `daytona-snapshot` record binds the exact snapshot ID, organization,
+API endpoint, and source sandbox. Provider names include the checkpoint ID to
+avoid collisions. Verify, fork, and delete reject identity or scope mismatches;
+deletion waits for provider-confirmed absence. A missing snapshot on the initial
+lookup does not authorize removal of the local record: use `--local-only` only
+after checking the account and endpoint. Failed or uncertain captures retain a
+recovery record when a snapshot may exist. If capture completion cannot be
+confirmed, Crabbox leaves the source stopped and reports the source and snapshot
+to inspect before restarting it.
+
+Native capture currently requires direct Daytona credentials; it is not exposed
+through the coordinator. Use `--mode native` (or an explicit strategy); default
+auto mode retains the existing workspace-archive behavior. Snapshots may contain
+credentials and other filesystem state and incur storage charges until deleted.
+
+## Live Smoke
+
+The shared live-smoke harness can validate Daytona without a coordinator:
+
+```sh
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=daytona CRABBOX_LIVE_REPO=/path/to/my-app scripts/live-smoke.sh
+```
+
+The smoke requires a snapshot through `CRABBOX_DAYTONA_SNAPSHOT`,
+`DAYTONA_SNAPSHOT`, or `daytona.snapshot`. It exits before any Daytona `run`,
+`list`, `warmup`, or `stop` command when the snapshot is missing, so
+credentialless machines can verify the guard without mutating provider state.
+With a snapshot configured, the harness runs one delegated Daytona command and
+then lists normalized Daytona inventory.
+
+For a coordinator deployment, store `DAYTONA_CRABBOX_KEY` as a Worker secret.
+The optional `CRABBOX_DAYTONA_SNAPSHOT` Worker variable selects a shared
+snapshot; when it is empty, the Daytona account default is used.
+
+Clients need only normal Crabbox broker authentication. They do not need a
+Daytona CLI profile or Daytona API environment variables. Verify the fallback
+without creating a sandbox:
+
+```sh
+crabbox doctor --provider daytona
+```
+
+The broker readiness check performs a read-only sandbox inventory request and
+reports `daytona-fallback` with `client_auth=crabbox`,
+`control_plane=coordinator`, `data_plane=ssh-rsync`, and `mutation=false`.
 
 ## Auth
 
@@ -35,8 +117,16 @@ Crabbox reads the active Daytona CLI profile when no Daytona auth values are set
 in the environment or config:
 
 ```sh
-daytona login --api-key ...
+daytona login
 ```
+
+Both browser OAuth login and `daytona login --api-key ...` are supported.
+Crabbox reads `config.json` from `DAYTONA_CONFIG_DIR` when set, without falling
+back to another profile store. Otherwise it searches the normal Daytona CLI
+config locations. OAuth uses the active profile's access token and organization;
+expired or missing token expiry is rejected before a provider request. Run
+`daytona login` to reauthenticate. The Daytona CLI owns token refresh and profile
+writes; Crabbox never uses the saved refresh token.
 
 You can also supply explicit API-key auth:
 
@@ -51,7 +141,8 @@ export DAYTONA_JWT_TOKEN=...
 export DAYTONA_ORGANIZATION_ID=...
 ```
 
-`DAYTONA_ORGANIZATION_ID` is required with JWT auth. Explicit environment values
+`DAYTONA_ORGANIZATION_ID` is required with explicit JWT auth; a CLI OAuth profile
+supplies its active organization. Explicit environment values
 (or Crabbox config values) override the Daytona CLI profile.
 
 Each auth variable also has a `CRABBOX_`-prefixed form that takes precedence over
@@ -93,38 +184,216 @@ The non-auth settings can also be set through environment variables:
 `CRABBOX_DAYTONA_WORK_ROOT`, `CRABBOX_DAYTONA_SSH_GATEWAY_HOST`, and
 `CRABBOX_DAYTONA_SSH_ACCESS_MINUTES`.
 
-## Lifecycle
+## Managed lifecycle
 
-1. Create or resolve a Daytona sandbox from `daytona.snapshot`.
-2. Store Crabbox labels and a local repo claim for the lease.
-3. For `run`, build the Crabbox sync manifest, stream a gzipped tar archive to
+Brokered allocation includes native wall-clock TTL even for kept or explicitly
+retained sandboxes. The coordinator records returned UUIDs before readiness and
+confirms exact-resource deletion in the original allocation context. A lost
+create response remains visibly unresolved; name/label matches and elapsed TTL
+are not deletion proof. Legacy records without scope and changed credentials
+require operator resolution. See [managed Daytona cleanup](../features/lifecycle-cleanup.md#managed-daytona-cleanup)
+for lifetime, key-rotation, and recovery behavior.
+
+## Direct lifecycle
+
+### Fixed operation IDs
+
+Direct `warmup --lease-id cbx_<12 lowercase hex>` and checkpoint forks with the
+same flag bind one operation to its exact sandbox. A durable create intent is
+written before submission; an uncertain response can be reconciled by replaying
+the original request without submitting another create. The binding includes the
+API endpoint, native organization, snapshot selection, project repository and
+checkpoint, sizing, user, target, and lifetime. Credential rotation within that
+same organization does not change the binding. A released ID cannot be reused.
+
+Keep the source snapshot until acquisition completes successfully. Incomplete
+retries revalidate the exact pinned snapshot and sandbox sizing, even if the
+resource UUID is already known. If the source is retired first, the incomplete
+lease remains held for explicit cleanup; no replacement is created. Successfully
+acquired children can replay after their source snapshot is retired.
+
+Fixed acquisition must establish the organization before allocation. OAuth uses
+the selected organization from the existing CLI profile. API-key mode reads the
+authenticated `organizationId` from `/api-keys/current`, including empty accounts.
+The maintained Daytona Go client exposes this field directly. Missing, invalid,
+or conflicting identity is rejected; an API deployment without current-key
+organization metadata requires an OAuth organization profile. No credentials or
+token-derived identifiers are stored in fixed claims.
+
+Fixed claims use a distinct provider marker so older clients cannot treat them
+as ordinary Daytona claims and erase terminal replay protection. Failed or
+uncertain cleanup retains the claim. An unqualified 404 is not deletion proof:
+the provider's resource-access layer can also use that response for a different
+organization. Daytona grants every valid organization API key sandbox read
+access, including keys with no permissions; sandbox read access cannot be
+withheld within the organization. See [Daytona permissions and scopes](https://www.daytona.io/docs/en/api-keys/#permissions--scopes).
+Fresh organization attestation therefore distinguishes the access boundary
+before cleanup accepts the native exact-UUID absence receipt.
+Fixed cleanup durably binds the native UUID, verifies it through
+`GET /sandbox/{id}`, and records an identity-validated deletion acknowledgment
+before reconciling removal. The exact lookup reads the database rather than the
+ordinary cursor-list search index. Cleanup requires the endpoint to expose
+failed-deletion records until destruction completes, as the current Daytona API
+does for `error` and `build_failed` states even when their desired state is
+`destroyed`.
+
+Once cleanup durably records its entry before DELETE, replay and execution are
+blocked even if the DELETE response is lost and the sandbox still appears ready;
+retry `stop` to reconcile it. Acknowledgment only means destruction was requested.
+Cleanup then requires a structured exact-UUID not-found response and fresh
+access to the original authenticated organization, or an identity-validated
+`destroyed` record. Failed deletions, conflicting identities, and malformed
+responses retain custody. The exact lookup can expose destroyed spot-preemption
+records for 24 hours; those terminal records do not keep a fixed claim pending.
+This confirms the provider-visible terminal outcome, not independent proof of
+physical storage reclamation.
+
+This works after deletion of the last live sandbox and accommodates the native
+rename during deletion. The durable acknowledgment survives interruption and
+same-organization credential rotation. Native TTL or external deletion can remove
+a successfully acquired sandbox before Crabbox requests deletion. In that case,
+`stop`, `inspect`, and `status` reconcile the recorded exact UUID against fresh
+authenticated organization identity and exact database absence, then persist the same terminal claim. Inspection never issues DELETE.
+Neither a bare 404 nor an elapsed deadline establishes removal. Incomplete creates
+without a deletion witness, including attempts whose UUID was never observed,
+remain explicit operator reconciliation obligations. No second create is submitted.
+A valid released claim remains available through `inspect` and
+`status` as `released`, never ready, with no provider request or remote access.
+`status --wait` reports that terminal state instead of waiting for readiness.
+
+The fixed producer also labels its native sandbox with `fixed_claim_provider`
+and an attempt nonce. The fingerprint alone remains opaque metadata on ordinary
+leases; it does not identify a fixed owner or grant recovery authority. Native
+labels never replace the matching durable claim.
+
+Direct control-plane HTTP requests have a 60-second default whole-request
+timeout, including response-body reads. Earlier caller cancellation or deadlines
+still apply. Toolbox execution and archive uploads keep their caller-controlled
+lifetimes rather than inheriting this control-plane budget.
+
+New ordinary leases record the API endpoint and authenticated organization in
+their local claim before readiness, using current-key organization metadata or
+the authenticated OAuth organization. Acquisition fails before creating a
+sandbox if that identity cannot be attested. Credential rotation within the
+same organization preserves the binding.
+
+If native TTL or external deletion removes such a sandbox, use
+`crabbox stop --force --provider daytona --id <canonical-cbx-id>`. Crabbox verifies
+the current endpoint/organization against the original binding, an exact
+structured not-found, and complete inventory without a Crabbox label filter.
+The cursor inventory may briefly lag the exact lookup; a stale entry retains the
+claim until a later retry. Inventory is bounded to 100 pages of 100 sandboxes and
+8 MiB per response;
+malformed, null, repeated, oversized, or failed pages retain the claim. Recovery
+has a three-minute total budget and reports `forgotten locally (resource absent)`
+without sending a delete. Ordinary `stop` and fixed-ID replay keep their existing
+ownership rules.
+
+### Recovering pre-binding claims
+
+Older ordinary claims lack the original authenticated account binding. Forced
+recovery reports `claim predates account binding; manual recovery per docs` and
+retains them, even if the currently selected account reports not-found. Inspect
+the exact sandbox ID with the original Daytona endpoint and owning account,
+complete any native cleanup there, and retain the claim until that cleanup is
+independently verified. With no concurrent Crabbox operation and no checkpoint,
+fixed-ID, or registration owner, remove only its exact file from the
+[local claims directory](../features/identifiers.md#local-claims); changing a claim's scope to the current
+account is not a supported recovery procedure.
+
+1. Create or resolve a Daytona sandbox from `daytona.snapshot` or an explicitly
+   selected class's default snapshot.
+2. Create private previews, configure Daytona's native wall-clock TTL and idle
+   auto-stop interval, and store Crabbox labels and an exact local repo claim.
+   The adapter records allocation before waiting for readiness, so a failed
+   startup is rolled back. A lost create response is reconciled by the unique
+   sandbox name and verified ownership, without allocating again. Failed
+   cleanup retains a recovery claim and reports the exact sandbox and lease IDs.
+3. For ordinary `run`, build the Crabbox sync manifest, stream a gzipped tar archive to
    the Daytona toolbox upload endpoint, extract it in the sandbox, and execute
-   the command through the Daytona process APIs.
-4. For `ssh`, request short-lived SSH access (TTL `daytona.sshAccessMinutes`),
+   the command through the Daytona process APIs. Remote process timeouts are
+   derived from the caller's context deadline, rounded up to whole seconds, and
+   capped at Daytona's maximum supported value; callers without a deadline use
+   that maximum. Toolbox HTTP requests are canceled by their request context
+   without an independent client-wide timeout.
+   Sync prunes only deleted manifest-owned source paths; dependencies, caches,
+   and other remote-only files survive ordinary resyncs. The next manifest is
+   published only after successful extraction. Active sync and execution
+   refresh Daytona activity at least every 30 seconds so quiet commands do not
+   trigger idle auto-stop.
+4. For script runs, admit the exact lease and repository claim, then use the
+   normal SSH workspace owner, private script upload, and shell runner. Scripts
+   retain their shebang; scripts without one run with Bash. Trailing arguments
+   are passed literally, the cwd is the lease's repository workspace, and
+   `--env-from-profile` uses the private environment-file path. `--no-sync`
+   skips repository sync while still uploading the script. Activity refreshes
+   cover setup, sync, and execution with the same native idle policy.
+   After cancellation, another SSH script run must acquire the workspace owner;
+   a live or ambiguous witnessed child blocks reuse. This does not establish
+   settlement of an ordinary SDK command.
+5. For `ssh`, request short-lived SSH access (TTL `daytona.sshAccessMinutes`),
    parse Daytona's `sshCommand`, and redact the token in normal output.
-5. Delete the sandbox on release unless the lease is kept.
+6. Delete the sandbox on release unless the lease is kept.
+
+`--ttl` is a hard upper bound even while commands run or a lease is kept.
+Daytona lifetime settings use whole minutes, so positive durations are rounded
+up. Idle auto-stop preserves the sandbox filesystem; native TTL ultimately
+deletes the sandbox. `heartbeat --idle-timeout` changes the provider's auto-stop
+policy as well as Crabbox metadata. Status readiness comes from Daytona's live
+state, never a previously stored `ready` label. Explicit `crabbox stop` (and its
+`release` alias) waits for confirmed provider deletion under the caller's
+cancellation and deadline. The CLI remains interruptible by signal; a supervising
+process owns its command budget. Non-cancelable callers, including detached job
+cleanup, retain the 30-second fallback. Individual control-plane requests retain
+their 60-second limit. Automatic run/watch cleanup and detached rollback keep
+their separate 30-second budget.
+If `stop` cannot resolve the claimed sandbox, it returns the lookup error and
+preserves the local recovery claim. A missing sandbox in the current account or
+API endpoint does not prove deletion in the original scope, even after native TTL.
+
+API, toolbox, and archive-upload clients refuse redirects that change scheme,
+host, or effective port. Custom endpoints require HTTPS except for loopback
+development endpoints.
 
 ## Capabilities
 
 - Provider kind: SSH-lease (Linux only).
 - SSH: yes, via a short-lived Daytona SSH access token.
-- Crabbox sync: yes, archive sync through the Daytona toolbox.
+- Sync: direct ordinary commands use Daytona toolbox archive sync; script runs
+  and brokered mode use normal Crabbox rsync over SSH.
 - Desktop / browser / code: no — Daytona has no Crabbox VNC or `code` surface.
 - Actions hydration: no.
-- Coordinator (broker): no — Daytona always runs direct from the CLI.
+- Coordinator (broker): yes for Linux SSH/sync/run. The coordinator owns the
+  API key and rotates the lease's SSH token.
+- Broker readiness: read-only Daytona inventory plus explicit coordinator and
+  SSH/rsync data-plane diagnostics; no sandbox is created.
+- Native checkpoint / fork / snapshot: yes, for direct Linux leases; filesystem
+  capture only. In-place native restore and memory capture are not supported.
 
 ## Gotchas
 
-- `daytona.snapshot` (or `--daytona-snapshot`) is required to create a sandbox.
-  The snapshot owns CPU, memory, disk, and installed tooling.
-- `--class` and `--type` are rejected; size the sandbox through the snapshot.
+- Direct mode requires `daytona.snapshot` (or `--daytona-snapshot`) unless a
+  class explicitly selects a default container tier. Brokered
+  mode uses the coordinator's optional `CRABBOX_DAYTONA_SNAPSHOT`.
+- Brokered release and rollback are idempotent when the owned sandbox was
+  already deleted or expired.
+- Direct `--class` selects or validates snapshot sizing; `--type` remains
+  unsupported. YAML/environment classes select a tier only without a snapshot;
+  existing snapshots keep precedence. Brokered mode rejects `--class` but preserves existing
+  YAML/environment class configuration without changing coordinator-owned sizing.
 - `--id <sandbox-id-or-slug>` is required to address an existing sandbox.
-- Daytona `run` is delegated to the toolbox APIs; it is not core-over-SSH
-  execution. Because of that, the following `run` options are rejected:
-  `--sync-only`, `--checksum`, `--force-sync-large`, `--full-resync`,
-  `--fresh-pr`, `--script` / `--script-stdin`, `--env-helper`,
+- Ordinary Daytona `run` commands delegate to the toolbox APIs and reject:
+  `--checksum`, `--full-resync`,
+  `--fresh-pr`, `--env-helper`,
   `--capture-stdout` / `--capture-stderr`, `--capture-on-fail`, `--download`,
   `--artifact-glob`, `--require-artifact`, `--emit-proof`, and `--stop-after`.
+- `--script` / `--script-stdin` explicitly select the SSH runner and its normal
+  sync, environment, capture, and exit-code behavior. The SDK transport never
+  retries failed commands through SSH. Script runs need snapshot tooling for
+  SSH, Git, rsync, tar, and Bash, plus access to the Daytona SSH gateway.
+- Use `--sync-only` to pre-upload the archive into a kept sandbox before a later
+  command. Large-sync guardrails still apply; `--force-sync-large` is honored
+  for intentional large archive syncs.
 - `--actions-runner` is rejected because it needs a normal SSH lease host.
 - `--keep-on-failure` keeps a newly created failed sandbox until Daytona
   auto-stop or an explicit `crabbox stop`.

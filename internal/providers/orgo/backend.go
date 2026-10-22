@@ -1,0 +1,808 @@
+package orgo
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
+)
+
+const (
+	orgoCreatedWorkspaceLabel = "orgo_workspace_created"
+	orgoWorkspaceLabel        = "orgo_workspace_id"
+	orgoReadyTimeout          = 5 * time.Minute
+	orgoReadyPollInterval     = 250 * time.Millisecond
+	orgoCleanupTimeout        = 30 * time.Second
+)
+
+func NewOrgoBackend(spec core.ProviderSpec, cfg core.Config, rt core.Runtime) core.Backend {
+	cfg.Provider = providerName
+	applyOrgoDefaults(&cfg)
+	return &orgoBackend{spec: spec, cfg: cfg, rt: rt}
+}
+
+type orgoBackend struct {
+	spec   core.ProviderSpec
+	cfg    core.Config
+	rt     core.Runtime
+	client orgoAPI
+}
+
+type orgoLease struct {
+	LeaseID          string
+	Slug             string
+	Computer         orgoComputer
+	CreatedWorkspace string
+}
+
+func (b *orgoBackend) Spec() core.ProviderSpec { return b.spec }
+
+func (b *orgoBackend) Warmup(ctx context.Context, req core.WarmupRequest) error {
+	if req.ActionsRunner {
+		return core.Exit(2, "--actions-runner is not supported for provider=%s", providerName)
+	}
+	if req.Options.Tailscale.Enabled {
+		return core.Exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
+	}
+	started := core.ClockNow(b.rt.Clock)
+	client, err := b.api()
+	if err != nil {
+		return err
+	}
+	lease, err := b.createComputer(ctx, client, req.Repo, req.RequestedSlug, req.Reclaim)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(b.rt.Stdout, "leased %s slug=%s provider=%s computer=%s workspace=%s\n", lease.LeaseID, lease.Slug, providerName, lease.Computer.ID, lease.Computer.WorkspaceID)
+	if !req.Keep {
+		fmt.Fprintf(b.rt.Stderr, "warning: orgo warmup keeps the computer until explicit stop\n")
+	}
+	total := core.ClockNow(b.rt.Clock).Sub(started)
+	return shared.CompleteWarmup(b.rt, req.TimingJSON, shared.WarmupCompletion{
+		Provider: providerName,
+		LeaseID:  lease.LeaseID,
+		Slug:     lease.Slug,
+		Total:    total,
+	})
+}
+
+func (b *orgoBackend) Run(ctx context.Context, req core.RunRequest) (result core.RunResult, retErr error) {
+	if err := b.rejectRunOptions(req); err != nil {
+		return core.RunResult{}, err
+	}
+	if len(req.Command) == 0 {
+		return core.RunResult{}, core.Exit(2, "missing command")
+	}
+	started := core.ClockNow(b.rt.Clock)
+	client, err := b.api()
+	if err != nil {
+		return core.RunResult{}, err
+	}
+	lease := orgoLease{}
+	acquired := false
+	if strings.TrimSpace(req.ID) == "" {
+		lease, err = b.createComputer(ctx, client, req.Repo, req.RequestedSlug, req.Reclaim)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		acquired = true
+		fmt.Fprintf(b.rt.Stderr, "leased %s slug=%s provider=%s computer=%s workspace=%s\n", lease.LeaseID, lease.Slug, providerName, lease.Computer.ID, lease.Computer.WorkspaceID)
+	} else {
+		lease, err = b.resolveComputer(ctx, client, req.ID)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+		lease.Computer, err = b.ensureComputerRunning(ctx, client, lease.Computer)
+		if err != nil {
+			return core.RunResult{}, err
+		}
+	}
+
+	shouldStop := acquired && !req.Keep
+	result = core.RunResult{Provider: providerName, LeaseID: lease.LeaseID, Slug: lease.Slug, SyncDelegated: true}
+	commandRan := false
+	defer func() {
+		// HTTP failures expose provider-specific public codes. Pin the primary
+		// outcome before cleanup or reporting adds a different failure.
+		result, retErr = shared.PinDelegatedRunFailure(result, retErr)
+		if shouldStop {
+			if cleanupErr := b.cleanupLease(client, lease); cleanupErr != nil {
+				result, retErr = shared.AppendDelegatedRunFailure(result, retErr, fmt.Errorf("orgo cleanup failed for %s: %w", lease.Computer.ID, cleanupErr), 1)
+			}
+		}
+		result.Total = core.ClockNow(b.rt.Clock).Sub(started)
+		result = core.FinalizeRunResult(result, retErr)
+		if commandRan {
+			fmt.Fprintf(b.rt.Stderr, "orgo run summary sync_delegated=true command=%s total=%s exit=%d\n", result.Command.Round(time.Millisecond), result.Total.Round(time.Millisecond), result.ExitCode)
+		}
+		if req.TimingJSON {
+			timingErr := core.WriteTimingJSON(b.rt.Stderr, core.TimingReportWithRunResult(core.TimingReport{
+				Provider: providerName, LeaseID: lease.LeaseID, Slug: lease.Slug,
+				SyncDelegated: true, SyncSkipped: true,
+				CommandMs: result.Command.Milliseconds(), TotalMs: result.Total.Milliseconds(),
+				ExitCode: result.ExitCode, Label: strings.TrimSpace(req.Label),
+			}, result, retErr))
+			result, retErr = shared.AppendDelegatedRunFailure(result, retErr, timingErr, core.ExitCodeForError(timingErr, 1))
+		}
+	}()
+
+	intent, err := core.ParseCommandIntent(req.Command, req.ShellMode, req.CommandLiteralArgs)
+	if err != nil {
+		return result, err
+	}
+	command, err := b.buildCommand(intent, req.Env)
+	if err != nil {
+		return result, err
+	}
+	result.CommandText = intent.ShellScript()
+	if req.EnvSummary {
+		core.PrintEnvForwardingSummary(b.rt.Stderr, providerName, "forwarded", req.Options.EnvAllow, req.Env)
+	}
+	commandStarted := core.ClockNow(b.rt.Clock)
+	req.Observation.Phase(core.RunPhaseCommand)
+	stdout, stderr := req.Observation.CommandWriters(b.rt.Stdout, b.rt.Stderr, core.RunOutputWorkload)
+	exitCode, runErr := client.RunBash(ctx, lease.Computer.ID, command, stdout, stderr)
+	result.Command = core.ClockNow(b.rt.Clock).Sub(commandStarted)
+	commandRan = true
+	if runErr != nil {
+		core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, lease.LeaseID, lease.Slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, &shouldStop)
+		return result, runErr
+	}
+	outcome := shared.FinalizeDelegatedCommandOutcome(exitCode, nil)
+	result.ExitCode, result.Status, result.ErrorKind = outcome.ExitCode, outcome.Status, outcome.ErrorKind
+	if result.ExitCode != 0 {
+		core.HandleDelegatedRunFailure(b.rt.Stderr, req, providerName, lease.LeaseID, lease.Slug, b.cfg.IdleTimeout, b.cfg.TTL, acquired, &shouldStop)
+		return result, core.ExitError{Code: result.ExitCode, Message: fmt.Sprintf("%s computer exit=%d", providerName, result.ExitCode)}
+	}
+	return result, nil
+}
+
+func (b *orgoBackend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
+	client, err := b.api()
+	if err != nil {
+		return nil, err
+	}
+	computers, err := b.listComputers(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	claimsByComputer := map[string]core.LeaseClaim{}
+	if claims, err := core.ListLeaseClaims(); err == nil {
+		for _, claim := range claims {
+			if claim.Provider == providerName && strings.TrimSpace(claim.CloudID) != "" && b.validateOrgoClaim(claim) == nil {
+				claimsByComputer[claim.CloudID] = claim
+			}
+		}
+	}
+	servers := make([]core.Server, 0, len(computers))
+	for _, computer := range computers {
+		claim := claimsByComputer[computer.ID]
+		servers = append(servers, orgoComputerServer(computer, claim))
+	}
+	return servers, nil
+}
+
+func (b *orgoBackend) Status(ctx context.Context, req core.StatusRequest) (core.StatusView, error) {
+	if strings.TrimSpace(req.ID) == "" {
+		return core.StatusView{}, core.Exit(2, "provider=%s status requires --id <computer-id-or-slug>", providerName)
+	}
+	client, err := b.api()
+	if err != nil {
+		return core.StatusView{}, err
+	}
+	lease, err := b.resolveComputer(ctx, client, req.ID)
+	if err != nil {
+		return core.StatusView{}, err
+	}
+	timeout := req.WaitTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	deadline := core.ClockNow(b.rt.Clock).Add(timeout)
+	for {
+		view := orgoStatusView(lease)
+		if !req.Wait || view.Ready {
+			return view, nil
+		}
+		switch view.State {
+		case "error", "failed", "deleted":
+			return view, core.Exit(5, "orgo computer %s entered %s state", lease.Computer.ID, view.State)
+		}
+		if core.ClockNow(b.rt.Clock).After(deadline) {
+			return core.StatusView{}, core.Exit(5, "timed out waiting for orgo computer %s to become ready", lease.Computer.ID)
+		}
+		select {
+		case <-ctx.Done():
+			return core.StatusView{}, ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
+		computer, err := client.GetComputer(ctx, lease.Computer.ID)
+		if err != nil {
+			return core.StatusView{}, err
+		}
+		lease.Computer = computer
+	}
+}
+
+func (b *orgoBackend) Stop(ctx context.Context, req core.StopRequest) error {
+	if strings.TrimSpace(req.ID) == "" {
+		return core.Exit(2, "provider=%s stop requires --id <computer-id-or-slug>", providerName)
+	}
+	client, err := b.api()
+	if err != nil {
+		return err
+	}
+	lease, err := b.resolveClaimedComputer(ctx, client, req.ID)
+	if err != nil {
+		return err
+	}
+	return b.deleteLease(ctx, client, lease)
+}
+
+func (b *orgoBackend) resolveClaimedComputer(ctx context.Context, client orgoAPI, identifier string) (orgoLease, error) {
+	id := strings.TrimSpace(identifier)
+	claim, ok, err := resolveLeaseClaimForProviderCloudID(id)
+	if err != nil {
+		return orgoLease{}, err
+	}
+	if !ok {
+		claim, ok, err = resolveLeaseClaimForProvider(id)
+		if err != nil {
+			return orgoLease{}, err
+		}
+	}
+	if !ok {
+		return orgoLease{}, core.Exit(4, "provider=%s refuses to stop unclaimed computer %s", providerName, id)
+	}
+	computerID := strings.TrimSpace(claim.CloudID)
+	if computerID == "" {
+		return orgoLease{}, core.Exit(4, "provider=%s claim %s has no computer identity", providerName, claim.LeaseID)
+	}
+	if err := b.validateOrgoClaim(claim); err != nil {
+		return orgoLease{}, err
+	}
+	lease := orgoLease{
+		LeaseID: claim.LeaseID,
+		Slug:    claim.Slug,
+		Computer: orgoComputer{
+			ID:          computerID,
+			WorkspaceID: strings.TrimSpace(claim.Labels[orgoWorkspaceLabel]),
+		},
+		CreatedWorkspace: strings.TrimSpace(claim.Labels[orgoCreatedWorkspaceLabel]),
+	}
+	computer, err := client.GetComputer(ctx, computerID)
+	if err != nil {
+		if !isOrgoNotFound(err) {
+			return orgoLease{}, err
+		}
+		workspaceID := lease.Computer.WorkspaceID
+		if workspaceID == "" {
+			return orgoLease{}, err
+		}
+		workspace, workspaceErr := client.GetWorkspace(ctx, workspaceID)
+		if workspaceErr != nil {
+			if isConfirmedOrgoHTTPNotFound(workspaceErr) {
+				return lease, nil
+			}
+			return orgoLease{}, errors.Join(err, fmt.Errorf("verify orgo workspace inventory: %w", workspaceErr))
+		}
+		if workspace.Computers == nil {
+			return orgoLease{}, errors.Join(err, errors.New("verify orgo workspace inventory: response omitted computers"))
+		}
+		for _, candidate := range workspace.Computers {
+			if candidate.ID == computerID {
+				return orgoLease{}, err
+			}
+		}
+		// A readable, complete workspace inventory proves the claimed computer is
+		// absent. Keep the workspace identity so a prior partial cleanup can retry.
+		lease.Computer.ID = ""
+		return lease, nil
+	}
+	if computer.WorkspaceID == "" {
+		computer.WorkspaceID = lease.Computer.WorkspaceID
+	} else if computer.WorkspaceID != lease.Computer.WorkspaceID {
+		return orgoLease{}, core.Exit(2, "provider=%s computer %s belongs to a different workspace namespace", providerName, computer.ID)
+	}
+	if expected := strings.TrimSpace(claim.Labels["orgo_instance_id"]); expected != "" && computer.InstanceID != "" && computer.InstanceID != expected {
+		return orgoLease{}, core.Exit(2, "provider=%s computer %s no longer matches its claimed instance identity", providerName, computer.ID)
+	}
+	lease.Computer = computer
+	return lease, nil
+}
+
+func (b *orgoBackend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.DoctorResult, error) {
+	client, err := b.api()
+	if err != nil {
+		return core.DoctorResult{}, err
+	}
+	computers, err := b.listComputers(ctx, client)
+	if err != nil {
+		return core.DoctorResult{}, err
+	}
+	return core.InventoryDoctorResult(providerName, len(computers)), nil
+}
+
+func (b *orgoBackend) api() (orgoAPI, error) {
+	if b.client != nil {
+		return b.client, nil
+	}
+	client, err := newOrgoClient(b.cfg, b.rt)
+	if err != nil {
+		return nil, err
+	}
+	b.client = client
+	return client, nil
+}
+
+func (b *orgoBackend) createComputer(ctx context.Context, client orgoAPI, repo core.Repo, requestedSlug string, reclaim bool) (orgoLease, error) {
+	leaseID := core.NewLeaseID()
+	slug, err := core.AllocateClaimLeaseSlug(leaseID, requestedSlug)
+	if err != nil {
+		return orgoLease{}, err
+	}
+	workspaceID := strings.TrimSpace(b.cfg.Orgo.WorkspaceID)
+	createdWorkspace := ""
+	if workspaceID == "" {
+		workspaceName := "crabbox-" + leaseID
+		workspace, err := client.CreateWorkspace(ctx, workspaceName)
+		if err != nil {
+			return orgoLease{}, fmt.Errorf("create orgo workspace name=%q: %w", workspaceName, err)
+		}
+		workspaceID = workspace.ID
+		createdWorkspace = workspace.ID
+	}
+	req := b.createComputerRequest(workspaceID, leaseID)
+	computer, err := client.CreateComputer(ctx, req)
+	if err != nil {
+		err = fmt.Errorf("create orgo computer workspace=%s name=%q: %w", workspaceID, req.Name, err)
+		if createdWorkspace != "" {
+			if cleanupErr := b.cleanupLease(client, orgoLease{CreatedWorkspace: createdWorkspace}); cleanupErr != nil {
+				return orgoLease{}, errors.Join(err, fmt.Errorf("rollback orgo workspace %s: %w", createdWorkspace, cleanupErr))
+			}
+		}
+		return orgoLease{}, err
+	}
+	if computer.WorkspaceID == "" {
+		computer.WorkspaceID = workspaceID
+	}
+	computer, err = b.waitForComputerRunning(ctx, client, computer, false)
+	if err != nil {
+		cleanupErr := b.cleanupLease(client, orgoLease{
+			Computer:         computer,
+			CreatedWorkspace: createdWorkspace,
+		})
+		if cleanupErr != nil {
+			return orgoLease{}, errors.Join(err, fmt.Errorf("rollback orgo computer %s workspace %s: %w", computer.ID, computer.WorkspaceID, cleanupErr))
+		}
+		return orgoLease{}, err
+	}
+	lease := orgoLease{LeaseID: leaseID, Slug: slug, Computer: computer, CreatedWorkspace: createdWorkspace}
+	if err := b.claimLease(repo, lease, reclaim); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), orgoCleanupTimeout)
+		cleanupErr := b.deleteLeaseResources(cleanupCtx, client, lease)
+		cancel()
+		if cleanupErr != nil {
+			return orgoLease{}, errors.Join(err, fmt.Errorf("rollback orgo computer %s workspace %s: %w", computer.ID, computer.WorkspaceID, cleanupErr))
+		}
+		return orgoLease{}, err
+	}
+	return lease, nil
+}
+
+func (b *orgoBackend) ensureComputerRunning(ctx context.Context, client orgoAPI, computer orgoComputer) (orgoComputer, error) {
+	return b.waitForComputerRunning(ctx, client, computer, true)
+}
+
+func (b *orgoBackend) waitForComputerRunning(ctx context.Context, client orgoAPI, computer orgoComputer, startStopped bool) (orgoComputer, error) {
+	deadline := core.ClockNow(b.rt.Clock).Add(orgoReadyTimeout)
+	startRequested := false
+	initial := true
+	_, err := shared.Poll(context.WithoutCancel(ctx), 0, orgoReadyPollInterval,
+		func(context.Context, time.Duration) error {
+			if err := shared.SleepContext(ctx, orgoReadyPollInterval); err != nil {
+				return ctx.Err()
+			}
+			return nil
+		},
+		func(context.Context) (orgoComputer, error) {
+			if initial {
+				initial = false
+				return computer, nil
+			}
+			refreshed, err := client.GetComputer(ctx, computer.ID)
+			if err != nil {
+				return orgoComputer{}, err
+			}
+			if refreshed.WorkspaceID == "" {
+				refreshed.WorkspaceID = computer.WorkspaceID
+			}
+			return refreshed, nil
+		},
+		func(_ context.Context, current orgoComputer, fetchErr error) (bool, error) {
+			if fetchErr != nil {
+				return false, fetchErr
+			}
+			computer = current
+			state := normalizeOrgoStatus(computer.Status)
+			switch state {
+			case "running":
+				return true, nil
+			case "error", "failed", "deleted":
+				return false, core.Exit(5, "orgo computer %s entered %s state while starting", computer.ID, state)
+			case "stopped", "suspended":
+				if startStopped && !startRequested {
+					if err := client.StartComputer(ctx, computer.ID); err != nil {
+						return false, err
+					}
+					startRequested = true
+					computer.Status = "starting"
+					state = "starting"
+				}
+			}
+			if !core.ClockNow(b.rt.Clock).Before(deadline) {
+				return false, core.Exit(5, "timed out waiting for orgo computer %s to become running (last state=%s)", computer.ID, state)
+			}
+			return false, nil
+		}, nil)
+	if err != nil {
+		return computer, err
+	}
+	return computer, nil
+}
+
+func (b *orgoBackend) createComputerRequest(workspaceID, leaseID string) orgoCreateComputerRequest {
+	cfg := b.cfg.Orgo
+	return orgoCreateComputerRequest{
+		WorkspaceID: workspaceID,
+		Name:        "crabbox-" + leaseID,
+		OS:          "linux",
+		RAMGB:       cfg.RAMGB,
+		CPUs:        cfg.CPUs,
+		DiskGB:      cfg.DiskGB,
+		Resolution:  strings.TrimSpace(cfg.Resolution),
+	}
+}
+
+func (b *orgoBackend) claimLease(repo core.Repo, lease orgoLease, reclaim bool) error {
+	labels := map[string]string{
+		"provider":           providerName,
+		orgoWorkspaceLabel:   lease.Computer.WorkspaceID,
+		"orgo_instance_id":   lease.Computer.InstanceID,
+		"orgo_connectionURL": lease.Computer.ConnectionURL,
+		"target":             targetLinux,
+	}
+	if lease.CreatedWorkspace != "" {
+		labels[orgoCreatedWorkspaceLabel] = lease.CreatedWorkspace
+	}
+	server := orgoComputerServer(lease.Computer, core.LeaseClaim{
+		LeaseID: lease.LeaseID,
+		Slug:    lease.Slug,
+		Labels:  labels,
+	})
+	return claimLeaseForRepoProviderEndpoint(lease.LeaseID, lease.Slug, orgoClaimScope(b.cfg, lease.Computer.WorkspaceID), repo.Root, b.cfg.IdleTimeout, reclaim, server)
+}
+
+func orgoClaimScope(cfg core.Config, workspaceID string) string {
+	endpoint := strings.TrimRight(strings.TrimSpace(core.Blank(cfg.Orgo.APIBase, core.OrgoConfigDefaultAPIBase)), "/")
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.Host != "" {
+		parsed.Scheme = strings.ToLower(parsed.Scheme)
+		parsed.Host = strings.ToLower(parsed.Host)
+		endpoint = parsed.String()
+	}
+	return "endpoint:" + endpoint + "|workspace:" + strings.TrimSpace(workspaceID)
+}
+
+func (b *orgoBackend) orgoClaimBinding(leaseID, slug, computerID, workspaceID string) shared.ClaimBinding {
+	return shared.ClaimBinding{
+		Provider:       providerName,
+		ProviderScope:  orgoClaimScope(b.cfg, workspaceID),
+		LeaseID:        leaseID,
+		Slug:           slug,
+		CloudID:        computerID,
+		RequiredLabels: map[string]string{orgoWorkspaceLabel: workspaceID},
+	}
+}
+
+func (b *orgoBackend) validateOrgoClaim(claim core.LeaseClaim) error {
+	workspaceID := strings.TrimSpace(claim.Labels[orgoWorkspaceLabel])
+	if workspaceID == "" {
+		return core.Exit(2, "provider=%s lease=%s has no claimed workspace namespace", providerName, claim.LeaseID)
+	}
+	if configured := strings.TrimSpace(b.cfg.Orgo.WorkspaceID); configured != "" && configured != workspaceID {
+		return core.Exit(2, "provider=%s lease=%s belongs to a different workspace namespace", providerName, claim.LeaseID)
+	}
+	_, err := shared.RequireExactClaim(b.orgoClaimBinding(claim.LeaseID, claim.Slug, claim.CloudID, workspaceID))
+	return err
+}
+
+func (b *orgoBackend) resolveComputer(ctx context.Context, client orgoAPI, identifier string) (orgoLease, error) {
+	id := strings.TrimSpace(identifier)
+	leaseID, slug := id, ""
+	createdWorkspace := ""
+	workspaceID := ""
+	// Exact provider resource identity wins over friendly slug matching. This is
+	// required for destructive operations when a slug happens to equal another
+	// computer's ID.
+	claim, ok, err := resolveLeaseClaimForProviderCloudID(id)
+	if err != nil {
+		return orgoLease{}, err
+	}
+	if !ok {
+		claim, ok, err = resolveLeaseClaimForProvider(id)
+		if err != nil {
+			return orgoLease{}, err
+		}
+	}
+	if ok {
+		if err := b.validateOrgoClaim(claim); err != nil {
+			return orgoLease{}, err
+		}
+		leaseID = claim.LeaseID
+		slug = claim.Slug
+		createdWorkspace = strings.TrimSpace(claim.Labels[orgoCreatedWorkspaceLabel])
+		workspaceID = strings.TrimSpace(claim.Labels[orgoWorkspaceLabel])
+		if strings.TrimSpace(claim.CloudID) != "" {
+			id = claim.CloudID
+		}
+	}
+	computer, err := client.GetComputer(ctx, id)
+	if err != nil {
+		return orgoLease{}, err
+	}
+	if computer.WorkspaceID == "" {
+		computer.WorkspaceID = workspaceID
+	}
+	if slug == "" {
+		slug = computer.Name
+	}
+	return orgoLease{LeaseID: leaseID, Slug: slug, Computer: computer, CreatedWorkspace: createdWorkspace}, nil
+}
+
+func (b *orgoBackend) deleteLease(ctx context.Context, client orgoAPI, lease orgoLease) error {
+	if !strings.HasPrefix(lease.LeaseID, "cbx_") {
+		return b.deleteLeaseResources(ctx, client, lease)
+	}
+	claim, exists, err := core.ReadLeaseClaimWithPresence(lease.LeaseID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return core.Exit(2, "provider=%s lease=%s has no exact local ownership claim", providerName, lease.LeaseID)
+	}
+	computerID := core.Blank(strings.TrimSpace(lease.Computer.ID), claim.CloudID)
+	workspaceID := core.Blank(strings.TrimSpace(lease.Computer.WorkspaceID), claim.Labels[orgoWorkspaceLabel])
+	binding := b.orgoClaimBinding(lease.LeaseID, lease.Slug, computerID, workspaceID)
+	claim, err = shared.RequireExactClaim(binding)
+	if err != nil {
+		return err
+	}
+	return shared.RemoveExactClaimAfterContext(ctx, claim, binding, func() error {
+		if lease.Computer.ID != "" {
+			computer, err := client.GetComputer(ctx, lease.Computer.ID)
+			if err != nil {
+				if !isOrgoNotFound(err) {
+					return err
+				}
+				workspace, workspaceErr := client.GetWorkspace(ctx, workspaceID)
+				if workspaceErr != nil {
+					if isConfirmedOrgoHTTPNotFound(workspaceErr) {
+						return nil
+					}
+					return errors.Join(err, fmt.Errorf("verify orgo workspace inventory: %w", workspaceErr))
+				}
+				if workspace.Computers == nil {
+					return errors.Join(err, errors.New("verify orgo workspace inventory: response omitted computers"))
+				}
+				for _, candidate := range workspace.Computers {
+					if candidate.ID == lease.Computer.ID {
+						return err
+					}
+				}
+				lease.Computer.ID = ""
+			} else if computer.ID != claim.CloudID ||
+				(computer.WorkspaceID != "" && computer.WorkspaceID != workspaceID) ||
+				(claim.Labels["orgo_instance_id"] != "" && computer.InstanceID != claim.Labels["orgo_instance_id"]) {
+				return core.Exit(2, "provider=%s computer %s no longer matches its exact ownership claim", providerName, lease.Computer.ID)
+			}
+		}
+		return b.deleteLeaseResources(ctx, client, lease)
+	})
+}
+
+func (b *orgoBackend) deleteLeaseResources(ctx context.Context, client orgoAPI, lease orgoLease) error {
+	var computerErr error
+	if strings.TrimSpace(lease.Computer.ID) != "" {
+		if err := client.DeleteComputer(ctx, lease.Computer.ID); err != nil {
+			computerErr = err
+		}
+	}
+	cleanupErr := computerErr
+	if strings.TrimSpace(lease.CreatedWorkspace) != "" {
+		if err := client.DeleteWorkspace(ctx, lease.CreatedWorkspace); err != nil {
+			cleanupErr = errors.Join(computerErr, err)
+		} else {
+			// Deleting a Crabbox-created workspace cascades to its computers, so a
+			// successful workspace delete supersedes an earlier computer error.
+			cleanupErr = nil
+		}
+	}
+	return cleanupErr
+}
+
+func isOrgoNotFound(err error) bool {
+	var exitErr core.ExitError
+	return errors.As(err, &exitErr) && exitErr.Code == 4
+}
+
+func isConfirmedOrgoHTTPNotFound(err error) bool {
+	var httpErr *orgoHTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound
+}
+
+func (b *orgoBackend) cleanupLease(client orgoAPI, lease orgoLease) error {
+	ctx, cancel := context.WithTimeout(context.Background(), orgoCleanupTimeout)
+	defer cancel()
+	return b.deleteLease(ctx, client, lease)
+}
+
+func (b *orgoBackend) listComputers(ctx context.Context, client orgoAPI) ([]orgoComputer, error) {
+	workspaceID := strings.TrimSpace(b.cfg.Orgo.WorkspaceID)
+	if workspaceID != "" {
+		workspace, err := client.GetWorkspace(ctx, workspaceID)
+		if err != nil {
+			return nil, err
+		}
+		return orgoComputersForWorkspace(workspace), nil
+	}
+	workspaces, err := client.ListWorkspaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var computers []orgoComputer
+	for _, workspace := range workspaces {
+		if workspace.Computers == nil {
+			full, err := client.GetWorkspace(ctx, workspace.ID)
+			if err != nil {
+				return nil, err
+			}
+			workspace = full
+		}
+		computers = append(computers, orgoComputersForWorkspace(workspace)...)
+	}
+	return computers, nil
+}
+
+func orgoComputersForWorkspace(workspace orgoWorkspace) []orgoComputer {
+	computers := append([]orgoComputer(nil), workspace.Computers...)
+	for i := range computers {
+		if computers[i].WorkspaceID == "" {
+			computers[i].WorkspaceID = workspace.ID
+		}
+	}
+	return computers
+}
+
+func (b *orgoBackend) buildCommand(intent core.CommandIntent, env map[string]string) (string, error) {
+	command := intent.ShellScript()
+	if len(env) == 0 {
+		return command, nil
+	}
+	names := make([]string, 0, len(env))
+	for name := range env {
+		if !core.ValidShellEnvName(name) {
+			return "", core.Exit(2, "provider=%s cannot forward invalid env var name %q", providerName, name)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var bld strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&bld, "export %s=%s\n", name, core.ShellQuote(env[name]))
+	}
+	bld.WriteString(command)
+	return bld.String(), nil
+}
+
+func (b *orgoBackend) rejectRunOptions(req core.RunRequest) error {
+	if err := core.RejectDelegatedSyncOptionsForSpec(b.spec, req); err != nil {
+		return err
+	}
+	if req.Options.Tailscale.Enabled {
+		return core.Exit(2, "provider=%s is delegated-run only and does not support Tailscale options", providerName)
+	}
+	if req.Options.Desktop || req.Options.Browser || req.Options.Code {
+		return core.Exit(2, "provider=%s does not support desktop, browser, or code-server options", providerName)
+	}
+	return nil
+}
+
+func orgoComputerServer(computer orgoComputer, claim core.LeaseClaim) core.Server {
+	labels := map[string]string{
+		"provider":         providerName,
+		orgoWorkspaceLabel: computer.WorkspaceID,
+		"target":           targetLinux,
+	}
+	if claim.LeaseID != "" {
+		labels["lease"] = claim.LeaseID
+	}
+	if claim.Slug != "" {
+		labels["slug"] = claim.Slug
+	}
+	for key, value := range claim.Labels {
+		if value != "" {
+			labels[key] = value
+		}
+	}
+	server := core.Server{
+		CloudID:  computer.ID,
+		Provider: providerName,
+		Name:     core.Blank(computer.Name, computer.ID),
+		Status:   normalizeOrgoStatus(computer.Status),
+		Labels:   labels,
+	}
+	server.ServerType.Name = "orgo-computer"
+	if strings.TrimSpace(computer.ConnectionURL) != "" {
+		server.PublicNet.IPv4.IP = computer.ConnectionURL
+	} else {
+		server.PublicNet.IPv4.IP = computer.Hostname
+	}
+	return server
+}
+
+func orgoStatusView(lease orgoLease) core.StatusView {
+	state := normalizeOrgoStatus(lease.Computer.Status)
+	return core.StatusView{
+		ID:         core.Blank(lease.LeaseID, lease.Computer.ID),
+		Slug:       lease.Slug,
+		Provider:   providerName,
+		TargetOS:   targetLinux,
+		State:      state,
+		ServerID:   lease.Computer.ID,
+		ServerType: "orgo-computer",
+		Host:       core.Blank(lease.Computer.ConnectionURL, lease.Computer.Hostname),
+		Network:    networkPublic,
+		Ready:      state == "running",
+		Labels: map[string]string{
+			orgoWorkspaceLabel: lease.Computer.WorkspaceID,
+			"orgo_instance_id": lease.Computer.InstanceID,
+		},
+	}
+}
+
+func normalizeOrgoStatus(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status == "" {
+		return "unknown"
+	}
+	return status
+}
+
+func applyOrgoDefaults(cfg *core.Config) {
+	cfg.Provider = providerName
+	if cfg.TargetOS == "" {
+		cfg.TargetOS = targetLinux
+	}
+	if strings.TrimSpace(cfg.Orgo.APIBase) == "" {
+		cfg.Orgo.APIBase = core.OrgoConfigDefaultAPIBase
+	}
+	if cfg.Orgo.RAMGB <= 0 {
+		cfg.Orgo.RAMGB = core.OrgoConfigDefaultRAMGB
+	}
+	if cfg.Orgo.CPUs <= 0 {
+		cfg.Orgo.CPUs = core.OrgoConfigDefaultCPUs
+	}
+	if cfg.Orgo.DiskGB <= 0 {
+		cfg.Orgo.DiskGB = core.OrgoConfigDefaultDiskGB
+	}
+	if strings.TrimSpace(cfg.Orgo.Resolution) == "" {
+		cfg.Orgo.Resolution = core.OrgoConfigDefaultResolution
+	}
+}

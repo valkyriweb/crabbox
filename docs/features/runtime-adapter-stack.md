@@ -27,6 +27,25 @@ It is not a general reverse proxy, identity provider, WAF, or remote shell.
 The fleet UI and provider adapter are deployment choices. The three adapter
 commands are reusable Crabbox building blocks.
 
+### Proxmox
+
+`crabbox adapter serve --provider proxmox` supports fixed-ID Linux SSH
+workspaces through the direct Proxmox adapter. The provider exposes the existing
+controller contract; the lifecycle service needs no Proxmox-specific routing.
+See [Proxmox setup](../providers/proxmox.md#runtime-adapter) for prerequisites.
+
+Each workspace retains a versioned, opaque scope derived from the normalized
+API endpoint, node, template, storage, pool, bridge, clone mode, guest user,
+work root and non-secret token ID. Restarting with the same settings or rotating
+only the token secret preserves that scope. Changing the token ID or any bound
+setting refuses lifecycle operations for existing workspaces before Proxmox I/O.
+There is no automatic migration: restore the original configuration and drain
+all existing workspaces to confirmed cleanup before applying the change.
+
+The scope protects routing, not resource ownership. Every fixed-ID operation
+still requires the exact local claim, VMID and native `vmgenid`; uncertain
+inventory or cleanup keeps custody until it can be verified.
+
 ## Topology
 
 ```text
@@ -86,7 +105,10 @@ files, or provider credentials. Keep the bearer token between the fleet UI and
 ### Outbound coordinator control
 
 1. `adapter connect` authenticates to the coordinator using normal Crabbox
-   configuration and obtains a short-lived relay ticket.
+   configuration and obtains a short-lived relay ticket. A new adapter ID starts
+   with a ten-minute provisional owner/org claim; agent connection or successful
+   lease registration makes it durable. Only expired inactive provisional claims
+   are recoverable, and existing adapter claims remain durable across upgrades.
 2. It opens an outbound WebSocket and accepts only the documented typed
    workspace operations.
 3. Each operation is forwarded through the verified, current-user-owned Unix

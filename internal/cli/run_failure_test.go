@@ -2,11 +2,45 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+type fakeRunFailureEvidenceBackend struct {
+	begin func(context.Context, RunFailureEvidenceRequest) (RunFailureEvidenceCollector, error)
+}
+
+func (b fakeRunFailureEvidenceBackend) Spec() ProviderSpec {
+	return ProviderSpec{Name: "evidence-test"}
+}
+func (b fakeRunFailureEvidenceBackend) Acquire(context.Context, AcquireRequest) (LeaseTarget, error) {
+	return LeaseTarget{}, nil
+}
+func (b fakeRunFailureEvidenceBackend) Resolve(context.Context, ResolveRequest) (LeaseTarget, error) {
+	return LeaseTarget{}, nil
+}
+func (b fakeRunFailureEvidenceBackend) List(context.Context, ListRequest) ([]LeaseView, error) {
+	return nil, nil
+}
+func (b fakeRunFailureEvidenceBackend) ReleaseLease(context.Context, ReleaseLeaseRequest) error {
+	return nil
+}
+func (b fakeRunFailureEvidenceBackend) Touch(context.Context, TouchRequest) (Server, error) {
+	return Server{}, nil
+}
+func (b fakeRunFailureEvidenceBackend) BeginRunFailureEvidence(ctx context.Context, req RunFailureEvidenceRequest) (RunFailureEvidenceCollector, error) {
+	return b.begin(ctx, req)
+}
 
 func TestClassifyRunFailureStages(t *testing.T) {
 	tests := []struct {
@@ -19,6 +53,9 @@ func TestClassifyRunFailureStages(t *testing.T) {
 		{name: "provider auth", text: "<!doctype html><html><title>Cloudflare Access</title><body>login</body></html>", want: "provider_auth", retry: "false"},
 		{name: "install", text: "pnpm install failed with ENOMEM", want: "install", retry: "unknown"},
 		{name: "model", text: "model call failed: context window maximum tokens exceeded", want: "model_call", retry: "unknown"},
+		{name: "import flag", text: "pnpm install --package-import-method=copy completed", want: "unknown", retry: "unknown"},
+		{name: "child flag", text: "pnpm install --child-concurrency=2 completed", want: "unknown", retry: "unknown"},
+		{name: "network flag", text: "pnpm install --network-concurrency=4 completed", want: "unknown", retry: "unknown"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -28,6 +65,65 @@ func TestClassifyRunFailureStages(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClassifyRunFailureUsesNormalizedMemoryEvidence(t *testing.T) {
+	got := ClassifyRunFailureWithEvidence(255, "connection reset by peer", []TimingPhase{{Name: "test"}}, RunFailureEvidence{
+		ResourceExhaustion: ResourceExhaustionMemory,
+	})
+	if got.BlockedStage != "resource_exhaustion" || got.ResourceExhaustion != ResourceExhaustionMemory || got.RetryLikely != "false" {
+		t.Fatalf("ClassifyRunFailureWithEvidence()=%#v", got)
+	}
+	fields := FormatFailureClassificationFields(got)
+	for _, want := range []string{"blocked_stage=resource_exhaustion", "resource_exhaustion=memory", "retry_likely=false"} {
+		if !strings.Contains(fields, want) {
+			t.Fatalf("classification fields missing %q: %s", want, fields)
+		}
+	}
+}
+
+func TestRunOutcomeFailureKeepsMemoryEvidenceAcrossSecondaryFailures(t *testing.T) {
+	got := classifyRunOutcomeFailure(0, "", nil, RunFailureEvidence{
+		ResourceExhaustion: ResourceExhaustionMemory,
+	}, true, false)
+	if got.BlockedStage != "resource_exhaustion" || got.ResourceExhaustion != ResourceExhaustionMemory || got.RetryLikely != "false" {
+		t.Fatalf("classifyRunOutcomeFailure()=%#v, want memory exhaustion", got)
+	}
+
+	got = classifyRunOutcomeFailure(0, "", []TimingPhase{{Name: "build"}}, RunFailureEvidence{}, true, false)
+	if got.BlockedStage != "test" || got.ResourceExhaustion != "" || got.RetryLikely != "false" {
+		t.Fatalf("classifyRunOutcomeFailure()=%#v, want test failure", got)
+	}
+}
+
+func TestRunFailureEvidenceErrorsAreWarnings(t *testing.T) {
+	t.Run("baseline", func(t *testing.T) {
+		var warnings bytes.Buffer
+		backend := fakeRunFailureEvidenceBackend{begin: func(context.Context, RunFailureEvidenceRequest) (RunFailureEvidenceCollector, error) {
+			return nil, errors.New("baseline read failed")
+		}}
+		if collector := beginRunFailureEvidence(context.Background(), backend, LeaseTarget{}, &warnings); collector != nil {
+			t.Fatal("baseline error returned a collector")
+		}
+		if !strings.Contains(warnings.String(), "warning: failed-run evidence baseline unavailable") {
+			t.Fatalf("missing baseline warning: %s", warnings.String())
+		}
+	})
+
+	t.Run("collection", func(t *testing.T) {
+		var warnings bytes.Buffer
+		collector := RunFailureEvidenceCollector(func(context.Context) (RunFailureEvidence, error) {
+			return RunFailureEvidence{}, errors.New("post-failure read failed")
+		})
+		canceled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if evidence := collectRunFailureEvidence(canceled, collector, &warnings); evidence.ResourceExhaustion != "" {
+			t.Fatalf("evidence=%#v, want empty", evidence)
+		}
+		if !strings.Contains(warnings.String(), "warning: failed-run evidence collection incomplete") {
+			t.Fatalf("missing collection warning: %s", warnings.String())
+		}
+	})
 }
 
 func TestClassifyRunFailureBlacksmithInfraStages(t *testing.T) {
@@ -81,26 +177,37 @@ func TestClassifyRunFailureDoesNotTreatUserCancellationAsBlacksmithInfra(t *test
 }
 
 func TestClassifyRunFailureUsesFinalPhaseAfterErrorSignatures(t *testing.T) {
-	got := ClassifyRunFailure(1, "pnpm install completed\nunit tests failed", []TimingPhase{
-		{Name: "install"},
-		{Name: "test"},
-	})
-	if got.BlockedStage != "unknown" {
-		t.Fatalf("ClassifyRunFailure()=%#v, want unknown", got)
-	}
-	got = ClassifyRunFailure(1, "test failed", []TimingPhase{
-		{Name: "install"},
-		{Name: "test"},
-	})
-	if got.BlockedStage != "unknown" {
-		t.Fatalf("ClassifyRunFailure()=%#v, want unknown", got)
-	}
-	got = ClassifyRunFailure(1, "exit status 1", []TimingPhase{
-		{Name: "test"},
-		{Name: "install"},
-	})
-	if got.BlockedStage != "install" {
-		t.Fatalf("ClassifyRunFailure()=%#v, want install", got)
+	for _, tt := range []struct {
+		name, text, phases, stage, retry string
+		code                             int
+	}{
+		{"test after install", "pnpm install --package-import-method=copy completed\nunit tests failed", "install build test", "test", "unknown", 1},
+		{"test without error signature", "exit status 23", "install build test", "test", "unknown", 23},
+		{"build", "pnpm install --child-concurrency=2 completed", "install build", "build", "unknown", 2},
+		{"install after test", "test failed", "test install", "install", "unknown", 1},
+		{"setup", "exit status 1", "setup", "install", "unknown", 1},
+		{"hydration", "exit status 1", "hydrate", "install", "unknown", 1},
+		{"stale install error", "EXDEV retry\nENOMEM retry\ninstall completed\nassertion failed", "install build test", "test", "unknown", 1},
+		{"stale model error", "model call rate limit; retry succeeded\ncompiler failed", "test build", "build", "unknown", 1},
+		{"unknown final phase", "ENOMEM retry succeeded", "install custom-check", "unknown", "unknown", 1},
+		{"custom phase is not a stage", "exit status 1", "test-setup", "unknown", "unknown", 1},
+		{"case normalized", "exit status 1", "INSTALL BUILD TEST", "test", "unknown", 1},
+		{"unmarked model error", "model call rate limit", "user-command", "model_call", "unknown", 1},
+		{"ssh precedence", "timed out waiting for SSH", "test", "ssh", "true", 255},
+		{"auth precedence", "<!doctype html><html><title>Cloudflare Access</title><body>login</body></html>", "test", "provider_auth", "false", 1},
+		{"cancellation precedence", "Testbox ready\nGitHub Actions run cancelled", "install build test", "actions_cancelled", "true", 130},
+		{"success", "ENOMEM\nmodel call failed", "install build test", "", "", 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var phases []TimingPhase
+			for _, name := range strings.Fields(tt.phases) {
+				phases = append(phases, TimingPhase{Name: name})
+			}
+			got := ClassifyRunFailure(tt.code, tt.text, phases)
+			if got.BlockedStage != tt.stage || got.RetryLikely != tt.retry {
+				t.Fatalf("ClassifyRunFailure()=%#v, want stage=%q retry=%q", got, tt.stage, tt.retry)
+			}
+		})
 	}
 }
 
@@ -146,8 +253,9 @@ func TestFormatRunSummaryIncludesFailureClassification(t *testing.T) {
 
 func TestTimingJSONIncludesFailureClassification(t *testing.T) {
 	report := timingReportFromRun("aws", "cbx_123", "slug", runTimings{
-		blockedStage: "ssh",
-		retryLikely:  "true",
+		blockedStage:       "resource_exhaustion",
+		resourceExhaustion: ResourceExhaustionMemory,
+		retryLikely:        "false",
 	}, time.Second, 1)
 	var buf bytes.Buffer
 	if err := writeTimingJSON(&buf, report); err != nil {
@@ -157,14 +265,216 @@ func TestTimingJSONIncludesFailureClassification(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.BlockedStage != "ssh" || got.RetryLikely != "true" {
+	if got.BlockedStage != "resource_exhaustion" || got.ResourceExhaustion != ResourceExhaustionMemory || got.RetryLikely != "false" {
 		t.Fatalf("classification not encoded: %#v", got)
 	}
 }
 
+func TestPrintRunFailureDigestIncludesMemoryGuidance(t *testing.T) {
+	var buf bytes.Buffer
+	printRunFailureDigest(&buf, runFailureDigestInput{
+		LeaseID:        "cbx_123",
+		CommandDisplay: "go test ./...",
+		Classification: FailureClassification{
+			BlockedStage:       "resource_exhaustion",
+			ResourceExhaustion: ResourceExhaustionMemory,
+			RetryLikely:        "false",
+		},
+	})
+	out := buf.String()
+	for _, want := range []string{
+		"area: resource_exhaustion",
+		"retryable: false",
+		"resource_exhaustion: memory",
+		"hint: reduce memory demand and inspect active limits and runtime capacity before retrying",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("digest missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "next: crabbox run") {
+		t.Fatalf("deterministic memory exhaustion should not suggest an unchanged retry:\n%s", out)
+	}
+}
+
+func TestRunFailureEvidencePresentationSnapshot(t *testing.T) {
+	var evidence RunFailureEvidence
+	if err := json.Unmarshal([]byte(`{"resourceExhaustion":"memory","hint":"Check the selected runtime capacity","details":{"runtime_memory_total_bytes":"8388608","bad":"\u001b[2J","bad\nkey":"value"}}`), &evidence); err != nil {
+		t.Fatal(err)
+	}
+	got := collectRunFailureEvidence(t.Context(), func(context.Context) (RunFailureEvidence, error) { return evidence, nil }, nil)
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "8388608") || strings.Contains(string(encoded), "bad") || !strings.Contains(string(encoded), "Check the selected") {
+		t.Fatalf("missing or unsafe presentation snapshot: %s", encoded)
+	}
+	var input runFailureDigestInput
+	if err := json.Unmarshal([]byte(`{"Evidence":`+string(encoded)+`}`), &input); err != nil {
+		t.Fatal(err)
+	}
+	input.Classification = ClassifyRunFailureWithEvidence(137, "", nil, got)
+	var out bytes.Buffer
+	printRunFailureDigest(&out, input)
+	if !strings.Contains(out.String(), "hint: Check the selected runtime capacity") || !strings.Contains(out.String(), "runtime_memory_total_bytes=8388608") {
+		t.Fatalf("digest lost evidence: %s", out.String())
+	}
+	var report TimingReport
+	if err := json.Unmarshal([]byte(`{"exitCode":137,"failureEvidence":`+string(encoded)+`}`), &report); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := writeTimingJSON(&out, report); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"failureEvidence"`) || !strings.Contains(out.String(), "8388608") {
+		t.Fatalf("timing lost evidence: %s", out.String())
+	}
+}
+
+func TestTimingReportFromRunFailureEvidenceSnapshot(t *testing.T) {
+	timings := runTimings{
+		blockedStage:       "resource_exhaustion",
+		resourceExhaustion: ResourceExhaustionMemory,
+		retryLikely:        "false",
+		failureEvidence: RunFailureEvidence{
+			ResourceExhaustion: ResourceExhaustionMemory,
+			Hint:               "Check active limits and runtime capacity",
+			Details:            map[string]string{"memory_limit_bytes": "1024", "unsafe": "\x1b[2J"},
+		},
+	}
+	report := timingReportFromRun("evidence-test", "cbx_test", "test", timings, time.Second, 137)
+	if report.FailureEvidence == nil || report.FailureEvidence.Hint != timings.failureEvidence.Hint ||
+		!reflect.DeepEqual(report.FailureEvidence.Details, map[string]string{"memory_limit_bytes": "1024"}) {
+		t.Fatalf("constructor lost or failed to sanitize failure evidence: %+v", report.FailureEvidence)
+	}
+	if report.ExitCode != 137 || report.ResourceExhaustion != ResourceExhaustionMemory || report.BlockedStage != "resource_exhaustion" || report.RetryLikely != "false" {
+		t.Fatalf("constructor changed failure classification: %+v", report)
+	}
+	timings.failureEvidence.Details["memory_limit_bytes"] = "2048"
+	if report.FailureEvidence.Details["memory_limit_bytes"] != "1024" {
+		t.Fatal("report aliases the timing input's evidence map")
+	}
+	rebuilt := timingReportFromRunWithActionsURL("evidence-test", "cbx_test", "test", timings, time.Second, 137, "")
+	if rebuilt.FailureEvidence == nil || rebuilt.FailureEvidence.Details["memory_limit_bytes"] != "2048" {
+		t.Fatal("reconstructed report did not project the timing input")
+	}
+	rebuilt.FailureEvidence.Details["memory_limit_bytes"] = "4096"
+	if timings.failureEvidence.Details["memory_limit_bytes"] != "2048" || report.FailureEvidence.Details["memory_limit_bytes"] != "1024" {
+		t.Fatal("reconstructed snapshot aliases its input or a prior report")
+	}
+}
+
+func TestRunFailureEvidencePresentationBounds(t *testing.T) {
+	for _, hint := range []string{"unsafe\x1b[2J", "bad\nline", "bad\u202e", string([]byte{0xff}), strings.Repeat("a", 769)} {
+		evidence := RunFailureEvidence{ResourceExhaustion: ResourceExhaustionMemory, Hint: hint, Details: map[string]string{
+			"good": "value", "bad/key": "value", "oversized": strings.Repeat("b", 257),
+		}}
+		got := collectRunFailureEvidence(t.Context(), func(context.Context) (RunFailureEvidence, error) { return evidence, nil }, nil)
+		if got.ResourceExhaustion != ResourceExhaustionMemory || got.Hint != "" || !reflect.DeepEqual(got.Details, map[string]string{"good": "value"}) {
+			t.Fatalf("optional fields affected classification or bounds: %+v", got)
+		}
+		evidence.Details["good"] = "mutated"
+		if got.Details["good"] != "value" {
+			t.Fatal("evidence was not cloned")
+		}
+	}
+	details := map[string]string{}
+	for i := range 30 {
+		details[fmt.Sprintf("key_%02d", i)] = strings.Repeat("v", 256)
+	}
+	got := sanitizeRunFailureEvidence(RunFailureEvidence{Hint: strings.Repeat("h", 768), Details: details})
+	size := len(got.Hint)
+	for key, value := range got.Details {
+		size += len(key) + len(value)
+	}
+	if size > 4096 || len(got.Details) > 16 || len(got.Details) == 0 {
+		t.Fatalf("unbounded snapshot size=%d entries=%d", size, len(got.Details))
+	}
+}
+
+func TestRunFailureEvidenceFinalization(t *testing.T) {
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(repoRoot)
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep=%t", keep), func(t *testing.T) {
+			lease, _ := setupRunClaimSnapshotTest(t)
+			pathDir := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))[0]
+			t.Setenv("PATH", pathDir+string(os.PathListSeparator)+"/usr/bin:/bin")
+			installWorkspaceOwnerAwareSSH(t, filepath.Join(pathDir, "ssh"), "#!/bin/sh\ncase \"$1\" in *fixture-memory-command*) exit 137 ;; *'tar -cz'*) exit 1 ;; esac\nexit 0\n")
+			begins, collects, releases := 0, 0, 0
+			source := map[string]string{"runtime_memory_total_bytes": "8388608"}
+			runEnvProfileTestEvidenceHook = func(context.Context, RunFailureEvidenceRequest) (RunFailureEvidenceCollector, error) {
+				begins++
+				return func(context.Context) (RunFailureEvidence, error) {
+					collects++
+					return RunFailureEvidence{ResourceExhaustion: ResourceExhaustionMemory, Hint: "Check runtime capacity and swap", Details: source}, nil
+				}, nil
+			}
+			runEnvProfileTestReleaseRequestHook = func(req ReleaseLeaseRequest) error {
+				releases++
+				source["runtime_memory_total_bytes"] = "changed-after-collection"
+				data, _ := json.Marshal(req.Lease.Server)
+				if strings.Contains(string(data), "runtime_memory_total") {
+					t.Error("reporting evidence entered release authority")
+				}
+				return nil
+			}
+			t.Cleanup(func() { runEnvProfileTestEvidenceHook = nil })
+			args := []string{"--provider", runEnvProfileTestProvider{}.Spec().Name, "--no-sync", "--no-hydrate", "--timing-json"}
+			if keep {
+				args = append(args, "--id", lease.LeaseID, "--keep")
+			}
+			args = append(args, "--", "fixture-memory-command")
+			var stdout, stderr bytes.Buffer
+			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(t.Context(), args)
+			var exitErr ExitError
+			if !AsExitError(err, &exitErr) || exitErr.Code != 137 {
+				t.Fatalf("original exit lost: %v\n%s", err, stderr.String())
+			}
+			wantReleases := 1
+			if keep {
+				wantReleases = 0
+			}
+			if begins != 1 || collects != 1 || releases != wantReleases || strings.Count(stderr.String(), "failure digest\n") != 1 {
+				t.Fatalf("lifecycle counts begin=%d collect=%d release=%d\n%s", begins, collects, releases, stderr.String())
+			}
+			var report TimingReport
+			bundle := ""
+			for _, line := range strings.Split(stderr.String(), "\n") {
+				if strings.HasPrefix(line, "{") {
+					_ = json.Unmarshal([]byte(line), &report)
+				}
+				if strings.HasPrefix(line, "failure-bundle local=") {
+					bundle = strings.Fields(strings.TrimPrefix(line, "failure-bundle local="))[0]
+				}
+			}
+			if report.ExitCode != 137 || report.ResourceExhaustion != ResourceExhaustionMemory || report.FailureEvidence == nil || report.FailureEvidence.Details["runtime_memory_total_bytes"] != "8388608" {
+				t.Fatalf("final timing lost snapshot: %+v\n%s", report, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "hint: Check runtime capacity and swap") || strings.Contains(stderr.String(), "changed-after-collection") {
+				t.Fatal("deferred digest did not retain sanitized snapshot")
+			}
+			if bundle == "" {
+				t.Fatalf("no failure bundle\n%s", stderr.String())
+			}
+			contents := readTarGzContents(t, bundle)
+			var captured TimingReport
+			if err := json.Unmarshal(contents["crabbox-artifacts/timings.json"], &captured); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(captured.FailureEvidence, report.FailureEvidence) {
+				t.Fatal("bundle and final evidence differ")
+			}
+		})
+	}
+}
+
 func TestPrintRunFailureDigest(t *testing.T) {
-	stderrTail := newStreamTailBuffer(40)
-	_, _ = stderrTail.Write([]byte("setup ok\nunit failed\n"))
 	var buf bytes.Buffer
 	printRunFailureDigest(&buf, runFailureDigestInput{
 		LeaseID:        "cbx_123",
@@ -173,7 +483,7 @@ func TestPrintRunFailureDigest(t *testing.T) {
 		CommandDisplay: "go test ./...",
 		Classification: FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"},
 		Phases:         []TimingPhase{{Name: "test"}},
-	}, newStreamTailBuffer(40), stderrTail, "", "")
+	})
 	out := buf.String()
 	for _, want := range []string{
 		"failure digest",
@@ -181,28 +491,132 @@ func TestPrintRunFailureDigest(t *testing.T) {
 		"area: user_command",
 		"next: crabbox logs run_123 --tail 80",
 		"next: crabbox doctor --from-run run_123",
-		"next: crabbox run --id blue-lobster --fresh-sync -- go test ./...",
-		"tail stderr:",
-		"unit failed",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("digest missing %q:\n%s", want, out)
 		}
 	}
+	if strings.Contains(out, "next: crabbox run ") {
+		t.Fatalf("unknown failure advertised a blind rerun:\n%s", out)
+	}
 }
 
-func TestRunFailureDigestRoutingArgsUseExternalRoutingFile(t *testing.T) {
+func TestPrintRunFailureDigestExplainsUnavailableRunHistory(t *testing.T) {
+	var buf bytes.Buffer
+	printRunFailureDigest(&buf, runFailureDigestInput{
+		LeaseID:               "cbx_123",
+		Slug:                  "blue-lobster",
+		RunID:                 "run_local123",
+		RunHistoryUnavailable: true,
+		CommandDisplay:        "go test ./...",
+		Classification:        FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"},
+	})
+	out := buf.String()
+	for _, want := range []string{
+		"run_history: unavailable",
+		"next: crabbox ssh --id blue-lobster",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("digest missing %q:\n%s", want, out)
+		}
+	}
+	for _, unexpected := range []string{
+		"crabbox logs run_",
+		"crabbox events run_",
+		"crabbox doctor --from-run run_",
+		"next: crabbox run ",
+	} {
+		if strings.Contains(out, unexpected) {
+			t.Fatalf("digest should not include run-based command %q:\n%s", unexpected, out)
+		}
+	}
+}
+
+func TestFailureDigestNextCommandsRespectRunHistoryAvailability(t *testing.T) {
+	historyCommands := []string{
+		"crabbox logs run_123 --tail 80",
+		"crabbox events run_123 --type stderr",
+		"crabbox doctor --from-run run_123",
+	}
+	leaseCommands := []string{
+		"crabbox ssh --provider local-container --id retained-direct",
+		"crabbox run --provider local-container --id retained-direct --fresh-sync -- go test ./...",
+		"crabbox stop --provider local-container retained-direct",
+	}
+	tests := []struct {
+		name               string
+		runID              string
+		historyUnavailable bool
+		wantHistory        bool
+	}{
+		{name: "run ID with unavailable history", runID: "run_123", historyUnavailable: true},
+		{name: "run ID with available history", runID: "run_123", wantHistory: true},
+		{name: "no run ID", historyUnavailable: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			commands := classifiedFailureDigestNextCommands(runFailureDigestInput{
+				Provider:              "local-container",
+				LeaseID:               "cbx_123",
+				Slug:                  "retained-direct",
+				RunID:                 tt.runID,
+				RunHistoryUnavailable: tt.historyUnavailable,
+				CommandDisplay:        "go test ./...",
+				Classification:        FailureClassification{RetryLikely: "true"},
+			}, "true")
+			joined := strings.Join(commands, "\n")
+			for _, command := range historyCommands {
+				if got := strings.Contains(joined, command); got != tt.wantHistory {
+					t.Fatalf("history command presence=%v, want %v for %q:\n%s", got, tt.wantHistory, command, joined)
+				}
+			}
+			for _, command := range leaseCommands {
+				if !strings.Contains(joined, command) {
+					t.Fatalf("lease recovery command missing %q:\n%s", command, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestFailureDigestRetryAdviceByClassification(t *testing.T) {
+	for _, test := range []struct {
+		retry   string
+		wantRun bool
+	}{
+		{retry: "true", wantRun: true},
+		{retry: "false"},
+		{retry: "unknown"},
+	} {
+		t.Run(test.retry, func(t *testing.T) {
+			commands := classifiedFailureDigestNextCommands(runFailureDigestInput{
+				LeaseID:        "cbx_123",
+				RunID:          "run_123",
+				CommandDisplay: "go test ./...",
+			}, test.retry)
+			joined := strings.Join(commands, "\n")
+			if got := strings.Contains(joined, "crabbox run "); got != test.wantRun {
+				t.Fatalf("retry=%s run advice=%t want=%t:\n%s", test.retry, got, test.wantRun, joined)
+			}
+			if !strings.Contains(joined, "crabbox doctor --from-run run_123") {
+				t.Fatalf("retry=%s lost run-scoped diagnosis:\n%s", test.retry, joined)
+			}
+		})
+	}
+}
+
+func TestRunFailureDigestRoutingUseExternalRoutingFile(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	args := runFailureDigestRoutingArgs(Config{
+	args := CommandRoutingFor(Config{
 		Provider: "external",
 		External: ExternalConfig{
 			Command: "provider-command",
 			Args:    []string{"--token", "secret-value"},
 			Config:  map[string]any{"token": "secret-config"},
 		},
-	}, "provider-id")
-	got := strings.Join(args, " ")
-	for _, want := range []string{"--provider external", "--external-routing-file"} {
+	}, "provider-id", CommandRoutingRetry)
+	got := strings.Join(args.Args, " ")
+	for _, want := range []string{"--provider external", "--external-routing-file", "--external-routing-digest"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("routing args missing %q: %s", want, got)
 		}
@@ -214,18 +628,18 @@ func TestRunFailureDigestRoutingArgsUseExternalRoutingFile(t *testing.T) {
 	}
 }
 
-func TestRunFailureDigestSSHRoutingArgsUseExternalRoutingFile(t *testing.T) {
+func TestRunFailureDigestSSHRoutingUseExternalRoutingFile(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	args := runFailureDigestSSHRoutingArgs(Config{
+	args := CommandRoutingFor(Config{
 		Provider: "external",
 		External: ExternalConfig{
 			Command: "provider-command",
 			Args:    []string{"--token", "secret-value"},
 			Config:  map[string]any{"token": "secret-config"},
 		},
-	}, "cbx_abcdef123456")
-	got := strings.Join(args, " ")
-	for _, want := range []string{"--provider external", "--external-routing-file"} {
+	}, "cbx_abcdef123456", CommandRoutingRetry)
+	got := strings.Join(args.Args, " ")
+	for _, want := range []string{"--provider external", "--external-routing-file", "--external-routing-digest"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("ssh routing args missing %q: %s", want, got)
 		}
@@ -238,15 +652,13 @@ func TestRunFailureDigestSSHRoutingArgsUseExternalRoutingFile(t *testing.T) {
 }
 
 func TestPrintRunFailureDigestExplainsAndChainShortCircuit(t *testing.T) {
-	stderrTail := newStreamTailBuffer(40)
-	_, _ = stderrTail.Write([]byte("pnpm check failed\n"))
 	var buf bytes.Buffer
 	printRunFailureDigest(&buf, runFailureDigestInput{
 		LeaseID:        "cbx_123",
 		CommandDisplay: "pnpm check && pnpm test",
 		ShellMode:      true,
-		Classification: FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"},
-	}, newStreamTailBuffer(40), stderrTail, "", "")
+		Classification: FailureClassification{BlockedStage: "unknown", RetryLikely: "true"},
+	})
 	out := buf.String()
 	for _, want := range []string{
 		"area: user_command",
@@ -271,7 +683,7 @@ func TestPrintRunFailureDigestSuppressesMixedAndOrChain(t *testing.T) {
 		CommandDisplay: "pnpm build && pnpm test || pnpm cleanup",
 		ShellMode:      true,
 		Classification: FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"},
-	}, newStreamTailBuffer(40), newStreamTailBuffer(40), "", "")
+	})
 	out := buf.String()
 	for _, unexpected := range []string{"shell_chain:", "would_skip_if_left_failed:", "chain_semantics:"} {
 		if strings.Contains(out, unexpected) {
@@ -291,7 +703,7 @@ func TestPrintRunFailureDigestIncludesObservedPhases(t *testing.T) {
 			{Name: "check"},
 			{Name: "test"},
 		},
-	}, newStreamTailBuffer(40), newStreamTailBuffer(40), "", "")
+	})
 	out := buf.String()
 	for _, want := range []string{
 		"phase: test",
@@ -315,22 +727,24 @@ func TestPrintRunFailureDigestIncludesStructuredTestFailures(t *testing.T) {
 			Tests:    2,
 			Failures: 1,
 			Failed: []TestFailure{{
-				File:    "src/example.test.ts",
-				Name:    "renders",
-				Kind:    "failure",
-				Message: "expected true",
+				File:      "src/example.test.ts\x1b]0;file\x07",
+				Classname: "ui\u202e",
+				Name:      "renders\bhidden",
+				Kind:      "failure\u0085",
+				Message:   "expected true\rspoofed",
 			}},
 		},
-	}, newStreamTailBuffer(40), newStreamTailBuffer(40), "", "")
+	})
 	out := buf.String()
 	for _, want := range []string{
 		"test_results: files=1 tests=2 failures=1 errors=0 skipped=0",
-		"failed_test: src/example.test.ts failure  renders - expected true",
+		`failed_test: src/example.test.ts\u001B]0;file\u0007 failure\u0085 ui\u202E.renders\u0008hidden - expected true\u000Dspoofed`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("digest missing %q:\n%s", want, out)
 		}
 	}
+	assertTerminalSafe(t, out)
 }
 
 func TestFailureDigestSuppressesScriptRetryCommand(t *testing.T) {
@@ -338,12 +752,102 @@ func TestFailureDigestSuppressesScriptRetryCommand(t *testing.T) {
 		LeaseID:        "cbx_123",
 		CommandDisplay: "'--script=./smoke test.sh' arg",
 		ScriptMode:     true,
-		Classification: FailureClassification{RetryLikely: "unknown"},
-	}, "unknown")
+		Classification: FailureClassification{RetryLikely: "true"},
+	}, "true")
 	for _, command := range commands {
 		if strings.Contains(command, "crabbox run") {
 			t.Fatalf("script retry command should be suppressed: %v", commands)
 		}
+	}
+}
+
+func TestFailureDigestPreservesRecoveryIntent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX rendered-shell argv fixture")
+	}
+	for _, tc := range []struct {
+		name                                    string
+		noSync, shell, script, stopped, noRetry bool
+		globs                                   []string
+	}{
+		{name: "default keeps fresh sync"},
+		{name: "no sync", noSync: true},
+		{name: "requirements", globs: []string{"reports/manifest.json", "reports/proof-*.json"}},
+		{name: "no sync requirements shell", noSync: true, shell: true, globs: []string{"reports/manifest.json", "reports/proof-*.json"}},
+		{name: "script suppressed", script: true, noSync: true, globs: []string{"proof.json"}},
+		{name: "retry suppressed", noRetry: true, noSync: true, globs: []string{"proof.json"}},
+		{name: "stopped suppressed", stopped: true, noSync: true, globs: []string{"proof.json"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Mkdir(filepath.Join(dir, "reports"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "reports", "proof-local.json"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			capture := filepath.Join(dir, "argv")
+			if err := os.WriteFile(filepath.Join(dir, "crabbox"), []byte("#!/bin/sh\nprintf '%s\\000' \"$@\" > \"$FIXTURE_ARGV\"\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			display := "printf '%s\\n' 'two words'"
+			if tc.shell {
+				display = "printf first && printf second"
+			}
+			routing := CommandRouting{Args: []string{"--provider", "local-container", "--local-container-runtime", "docker"}}
+			input := runFailureDigestInput{LeaseID: "cbx_fixture", CommandDisplay: display, ShellMode: tc.shell, ScriptMode: tc.script, LeaseStopped: tc.stopped, NoSync: tc.noSync, RequiredArtifactGlobs: tc.globs, Routing: routing}
+			retry := "true"
+			if tc.noRetry {
+				retry = "false"
+			}
+			var hint string
+			for _, command := range failureDigestNextCommands(input, retry) {
+				if strings.HasPrefix(command, "crabbox run ") {
+					if hint != "" {
+						t.Fatal("multiple retry commands")
+					}
+					hint = command
+				}
+			}
+			if tc.script || tc.stopped || tc.noRetry {
+				if hint != "" {
+					t.Fatalf("unexpected retry: %s", hint)
+				}
+				return
+			}
+			if hint == "" {
+				t.Fatal("missing retry")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "/bin/sh", "-c", hint)
+			cmd.Dir = dir
+			cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin", "FIXTURE_ARGV=" + capture}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("replay: %v %s", err, out)
+			}
+			data, err := os.ReadFile(capture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			args := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
+			syncFlag := "--fresh-sync"
+			if tc.noSync {
+				syncFlag = "--no-sync"
+			}
+			want := append(append([]string{"run"}, routing.Args...), "--id", "cbx_fixture", syncFlag)
+			for _, glob := range tc.globs {
+				want = append(want, "--require-artifact", glob)
+			}
+			if tc.shell {
+				want = append(want, "--shell", "--", display)
+			} else {
+				want = append(want, "--", "printf", "%s\\n", "two words")
+			}
+			if !reflect.DeepEqual(args, want) {
+				t.Fatalf("args=%q want=%q", args, want)
+			}
+		})
 	}
 }
 
@@ -354,9 +858,9 @@ func TestFailureDigestRoutesNextCommands(t *testing.T) {
 		WindowsMode:    windowsModeWSL2,
 		LeaseID:        "cbx_123",
 		CommandDisplay: "go test ./...",
-		Classification: FailureClassification{RetryLikely: "unknown"},
+		Classification: FailureClassification{RetryLikely: "true"},
 		StopCommand:    "crabbox stop --provider aws --target windows --windows-mode wsl2 cbx_123",
-	}, "unknown")
+	}, "true")
 	joined := strings.Join(commands, "\n")
 	for _, want := range []string{
 		"crabbox ssh --provider aws --target windows --windows-mode wsl2 --id cbx_123",
@@ -375,11 +879,12 @@ func TestFailureDigestRoutesProviderArgsToSSH(t *testing.T) {
 		Provider:       "proxmox",
 		LeaseID:        "cbx_123",
 		CommandDisplay: "go test ./...",
-		RoutingArgs:    runFailureDigestRoutingArgs(cfg, "cbx_123"),
-		SSHRoutingArgs: runFailureDigestSSHRoutingArgs(cfg, "cbx_123"),
-		Classification: FailureClassification{RetryLikely: "unknown"},
+		Routing:        CommandRoutingFor(cfg, "cbx_123", CommandRoutingRetry),
+		SSHRouting:     CommandRoutingFor(cfg, "cbx_123", CommandRoutingRetry),
+		StopRouting:    CommandRoutingFor(cfg, "cbx_123", CommandRoutingStop),
+		Classification: FailureClassification{RetryLikely: "true"},
 		StopCommand:    "crabbox stop --provider proxmox --proxmox-api-url https://pve.example cbx_123",
-	}, "unknown")
+	}, "true")
 	if len(commands) < 3 {
 		t.Fatalf("commands=%v", commands)
 	}
@@ -407,10 +912,11 @@ func TestFailureDigestPreservesInheritedKubeconfigForKubeVirt(t *testing.T) {
 		TargetOS:       targetLinux,
 		LeaseID:        "cbx_123",
 		CommandDisplay: "go test ./...",
-		RoutingArgs:    runFailureDigestRoutingArgs(cfg, "cbx_123"),
-		SSHRoutingArgs: runFailureDigestSSHRoutingArgs(cfg, "cbx_123"),
-		Classification: FailureClassification{RetryLikely: "unknown"},
-	}, "unknown")
+		Routing:        CommandRoutingFor(cfg, "cbx_123", CommandRoutingRetry),
+		SSHRouting:     CommandRoutingFor(cfg, "cbx_123", CommandRoutingRetry),
+		StopRouting:    CommandRoutingFor(cfg, "cbx_123", CommandRoutingStop),
+		Classification: FailureClassification{RetryLikely: "true"},
+	}, "true")
 	joined := strings.Join(commands, "\n")
 	for _, want := range []string{
 		"KUBECONFIG='/tmp/base.yaml:/tmp/cluster.yaml' crabbox ssh --provider kubevirt",
@@ -427,50 +933,42 @@ func TestFailureDigestPreservesInheritedKubeconfigForKubeVirt(t *testing.T) {
 	}
 }
 
-func TestRunFailureDigestIncludesXCPNgRoutingFlagsWithoutPassword(t *testing.T) {
-	args := runFailureDigestRoutingArgs(Config{
-		Provider: "xcp-ng",
+func TestFailureDigestPreservesSealosRouting(t *testing.T) {
+	t.Setenv("KUBECONFIG", "/tmp/base.yaml:/tmp/cluster.yaml")
+	cfg := Config{
+		Provider: "sealos-devbox",
 		TargetOS: targetLinux,
-		XCPNg: XCPNgConfig{
-			APIURL:       "pool-user:pool-pass@xcp-ng.example.test/path?view=1",
-			Username:     "root",
-			Password:     "xcp-ng-secret",
-			Template:     "ubuntu template",
-			TemplateUUID: "tpl-0001",
-			SR:           "default sr",
-			SRUUID:       "sr-0001",
-			Network:      "pool network",
-			NetworkUUID:  "net-0001",
-			Host:         "host-0001",
-			User:         "runner",
-			WorkRoot:     "/work/xcp-ng",
-			InsecureTLS:  true,
+		SealosDevbox: SealosDevboxConfig{
+			Kubectl:        "/opt/bin/kubectl",
+			Context:        "dev=west",
+			Namespace:      "team-devboxes",
+			Network:        "SSHGate",
+			SSHGatewayHost: "ssh.example.test",
+			SSHGatewayPort: "2222",
+			SSHUser:        "devbox",
+			WorkRoot:       "/home/devbox/project",
 		},
-	}, "cbx_123")
-	joined := strings.Join(args, " ")
+	}
+	commands := failureDigestNextCommands(runFailureDigestInput{
+		Provider:       "sealos-devbox",
+		TargetOS:       targetLinux,
+		LeaseID:        "cbx_123",
+		CommandDisplay: "go test ./...",
+		Routing:        CommandRoutingFor(cfg, "cbx_123", CommandRoutingRetry),
+		SSHRouting:     CommandRoutingFor(cfg, "cbx_123", CommandRoutingRetry),
+		StopRouting:    CommandRoutingFor(cfg, "cbx_123", CommandRoutingStop),
+		Classification: FailureClassification{RetryLikely: "true"},
+	}, "true")
+	joined := strings.Join(commands, "\n")
 	for _, want := range []string{
-		"--provider xcp-ng",
-		"--target linux",
-		"--xcp-ng-api-url xcp-ng.example.test/path?view=1",
-		"--xcp-ng-username root",
-		"--xcp-ng-template ubuntu template",
-		"--xcp-ng-template-uuid tpl-0001",
-		"--xcp-ng-sr default sr",
-		"--xcp-ng-sr-uuid sr-0001",
-		"--xcp-ng-network pool network",
-		"--xcp-ng-network-uuid net-0001",
-		"--xcp-ng-host host-0001",
-		"--xcp-ng-user runner",
-		"--xcp-ng-work-root /work/xcp-ng",
-		"--xcp-ng-insecure-tls",
+		"KUBECONFIG='/tmp/base.yaml:/tmp/cluster.yaml' crabbox ssh --provider sealos-devbox",
+		"KUBECONFIG='/tmp/base.yaml:/tmp/cluster.yaml' crabbox run --provider sealos-devbox",
+		"KUBECONFIG='/tmp/base.yaml:/tmp/cluster.yaml' crabbox stop --provider sealos-devbox",
+		"--sealos-devbox-context dev=west",
+		"--sealos-devbox-ssh-gateway-host ssh.example.test",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("failure digest routing missing %q:\n%v", want, args)
-		}
-	}
-	for _, secret := range []string{"xcp-ng-secret", "pool-user", "pool-pass", "password"} {
-		if strings.Contains(joined, secret) {
-			t.Fatalf("failure digest routing leaked %q: %v", secret, args)
+			t.Fatalf("commands missing %q:\n%s", want, joined)
 		}
 	}
 }
@@ -515,5 +1013,107 @@ func TestSelectProofLogExcerptRedactsHTMLAuthBody(t *testing.T) {
 	got := SelectProofLogExcerpt("<!doctype html><html><head><title>Cloudflare Access</title></head><body>login</body></html>")
 	if !strings.Contains(got, "redacted auth_cloudflare_html response") {
 		t.Fatalf("proof excerpt was not redacted: %q", got)
+	}
+}
+
+func TestFailureDigestStoppedLeaseKeepsHistoryAndLocalEvidence(t *testing.T) {
+	var out bytes.Buffer
+	printRunFailureDigest(&out, runFailureDigestInput{
+		LeaseID: "cbx_stopped", LeaseStopped: true, RunID: "run_failed",
+		CommandDisplay: "false", StopCommand: "crabbox stop --id cbx_stopped",
+	})
+	printFailureTail(&out, "stdout", nil, "stdout.log")
+	printFailureTail(&out, "stderr", nil, "stderr.log")
+	for _, want := range []string{"crabbox logs run_failed", "crabbox events run_failed", "crabbox doctor --from-run run_failed", "lease: stopped", "stderr.log", "stdout.log"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q: %s", want, out.String())
+		}
+	}
+	for _, command := range []string{"ssh", "run", "stop"} {
+		if strings.Contains(out.String(), "next: crabbox "+command+" ") {
+			t.Errorf("stale recovery command %s: %s", command, out.String())
+		}
+	}
+}
+
+func TestRunArtifactFailureClassificationPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		artifact, testFailed bool
+		evidence             RunFailureEvidence
+		stage, retry         string
+	}{
+		{name: "known artifact", artifact: true, stage: "artifacts", retry: "unknown"},
+		{name: "artifact before test policy", artifact: true, testFailed: true, stage: "artifacts", retry: "unknown"},
+		{name: "positive memory evidence", artifact: true, testFailed: true, evidence: RunFailureEvidence{ResourceExhaustion: ResourceExhaustionMemory}, stage: "resource_exhaustion", retry: "false"},
+		{name: "genuine workload seven", stage: "test", retry: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyRunOutcomeFailure(7, "", []TimingPhase{{Name: "test"}}, tc.evidence, tc.testFailed, tc.artifact)
+			if got.BlockedStage != tc.stage || got.RetryLikely != tc.retry || got.ResourceExhaustion != tc.evidence.ResourceExhaustion {
+				t.Fatalf("classification=%+v", got)
+			}
+		})
+	}
+}
+
+func TestApplyArtifactFailureOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		failure, observedContext error
+		memory                   ResourceExhaustionReason
+		wantStatus               RunStatus
+		wantKind                 RunErrorKind
+	}{
+		{name: "not artifact failure", wantStatus: RunStatusFailed, wantKind: RunErrorCommandExit},
+		{name: "validation", failure: Exit(7, "missing proof"), wantStatus: RunStatusFailed, wantKind: RunErrorProvider},
+		{name: "observed cancellation", failure: Exit(7, "flattened fetch failure"), observedContext: context.Canceled, wantStatus: RunStatusCanceled, wantKind: RunErrorCanceled},
+		{name: "observed deadline", failure: Exit(7, "flattened fetch failure"), observedContext: context.DeadlineExceeded, wantStatus: RunStatusTimedOut, wantKind: RunErrorTimeout},
+		{name: "wrapped cancellation", failure: fmt.Errorf("fetch: %w", context.Canceled), wantStatus: RunStatusCanceled, wantKind: RunErrorCanceled},
+		{name: "memory outranks secondary validation", failure: Exit(7, "missing proof"), memory: ResourceExhaustionMemory, wantStatus: RunStatusFailed, wantKind: RunErrorCommandExit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := TimingReport{ExitCode: 7, RunStatus: RunStatusFailed, ErrorKind: RunErrorCommandExit, ResourceExhaustion: tc.memory}
+			applyArtifactFailureOutcome(&report, tc.failure, tc.observedContext)
+			report = finalizeTimingReport(report)
+			if report.ExitCode != 7 || report.RunStatus != tc.wantStatus || report.ErrorKind != tc.wantKind || report.ResourceExhaustion != tc.memory {
+				t.Fatalf("report=%+v", report)
+			}
+		})
+	}
+}
+
+func TestArtifactFailureContextSnapshot(t *testing.T) {
+	for _, duringValidation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel_during_validation=%t", duringValidation), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			schema, err := parseArtifactSchema([]byte(`true`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := func(context.Context, SSHTarget, string, string, int) ([]byte, error) {
+				if duringValidation {
+					cancel()
+					return nil, ctx.Err()
+				}
+				return nil, errors.New("missing proof")
+			}
+			_, _, failure := validateArtifactSchemasWithReader(ctx, SSHTarget{}, "/work", []loadedArtifactSchema{{remote: "proof", schemaPath: "schema.json", schema: schema}}, reader)
+			if failure == nil {
+				t.Fatal("expected failed schema fetch")
+			}
+			observedContextErr := ctx.Err()
+			cancel() // Later cleanup cancellation cannot reclassify validation.
+			report := TimingReport{ExitCode: 7}
+			applyArtifactFailureOutcome(&report, failure, observedContextErr)
+			wantStatus, wantKind := RunStatusFailed, RunErrorProvider
+			if duringValidation {
+				wantStatus, wantKind = RunStatusCanceled, RunErrorCanceled
+			}
+			if report.RunStatus != wantStatus || report.ErrorKind != wantKind || report.ExitCode != 7 {
+				t.Fatalf("report=%+v", report)
+			}
+		})
 	}
 }

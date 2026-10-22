@@ -1,17 +1,37 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
+const runFailureEvidenceTimeout = 5 * time.Second
+
 type FailureClassification struct {
-	BlockedStage string
-	RetryLikely  string
+	BlockedStage       string
+	ResourceExhaustion ResourceExhaustionReason
+	RetryLikely        string
 }
 
 func ClassifyRunFailure(exitCode int, text string, phases []TimingPhase) FailureClassification {
+	return ClassifyRunFailureWithEvidence(exitCode, text, phases, RunFailureEvidence{})
+}
+
+func ClassifyRunFailureWithEvidence(exitCode int, text string, phases []TimingPhase, evidence RunFailureEvidence) FailureClassification {
+	if evidence.ResourceExhaustion == ResourceExhaustionMemory {
+		return FailureClassification{
+			BlockedStage:       "resource_exhaustion",
+			ResourceExhaustion: ResourceExhaustionMemory,
+			RetryLikely:        "false",
+		}
+	}
 	if exitCode == 0 {
 		return FailureClassification{}
 	}
@@ -32,11 +52,21 @@ func ClassifyRunFailure(exitCode int, text string, phases []TimingPhase) Failure
 		return FailureClassification{BlockedStage: "ssh", RetryLikely: "true"}
 	case isKnownHTMLAuthBody(lower):
 		return FailureClassification{BlockedStage: "provider_auth", RetryLikely: "false"}
+	}
+	// Runtime phases outrank workload text that may describe an earlier phase.
+	switch phaseName := finalTimingPhaseName(phases); phaseName {
+	case "install", "hydrate", "setup":
+		return FailureClassification{BlockedStage: "install", RetryLikely: "unknown"}
+	case "build", "test":
+		return FailureClassification{BlockedStage: phaseName, RetryLikely: "unknown"}
+	case "", "user-command":
+		// No specific phase was reported; retain diagnostic-only classification.
+	default:
+		return FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"}
+	}
+	switch {
 	case strings.Contains(lower, "exdev") ||
-		strings.Contains(lower, "enomem") ||
-		strings.Contains(lower, "package-import-method") ||
-		strings.Contains(lower, "child-concurrency") ||
-		strings.Contains(lower, "network-concurrency"):
+		strings.Contains(lower, "enomem"):
 		return FailureClassification{BlockedStage: "install", RetryLikely: "unknown"}
 	case strings.Contains(lower, "model_call") ||
 		strings.Contains(lower, "model call") ||
@@ -46,10 +76,28 @@ func ClassifyRunFailure(exitCode int, text string, phases []TimingPhase) Failure
 		strings.Contains(lower, "tokens") && strings.Contains(lower, "maximum"):
 		return FailureClassification{BlockedStage: "model_call", RetryLikely: "unknown"}
 	}
-	if phaseName := finalTimingPhaseName(phases); strings.Contains(phaseName, "install") || strings.Contains(phaseName, "hydrate") || strings.Contains(phaseName, "setup") {
-		return FailureClassification{BlockedStage: "install", RetryLikely: "unknown"}
-	}
 	return FailureClassification{BlockedStage: "unknown", RetryLikely: "unknown"}
+}
+
+func classifyRunOutcomeFailure(exitCode int, text string, phases []TimingPhase, evidence RunFailureEvidence, testResultsFailed, artifactValidationFailed bool) FailureClassification {
+	classification := ClassifyRunFailureWithEvidence(exitCode, text, phases, evidence)
+	if artifactValidationFailed && classification.ResourceExhaustion == "" {
+		return FailureClassification{BlockedStage: "artifacts", RetryLikely: "unknown"}
+	}
+	if testResultsFailed && classification.ResourceExhaustion == "" {
+		return FailureClassification{BlockedStage: "test", RetryLikely: "false"}
+	}
+	return classification
+}
+
+func applyArtifactFailureOutcome(report *TimingReport, artifactFailure, observedContextErr error) {
+	if artifactFailure == nil || report.ResourceExhaustion != "" {
+		return
+	}
+	// The workload succeeded; the synthetic gate code is not a command exit.
+	failure := errors.Join(artifactFailure, observedContextErr)
+	report.RunStatus = RunStatusForResult(RunResult{}, failure)
+	report.ErrorKind = RunErrorKindForResult(RunResult{}, failure)
 }
 
 func isBlacksmithActionsCancelled(lower string) bool {
@@ -76,6 +124,7 @@ func ApplyFailureClassification(report *TimingReport, classification FailureClas
 		return
 	}
 	report.BlockedStage = classification.BlockedStage
+	report.ResourceExhaustion = classification.ResourceExhaustion
 	report.RetryLikely = classification.RetryLikely
 }
 
@@ -87,7 +136,98 @@ func FormatFailureClassificationFields(classification FailureClassification) str
 	if retry == "" {
 		retry = "unknown"
 	}
-	return fmt.Sprintf(" blocked_stage=%s retry_likely=%s", classification.BlockedStage, retry)
+	fields := fmt.Sprintf(" blocked_stage=%s", classification.BlockedStage)
+	if classification.ResourceExhaustion != "" {
+		fields += fmt.Sprintf(" resource_exhaustion=%s", classification.ResourceExhaustion)
+	}
+	return fields + fmt.Sprintf(" retry_likely=%s", retry)
+}
+
+func beginRunFailureEvidence(ctx context.Context, backend SSHLeaseBackend, lease LeaseTarget, warnings io.Writer) RunFailureEvidenceCollector {
+	capability, ok := backend.(SSHRunFailureEvidenceBackend)
+	if !ok {
+		return nil
+	}
+	bounded, cancel := context.WithTimeout(ctx, runFailureEvidenceTimeout)
+	defer cancel()
+	collector, err := capability.BeginRunFailureEvidence(bounded, RunFailureEvidenceRequest{Lease: lease})
+	if err != nil {
+		fmt.Fprintf(nonNilWriter(warnings), "warning: failed-run evidence baseline unavailable: %v\n", err)
+		return nil
+	}
+	return collector
+}
+
+func collectRunFailureEvidence(ctx context.Context, collector RunFailureEvidenceCollector, warnings io.Writer) RunFailureEvidence {
+	if collector == nil {
+		return RunFailureEvidence{}
+	}
+	bounded, cancel := context.WithTimeout(context.WithoutCancel(ctx), runFailureEvidenceTimeout)
+	defer cancel()
+	evidence, err := collector(bounded)
+	if err != nil {
+		fmt.Fprintf(nonNilWriter(warnings), "warning: failed-run evidence collection incomplete: %v\n", err)
+		return RunFailureEvidence{}
+	}
+	switch evidence.ResourceExhaustion {
+	case "", ResourceExhaustionMemory:
+		return sanitizeRunFailureEvidence(evidence)
+	default:
+		fmt.Fprintf(nonNilWriter(warnings), "warning: failed-run evidence collection returned unsupported resource exhaustion reason %q\n", evidence.ResourceExhaustion)
+		return RunFailureEvidence{}
+	}
+}
+
+// Optional presentation must never invalidate positive provider evidence.
+func sanitizeRunFailureEvidence(evidence RunFailureEvidence) RunFailureEvidence {
+	clean := RunFailureEvidence{ResourceExhaustion: evidence.ResourceExhaustion}
+	if safeFailurePresentation(evidence.Hint, 768) {
+		clean.Hint = evidence.Hint
+	}
+	keys := make([]string, 0, len(evidence.Details))
+	for key := range evidence.Details {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	total := len(clean.Hint)
+	for _, key := range keys {
+		value := evidence.Details[key]
+		if !safeFailurePresentation(key, 64) || !safeFailurePresentation(value, 256) ||
+			strings.IndexFunc(key, func(r rune) bool {
+				return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-')
+			}) >= 0 || total+len(key)+len(value) > 4096 {
+			continue
+		}
+		if clean.Details == nil {
+			clean.Details = make(map[string]string)
+		}
+		clean.Details[key] = value
+		total += len(key) + len(value)
+		if len(clean.Details) == 16 {
+			break
+		}
+	}
+	return clean
+}
+
+func safeFailurePresentation(value string, limit int) bool {
+	return value != "" && len(value) <= limit && utf8.ValidString(value) &&
+		strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }) < 0
+}
+
+func runFailureEvidenceSnapshot(evidence RunFailureEvidence) *RunFailureEvidence {
+	clean := sanitizeRunFailureEvidence(evidence)
+	if clean.ResourceExhaustion == "" && clean.Hint == "" && len(clean.Details) == 0 {
+		return nil
+	}
+	return &clean
+}
+
+func nonNilWriter(w io.Writer) io.Writer {
+	if w == nil {
+		return io.Discard
+	}
+	return w
 }
 
 func RedactKnownFailureBody(text string) (string, bool) {
@@ -159,24 +299,30 @@ func finalTimingPhaseName(phases []TimingPhase) string {
 }
 
 type runFailureDigestInput struct {
-	Provider       string
-	TargetOS       string
-	WindowsMode    string
-	LeaseID        string
-	Slug           string
-	RunID          string
-	CommandDisplay string
-	ShellMode      bool
-	ScriptMode     bool
-	RoutingArgs    []string
-	SSHRoutingArgs []string
-	StopCommand    string
-	Classification FailureClassification
-	Phases         []TimingPhase
-	Results        *TestResultSummary
+	Provider              string
+	TargetOS              string
+	WindowsMode           string
+	LeaseID               string
+	LeaseStopped          bool
+	Slug                  string
+	RunID                 string
+	RunHistoryUnavailable bool
+	CommandDisplay        string
+	ShellMode             bool
+	ScriptMode            bool
+	NoSync                bool
+	RequiredArtifactGlobs []string
+	Routing               CommandRouting
+	SSHRouting            CommandRouting
+	StopRouting           CommandRouting
+	StopCommand           string
+	Classification        FailureClassification
+	Evidence              RunFailureEvidence
+	Phases                []TimingPhase
+	Results               *TestResultSummary
 }
 
-func printRunFailureDigest(w io.Writer, input runFailureDigestInput, stdoutTail, stderrTail *streamTailBuffer, stdoutCapture, stderrCapture string) {
+func printRunFailureDigest(w io.Writer, input runFailureDigestInput) {
 	if w == nil {
 		return
 	}
@@ -190,15 +336,32 @@ func printRunFailureDigest(w io.Writer, input runFailureDigestInput, stdoutTail,
 	fmt.Fprintf(w, "  phase: %s\n", blank(phase, "unknown"))
 	fmt.Fprintf(w, "  area: %s\n", area)
 	fmt.Fprintf(w, "  retryable: %s\n", retry)
+	if input.Classification.ResourceExhaustion != "" {
+		fmt.Fprintf(w, "  resource_exhaustion: %s\n", input.Classification.ResourceExhaustion)
+	}
+	if input.Classification.ResourceExhaustion == ResourceExhaustionMemory {
+		evidence := sanitizeRunFailureEvidence(input.Evidence)
+		fmt.Fprintf(w, "  hint: %s\n", blank(evidence.Hint, "reduce memory demand and inspect active limits and runtime capacity before retrying"))
+		keys := make([]string, 0, len(evidence.Details))
+		for key := range evidence.Details {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			fmt.Fprintf(w, "  evidence: %s=%s\n", key, evidence.Details[key])
+		}
+	}
+	if input.LeaseStopped {
+		fmt.Fprintln(w, "  lease: stopped; lease-based recovery is unavailable")
+	}
+	if input.RunHistoryUnavailable {
+		fmt.Fprintln(w, "  run_history: unavailable")
+	}
 	printFailureDigestPhases(w, input.Phases)
 	printFailureDigestShellChain(w, input)
 	printFailureDigestResults(w, input.Results)
-	for _, command := range failureDigestNextCommands(input, retry) {
+	for _, command := range classifiedFailureDigestNextCommands(input, retry) {
 		fmt.Fprintf(w, "  next: %s\n", command)
-	}
-	printFailureDigestTail(w, "stderr", stderrTail, stderrCapture)
-	if stderrCapture != "" || tailLineCount(stderrTail) == 0 {
-		printFailureDigestTail(w, "stdout", stdoutTail, stdoutCapture)
 	}
 }
 
@@ -234,6 +397,8 @@ func failureDigestPhase(classification FailureClassification, phases []TimingPha
 
 func failureDigestArea(classification FailureClassification, phase string) string {
 	switch classification.BlockedStage {
+	case "artifacts":
+		return "artifacts"
 	case "provider_auth":
 		return "provider_auth"
 	case "ssh":
@@ -242,6 +407,8 @@ func failureDigestArea(classification FailureClassification, phase string) strin
 		return "install_setup"
 	case "model_call":
 		return "model_tool_provider_limit"
+	case "resource_exhaustion":
+		return "resource_exhaustion"
 	}
 	switch {
 	case strings.Contains(phase, "sync"):
@@ -257,7 +424,7 @@ func failureDigestArea(classification FailureClassification, phase string) strin
 
 func failureDigestNextCommands(input runFailureDigestInput, retry string) []string {
 	var commands []string
-	if input.RunID != "" {
+	if input.RunID != "" && !input.RunHistoryUnavailable {
 		commands = append(commands,
 			"crabbox logs "+input.RunID+" --tail 80",
 			"crabbox events "+input.RunID+" --type stderr",
@@ -265,31 +432,44 @@ func failureDigestNextCommands(input runFailureDigestInput, retry string) []stri
 		)
 	}
 	leaseRef := firstNonBlank(input.Slug, input.LeaseID)
-	if leaseRef != "" {
-		sshRouting := append([]string(nil), input.SSHRoutingArgs...)
-		if len(sshRouting) == 0 {
-			sshRouting = fallbackFailureDigestRoutingArgs(input)
+	if leaseRef != "" && !input.LeaseStopped {
+		sshRouting := input.SSHRouting
+		if len(sshRouting.Args) == 0 {
+			sshRouting = fallbackFailureDigestRouting(input, CommandRoutingRetry)
 		}
-		commands = append(commands, crabboxCommandString(append(append([]string{"ssh"}, sshRouting...), "--id", leaseRef)))
+		commands = append(commands, sshRouting.ShellCommand(append(append([]string{"crabbox", "ssh"}, sshRouting.Args...), "--id", leaseRef)))
 		if retry != "false" && !input.ScriptMode && canSuggestRunRetry(input.CommandDisplay) {
-			routing := append([]string(nil), input.RoutingArgs...)
-			if len(routing) == 0 {
-				routing = fallbackFailureDigestRoutingArgs(input)
+			routing := input.Routing
+			if len(routing.Args) == 0 {
+				routing = fallbackFailureDigestRouting(input, CommandRoutingRetry)
 			}
-			runArgs := append(append([]string{"run"}, routing...), "--id", leaseRef, "--fresh-sync")
+			syncFlag := "--fresh-sync"
+			if input.NoSync {
+				syncFlag = "--no-sync"
+			}
+			runArgs := append(append([]string{"crabbox", "run"}, routing.Args...), "--id", leaseRef, syncFlag)
+			for _, glob := range input.RequiredArtifactGlobs {
+				runArgs = append(runArgs, "--require-artifact", glob)
+			}
 			if input.ShellMode {
 				runArgs = append(runArgs, "--shell")
 			}
-			runCommand := crabboxCommandString(runArgs) + " -- " + failureDigestRetryCommand(input)
-			commands = append(commands, runCommand)
+			commands = append(commands, routing.ShellCommand(runArgs)+" -- "+failureDigestRetryCommand(input))
 		}
-		stopRouting := append([]string(nil), input.RoutingArgs...)
-		if len(stopRouting) == 0 {
-			stopRouting = fallbackFailureDigestRoutingArgs(input)
+		stopRouting := input.StopRouting
+		if len(stopRouting.Args) == 0 {
+			stopRouting = fallbackFailureDigestRouting(input, CommandRoutingStop)
 		}
-		commands = append(commands, firstNonBlank(input.StopCommand, crabboxCommandString(append(append([]string{"stop"}, stopRouting...), leaseRef))))
+		commands = append(commands, firstNonBlank(input.StopCommand, stopRouting.ShellCommand(append(append([]string{"crabbox", "stop"}, stopRouting.Args...), leaseRef))))
 	}
 	return commands
+}
+
+func classifiedFailureDigestNextCommands(input runFailureDigestInput, retry string) []string {
+	if retry != "true" {
+		retry = "false"
+	}
+	return failureDigestNextCommands(input, retry)
 }
 
 func failureDigestRetryCommand(input runFailureDigestInput) string {
@@ -312,76 +492,145 @@ func printFailureDigestShellChain(w io.Writer, input runFailureDigestInput) {
 	fmt.Fprintln(w, "  chain_semantics: && only runs later segments if all earlier segments succeed")
 }
 
+// Only attribute simple chains. This scanner is not a shell grammar: compound
+// syntax, substitutions, lists, and pipelines make its explanation uncertain.
 func shellAndChainSegments(command string) []string {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return nil
 	}
 	var segments []string
-	var b strings.Builder
-	inSingle := false
-	inDouble := false
-	escaped := false
-	depth := 0
-	flush := func() {
-		part := strings.TrimSpace(b.String())
-		if part != "" {
-			segments = append(segments, part)
+	inSingle, inDouble, escaped := false, false, false
+	inWord := false
+	redirection := false
+	brackets := 0
+	start := 0
+	nextLogicalByte := func(i int) byte {
+		i++
+		for i+1 < len(command) && command[i] == '\\' && command[i+1] == '\n' {
+			i += 2
 		}
-		b.Reset()
+		if i < len(command) {
+			return command[i]
+		}
+		return 0
 	}
 	for i := 0; i < len(command); i++ {
 		ch := command[i]
 		if escaped {
-			b.WriteByte(ch)
 			escaped = false
+			// A removed continuation does not start or end a shell word.
+			if ch != '\n' {
+				inWord = true
+				redirection = false
+			}
 			continue
 		}
 		if ch == '\\' && !inSingle {
-			b.WriteByte(ch)
 			escaped = true
 			continue
 		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			inWord = true
+			redirection = false
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		if ch == '"' {
+			inDouble = !inDouble
+			inWord = true
+			redirection = false
+			continue
+		}
+		if ch == '`' {
+			return nil
+		}
+		if ch == '$' {
+			switch nextLogicalByte(i) {
+			case '(', '{', '[':
+				return nil
+			case '\'', '"':
+				if !inDouble {
+					return nil
+				}
+			}
+		}
+		if inDouble {
+			continue
+		}
+		followsRedirection := redirection
+		redirection = false
 		switch ch {
-		case '\'':
-			if !inDouble {
-				inSingle = !inSingle
-			}
-			b.WriteByte(ch)
-		case '"':
-			if !inSingle {
-				inDouble = !inDouble
-			}
-			b.WriteByte(ch)
-		case '(', '{', '[':
-			if !inSingle && !inDouble {
-				depth++
-			}
-			b.WriteByte(ch)
-		case ')', '}', ']':
-			if !inSingle && !inDouble && depth > 0 {
-				depth--
-			}
-			b.WriteByte(ch)
-		case '&':
-			if !inSingle && !inDouble && depth == 0 && i+1 < len(command) && command[i+1] == '&' {
-				flush()
-				i++
-				continue
-			}
-			b.WriteByte(ch)
-		case '|':
-			if !inSingle && !inDouble && depth == 0 && i+1 < len(command) && command[i+1] == '|' {
+		case '(', ')', '}', ';', '\r', '|':
+			return nil
+		case '{':
+			if i+1 >= len(command) || command[i+1] != '}' {
 				return nil
 			}
-			b.WriteByte(ch)
-		default:
-			b.WriteByte(ch)
+			i++
+		case '\n':
+			if len(segments) == 0 || strings.TrimSpace(command[start:i]) != "" {
+				return nil
+			}
+			continue
+		case '#':
+			if !inWord {
+				return nil
+			}
+		case ' ', '\t':
+			inWord = false
+			continue
+		case '[':
+			if nextLogicalByte(i) == '[' {
+				return nil
+			}
+			brackets++
+		case ']':
+			if brackets > 0 {
+				brackets--
+			}
+		case '<', '>':
+			if ch == '<' && i+1 < len(command) && command[i+1] == '<' {
+				return nil
+			}
+			inWord = false
+			redirection = true
+			continue
+		case '&':
+			if brackets > 0 {
+				return nil
+			}
+			if followsRedirection {
+				continue
+			}
+			if i+1 >= len(command) || command[i+1] != '&' {
+				return nil
+			}
+			part := strings.TrimSpace(command[start:i])
+			if part == "" {
+				return nil
+			}
+			segments = append(segments, part)
+			i++
+			start = i + 1
+			inWord = false
+			continue
 		}
+		inWord = true
 	}
-	flush()
-	if len(segments) < 2 {
+	last := strings.TrimSpace(command[start:])
+	if inSingle || inDouble || escaped || brackets > 0 || last == "" || len(segments) == 0 {
 		return nil
+	}
+	segments = append(segments, last)
+	for _, segment := range segments {
+		switch strings.Fields(segment)[0] {
+		case "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "select", "function", "coproc", "!":
+			return nil
+		}
 	}
 	return segments
 }
@@ -396,146 +645,23 @@ func printFailureDigestResults(w io.Writer, results *TestResultSummary) {
 		limit = 5
 	}
 	for i := 0; i < limit; i++ {
-		failure := results.Failed[i]
-		name := failure.Name
-		if failure.Classname != "" {
-			name = failure.Classname + "." + name
-		}
-		location := firstNonBlank(failure.File, failure.Suite, "-")
-		message := strings.TrimSpace(firstLine(failure.Message))
-		if message != "" {
-			fmt.Fprintf(w, "  failed_test: %s %-8s %s - %s\n", location, failure.Kind, name, message)
+		display := terminalSafeTestFailure(results.Failed[i])
+		if display.message != "" {
+			fmt.Fprintf(w, "  failed_test: %s %-8s %s - %s\n", display.location, display.kind, display.name, display.message)
 			continue
 		}
-		fmt.Fprintf(w, "  failed_test: %s %-8s %s\n", location, failure.Kind, name)
+		fmt.Fprintf(w, "  failed_test: %s %-8s %s\n", display.location, display.kind, display.name)
 	}
 	if len(results.Failed) > limit {
 		fmt.Fprintf(w, "  failed_test: +%d more\n", len(results.Failed)-limit)
 	}
 }
 
-func runFailureDigestRoutingArgs(cfg Config, leaseID string) []string {
-	args := []string{}
-	if strings.TrimSpace(cfg.Provider) != "" {
-		args = append(args, "--provider", cfg.Provider)
-	}
-	if strings.TrimSpace(cfg.TargetOS) != "" {
-		args = append(args, "--target", cfg.TargetOS)
-	}
-	if cfg.TargetOS == targetWindows && strings.TrimSpace(cfg.WindowsMode) != "" {
-		args = append(args, "--windows-mode", cfg.WindowsMode)
-	}
-	if strings.TrimSpace(cfg.Static.Host) != "" {
-		args = append(args, "--static-host", cfg.Static.Host)
-	}
-	if strings.TrimSpace(cfg.Static.User) != "" {
-		args = append(args, "--static-user", cfg.Static.User)
-	}
-	if strings.TrimSpace(cfg.Static.Port) != "" {
-		args = append(args, "--static-port", cfg.Static.Port)
-	}
-	if strings.TrimSpace(cfg.Static.WorkRoot) != "" {
-		args = append(args, "--static-work-root", cfg.Static.WorkRoot)
-	}
-	return appendProviderStopRoutingArgs(args, cfg, leaseID)
-}
-
-func runFailureDigestSSHRoutingArgs(cfg Config, leaseID string) []string {
-	args := []string{}
-	if strings.TrimSpace(cfg.Provider) != "" {
-		args = append(args, "--provider", cfg.Provider)
-	}
-	if strings.TrimSpace(cfg.TargetOS) != "" {
-		args = append(args, "--target", cfg.TargetOS)
-	}
-	if cfg.TargetOS == targetWindows && strings.TrimSpace(cfg.WindowsMode) != "" {
-		args = append(args, "--windows-mode", cfg.WindowsMode)
-	}
-	if strings.TrimSpace(cfg.Static.Host) != "" {
-		args = append(args, "--static-host", cfg.Static.Host)
-	}
-	if strings.TrimSpace(cfg.Static.User) != "" {
-		args = append(args, "--static-user", cfg.Static.User)
-	}
-	if strings.TrimSpace(cfg.Static.Port) != "" {
-		args = append(args, "--static-port", cfg.Static.Port)
-	}
-	if strings.TrimSpace(cfg.Static.WorkRoot) != "" {
-		args = append(args, "--static-work-root", cfg.Static.WorkRoot)
-	}
-	return appendProviderStopRoutingArgs(args, cfg, leaseID)
-}
-
-func fallbackFailureDigestRoutingArgs(input runFailureDigestInput) []string {
-	args := []string{}
-	if strings.TrimSpace(input.Provider) != "" {
-		args = append(args, "--provider", input.Provider)
-	}
-	if strings.TrimSpace(input.TargetOS) != "" {
-		args = append(args, "--target", input.TargetOS)
-	}
-	if input.TargetOS == targetWindows && strings.TrimSpace(input.WindowsMode) != "" {
-		args = append(args, "--windows-mode", input.WindowsMode)
-	}
-	return args
-}
-
-func crabboxCommandString(args []string) string {
-	env := []string{}
-	rest := make([]string, 0, len(args))
-	index := 0
-	for index < len(args) && isShellEnvAssignment(args[index]) {
-		env = append(env, args[index])
-		index++
-	}
-	if index < len(args) {
-		rest = append(rest, args[index])
-		index++
-	}
-	for index < len(args) && isShellEnvAssignment(args[index]) {
-		env = append(env, args[index])
-		index++
-	}
-	rest = append(rest, args[index:]...)
-	command := append(env, "crabbox")
-	command = append(command, rest...)
-	return readableShellCommand(command)
+func fallbackFailureDigestRouting(input runFailureDigestInput, purpose CommandRoutingPurpose) CommandRouting {
+	return CommandRoutingFor(Config{Provider: input.Provider, TargetOS: input.TargetOS, WindowsMode: input.WindowsMode}, input.LeaseID, purpose)
 }
 
 func canSuggestRunRetry(commandDisplay string) bool {
 	commandDisplay = strings.TrimSpace(commandDisplay)
 	return commandDisplay != "" && !strings.HasPrefix(commandDisplay, "--script")
-}
-
-func printFailureDigestTail(w io.Writer, label string, tail *streamTailBuffer, capturedPath string) {
-	if capturedPath != "" {
-		fmt.Fprintf(w, "  tail %s: captured at %s\n", label, capturedPath)
-		return
-	}
-	if tail == nil {
-		return
-	}
-	lines := tail.Lines()
-	if len(lines) == 0 {
-		return
-	}
-	if len(lines) > 8 {
-		lines = lines[len(lines)-8:]
-	}
-	text := strings.Join(lines, "\n")
-	if redacted, ok := RedactKnownFailureBody(text); ok {
-		fmt.Fprintf(w, "  tail %s: %s\n", label, redacted)
-		return
-	}
-	fmt.Fprintf(w, "  tail %s:\n", label)
-	for _, line := range lines {
-		fmt.Fprintf(w, "    %s\n", line)
-	}
-}
-
-func tailLineCount(tail *streamTailBuffer) int {
-	if tail == nil {
-		return 0
-	}
-	return len(tail.Lines())
 }

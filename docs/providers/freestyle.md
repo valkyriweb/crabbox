@@ -7,7 +7,7 @@ Read when:
 - changing `internal/providers/freestyle`.
 
 Freestyle is a delegated run provider. Crabbox uses the [Freestyle](https://freestyle.sh)
-v1 REST API (`https://api.freestyle.sh`) for VM lifecycle, archive sync, and
+[v5 REST API](https://api.freestyle.sh/) for VM lifecycle, archive sync, and
 command execution through pure Go `net/http` calls. Freestyle owns VM state and
 exec transport; Crabbox owns local config, repo claims, sync manifests and
 guardrails, slugs, timing summaries, and normalized list/status rendering.
@@ -64,6 +64,8 @@ export FREESTYLE_API_KEY=...
 Freestyle API keys must not be passed as CLI flags. Crabbox reads them from
 environment variables only.
 
+Provider error diagnostics redact the configured API key before display.
+
 `FREESTYLE_API_URL`, `CRABBOX_FREESTYLE_API_URL`, or `freestyle.apiUrl` in the
 user config can override the default `https://api.freestyle.sh`. Repository
 config cannot override this credential destination. Custom endpoints must use
@@ -78,10 +80,9 @@ target: linux
 freestyle:
   apiUrl: https://api.freestyle.sh
   workdir: crabbox
-  # Optional. Omit both to use the Freestyle plan defaults
-  # (4 vCPU / 8 GiB / 20 GB). vcpus and memoryGB must each be a
-  # power of two. Setting them on a plan without custom-sizing
-  # entitlement fails with CUSTOM_SIZING_NOT_ALLOWED.
+  # Optional. Omit both to use Freestyle default resources. Explicit sizing uses the grow-only resize API after creation;
+  # vcpus is a CPU count and memoryGB is converted to MiB. Requests below
+  # the default size or above plan limits fail and trigger cleanup of the new VM.
   vcpus: 4
   memoryGB: 8
 ```
@@ -95,38 +96,106 @@ Provider flags:
 --freestyle-memory-gb
 ```
 
+When Freestyle is selected, decoded negative `vcpus` or `memoryGB` values,
+including explicit negative sizing flags, fail with exit 2 before fresh sandbox
+creation instead of silently omitting sizing. Existing lease reuse, inspection,
+and stop do not consume creation sizing. Zero still omits that sizing
+field, and positive values are passed through for service-side validation.
+This check does not change the existing YAML/environment decoding rules; it
+does not make every raw negative YAML or environment value an error.
+
 `--freestyle-workdir` / `freestyle.workdir` is interpreted as a relative
 directory below `/workspace`. Crabbox rejects absolute paths and `..` escapes
 before workspace preparation and sync.
 
 ## Lifecycle
 
-1. Create or resolve a Crabbox-owned Freestyle VM.
-2. Store a local lease ID with the `fsb_` prefix and a friendly slug.
-3. Validate the Freestyle workdir, build the Crabbox sync manifest, and upload a
-   gzipped archive into `/workspace/<freestyle.workdir>`.
-4. Execute commands through Freestyle's exec API in that workdir via `bash -lc`.
+1. Validate the workdir and prepare a bounded archive before creating a VM;
+   reused VMs are authorized before local preparation.
+2. Wait for a newly created VM to reach `running`, then store a local lease ID
+   with the `fsb_` prefix and a friendly slug. Creation waits up to one minute;
+   a failed wait deletes the exact newly created VM.
+3. Upload the prepared archive and synchronize `/workspace/<freestyle.workdir>`
+   through Crabbox's shared archive transaction.
+4. Execute commands as root through Freestyle's exec API in that workdir via
+   `bash -lc`.
 5. Stop deletes the VM and removes the local lease claim.
+
+`run --lease-output` records the Freestyle lease, reuse/retention state, and
+matching `crabbox stop --provider freestyle --id ...` cleanup command for
+orchestrators that need to inspect or clean up retained VMs later.
+
+Run retention, cleanup, and timing use Crabbox's shared sandbox lifecycle.
+An automatic VM deletion failure after a successful command returns exit 1,
+reports a provider failure, and leaves the session and claim available for
+recovery; it is no longer a warning attached to a successful run. A prior
+command failure keeps its exit code even when deletion or timing output also
+fails. Transport and cancellation causes remain inspectable by callers.
+Setup failures honor `--keep-on-failure`, reused VMs remain kept, and cleanup
+uses an uncanceled 30-second budget. Freestyle still owns its HTTP transport,
+command encoding, and existing claim/reclaim rules.
+
+Commands use Freestyle's default 30-second execution limit. A null or absent exec
+exit status is reported as a timeout, with captured output preserved.
+`--keep-on-failure` retains the VM for inspection after that timeout.
 
 ## Sync
 
 Freestyle advertises archive sync (`FeatureArchiveSync`). Crabbox supports
 `--sync-only`, `--force-sync-large`, and `--no-sync`.
 
-Crabbox creates Freestyle VMs with an explicit empty external-port list. No
-guest service is publicly exposed by default.
+Crabbox creates Freestyle VMs with a canonical `crabbox-...` display name and
+provider slug. The explicit firewall allows outbound traffic to public addresses
+for package downloads and remote tests. No inbound rule exposes guest services.
 
 When `sync.delete` is enabled, Crabbox extracts into a staging directory and
 replaces the retained workspace only after extraction succeeds. Failed uploads
 leave the prior workspace intact. `sync.timeout` bounds archive creation,
-upload, extraction, and replacement.
+upload, extraction, and replacement. Local manifest planning and VM provisioning
+are outside that budget; archive creation consumes part of the remaining
+transfer budget. Fresh runs upload the snapshot prepared before VM creation,
+even if the checkout changes during provisioning. Timing reports preparation
+once and separates upload, extraction and cleanup.
 
-Archive upload tries Freestyle's file API first. When that endpoint is
-unavailable, Crabbox falls back to chunked base64 upload through exec. Sync still
-completes reliably through the fallback path.
+File and byte guardrails apply to the complete archive, not only changed files.
+`sync-plan --json` previews those same full-archive limits before allocation.
+The provider also limits compressed archives to 64 MiB, checked before allocation
+and again by a bounded upload read. `--force-sync-large` overrides the normal
+sync guardrails but not this compressed transport limit.
 
-The raw VM ID, Crabbox VM name, and generated slug shown by `crabbox list` can
-recover a Crabbox-owned VM after local claim state is lost.
+Freestyle offers a [native filesystem API](https://www.freestyle.sh/docs/vms/files)
+with binary reads, atomic writes, and chunked large-file transfers. This adapter
+uses exec for archive transfer, retaining Crabbox's existing staging, fallback,
+and workspace publication transaction. It sends binary data through exec's
+base64-encoded stdin in chunks of at most 512 KiB, leaving room for encoding
+and JSON within the service's 1 MiB request limit.
+If stdin upload fails, Crabbox falls back to decoded chunks below 32 KiB in
+base64 exec commands, leaving room for shell syntax within the 64 KiB command
+limit. The two attempts use separate temporary paths and publish only after
+acknowledged upload or successful decoding. Shared sync owns extraction and workspace replacement. Failed publication is
+reported, and bounded cleanup preserves the primary error. An unknown remote
+write completing after cleanup can still leave its isolated attempt file; it
+cannot overwrite the archive consumed by the fallback.
+
+Freestyle does not report an instance type. Status leaves `serverType` empty,
+matching the inventory type; the VM name remains available in `crabbox list`.
+
+The raw VM ID, Crabbox VM display name (or provider slug if unnamed), and
+generated lease slug shown by `crabbox list` can identify a VM after local claim state is lost. Read-only status recovery still
+requires the provider VM name to match Crabbox's canonical `crabbox-...` form.
+Reuse and deletion additionally require an exact local claim. To intentionally
+adopt a canonical VM, persist that claim before stopping it:
+
+```sh
+crabbox run --provider freestyle --id fsb_vm123 --reclaim --no-sync -- true
+crabbox stop --provider freestyle --id fsb_vm123
+```
+
+`--reclaim` is the explicit operator authorization: canonical name shape alone
+never reaches Freestyle command or delete operations. If partial acquisition
+(such as resizing) fails and deletion also fails, the error reports this exact
+adopt-then-stop sequence for the surviving VM. A cleanup failure does not bypass
+the exact-claim requirement.
 
 `--checksum` is not supported because Freestyle uses archive sync rather than
 Crabbox rsync checksum mode.

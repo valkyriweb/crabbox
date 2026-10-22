@@ -7,18 +7,20 @@ import (
 )
 
 const (
-	rescueBrowserNotLaunched      = "browser not launched"
-	rescueClipboardUnavailable    = "clipboard unavailable"
-	rescueDesktopSessionMissing   = "desktop session missing"
-	rescueInputStackDead          = "input stack dead"
-	rescueVNCBridgeDisconnected   = "VNC bridge disconnected"
-	rescueVNCBridgeNotRunning     = "WebVNC daemon not running"
-	rescueVNCObserverSlotsFull    = "WebVNC observer slots exhausted"
-	rescueVNCStaleViewer          = "WebVNC viewer already active"
-	rescueVNCTargetUnreachable    = "VNC target unreachable"
-	rescueWindowManagerMissing    = "window manager missing"
-	rescueScreenshotCaptureBroken = "screenshot capture broken"
-	rescueArtifactCaptureFailed   = "artifact capture failed"
+	rescueBrowserNotLaunched        = "browser not launched"
+	rescueClipboardDeliveryFailed   = "clipboard delivery failed"
+	rescueClipboardUnavailable      = "clipboard unavailable"
+	rescueDesktopCommandNotLaunched = "desktop command not launched"
+	rescueDesktopSessionMissing     = "desktop session missing"
+	rescueInputStackDead            = "input stack dead"
+	rescueVNCBridgeDisconnected     = "VNC bridge disconnected"
+	rescueVNCBridgeNotRunning       = "WebVNC daemon not running"
+	rescueVNCObserverSlotsFull      = "WebVNC observer slots exhausted"
+	rescueVNCStaleViewer            = "WebVNC viewer already active"
+	rescueVNCTargetUnreachable      = "VNC target unreachable"
+	rescueWindowManagerMissing      = "window manager missing"
+	rescueScreenshotCaptureBroken   = "screenshot capture broken"
+	rescueArtifactCaptureFailed     = "artifact capture failed"
 )
 
 type rescueContext struct {
@@ -55,59 +57,55 @@ func webVNCStatusRescueCommand(ctx rescueContext) string {
 }
 
 func webVNCResetRescueCommand(ctx rescueContext) string {
-	args := crabboxLeaseCommandArgs(ctx, "webvnc", "reset")
-	args = append(args, "--open")
-	return strings.Join(readableShellWords(args), " ")
+	routing := crabboxLeaseCommandRouting(ctx, "webvnc", "reset")
+	return routing.ShellCommand(append(routing.Args, "--open"))
 }
 
 func webVNCDaemonStartRescueCommand(ctx rescueContext) string {
-	args := crabboxLeaseCommandArgs(ctx, "webvnc", "daemon", "start")
-	args = append(args, "--open")
-	return strings.Join(readableShellWords(args), " ")
+	routing := crabboxLeaseCommandRouting(ctx, "webvnc", "daemon", "start")
+	return routing.ShellCommand(append(routing.Args, "--open"))
 }
 
 func desktopLaunchRetryCommand(ctx rescueContext, command []string) string {
-	args := crabboxLeaseCommandArgs(ctx, "desktop", "launch")
-	args = append(args, "--")
-	args = append(args, command...)
-	return strings.Join(readableShellWords(args), " ")
+	routing := crabboxLeaseCommandRouting(ctx, "desktop", "launch")
+	return routing.ShellCommand(append(append(routing.Args, "--"), command...))
 }
 
 func crabboxLeaseCommand(ctx rescueContext, command ...string) string {
-	return strings.Join(readableShellWords(crabboxLeaseCommandArgs(ctx, command...)), " ")
+	routing := crabboxLeaseCommandRouting(ctx, command...)
+	return routing.ShellCommand(routing.Args)
 }
 
-func crabboxLeaseCommandArgs(ctx rescueContext, command ...string) []string {
-	targetOS := firstNonBlank(ctx.Target.TargetOS, ctx.Cfg.TargetOS)
-	args := append([]string{"crabbox"}, command...)
-	if strings.TrimSpace(ctx.Cfg.Provider) != "" {
-		args = append(args, "--provider", strings.TrimSpace(ctx.Cfg.Provider))
+func leaseCommandRouting(cfg Config, target SSHTarget, leaseID string, purpose CommandRoutingPurpose) CommandRouting {
+	cfg.TargetOS = firstNonBlank(target.TargetOS, cfg.TargetOS)
+	cfg.WindowsMode = firstNonBlank(target.WindowsMode, cfg.WindowsMode)
+	routing := CommandRoutingFor(cfg, leaseID, purpose, target)
+	if cfg.Network != "" && cfg.Network != NetworkAuto {
+		routing.Args = append(routing.Args, "--network", string(cfg.Network))
 	}
-	if targetOS != "" {
-		args = append(args, "--target", targetOS)
-	}
-	if strings.TrimSpace(ctx.Cfg.Provider) == staticProvider {
-		if staticHost := firstNonBlank(ctx.Cfg.Static.Host, ctx.Target.Host); staticHost != "" {
-			args = append(args, "--static-host", staticHost)
+	routing.Args = append(routing.Args, "--id", leaseID)
+	return routing
+}
+
+func crabboxLeaseCommandRouting(ctx rescueContext, command ...string) CommandRouting {
+	routing := leaseCommandRouting(ctx.Cfg, ctx.Target, ctx.LeaseID, CommandRoutingRescue)
+	routing.Args = append(append([]string{"crabbox"}, command...), routing.Args...)
+	return routing
+}
+
+// AppendExternalDesktopRoutingArgs excludes repository-provided credential
+// selectors so a generated CLI flag cannot promote them to trusted input.
+func AppendExternalDesktopRoutingArgs(args []string, cfg Config) []string {
+	if username := strings.TrimSpace(cfg.External.Connection.Desktop.Username); username != "" || IsExternalDesktopUsernameExplicit(&cfg) {
+		if cfg.credentialProvenance.externalDesktopUser != credentialSourceRepository {
+			args = append(args, "--external-desktop-username", username)
 		}
-		if staticUser := firstNonBlank(ctx.Cfg.Static.User, ctx.Target.User); staticUser != "" {
-			args = append(args, "--static-user", staticUser)
-		}
-		if staticPort := firstNonBlank(ctx.Cfg.Static.Port, ctx.Target.Port); staticPort != "" {
-			args = append(args, "--static-port", staticPort)
-		}
-		if strings.TrimSpace(ctx.Cfg.Static.WorkRoot) != "" {
-			args = append(args, "--static-work-root", strings.TrimSpace(ctx.Cfg.Static.WorkRoot))
+	}
+	if passwordEnv := strings.TrimSpace(cfg.External.Connection.Desktop.PasswordEnv); passwordEnv != "" || IsExternalDesktopPasswordEnvExplicit(&cfg) {
+		if cfg.credentialProvenance.externalDesktopEnv != credentialSourceRepository {
+			args = append(args, "--external-desktop-password-env", passwordEnv)
 		}
 	}
-	if ctx.Cfg.Network != "" && ctx.Cfg.Network != NetworkAuto {
-		args = append(args, "--network", string(ctx.Cfg.Network))
-	}
-	windowsMode := firstNonBlank(ctx.Target.WindowsMode, ctx.Cfg.WindowsMode)
-	if targetOS == targetWindows && windowsMode != "" {
-		args = append(args, "--windows-mode", windowsMode)
-	}
-	args = append(args, "--id", ctx.LeaseID)
 	return args
 }
 
@@ -118,6 +116,10 @@ func classifyDesktopFailure(output string) string {
 		return rescueInputStackDead
 	case strings.Contains(text, "missing clipboard tool"), strings.Contains(text, "xclip: not found"), strings.Contains(text, "xsel: not found"):
 		return rescueClipboardUnavailable
+	case strings.Contains(text, "clipboard helper exited"), strings.Contains(text, "clipboard helper failed"):
+		return rescueClipboardDeliveryFailed
+	case strings.Contains(text, "desktop command exited during launch"), strings.Contains(text, "desktop window not visible"):
+		return rescueDesktopCommandNotLaunched
 	case strings.Contains(text, "browser window not visible"), strings.Contains(text, "browser process not found"):
 		return rescueBrowserNotLaunched
 	case strings.Contains(text, "can't open display"), strings.Contains(text, "unable to open display"), strings.Contains(text, "display"):

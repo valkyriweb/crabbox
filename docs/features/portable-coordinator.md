@@ -37,8 +37,11 @@ Crabbox CLI ---- HTTPS / WebSocket ---- ingress ---- Node coordinator
 
 The coordinator remains a control plane. SSH readiness, repository sync,
 command execution, and stdout/stderr streaming stay direct between the CLI and
-the runner. The coordinator handles authentication, leases, run records,
-sharing, usage, cleanup, and optional live bridges.
+the runner for normal CLI leases. The specialized
+[private AWS workspace service](aws-private-workspaces.md) instead uses SSM for
+an API-managed workspace bootstrap and intentionally exposes no SSH path. The
+coordinator handles authentication, leases, run records, sharing, usage,
+cleanup, and optional live bridges.
 
 ## Runtime boundary
 
@@ -87,7 +90,8 @@ The initial production shape is intentionally small:
 - one PostgreSQL 13 or newer database reachable through `DATABASE_URL`;
 - durable PostgreSQL storage and backups;
 - an HTTPS ingress that supports WebSocket upgrades;
-- secret injection for coordinator auth and any managed-provider credentials;
+- secret injection for coordinator auth and any managed-provider credentials
+  that are not supplied by a workload identity or default provider chain;
 - outbound access to configured provider APIs;
 - an HTTP timeout long enough for persistent WebSockets.
 
@@ -107,7 +111,7 @@ Core runtime:
 DATABASE_URL                         required PostgreSQL connection string; use verified TLS remotely
 PORT                                 listener port, default 8080
 CRABBOX_PUBLIC_URL                   canonical external origin
-CRABBOX_CODE_ORIGIN_TEMPLATE         optional HTTPS per-lease Code origin template; ingress needs wildcard TLS/WebSockets
+CRABBOX_CODE_ORIGIN_TEMPLATE         required for browser Code; HTTPS per-lease template needs wildcard TLS/WebSockets
 CRABBOX_DATABASE_POOL_SIZE           PostgreSQL pool size, default 10
 CRABBOX_DATABASE_CONNECT_TIMEOUT_MS  connection timeout, default 10000
 CRABBOX_SHUTDOWN_TIMEOUT_MS          graceful shutdown budget, default 120000
@@ -116,8 +120,11 @@ CRABBOX_SHUTDOWN_TIMEOUT_MS          graceful shutdown budget, default 120000
 Authentication requires at least one supported coordinator identity path. Use
 signed user sessions, a shared operator token, an admin token, or a trusted
 reverse-proxy identity as documented in [Coordinator](coordinator.md) and
-[Security](../security.md). Managed provider credentials remain environment
-secrets; registered direct leases need no provider credentials in the service.
+[Security](../security.md). Managed-provider authentication can come from
+environment secrets or a provider default chain. On ECS, the dedicated private
+AWS deployment requires temporary task-role credentials and rejects static
+access keys. Registered direct leases need no provider credentials in the
+service.
 
 ## PostgreSQL state
 
@@ -144,6 +151,9 @@ are idempotent, so repeated job delivery is expected and safe.
 
 Node does not inherit Durable Object event ordering, so lifecycle mutations use
 an explicit process mutex. Slow provider calls do not hold that mutex.
+The Node and Cloudflare runtimes share the same FIFO mutex implementation.
+Borrowing, bridge tickets, ingress, and maintenance keep separate mutexes;
+runtime deletion and snapshot bootstrap use independent queues per resource key.
 Provisioning follows three phases:
 
 1. reserve the lease and cost under the lifecycle lock;
@@ -157,7 +167,9 @@ recoverable because the reservation exists before provider I/O begins.
 HTTP routes are classified as lifecycle or direct operations. Direct routes
 perform their own smaller critical sections. Bridge data frames bypass the
 global lifecycle mutex and retain per-socket ordering; control messages that
-mutate fleet state stay serialized.
+mutate fleet state stay serialized. Control heartbeats acquire their lifecycle
+transaction in shared fleet code, so Node dispatch does not wrap them in a second
+lock. They remain tracked for shutdown alongside other socket operations.
 
 ## WebSockets and shutdown
 
@@ -198,7 +210,9 @@ caller-supplied connection identity and derives the client address from the
 rightmost untrusted member of the forwarded chain. The ingress must strip any
 incoming copy of the trusted user header before setting its authenticated
 value. Set a stable trusted-user organization before creating records; without
-it, proxy-authenticated requests use the literal organization `unknown`.
+it, proxy-authenticated requests use a dedicated missing-org identity that is
+displayed as `unknown` but remains distinct from an org literally named
+`unknown`.
 
 Trust only the actual ingress addresses or a dedicated ingress subnet, and use
 network policy to block direct access from other workloads. Do not configure
@@ -279,6 +293,7 @@ ordering, maintenance, and shutdown.
 
 - [Coordinator](coordinator.md)
 - [Bring Your Own Infrastructure](bring-your-own-infrastructure.md)
+- [Private AWS workspaces](aws-private-workspaces.md)
 - [Infrastructure](../infrastructure.md)
 - [Security](../security.md)
 - [Browser portal](portal.md)

@@ -12,22 +12,22 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string      { return providerName }
-func (Provider) Aliases() []string { return nil }
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "azure",
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureArchiveSync},
-		Coordinator: core.CoordinatorNever,
+		Authentication:             core.DirectProviderAuthentication(core.ProviderAuthenticationAPIToken, core.ProviderAuthenticationCLI),
+		SyncGuardrailFullCandidate: true,
+		Name:                       providerName,
+		Family:                     "azure",
+		Kind:                       core.ProviderKindDelegatedRun,
+		Targets:                    []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:                   core.FeatureSet{core.FeatureArchiveSync, core.FeatureRunSession},
+		Coordinator:                core.CoordinatorNever,
+		ClassDisposition:           core.ProviderClassDispositionUnmapped,
 	}
 }
 
 func (Provider) RouteConfig(cfg *core.Config, _ *flag.FlagSet, _ any) error {
-	cfg.AzureBackend = core.AzureBackendDynamicSessions
+	cfg.Azure.Backend = core.AzureBackendDynamicSessions
 	return nil
 }
 
@@ -41,8 +41,6 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 
 func (Provider) ServerTypeForConfig(core.Config) string { return "" }
 
-func (Provider) ServerTypeForClass(string) string { return "" }
-
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
 	if cfg.TargetOS != "" && cfg.TargetOS != core.TargetLinux {
 		return nil, core.Exit(2, "%s supports target=linux only", providerName)
@@ -50,16 +48,4 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	cfg.Provider = providerName
 	cfg.TargetOS = core.TargetLinux
 	return NewAzureDynamicSessionsBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
-	}
-	return doctor, nil
 }

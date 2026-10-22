@@ -43,6 +43,18 @@ export CRABBOX_SEMAPHORE_PROJECT=my-app
 export CRABBOX_SEMAPHORE_TOKEN=...
 
 go build -trimpath -o bin/crabbox ./cmd/crabbox
+CRABBOX_LIVE=1 CRABBOX_LIVE_PROVIDERS=semaphore CRABBOX_LIVE_REPO=/path/to/my-app scripts/live-smoke.sh
+```
+
+The shared harness exits before any Semaphore `warmup`, `run`, `list`, or `stop`
+command when host, project, or token configuration is missing. With those values
+configured, it creates one short-lived Semaphore testbox, waits for SSH, verifies
+one no-sync command, lists normalized Semaphore inventory, and stops the lease.
+
+For manual debugging, run the same lifecycle directly:
+
+```sh
+go build -trimpath -o bin/crabbox ./cmd/crabbox
 
 bin/crabbox warmup --provider semaphore --semaphore-idle-timeout 10m
 lease=<slug-or-sem_id-from-warmup-output>
@@ -101,6 +113,25 @@ CRABBOX_SEMAPHORE_IDLE_TIMEOUT
 config-file values. Generate a token at `https://<host>/me/api-tokens`. For
 machine types see the [Semaphore machine types reference](https://docs.semaphore.io/reference/machine-types).
 
+Empty environment values fall through to the next alias or earlier setting;
+nonempty values are not trimmed during loading. All six YAML strings also
+preserve earlier values when omitted, null, or empty. A token can be loaded
+from user or repository configuration, but keeping it in the environment or
+user configuration avoids committing it. There is no token flag.
+
+All six bindings share one typed declaration. The raw machine, OS-image, and
+idle-timeout settings remain empty when omitted: their effective defaults are
+`f1-standard-2`, `ubuntu2204`, and `30m`, applied by flag registration and the
+existing runtime helpers. Registering an unvisited flag does not populate the
+raw setting, and an explicitly empty flag still writes an empty value. These
+loaded settings remain empty even though execution uses a fallback.
+`config show` does not expose a Semaphore section.
+
+Host/token source tracking and the later explicit-host flag phase are unchanged.
+Host, token, project, and duration validation still happens at the existing
+provider stages. Job creation, SSH setup, claims, and release behavior do not
+move into configuration generation.
+
 ## Lifecycle
 
 1. Resolve the project name to an ID (`GET /api/v1alpha/projects/<name>`, with a
@@ -112,9 +143,13 @@ machine types see the [Semaphore machine types reference](https://docs.semaphore
    and exposes an agent IP plus an `ssh` port.
 4. `GET /api/v1alpha/jobs/:id/debug_ssh_key`: fetch the SSH key and store it
    under the lease's per-box key path.
-5. Crabbox syncs and runs commands over SSH.
-6. `POST /api/v1alpha/jobs/:id/stop`: release the job; the local claim and stored
-   key are removed.
+5. Persist an exact ownership claim binding the Semaphore organization host,
+   project, immutable job ID, Crabbox lease, and local slug.
+6. Crabbox syncs and runs commands over SSH.
+7. Before release, recheck the exact local claim and fresh running Crabbox job
+   identity while holding the claim fence, then
+   `POST /api/v1alpha/jobs/:id/stop`. Remove the claim and stored key only
+   after the provider stop succeeds.
 
 ## Capabilities
 
@@ -148,6 +183,16 @@ machine types see the [Semaphore machine types reference](https://docs.semaphore
 - Local claims are provider-scoped: a slug claimed by another provider does not
   resolve as a Semaphore job. Resolve a lease by its full `sem_<job-id>` ID or by
   a slug from a recent warmup.
+- Stop refuses missing claims, a different organization host or project, the
+  wrong job ID, and jobs whose current provider identity is no longer a running
+  Crabbox testbox. Failed stops preserve both the claim and SSH key for retry;
+  an already-finished verified job clears its remaining local claim safely.
+- Claims from older Crabbox versions are upgraded only after their encoded job
+  identity, original project, and fresh provider-side ownership have been
+  verified. Legacy claims without project provenance and claimless jobs are
+  never adopted implicitly.
+- If a newly created job cannot be claimed and the rollback stop also fails,
+  Crabbox reports the exact job ID and retains its SSH key for manual recovery.
 
 ## Related Docs
 

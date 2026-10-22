@@ -12,20 +12,17 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string {
-	return []string{"cf-dynamic", "cfdw"}
-}
-
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "cloudflare",
-		Kind:        core.ProviderKindDelegatedRun,
-		Targets:     []core.TargetSpec{{OS: core.TargetWorkerRuntime}},
-		Features:    core.FeatureSet{core.FeatureCleanup, core.FeatureModuleRun, core.FeatureRunSession},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"cf-dynamic", "cfdw"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationAPIToken),
+		Name:             providerName,
+		Family:           "cloudflare",
+		Kind:             core.ProviderKindDelegatedRun,
+		Targets:          []core.TargetSpec{{OS: core.TargetWorkerRuntime}},
+		Features:         core.FeatureSet{core.FeatureCleanup, core.FeatureModuleRun, core.FeatureRunSession},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
 	}
 }
 
@@ -51,16 +48,4 @@ func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, err
 	cfg.Provider = providerName
 	cfg.TargetOS = core.TargetWorkerRuntime
 	return NewBackend(p.Spec(), cfg, rt), nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
-	}
-	return doctor, nil
 }

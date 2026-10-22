@@ -2,21 +2,28 @@ import { readFile } from "node:fs/promises";
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL as NodeURL } from "node:url";
 
+import { AsyncMutex } from "../src/async-mutex";
 import { prepareCoordinatorRequest, routeCoordinatorRequest } from "../src/coordinator-entry";
 import { FleetCoordinator } from "../src/fleet";
-import type { Env } from "../src/types";
+import { LocalServeRelayBackend, upgradeServeRelay } from "../src/serve-relay";
+import { AsyncOperationTracker } from "./async-operation-tracker";
+import {
+  createAWSDeploymentGuard,
+  nodeCoordinatorEnv,
+  requiresAWSDeploymentReadiness,
+} from "./aws-deployment";
 import { NodeCoordinatorRuntime, type NodeUpgradeContext } from "./node-runtime";
 import {
-  AsyncMutex,
-  AsyncOperationTracker,
   RequestBodyTooLargeError,
   closeServer,
+  createUntrustedForwardingDiagnostic,
   drainAndStop,
   fleetRequestQueue,
   isReadinessRequestMethod,
   isTrustedProxySource,
+  nodeResponseHeaders,
   nodeRequestAbortSignal,
   readNodeRequestBody,
   requestSourceIP,
@@ -24,21 +31,27 @@ import {
   settlesWithin,
   shouldReadUnauthenticatedRequestBody,
   unauthenticatedRequestBodyBytes,
+  validateTrustedProxyCIDRs,
   writeNodeResponseBody,
 } from "./server-support";
 
+const env = nodeCoordinatorEnv(process.env);
+validateTrustedProxyCIDRs(env.CRABBOX_TRUSTED_PROXY_CIDRS);
 const databaseURL = requiredEnv("DATABASE_URL");
 const port = positiveInt(process.env["PORT"], 8080);
 const shutdownTimeoutMs = positiveInt(process.env["CRABBOX_SHUTDOWN_TIMEOUT_MS"], 120_000);
-const env = process.env as unknown as Env;
+const awsDeployment = createAWSDeploymentGuard(env);
 const runtime = new NodeCoordinatorRuntime(databaseURL);
+env.serveRelayBackend = new LocalServeRelayBackend(runtime);
 const coordinator = new FleetCoordinator(runtime, env);
 const lifecycleMutex = new AsyncMutex();
 const activeRequests = new AsyncOperationTracker();
-const publicDirectory = resolve(fileURLToPath(new URL("../public", import.meta.url)));
+const publicDirectory = resolve(fileURLToPath(new NodeURL("../public", import.meta.url)));
 let shutdownPromise: Promise<void> | undefined;
+const diagnoseUntrustedForwarding = createUntrustedForwardingDiagnostic();
 
 runtime.setOperationRunner((callback) => lifecycleMutex.run(callback));
+await awsDeployment.start();
 await runtime.start(() => coordinator.alarm());
 
 const server = createServer((request, response) => {
@@ -59,11 +72,18 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     if (new URL(requestMetadata.url).pathname === "/v1/ready") {
       let result: Response;
       if (isReadinessRequestMethod(requestMetadata.method)) {
-        await runtime.storage.ready();
-        result =
-          requestMetadata.method === "HEAD"
-            ? new Response(null, { status: 200 })
-            : Response.json({ ok: true });
+        try {
+          await Promise.all([runtime.storage.ready(), awsDeployment.ready()]);
+          result =
+            requestMetadata.method === "HEAD"
+              ? new Response(null, { status: 200 })
+              : Response.json({ ok: true });
+        } catch {
+          result =
+            requestMetadata.method === "HEAD"
+              ? new Response(null, { status: 503 })
+              : Response.json({ ok: false, error: "dependency_unavailable" }, { status: 503 });
+        }
       } else {
         result = Response.json(
           { error: "method_not_allowed" },
@@ -91,6 +111,19 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
       }
       return;
     }
+    if (requiresAWSDeploymentReadiness(prepared.request)) {
+      try {
+        await awsDeployment.ready();
+      } catch {
+        await writeResponse(
+          response,
+          Response.json({ error: "dependency_unavailable" }, { status: 503 }),
+          true,
+        );
+        request.destroy();
+        return;
+      }
+    }
     const webRequest = await requestWithNodeBody(
       prepared.request,
       request,
@@ -105,7 +138,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
       request.destroy();
       return;
     }
-    console.error("coordinator request failed", error);
+    // Provider failures can contain environment-backed credentials; keep only safe context here.
+    console.error("coordinator request failed");
     await writeResponse(response, Response.json({ error: "internal_error" }, { status: 500 }));
   } finally {
     cancellation.dispose();
@@ -115,8 +149,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
 server.on("upgrade", (request, socket, head) => {
   void activeRequests
     .run(() => handleUpgrade(request, socket, head))
-    .catch((error) => {
-      console.error("coordinator websocket upgrade handler failed", error);
+    .catch(() => {
+      console.error("coordinator websocket upgrade handler failed");
       socket.destroy();
     });
 });
@@ -132,13 +166,19 @@ async function handleUpgrade(
     const webRequest = webRequestFromNode(request, requestContext);
     const authContext = { trustedProxy: requestContext.trustedProxy };
     const response = await runtime.runWithUpgrade(context, () =>
-      routeCoordinatorRequest(webRequest, env, runFleetRequest, authContext),
+      routeCoordinatorRequest(
+        webRequest,
+        env,
+        async (relayRequest) =>
+          upgradeServeRelay(relayRequest, await runFleetRequest(relayRequest), env),
+        authContext,
+      ),
     );
     if (!context.upgraded) {
       await writeUpgradeResponse(socket, response);
     }
-  } catch (error) {
-    console.error("coordinator websocket upgrade failed", error);
+  } catch {
+    console.error("coordinator websocket upgrade failed");
     if (!context.upgraded) {
       await writeUpgradeResponse(
         socket,
@@ -160,6 +200,8 @@ process.on("SIGINT", () => {
 });
 
 async function runFleetRequest(request: Request): Promise<Response> {
+  const bridgeFailure = await coordinator.prepareBridgeRequest(request);
+  if (bridgeFailure) return bridgeFailure;
   switch (fleetRequestQueue(request)) {
     case "direct":
       return coordinator.fetch(request);
@@ -204,13 +246,12 @@ interface NodeRequestContext {
 function nodeRequestContext(request: IncomingMessage): NodeRequestContext {
   const configuredCIDRs = env.CRABBOX_TRUSTED_PROXY_CIDRS;
   const peerAddress = request.socket.remoteAddress;
+  const forwardedFor = joinedHeader(request.headers["x-forwarded-for"]);
+  const trustedProxy = isTrustedProxySource(peerAddress, configuredCIDRs);
+  diagnoseUntrustedForwarding(peerAddress, forwardedFor, trustedProxy);
   return {
-    sourceIP: requestSourceIP(
-      peerAddress,
-      joinedHeader(request.headers["x-forwarded-for"]),
-      configuredCIDRs,
-    ),
-    trustedProxy: isTrustedProxySource(peerAddress, configuredCIDRs),
+    sourceIP: requestSourceIP(peerAddress, forwardedFor, configuredCIDRs),
+    trustedProxy,
   };
 }
 
@@ -258,7 +299,9 @@ async function writeResponse(
   closeConnection = false,
 ): Promise<void> {
   response.statusCode = result.status;
-  result.headers.forEach((value, name) => response.setHeader(name, value));
+  for (const [name, value] of nodeResponseHeaders(result.headers)) {
+    response.setHeader(name, value);
+  }
   if (closeConnection) {
     response.setHeader("connection", "close");
   }
@@ -276,7 +319,11 @@ async function writeUpgradeResponse(socket: Duplex, response: Response): Promise
   headers.set("content-length", String(body.byteLength));
   const statusText = STATUS_CODES[response.status] || "Error";
   const lines = [`HTTP/1.1 ${response.status} ${statusText}`];
-  headers.forEach((value, name) => lines.push(`${name}: ${value}`));
+  for (const [name, value] of nodeResponseHeaders(headers)) {
+    for (const item of Array.isArray(value) ? value : [value]) {
+      lines.push(`${name}: ${item}`);
+    }
+  }
   socket.end(`${lines.join("\r\n")}\r\n\r\n${body.toString()}`);
 }
 

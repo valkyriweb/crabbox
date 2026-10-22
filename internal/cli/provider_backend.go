@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -13,11 +12,12 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/prefixbuffer"
 )
 
 type Provider interface {
-	Name() string
-	Aliases() []string
+	// Spec returns stable metadata without runtime configuration or side effects.
 	Spec() ProviderSpec
 	RegisterFlags(fs *flag.FlagSet, defaults Config) any
 	ApplyFlags(cfg *Config, fs *flag.FlagSet, values any) error
@@ -30,6 +30,141 @@ type ProviderRouter interface {
 
 type ProviderConfigValidator interface {
 	ValidateConfig(cfg Config) error
+}
+
+// ProviderConfiguredFeatures supplies features enabled by trusted runtime
+// configuration. Spec remains the conservative, configuration-free catalog.
+type ProviderConfiguredFeatures interface {
+	ConfiguredFeatures(cfg Config) FeatureSet
+	ValidateRequestedCapabilities(cfg Config) error
+}
+
+func ProviderFeaturesForConfig(provider Provider, cfg Config) FeatureSet {
+	if configured, ok := provider.(ProviderConfiguredFeatures); ok {
+		return configured.ConfiguredFeatures(cfg)
+	}
+	return provider.Spec().Features
+}
+
+// CoordinatorAcquisitionFallback chooses one alternate provider only after an
+// authoritative capacity rejection. Fixed-ID operations never change provider.
+type CoordinatorAcquisitionFallback interface {
+	AcquisitionFallback(error) (string, bool)
+}
+
+// CoordinatorAcquireValidator keeps provider-owned creation policy at broker
+// acquisition; configuration checks must not prevent existing-lease cleanup.
+type CoordinatorAcquireValidator interface {
+	ValidateCoordinatorAcquire() error
+}
+
+// ProviderConfigDefaulter owns provider-specific defaults that must be applied
+// after generic config parsing. Core then finalizes the target unless the
+// optional ProviderConfigDefaultsPhase leaves that boundary with the caller.
+type ProviderConfigDefaulter interface {
+	ApplyConfigDefaults(cfg *Config) error
+}
+
+// ProviderConfigDefaultsTargetFinalization identifies who normalizes and validates
+// the target after provider defaults. The zero value preserves dispatcher ownership.
+type ProviderConfigDefaultsTargetFinalization uint8
+
+const (
+	ProviderConfigDefaultsDispatcherFinalizes ProviderConfigDefaultsTargetFinalization = iota
+	// ProviderConfigDefaultsCallerFinalizes preserves the caller's existing phase:
+	// config loading finalizes afterward, while commands may have finalized before
+	// applying provider-native defaults. It does not add a finalization pass.
+	ProviderConfigDefaultsCallerFinalizes
+)
+
+// ProviderConfigDefaultsPhase optionally refines ProviderConfigDefaulter's target
+// finalization boundary. Defaults must remain config-only in either phase.
+type ProviderConfigDefaultsPhase interface {
+	ConfigDefaultsTargetFinalization() ProviderConfigDefaultsTargetFinalization
+}
+
+type ProviderSSHTargetConfigurer interface {
+	ConfigureSSHTarget(target *SSHTarget, readyCommand string)
+}
+
+// DesktopLeaseCapabilityProvider admits an existing macOS desktop without a
+// creation-time desktop label. Providers must verify ownership; normal SSH/RFB
+// authentication and desktop readiness checks still apply afterward.
+type DesktopLeaseCapabilityProvider interface {
+	DesktopLeaseWithoutLabel(cfg Config, server Server, leaseID string) (bool, error)
+}
+
+// ProviderArchitectureCapability owns admission of the complete target/mode/
+// architecture tuple (including amd64), within ProviderSpec.Targets. Providers
+// without this capability retain core's managed architecture restrictions.
+// Runtime feasibility and explicit assertions are validated by the adapter.
+// ProviderResourceRequirementsCapability admits provisioned CPU/RAM constraints.
+// Providers without this capability must reject constrained acquisition.
+type ProviderResourceRequirementsCapability interface {
+	SupportsResourceRequirements(cfg Config) bool
+}
+
+type ProviderArchitectureCapability interface {
+	SupportsArchitecture(cfg Config, architecture string) bool
+}
+
+type ProviderReadyPoolLeaseImageIdentity struct {
+	Provider string
+	Region   string
+	Project  string
+	Image    *CoordinatorLeaseImage
+}
+
+type ProviderReadyPoolImageIdentityRequest struct {
+	Identity CoordinatorReadyPoolImageIdentity
+	Lease    ProviderReadyPoolLeaseImageIdentity
+}
+
+// ProviderReadyPoolImageIdentityCapability owns provider-specific validation
+// of immutable image evidence returned with a typed ready-pool lease.
+type ProviderReadyPoolImageIdentityCapability interface {
+	ReadyPoolImageIdentityMatchesLease(ProviderReadyPoolImageIdentityRequest) bool
+}
+
+// CoordinatorArchitecturePolicy lets a provider place on a machine of either
+// supported architecture when the caller did not explicitly select one.
+type CoordinatorArchitecturePolicy interface {
+	CoordinatorSelectsArchitecture() bool
+}
+
+// ProviderConfigArchitectureDescriber describes an omitted architecture for
+// config diagnostics only. It must not probe the runtime or change execution.
+type ProviderConfigArchitectureDescriber interface {
+	DescribeImplicitArchitecture(cfg Config) string
+}
+
+// ProviderClaimScoper contributes opaque routing identity to local claims.
+// Core persists and compares the value without interpreting provider fields.
+// The adapter must preserve its historical normalization, including whitespace.
+type ProviderClaimScoper interface {
+	ClaimScope(cfg Config) string
+}
+
+// RunLeaseClaimResolver prepares an already-bound canonical lease while core
+// holds its claim lock. It must honor cancellation and must not acquire claim
+// locks or publish local claims; core validates and publishes the result once.
+type RunLeaseClaimResolver interface {
+	ResolveRunLeaseUnderClaim(context.Context, ResolveRequest, LeaseClaim) (LeaseTarget, error)
+}
+
+// ExecLeaseClaimResolver admits only lease kinds whose release paths honor the
+// same claim fence as exec. Core holds a shared fence through execution; the
+// resolver must reject incompatible claims before native effects and must not
+// reenter or publish claims while preparing fresh access.
+type ExecLeaseClaimResolver interface {
+	ResolveExecLeaseUnderClaim(context.Context, ResolveRequest, LeaseClaim) (LeaseTarget, error)
+}
+
+// ProviderDiagnosticSecretSource contributes runtime-only credentials to the
+// final diagnostic redaction pass. Providers should include every credential
+// source that is intentionally absent from Config, including local CLI stores.
+type ProviderDiagnosticSecretSource interface {
+	DiagnosticSecrets(cfg Config) []string
 }
 
 // ControllerProviderContract binds controller lifecycle retries to one opaque
@@ -51,8 +186,35 @@ type LeaseClaimEndpointPreparer interface {
 	PrepareLeaseClaimEndpoint(existing LeaseClaim, provider, slug string, server Server, allowProviderMetadata bool) (Server, error)
 }
 
-type ProviderCommandRoutingArgs interface {
-	CommandRoutingArgs(cfg Config, leaseID string) []string
+// ProviderCommandRouter owns the non-secret route for generated follow-up commands.
+// Core owns shell rendering and passes Env separately to subprocesses.
+// Adapters use RoutingSafeURL for URL-valued fields, never for opaque paths/selectors.
+type ProviderCommandRouter interface {
+	CommandRouting(cfg Config, request CommandRoutingRequest) CommandRouting
+}
+
+// CommandRoutingRequest carries resolved lease context without making core
+// interpret provider-specific target or release settings.
+type CommandRoutingRequest struct {
+	LeaseID string
+	Purpose CommandRoutingPurpose
+	Target  SSHTarget
+}
+
+type CommandRoutingPurpose string
+
+const (
+	CommandRoutingReconnect CommandRoutingPurpose = "reconnect"
+	CommandRoutingRescue    CommandRoutingPurpose = "rescue"
+	CommandRoutingRetry     CommandRoutingPurpose = "retry"
+	CommandRoutingStop      CommandRoutingPurpose = "stop"
+)
+
+// CommandRouting keeps environment assignments out of argv. Env contains only
+// non-secret routing selectors, never credentials or credential contents.
+type CommandRouting struct {
+	Args []string
+	Env  []string
 }
 
 type DesktopCredentials struct {
@@ -64,15 +226,43 @@ type DesktopCredentialProvider interface {
 	DesktopCredentials(cfg Config, target SSHTarget) (DesktopCredentials, bool)
 }
 
+// DesktopCredentialResolver is the error-reporting form used by providers
+// whose configured credential source can be present but unavailable at runtime.
+type DesktopCredentialResolver interface {
+	ResolveDesktopCredentials(cfg Config, target SSHTarget) (DesktopCredentials, bool, error)
+}
+
 type ProviderServerTypeProvider interface {
 	ServerTypeForConfig(cfg Config) string
-	ServerTypeForClass(class string) string
+}
+
+// ClassSpec reports the concrete machine one class resolves to on this
+// provider's default target, with its nominal shape when known.
+type ClassSpec struct {
+	Class    string `json:"class"`
+	Type     string `json:"type"`
+	VCPUs    int    `json:"vcpu,omitempty"`
+	MemoryGB int    `json:"memoryGb,omitempty"`
+}
+
+// ProviderClassSpecProvider reports provider-owned machine class resolutions
+// for the provider matrix.
+type ProviderClassSpecProvider interface {
+	ClassSpecs() []ClassSpec
+}
+
+// ProviderServerTypeOverrideProvider reports an exact provider-native machine
+// selection that outranks a non-explicit stored ServerType.
+type ProviderServerTypeOverrideProvider interface {
+	ServerTypeOverrideForConfig(cfg Config) (string, bool)
 }
 
 type Backend interface {
 	Spec() ProviderSpec
 }
 
+// DoctorProvider overrides diagnostic configuration when the ordinary backend
+// requires acquisition-only inputs. Otherwise core uses Configure and DoctorBackend.
 type DoctorProvider interface {
 	Provider
 	ConfigureDoctor(cfg Config, rt Runtime) (DoctorBackend, error)
@@ -81,6 +271,52 @@ type DoctorProvider interface {
 type DoctorBackend interface {
 	Backend
 	Doctor(ctx context.Context, req DoctorRequest) (DoctorResult, error)
+}
+
+// ProviderSizeCatalogBackend exposes a provider's live, provider-owned machine
+// catalog without teaching core about provider-specific size slugs or regions.
+type ProviderSizeCatalogBackend interface {
+	Backend
+	SizeCatalog(ctx context.Context, refresh bool) ([]ProviderSize, error)
+}
+
+// ProviderSizeSelector declares how a live catalog name selects a machine.
+type ProviderSizeSelector string
+
+// ProviderSizeSelectorType uses catalog Name verbatim as the existing --type value.
+const ProviderSizeSelectorType ProviderSizeSelector = "type"
+
+// ProviderSizeSelectionBackend reports already-resolved provider configuration;
+// resource facts remain owned by SizeCatalog.
+type ProviderSizeSelectionBackend interface {
+	ProviderSizeCatalogBackend
+	SizeSelection() ProviderSizeSelection
+}
+
+type ProviderSizeSelection struct {
+	Selector      ProviderSizeSelector `json:"selector"`
+	EffectiveType string               `json:"effectiveType"`
+	Region        string               `json:"region"`
+}
+
+type ProviderSize struct {
+	Name                string            `json:"name"`
+	VCPU                int               `json:"vcpu"`
+	RAMGB               int               `json:"ramGb"`
+	DiskGB              int               `json:"diskGb"`
+	GPU                 *ProviderSizeGPU  `json:"gpu,omitempty"`
+	Regions             []string          `json:"regions"`
+	PricePerHourMicro   int64             `json:"pricePerHourMicro"`
+	TransferGiBPerMonth int64             `json:"transferGiBPerMonth,omitempty"`
+	EstimatedSnapshotGB int               `json:"estimatedSnapshotGb,omitempty"`
+	DefaultImage        string            `json:"defaultImage,omitempty"`
+	ProviderMetadata    map[string]string `json:"providerMetadata,omitempty"`
+}
+
+type ProviderSizeGPU struct {
+	Label         string `json:"label"`
+	VRAMGB        int    `json:"vramGb"`
+	ScratchDiskGB int    `json:"scratchDiskGb,omitempty"`
 }
 
 type SSHLoginBackend interface {
@@ -93,12 +329,104 @@ type LeaseTouchBackend interface {
 	Touch(ctx context.Context, req TouchRequest) (Server, error)
 }
 
+// LeaseHeartbeatBackend is implemented by providers that keep a lease alive
+// through their own API instead of a Crabbox-managed SSH lease touch. It is
+// optional: the `heartbeat` command reports the same unsupported error for
+// providers that do not implement it.
+//
+// Providers own lease resolution, ownership and state validation on this path.
+// They must refuse identifiers without an exact local claim.
+//
+// A heartbeat refreshes idle activity without writing lifecycle policy or
+// changing absolute lifetime limits. `--idle-timeout` is rejected before this
+// capability is reached: it reports the provider's window rather than replacing it.
+type LeaseHeartbeatBackend interface {
+	Backend
+	Heartbeat(ctx context.Context, req LeaseHeartbeatRequest) (LeaseHeartbeatResult, error)
+}
+
+type LeaseHeartbeatRequest struct {
+	// ID is the lease id, sandbox name, or slug exactly as the user typed it,
+	// unresolved and unvalidated.
+	ID string
+}
+
+type LeaseHeartbeatResult struct {
+	LeaseID string
+	Slug    string
+	State   string
+	// LastTouchedAt is when the provider observed the lease. Core renders it
+	// as-is and persists nothing on this path, so a local claim's own touch
+	// time is left alone.
+	LastTouchedAt time.Time
+	// IdleTimeout is the provider's OWN idle window, as reported by the
+	// provider for this lease. Leave it zero when the provider does not report
+	// one: the rendered view then omits the field rather than substituting
+	// Crabbox's configured default, which has no bearing on a lease whose idle
+	// policy the provider owns.
+	IdleTimeout time.Duration
+}
+
 type SSHLeaseBackend interface {
 	SSHLoginBackend
 	LeaseTouchBackend
 	Acquire(ctx context.Context, req AcquireRequest) (LeaseTarget, error)
 	List(ctx context.Context, req ListRequest) ([]LeaseView, error)
 	ReleaseLease(ctx context.Context, req ReleaseLeaseRequest) error
+}
+
+// SSHRunActivityBackend keeps provider-owned idle activity alive after lease
+// admission, including setup and sync. Stop must cancel and join its work.
+// Calls may hold a shared claim fence and must not reenter or mutate claims.
+type SSHRunActivityBackend interface {
+	BeginSSHRunActivity(context.Context, LeaseTarget) (stop func(), err error)
+}
+
+// SSHRunFailureEvidenceBackend optionally captures provider-owned state just
+// before an SSH command starts. The returned collector retains that baseline
+// inside the provider and returns only normalized evidence to core after a
+// command or transport failure.
+type SSHRunFailureEvidenceBackend interface {
+	Backend
+	BeginRunFailureEvidence(ctx context.Context, req RunFailureEvidenceRequest) (RunFailureEvidenceCollector, error)
+}
+
+type RunFailureEvidenceRequest struct {
+	Lease LeaseTarget
+}
+
+type RunFailureEvidenceCollector func(context.Context) (RunFailureEvidence, error)
+
+type RunFailureEvidence struct {
+	ResourceExhaustion ResourceExhaustionReason `json:"resourceExhaustion,omitempty"`
+	// Hint and Details are optional, bounded presentation data, not classification inputs.
+	Hint    string            `json:"hint,omitempty"`
+	Details map[string]string `json:"details,omitempty"`
+}
+
+type ResourceExhaustionReason string
+
+const (
+	ResourceExhaustionMemory ResourceExhaustionReason = "memory"
+)
+
+// ExclusiveOneShotAcquireBackend marks Acquire results that are newly
+// provisioned and exclusive to the caller until the one-shot run completes.
+// Backends are non-exclusive by default.
+type ExclusiveOneShotAcquireBackend interface {
+	AcquireIsExclusiveOneShot() bool
+}
+
+// StatusTouchClaimValidator lets a provider require identity labels that core
+// cannot interpret before status --wait extends a remotely visible lease.
+type StatusTouchClaimValidator interface {
+	StatusTouchClaimMatches(LeaseTarget, LeaseClaim) bool
+}
+
+// StatusTouchClaimAuthorizer lets a provider fully authorize an exact claim
+// whose ownership scope must be hydrated or validated at runtime.
+type StatusTouchClaimAuthorizer interface {
+	AuthorizeStatusTouchClaim(context.Context, LeaseTarget, LeaseClaim) error
 }
 
 type ResolvedLeaseTargetRebinder interface {
@@ -110,18 +438,35 @@ type TailscaleMetadataBackend interface {
 	UpdateTailscaleMetadata(ctx context.Context, lease LeaseTarget, meta TailscaleMetadata) (Server, error)
 }
 
+// RunOptionsValidator optionally checks run flags before a caller acquires a
+// lease, including during dry-run planning. Validation must be side-effect-free:
+// no external I/O or lease-state access, and no dependency on a resolved lease.
+// Providers implement it for admission before Configure; their backend must
+// reuse the same policy at Run entry. No backend creation, processes, credential
+// lookup, or state writes are allowed. Planned reuse has ReuseLease=true and an
+// empty ID; a nonempty ID also implies reuse. Runtime-only fields such as Repo,
+// RunID, and Env may be absent during prewarm admission.
+type RunOptionsValidator interface {
+	ValidateRunOptions(RunRequest) error
+}
+
 type DelegatedRunBackend interface {
 	Backend
 	Warmup(ctx context.Context, req WarmupRequest) error
 	Run(ctx context.Context, req RunRequest) (RunResult, error)
 	List(ctx context.Context, req ListRequest) ([]LeaseView, error)
 	Status(ctx context.Context, req StatusRequest) (StatusView, error)
+	// Stop owns local claim finalization, including retention. Callers must not
+	// remove the claim afterward: a replacement may exist once Stop returns.
 	Stop(ctx context.Context, req StopRequest) error
 }
 
-type DelegatedRunArtifactBackend interface {
+// StopReclaimBackend supports an explicit one-shot adoption before stopping an
+// exactly identified resource. Providers without a strong adoption contract do
+// not implement it.
+type StopReclaimBackend interface {
 	Backend
-	CollectRunArtifacts(ctx context.Context, req DelegatedRunArtifactRequest) (DelegatedRunArtifactResult, error)
+	ReclaimAndStop(ctx context.Context, req StopRequest) error
 }
 
 type DelegatedRunDownloadBackend interface {
@@ -139,6 +484,7 @@ type PortsRequest struct {
 
 type CopyRequest struct {
 	Options     LeaseOptions
+	RepoRoot    string
 	ID          string
 	Source      string
 	Destination string
@@ -174,6 +520,54 @@ type ReleaseLeaseReporter interface {
 	ReleaseLeaseMessage(lease LeaseTarget) string
 }
 
+// ReleaseLeaseOutcome describes the lease recovery outcome of one release invocation,
+// independently of errors finalizing local state. Zero means retained or unconfirmed.
+type ReleaseLeaseOutcome struct {
+	// Terminal means the release owner confirmed the end of the recoverable lease.
+	Terminal bool
+	// ForgottenLocally means verified absence removed only the local claim.
+	ForgottenLocally bool
+}
+
+// ReleaseLeaseOutcomeBackend performs the same guarded operation as ReleaseLease
+// once, preserving its ordinary error. Providers with retained or asynchronous
+// release semantics must implement this capability. Without it, a successful
+// ReleaseLease ends the recoverable lease; an error leaves the outcome unconfirmed.
+// Claim retention (including terminal receipts) does not determine this outcome.
+type ReleaseLeaseOutcomeBackend interface {
+	ReleaseLeaseWithOutcome(context.Context, ReleaseLeaseRequest) (ReleaseLeaseOutcome, error)
+}
+
+// ReleaseLeaseConnectionCleanupPolicy lets a provider defer generic connection
+// cleanup until after its guarded release succeeds.
+type ReleaseLeaseConnectionCleanupPolicy interface {
+	// ReleaseLeaseConnectionCleanupSafe reports whether generic remote cleanup
+	// may run before the provider's guarded release.
+	ReleaseLeaseConnectionCleanupSafe() bool
+}
+
+// ReleaseLeaseWorkspacePolicy keeps run-owned authority available for a guarded
+// close after successful lease release. The captured SSH route must still reach
+// the workspace; retaining disk on a stopped host is not sufficient.
+// ReleaseLeaseWorkspaceCloser requests closing run-owned workspace authority
+// while the captured route is reachable, before provider release.
+type ReleaseLeaseWorkspaceCloser interface {
+	RequiresSSHWorkspaceCloseBeforeRelease() bool
+}
+
+type ReleaseLeaseWorkspacePolicy interface {
+	PreservesSSHWorkspaceAfterRelease() bool
+}
+
+// ReleaseLeaseTargetRefresher opts a provider into refreshing authorization
+// and connection metadata immediately before automatic lease cleanup.
+type ReleaseLeaseTargetRefresher interface {
+	ReleaseLeaseConnectionCleanupPolicy
+	RefreshReleaseLeaseTarget(context.Context, LeaseTarget) (LeaseTarget, error)
+}
+
+var ErrReleaseLeaseOwnershipChanged = errors.New("release lease ownership changed")
+
 type CheckpointForkWorkdirValidator interface {
 	ValidateCheckpointForkWorkdir(ctx context.Context, lease LeaseTarget, workdir string) error
 }
@@ -184,10 +578,18 @@ type ReleaseLeaseClaimRetainer interface {
 	RetainLeaseClaimAfterRelease(lease LeaseTarget) bool
 }
 
+type ReleaseLeaseClaimRetentionVerifier interface {
+	// An error leaves claim state untouched so uncertain ownership fails closed.
+	RetainLeaseClaimAfterReleaseWithClaim(lease LeaseTarget, previous LeaseClaim) (bool, error)
+}
+
 type NativeCheckpointCapability struct {
 	Kind              string
 	Direct            bool
 	CreateUnsupported string
+	RetireUnsupported string
+	ReplayCapture     bool
+	RetireSource      bool
 }
 
 type NativeCheckpointRequest struct {
@@ -202,36 +604,78 @@ type NativeCheckpointProvider interface {
 	NativeCheckpointCapability(req NativeCheckpointRequest) (NativeCheckpointCapability, bool)
 }
 
+// NativeCheckpointSourcePolicyProvider lets API-native capture resolve a source
+// without starting it or minting transport credentials before stop consent.
+type NativeCheckpointSourcePolicyProvider interface {
+	NativeCheckpointSourceStatusOnly(Config) bool
+}
+
 type NativeCheckpointImage struct {
-	ID         string
-	Name       string
-	State      string
-	Provider   string
-	Kind       string
-	Region     string
-	ResourceID string
-	Direct     bool
+	ID               string
+	Name             string
+	State            string
+	Provider         string
+	Kind             string
+	Region           string
+	AccountID        string
+	ResourceID       string
+	ResourceUniqueID string
+	SnapshotIDs      []string
+	Architecture     string
+	Direct           bool
 }
 
 type NativeCheckpointCreateRequest struct {
-	Config      Config
-	Server      Server
-	Target      SSHTarget
-	LeaseID     string
-	Name        string
-	RepoName    string
-	Workdir     string
-	Strategy    string
-	NoReboot    bool
-	Wait        bool
-	WaitTimeout time.Duration
-	Stderr      io.Writer
+	// Persist durably records cleanup identity before a provider mutates remote resources.
+	// Providers requiring interruption recovery must stop if persistence fails.
+	Persist      func(NativeCheckpointCreateResult) error
+	Config       Config
+	Server       Server
+	Target       SSHTarget
+	CheckpointID string
+	LeaseID      string
+	Name         string
+	RepoName     string
+	Workdir      string
+	Strategy     string
+	NoReboot     bool
+	Wait         bool
+	WaitTimeout  time.Duration
+	Stderr       io.Writer
+	Capture      *NativeCheckpointCapture
+	Metadata     map[string]string
+}
+
+// NativeCheckpointCapture is the host-owned operation journal. Provider metadata
+// is correlation only; source authority comes from the bound local claim.
+type NativeCheckpointCapture struct {
+	SourceDisposition string `json:"sourceDisposition"`
+	Phase             string `json:"phase"`
+	StrategyExplicit  bool   `json:"strategyExplicit,omitempty"`
+	SourceID          string `json:"sourceId"`
+	SourceName        string `json:"sourceName"`
+	SourceScope       string `json:"sourceScope"`
+	SourceRevision    string `json:"sourceRevision"`
+	SourceClaimedAt   string `json:"sourceClaimedAt"`
+	SourceIntent      string `json:"sourceIntent,omitempty"`
+	Error             string `json:"error,omitempty"`
+	DiscardFailed     bool   `json:"discardFailed,omitempty"`
 }
 
 type NativeCheckpointCreateResult struct {
-	Image    NativeCheckpointImage
-	Metadata map[string]string
+	// CaptureEstablished attests a fixed capture under the provider's own
+	// contract. False preserves success semantics and omits the JSON assertion.
+	CaptureEstablished bool `json:"-"`
+	Image              NativeCheckpointImage
+	Metadata           map[string]string
 }
+
+// NativeCheckpointNotSubmittedError attests that this invocation never attempted
+// image submission. An empty result or a failed request cannot establish this.
+type NativeCheckpointNotSubmittedError struct{ Cause error }
+
+func (e NativeCheckpointNotSubmittedError) Error() string { return e.Cause.Error() }
+func (e NativeCheckpointNotSubmittedError) Unwrap() error { return e.Cause }
 
 type NativeCheckpointWorkdirRequest struct {
 	Config   Config
@@ -242,9 +686,32 @@ type NativeCheckpointWorkdirRequest struct {
 }
 
 type NativeCheckpointResourceRequest struct {
-	Config   Config
-	Image    NativeCheckpointImage
-	Metadata map[string]string
+	// Persist records recovered identity before deletion; absent on read-only verification.
+	Persist func(NativeCheckpointCreateResult) error
+	// LoadConfig is required only when the provider needs current CLI settings.
+	LoadConfig func() (Config, error)
+	Image      NativeCheckpointImage
+	Metadata   map[string]string
+	Capture    *NativeCheckpointCapture
+}
+
+// NativeCheckpointAbandonProvider binds positive source-cleanup evidence without
+// asserting that the original image was submitted, absent, or safe to discard.
+type NativeCheckpointAbandonProvider interface {
+	PrepareNativeCheckpointAbandon(context.Context, NativeCheckpointCreateRequest) (map[string]string, error)
+}
+
+// CheckpointSourceVerifier must use provider authority, not a filtered lease
+// inventory or a missing local claim, to confirm the captured source is gone.
+type CheckpointSourceVerifier interface {
+	CheckpointSourceAbsent(context.Context, CheckpointSourceRequest) (bool, error)
+}
+
+type CheckpointSourceRequest struct {
+	LeaseID   string
+	Capture   NativeCheckpointCapture
+	Resource  NativeCheckpointResourceRequest
+	AccountID string
 }
 
 type NativeCheckpointVerifyResult struct {
@@ -261,18 +728,20 @@ type NativeCheckpointLifecycleProvider interface {
 }
 
 type NativeCheckpointForkRecord struct {
-	Kind        string
-	ImageID     string
-	Name        string
-	Resource    string
-	Region      string
-	Project     string
-	Direct      bool
-	HostID      string
-	TargetOS    string
-	WindowsMode string
-	ServerType  string
-	Metadata    map[string]string
+	Kind         string
+	ImageID      string
+	Name         string
+	Resource     string
+	Region       string
+	Project      string
+	Direct       bool
+	HostID       string
+	TargetOS     string
+	WindowsMode  string
+	Desktop      bool
+	ServerType   string
+	Architecture string
+	Metadata     map[string]string
 }
 
 type NativeCheckpointForkRequest struct {
@@ -287,6 +756,30 @@ type NativeCheckpointForkProvider interface {
 	ApplyNativeCheckpointForkConfig(req NativeCheckpointForkRequest) error
 }
 
+// DelegatedCheckpointBackend lets a delegated-run backend, which exposes no SSH
+// target, create and fork native checkpoints. Its provider still implements
+// NativeCheckpointProvider and NativeCheckpointLifecycleProvider.
+type DelegatedCheckpointBackend interface {
+	DelegatedRunBackend
+	// ResolveCheckpointSource resolves a lease the current repository already
+	// claims; it never adopts or reclaims one.
+	ResolveCheckpointSource(ctx context.Context, req ResolveRequest) (LeaseTarget, error)
+	// ForkNativeCheckpoint creates and claims one lease started from the record.
+	ForkNativeCheckpoint(ctx context.Context, req DelegatedCheckpointForkRequest) (DelegatedCheckpointFork, error)
+}
+
+type DelegatedCheckpointForkRequest struct {
+	Repo          Repo
+	RequestedSlug string
+	Record        NativeCheckpointForkRecord
+	Workdir       string
+}
+
+type DelegatedCheckpointFork struct {
+	Lease   LeaseTarget
+	Workdir string
+}
+
 type NativeCheckpointForkFlagProvider interface {
 	ApplyNativeCheckpointForkFlags(cfg *Config, fs *flag.FlagSet, values any) error
 }
@@ -296,20 +789,84 @@ type JSONListBackend interface {
 	ListJSON(ctx context.Context, req ListRequest) (any, error)
 }
 
+// StreamingListBackend emits bounded pages in display order. Callbacks are
+// synchronous: returning an error cancels outstanding reads.
+type StreamingListBackend interface {
+	Backend
+	StreamList(context.Context, ListRequest, func(ListPage) error) error
+}
+
+type ListPage struct {
+	Servers []Server
+	JSON    any
+	Section string
+	More    bool
+}
+
+// DelegatedFixedWarmupBackend explicitly opts into durable delegated acquisition.
+type DelegatedFixedWarmupBackend interface {
+	WarmupFixed(context.Context, FixedWarmupRequest) error
+}
+
+type FixedAcquisitionReceipt struct {
+	LeaseID, Slug, Provider, ResourceID string
+}
+
+type FixedWarmupRequest struct {
+	WarmupRequest
+	RequestedLeaseID string
+	OnAcquired       func(FixedAcquisitionReceipt) error
+}
+
+type DelegatedFixedReleaseBackend interface {
+	StopFixed(context.Context, FixedStopRequest) error
+}
+
+type FixedStopRequest struct {
+	StopRequest
+	ExpectedProviderIdentity ProviderIdentityExpectation
+}
+
 type IdempotentLeaseIDBackend interface {
 	SupportsRequestedLeaseID() bool
 }
 
+// ProviderBackendCapabilitySource exposes a metadata-only backend without
+// configuration, credentials, clients, or side effects. Catalogs inspect its
+// capability interfaces; they must not invoke lifecycle methods.
+type ProviderBackendCapabilitySource interface {
+	BackendCapabilities() Backend
+}
+
+type CheckpointLeaseIDBackend interface {
+	SupportsRequestedCheckpointID() bool
+}
+
 type ProviderSpec struct {
-	Name        string
-	Family      string
-	Kind        ProviderKind
-	Targets     []TargetSpec
-	Features    FeatureSet
-	Coordinator CoordinatorMode
+	// ClaimExpiryBound is the provider-enforced maximum lifetime after use.
+	// Zero means that age alone cannot authorize local claim pruning. Only
+	// opt in when expiry needs no running CLI and any settlement the claim
+	// guards is itself bounded by the same duration.
+	ClaimExpiryBound time.Duration
+	Authentication   ProviderAuthentication
+	Name             string
+	Aliases          []string
+	Family           string
+	Kind             ProviderKind
+	Targets          []TargetSpec
+	Features         FeatureSet
+	Coordinator      CoordinatorMode
+	BrokeredOnly     bool
+	ClassDisposition ProviderClassDisposition
+	SizeSelection    ProviderSizeSelector
+	// SyncGuardrailFullCandidate counts the complete ordinary workspace transfer.
+	// False preserves dirty-delta counting when the checkout has changes.
+	SyncGuardrailFullCandidate bool
 	// TailscaleEgressOnly marks FeatureTailscale as outbound userspace access,
 	// not a bidirectional peer endpoint.
 	TailscaleEgressOnly bool
+	// ActionsRunnerUnsupported rejects --actions-runner, not ordinary Actions hydration.
+	ActionsRunnerUnsupported bool
 }
 
 type ProviderKind string
@@ -354,8 +911,24 @@ const (
 	FeatureRunArtifacts Feature = "run-artifacts"
 	FeatureRunDownloads Feature = "run-downloads"
 	FeatureModuleRun    Feature = "module-run"
-	FeaturePauseResume  Feature = "pause-resume"
+	// FeatureShellScriptRun admits shell script input to a delegated command owner.
+	FeatureShellScriptRun Feature = "shell-script-run"
+	// FeatureSSHScriptRun routes explicit scripts through the core SSH owner,
+	// while a hybrid backend may delegate ordinary commands.
+	FeatureSSHScriptRun Feature = "ssh-script-run"
+	// FeatureClaimExec requires ExecLeaseClaimResolver, private POSIX SSH execution,
+	// and provider-owned idle activity that does not require exclusive claim writes.
+	FeatureClaimExec Feature = "claim-exec"
+	// FeatureFixedLeaseID advertises caller-supplied idempotent lease IDs.
+	FeatureFixedLeaseID Feature = "fixed-lease-id"
+	// FeatureFixedCurrentRepoStop requires RepositoryScopedStopBackend for fixed IDs.
+	FeatureFixedCurrentRepoStop Feature = "fixed-current-repo-stop"
+	FeaturePauseResume          Feature = "pause-resume"
+	FeatureLeaseHeartbeat       Feature = "lease-heartbeat"
+	FeatureMCP                  Feature = "mcp-attachments"
 )
+
+const FeaturePreparedArtifactWorkspace Feature = "prepared-artifact-workspace"
 
 type FeatureSet []Feature
 
@@ -397,17 +970,32 @@ type LocalCommandRequest struct {
 	Stdout               io.Writer
 	Stderr               io.Writer
 	DisableOutputCapture bool
+	// CaptureOutputToFiles gives POSIX children synchronous regular-file output.
+	// Requires a positive capture limit and no streaming writers.
+	CaptureOutputToFiles bool
 	// MaxCapturedOutputBytes bounds each internally captured output stream.
 	// On overflow the command context is canceled so a continuously emitting
 	// child cannot block forever after the capture buffer fills.
 	MaxCapturedOutputBytes int
 	CancelGracePeriod      time.Duration
+	// RequireProcessGroupJoin keeps this call active until its owned standalone
+	// process group closes, including after cancellation or cleanup grace expiry.
+	RequireProcessGroupJoin bool
+	// OnCleanupPending reports grace expiry once while the command still joins.
+	OnCleanupPending func(error) `json:"-"`
 }
 
 type LocalCommandResult struct {
 	ExitCode int
 	Stdout   string
 	Stderr   string
+}
+
+// IsPlainLocalCommandExit recognizes an ordinary unsuccessful local process
+// completion, not a wrapped/joined error or proof of a remote command outcome.
+func IsPlainLocalCommandExit(result LocalCommandResult, err error) bool {
+	processErr, ok := err.(*exec.ExitError)
+	return ok && processErr != nil && processErr.ProcessState != nil && processErr.ExitCode() > 0 && processErr.ExitCode() == result.ExitCode
 }
 
 type DoctorRequest struct {
@@ -444,7 +1032,56 @@ func CLIDoctorResult(provider string, leases int, runtime string) DoctorResult {
 
 type execCommandRunner struct{}
 
-func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+type childCredentialBoundaryCommandRunner struct {
+	next   CommandRunner
+	denied []string
+}
+
+func (r childCredentialBoundaryCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (LocalCommandResult, error) {
+	env := req.Env
+	if env == nil {
+		env = os.Environ()
+	}
+	req.Env = childEnvironmentWithout(env, r.denied...)
+	return r.next.Run(ctx, req)
+}
+
+func commandRunnerWithChildCredentialBoundary(next CommandRunner, denied []string) CommandRunner {
+	denied = appendUniqueStrings(nil, denied...)
+	if len(denied) == 0 {
+		return next
+	}
+	return childCredentialBoundaryCommandRunner{next: next, denied: denied}
+}
+
+// TrackLocalCommandCancellation records the caller cause for a signaled child
+// stopped by the cancellation watcher. Install it after configuring cmd.Cancel,
+// before starting a CommandContext command. Apply the returned function only
+// after Run or Wait joins that watcher; ordinary observed exits stay primary.
+func TrackLocalCommandCancellation(ctx context.Context, cmd *exec.Cmd) func(error) error {
+	stop := cmd.Cancel
+	var interrupted error
+	cmd.Cancel = func() error {
+		cause := ctx.Err()
+		err := stop()
+		if !errors.Is(err, os.ErrProcessDone) {
+			interrupted = cause
+		}
+		return err
+	}
+	return func(err error) error {
+		var processErr *exec.ExitError
+		if interrupted != nil && errors.As(err, &processErr) && processErr.ExitCode() < 0 {
+			return errors.Join(err, interrupted)
+		}
+		return err
+	}
+}
+
+func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (result LocalCommandResult, err error) {
+	if req.CaptureOutputToFiles && (req.DisableOutputCapture || req.MaxCapturedOutputBytes <= 0 || req.Stdout != nil || req.Stderr != nil) {
+		return LocalCommandResult{ExitCode: 1}, errors.New("file output capture requires a positive limit and no streaming writers")
+	}
 	commandCtx := ctx
 	var cancel context.CancelFunc
 	if req.MaxCapturedOutputBytes > 0 && !req.DisableOutputCapture {
@@ -463,26 +1100,17 @@ func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (Loca
 		cmd.WaitDelay = req.CancelGracePeriod
 	}
 	if req.MaxCapturedOutputBytes > 0 && !req.DisableOutputCapture {
-		// Provider commands are untrusted process trees. Once bounded capture
-		// overflows, terminate descendants too: a grandchild retaining stdout or
-		// stderr would otherwise keep os/exec's pipe drain blocked indefinitely.
-		// A controller child already belongs to a durable outer process group;
-		// nesting a new group here would let provider descendants escape recovery.
-		controllerOwnsTree := os.Getenv(controllerProcessTreeOwnedEnv) == "1"
-		if !controllerOwnsTree {
-			configureDaemonCommand(cmd)
-		}
-		cmd.Cancel = func() error {
-			if cmd.Process == nil {
-				return os.ErrProcessDone
-			}
-			if controllerOwnsTree {
-				return cmd.Process.Kill()
-			}
-			return stopDaemonProcess(cmd.Process, cmd.Process.Pid)
-		}
-		cmd.WaitDelay = controllerChildWaitDelay
+		configureBoundedCommandCancellation(cmd)
 	}
+	var group *localCommandGroupOwner
+	if req.RequireProcessGroupJoin {
+		group, err = configureJoinedLocalCommand(ctx, cmd, req.CancelGracePeriod, req.OnCleanupPending)
+		if err != nil {
+			return LocalCommandResult{ExitCode: 1}, err
+		}
+	}
+	stopCommand := cmd.Cancel
+	withCancellationCause := TrackLocalCommandCancellation(ctx, cmd)
 	env := req.Env
 	if env == nil {
 		env = os.Environ()
@@ -492,37 +1120,65 @@ func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (Loca
 	cmd.Env = stripControllerAcquireIdentityEnv(env)
 	cmd.Dir = req.Dir
 	cmd.Stdin = req.Stdin
-	stdout := commandCaptureBuffer{limit: req.MaxCapturedOutputBytes, cancel: cancel}
-	stderr := commandCaptureBuffer{limit: req.MaxCapturedOutputBytes, cancel: cancel}
-	if req.Stdout != nil {
-		if req.DisableOutputCapture {
-			cmd.Stdout = req.Stdout
-		} else {
-			cmd.Stdout = io.MultiWriter(req.Stdout, &stdout)
+	stdout := newCommandCaptureBuffer(req.MaxCapturedOutputBytes, cancel)
+	stderr := newCommandCaptureBuffer(req.MaxCapturedOutputBytes, cancel)
+	cmd.Stdout = commandOutputWriter(req.Stdout, &stdout, req.DisableOutputCapture)
+	cmd.Stderr = commandOutputWriter(req.Stderr, &stderr, req.DisableOutputCapture)
+	var files *commandFileCapture
+	if req.CaptureOutputToFiles {
+		var err error
+		files, err = newCommandFileCapture(req.MaxCapturedOutputBytes)
+		if err != nil {
+			return LocalCommandResult{ExitCode: 1}, err
 		}
-	} else {
-		if req.DisableOutputCapture {
-			cmd.Stdout = io.Discard
-		} else {
-			cmd.Stdout = &stdout
+		defer files.close()
+		cmd.Stdout, cmd.Stderr = files.streams[0].writer, files.streams[1].writer
+	}
+	var observedFileOverflow bool
+	err = cmd.Start()
+	if err == nil {
+		var finishCapture func() commandFileCaptureOutcome
+		if files != nil {
+			files.closeWriters()
+			finishCapture = files.watch(cancel, stopCommand, cmd.WaitDelay)
+		}
+		if group != nil {
+			// This owner is the sole reaper. Retain the leader's PID until
+			// every group signal and join is complete, including cancellation.
+			groupErr := group.beforeWait()
+			defer func() {
+				if groupErr != nil && !errors.Is(err, groupErr) {
+					err = errors.Join(err, groupErr)
+					if result.ExitCode == 0 {
+						result.ExitCode = 1
+					}
+				}
+			}()
+			close(group.waitReady)
+		}
+		err = withCancellationCause(cmd.Wait())
+		if finishCapture != nil {
+			observed := finishCapture()
+			err = errors.Join(err, observed.err)
+			if !observed.settled {
+				return LocalCommandResult{ExitCode: exitCode(err)}, err
+			}
+			if readErr := files.read(&stdout, &stderr); readErr != nil {
+				_ = stopCommand()
+				err = errors.Join(err, readErr)
+				return LocalCommandResult{ExitCode: exitCode(err)}, err
+			}
+			observedFileOverflow = observed.overflow
+			if stdout.buffer.Exceeded() || stderr.buffer.Exceeded() || observedFileOverflow || err != nil {
+				_ = stopCommand()
+			}
 		}
 	}
-	if req.Stderr != nil {
-		if req.DisableOutputCapture {
-			cmd.Stderr = req.Stderr
-		} else {
-			cmd.Stderr = io.MultiWriter(req.Stderr, &stderr)
-		}
-	} else {
-		if req.DisableOutputCapture {
-			cmd.Stderr = io.Discard
-		} else {
-			cmd.Stderr = &stderr
-		}
+	if errors.Is(err, exec.ErrWaitDelay) && req.MaxCapturedOutputBytes > 0 && !req.DisableOutputCapture {
+		_ = stopCommand()
 	}
-	err := cmd.Run()
-	result := LocalCommandResult{ExitCode: exitCode(err), Stdout: stdout.String(), Stderr: stderr.String()}
-	if stdout.overflow || stderr.overflow {
+	result = LocalCommandResult{ExitCode: exitCode(err), Stdout: stdout.String(), Stderr: stderr.String()}
+	if stdout.buffer.Exceeded() || stderr.buffer.Exceeded() || observedFileOverflow {
 		err = fmt.Errorf("captured command output exceeded %d-byte limit", req.MaxCapturedOutputBytes)
 		result.ExitCode = 5
 	}
@@ -532,32 +1188,55 @@ func (execCommandRunner) Run(ctx context.Context, req LocalCommandRequest) (Loca
 	return result, err
 }
 
+func commandOutputWriter(writer io.Writer, capture *commandCaptureBuffer, disabled bool) io.Writer {
+	if writer == nil {
+		writer = io.Discard
+	}
+	if disabled {
+		return writer
+	}
+	return io.MultiWriter(writer, capture)
+}
+
+// Bound pipe draining as well as process exit: CommandContext alone cannot
+// interrupt descendants retaining stdout/stderr after their parent exits.
+func configureBoundedCommandCancellation(cmd *exec.Cmd) {
+	// Controller children must stay in their durable outer process group.
+	controllerOwnsTree := os.Getenv(controllerProcessTreeOwnedEnv) == "1"
+	if !controllerOwnsTree {
+		configureDaemonCommand(cmd)
+	}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if controllerOwnsTree {
+			return cmd.Process.Kill()
+		}
+		return stopDaemonProcess(cmd.Process, cmd.Process.Pid)
+	}
+	cmd.WaitDelay = controllerChildWaitDelay
+}
+
 type commandCaptureBuffer struct {
-	buffer   bytes.Buffer
-	limit    int
-	overflow bool
-	cancel   context.CancelFunc
+	buffer prefixbuffer.Buffer
+	cancel context.CancelFunc
+}
+
+func newCommandCaptureBuffer(limit int, cancel context.CancelFunc) commandCaptureBuffer {
+	buffer := prefixbuffer.NewUnlimited()
+	if limit > 0 {
+		buffer = prefixbuffer.NewLimited(limit)
+	}
+	return commandCaptureBuffer{buffer: buffer, cancel: cancel}
 }
 
 func (b *commandCaptureBuffer) Write(data []byte) (int, error) {
-	if b.limit <= 0 {
-		return b.buffer.Write(data)
-	}
-	original := len(data)
-	remaining := b.limit - b.buffer.Len()
-	if remaining > 0 {
-		if len(data) > remaining {
-			b.overflow = true
-			data = data[:remaining]
-		}
-		_, _ = b.buffer.Write(data)
-	} else if original > 0 {
-		b.overflow = true
-	}
-	if b.overflow && b.cancel != nil {
+	n, err := b.buffer.Write(data)
+	if b.buffer.Exceeded() && b.cancel != nil {
 		b.cancel()
 	}
-	return original, nil
+	return n, err
 }
 
 func (b *commandCaptureBuffer) String() string {
@@ -589,11 +1268,15 @@ type LeaseOptions struct {
 }
 
 type AcquireRequest struct {
-	Repo             Repo
-	Options          LeaseOptions
-	Keep             bool
-	Reclaim          bool
-	RequestedLeaseID string
+	Repo                  Repo
+	Options               LeaseOptions
+	Keep                  bool
+	Reclaim               bool
+	RequestedLeaseID      string
+	RequestedCheckpointID string
+	// Native source identity remains available at the allocation owner, which can
+	// distinguish a fresh fork from replay of an already allocated resource.
+	CheckpointSource *NativeCheckpointForkRecord
 	RequestedSlug    string
 	// OnAcquired observes a fully validated raw provider identity before local
 	// routing, readiness, or claim side effects. Returning an error requires the
@@ -610,6 +1293,9 @@ type ResolveRequest struct {
 	StatusOnly  bool
 	ReadyProbe  bool
 	Prepare     bool
+	// IncludeDiagnostics opts explicit presentation callers into optional observations.
+	// It is not a provider protocol field or authority to modify lease state.
+	IncludeDiagnostics bool `json:"-"`
 	// RejectAuthSecret prevents interactive callers from launching SSH probes
 	// for token-as-username targets they cannot safely execute.
 	RejectAuthSecret bool
@@ -620,10 +1306,24 @@ type ResolveRequest struct {
 	ExpectedProviderIdentity ProviderIdentityExpectation
 }
 
+// IsReadOnlyStatus reports whether resolution may inspect provider inventory
+// without trusting or rewriting local claim state.
+func (r ResolveRequest) IsReadOnlyStatus() bool {
+	return r.StatusOnly && r.NoLocalStateMutations && !r.ReleaseOnly && !r.Reclaim
+}
+
 type ReleaseLeaseRequest struct {
 	Lease                    LeaseTarget
+	CheckpointID             string
 	Force                    bool
 	ExpectedProviderIdentity ProviderIdentityExpectation
+	// DeferProviderCleanupObservation queues coordinator cleanup without waiting
+	// for provider deletion. Automatic release paths use this so a completed run
+	// is not held open by asynchronous coordinator cleanup.
+	DeferProviderCleanupObservation bool
+	// GuardedRemoteCleanup lets providers that fence release authorization run
+	// generic remote teardown only after ownership is verified under that fence.
+	GuardedRemoteCleanup func(context.Context, LeaseTarget)
 }
 
 // ConfirmedAbsentLocalCleanupRequest carries the immutable provider identity
@@ -637,6 +1337,19 @@ type ConfirmedAbsentLocalCleanupRequest struct {
 type ConfirmedAbsentLocalStateCleaner interface {
 	Backend
 	CleanupConfirmedAbsentLocalState(context.Context, ConfirmedAbsentLocalCleanupRequest) error
+}
+
+// ConfirmedAbsentTerminalReceiptRetainer validates a provider-owned fixed receipt
+// that must survive confirmed-absence cleanup. Validation is local and read-only:
+// it must reject a missing fixed receipt and check terminal shape, configured
+// scope and every expected identity,
+// without provider calls or claim mutations. The request carries the controller
+// scope; the retainer owns its comparison with the receipt's claim scope, which
+// a provider may derive differently. Core holds the claim fence across
+// coordinator deregistration and revalidates the unchanged receipt afterward.
+type ConfirmedAbsentTerminalReceiptRetainer interface {
+	Backend
+	ValidateConfirmedAbsentTerminalReceipt(LeaseClaim, ConfirmedAbsentLocalCleanupRequest) error
 }
 
 // ProviderIdentityExpectation is the complete immutable identity known by a
@@ -659,17 +1372,17 @@ func ValidateProviderIdentityExpectation(i ProviderIdentityExpectation) error {
 	}{{"lease ID", i.LeaseID}, {"attempt lease ID", i.AttemptLeaseID}} {
 		name, value := identity.name, identity.value
 		if value != "" && (value != strings.TrimSpace(value) || !validLeaseClaimID(value)) {
-			return exit(2, "invalid expected provider %s", name)
+			return Exit(2, "invalid expected provider %s", name)
 		}
 	}
-	if i.Slug != "" && (i.Slug != strings.TrimSpace(i.Slug) || normalizeLeaseSlug(i.Slug) != i.Slug) {
-		return exit(2, "invalid expected provider slug")
+	if i.Slug != "" && (i.Slug != strings.TrimSpace(i.Slug) || NormalizeLeaseSlug(i.Slug) != i.Slug) {
+		return Exit(2, "invalid expected provider slug")
 	}
 	if i.ResourceID != "" && (i.ResourceID != strings.TrimSpace(i.ResourceID) || !validControllerInventoryIdentity(i.ResourceID)) {
-		return exit(2, "invalid expected provider resource ID")
+		return Exit(2, "invalid expected provider resource ID")
 	}
 	if i.LeaseID == "" && i.AttemptLeaseID == "" {
-		return exit(2, "expected provider identity requires a lease or attempt lease ID")
+		return Exit(2, "expected provider identity requires a lease or attempt lease ID")
 	}
 	return nil
 }
@@ -690,43 +1403,49 @@ func ValidateLeaseTargetProviderIdentity(lease LeaseTarget, expected ProviderIde
 	}{{"lease ID", expected.LeaseID}, {"attempt lease ID", expected.AttemptLeaseID}} {
 		name, value := identity.name, identity.value
 		if value != "" && actualLeaseID != value {
-			return exit(4, "provider %s mismatch before release: expected %s, found %s", name, value, blank(actualLeaseID, "<empty>"))
+			return Exit(4, "provider %s mismatch before release: expected %s, found %s", name, value, blank(actualLeaseID, "<empty>"))
 		}
 	}
 	if expected.Slug != "" {
-		actualSlug := serverSlug(lease.Server)
+		actualSlug := ServerSlug(lease.Server)
 		if actualSlug != expected.Slug {
-			return exit(4, "provider slug mismatch before release: expected %s, found %s", expected.Slug, blank(actualSlug, "<empty>"))
+			return Exit(4, "provider slug mismatch before release: expected %s, found %s", expected.Slug, blank(actualSlug, "<empty>"))
 		}
 	}
 	if expected.ResourceID != "" {
 		actualResourceID := lease.Server.DisplayID()
 		if actualResourceID != expected.ResourceID {
-			return exit(4, "provider resource ID mismatch before release: expected %s, found %s", expected.ResourceID, blank(actualResourceID, "<empty>"))
+			return Exit(4, "provider resource ID mismatch before release: expected %s, found %s", expected.ResourceID, blank(actualResourceID, "<empty>"))
 		}
 	}
 	return nil
 }
 
 type TouchRequest struct {
-	Lease       LeaseTarget
-	State       string
-	IdleTimeout time.Duration
+	Lease               LeaseTarget
+	State               string
+	IdleTimeout         time.Duration
+	IdleTimeoutOverride *time.Duration
 }
 
 type ListRequest struct {
-	Options LeaseOptions
-	All     bool
-	Refresh bool
+	Options  LeaseOptions
+	All      bool
+	Refresh  bool
+	Retained bool
 }
 
 type RunRequest struct {
+	Observation           *RunObservation `json:"-" yaml:"-"`
 	Repo                  Repo
 	ID                    string
+	ReuseLease            bool // Planned reuse without an ID; a nonempty ID also implies reuse.
+	RunID                 string
 	Options               LeaseOptions
 	Keep                  bool
 	Reclaim               bool
 	NoSync                bool
+	NoHydrate             bool
 	SyncOnly              bool
 	DebugSync             bool
 	ShellMode             bool
@@ -747,6 +1466,7 @@ type RunRequest struct {
 	FreshPR               FreshPRSpec
 	ApplyLocalPatch       bool
 	Command               []string
+	CommandLiteralArgs    map[int]bool // Profile argument positions that must not introduce shell syntax.
 	Label                 string
 	RequestedSlug         string
 	TimingJSON            bool
@@ -766,18 +1486,30 @@ type WarmupRequest struct {
 	ActionsRunner bool
 	RequestedSlug string
 	TimingJSON    bool
+	// BeforeComplete runs synchronous, best-effort core bookkeeping once after
+	// successful acquisition/retention and before final output. Providers opting
+	// in must include it in total timing; it cannot fail or roll back the lease.
+	BeforeComplete func()
 }
 
 type StatusRequest struct {
-	Options     LeaseOptions
-	ID          string
-	Wait        bool
-	WaitTimeout time.Duration
+	Options                       LeaseOptions
+	ID                            string
+	Wait                          bool
+	WaitTimeout                   time.Duration
+	AuthoritativeProviderMetadata bool
 }
 
 type StopRequest struct {
 	Options LeaseOptions
 	ID      string
+}
+
+// RepositoryScopedStopBackend validates the calling repository under its
+// existing exclusive release fence before native or connection cleanup. It
+// must reject unsupported claim kinds; validated terminal replay may be a no-op.
+type RepositoryScopedStopBackend interface {
+	StopForRepository(context.Context, StopRequest, string) error
 }
 
 type PauseRequest struct {
@@ -797,6 +1529,8 @@ type CleanupRequest struct {
 
 type RunResult struct {
 	ExitCode      int
+	Status        RunStatus
+	ErrorKind     RunErrorKind
 	Command       time.Duration
 	Total         time.Duration
 	SyncDelegated bool
@@ -810,16 +1544,96 @@ type RunResult struct {
 	Artifacts     []RunArtifact
 }
 
-type DelegatedRunArtifactRequest struct {
-	RunReq   RunRequest
-	Result   RunResult
-	MaxFiles int
-	MaxBytes int64
+type RunStatus string
+
+const (
+	RunStatusSucceeded RunStatus = "succeeded"
+	RunStatusFailed    RunStatus = "failed"
+	RunStatusTimedOut  RunStatus = "timed-out"
+	RunStatusCanceled  RunStatus = "canceled"
+)
+
+type RunErrorKind string
+
+const (
+	RunErrorNone        RunErrorKind = ""
+	RunErrorCommandExit RunErrorKind = "command-exit"
+	RunErrorTimeout     RunErrorKind = "timeout"
+	RunErrorCanceled    RunErrorKind = "canceled"
+	RunErrorProvider    RunErrorKind = "provider-error"
+)
+
+func FinalizeRunResult(result RunResult, err error) RunResult {
+	if result.Status == "" {
+		result.Status = RunStatusForResult(result, err)
+	}
+	if result.ErrorKind == "" {
+		result.ErrorKind = RunErrorKindForResult(result, err)
+	}
+	return result
 }
 
-type DelegatedRunArtifactResult struct {
-	Artifacts []RunArtifact
-	Output    string
+// PrimaryRunClassificationCause finds an explicit classification cause only on
+// the primary error path. Ordinary errors retain their full-graph classification;
+// joined secondary failures cannot supply an override through this lookup.
+func PrimaryRunClassificationCause(err error) error {
+	for err != nil {
+		if classified, ok := err.(interface{ RunClassificationCause() error }); ok {
+			if cause := classified.RunClassificationCause(); cause != nil {
+				return cause
+			}
+		}
+		switch wrapped := err.(type) {
+		case interface{ Unwrap() error }:
+			err = wrapped.Unwrap()
+		case interface{ Unwrap() []error }:
+			err = nil
+			for _, child := range wrapped.Unwrap() {
+				if child != nil {
+					err = child
+					break
+				}
+			}
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+func RunStatusForResult(result RunResult, err error) RunStatus {
+	if cause := PrimaryRunClassificationCause(err); cause != nil {
+		err = cause
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return RunStatusTimedOut
+	}
+	if errors.Is(err, context.Canceled) {
+		return RunStatusCanceled
+	}
+	if result.ExitCode != 0 || err != nil {
+		return RunStatusFailed
+	}
+	return RunStatusSucceeded
+}
+
+func RunErrorKindForResult(result RunResult, err error) RunErrorKind {
+	if cause := PrimaryRunClassificationCause(err); cause != nil {
+		err = cause
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return RunErrorTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return RunErrorCanceled
+	}
+	if result.ExitCode != 0 {
+		return RunErrorCommandExit
+	}
+	if err != nil {
+		return RunErrorProvider
+	}
+	return RunErrorNone
 }
 
 type RunSessionHandle struct {
@@ -833,11 +1647,68 @@ type RunSessionHandle struct {
 	CleanupCommand string `json:"cleanupCommand"`
 }
 
+func ValidateRunSessionFeatureSpec(spec ProviderSpec) error {
+	if !spec.Features.Has(FeatureRunSession) {
+		return nil
+	}
+	provider := blank(strings.TrimSpace(spec.Name), "provider")
+	switch spec.Kind {
+	case ProviderKindDelegatedRun:
+		return nil
+	case ProviderKindSSHLease:
+		if !spec.Features.Has(FeatureSSH) {
+			return Exit(2, "%s advertises %s as an SSH lease provider without %s", provider, FeatureRunSession, FeatureSSH)
+		}
+		if !spec.Features.Has(FeatureCleanup) {
+			return Exit(2, "%s advertises %s as an SSH lease provider without %s", provider, FeatureRunSession, FeatureCleanup)
+		}
+		return nil
+	default:
+		return Exit(2, "%s advertises %s with unsupported provider kind %s", provider, FeatureRunSession, spec.Kind)
+	}
+}
+
+func ValidateRunSessionForSpec(spec ProviderSpec, result RunResult) error {
+	session := result.Session
+	if session == nil {
+		return nil
+	}
+	provider := blank(strings.TrimSpace(spec.Name), "provider")
+	if !spec.Features.Has(FeatureRunSession) {
+		return Exit(2, "%s returned a run session but does not advertise %s", provider, FeatureRunSession)
+	}
+	if err := ValidateRunSessionFeatureSpec(spec); err != nil {
+		return err
+	}
+	if strings.TrimSpace(session.Provider) == "" {
+		return Exit(2, "%s returned a run session without provider", provider)
+	}
+	if strings.TrimSpace(session.LeaseID) == "" {
+		return Exit(2, "%s returned a run session without lease id", provider)
+	}
+	if strings.TrimSpace(session.CleanupCommand) == "" {
+		return Exit(2, "%s returned a run session without cleanup command", provider)
+	}
+	return nil
+}
+
 type LeaseTarget struct {
-	Server      Server
-	SSH         SSHTarget
-	LeaseID     string
-	Coordinator *CoordinatorClient
+	Server       Server
+	SSH          SSHTarget
+	LeaseID      string
+	Coordinator  *CoordinatorClient
+	runnerTiming *runnerProviderTiming
+	// Recorded by the validated provider lookup, never inferred from absent SSH.
+	providerRelease *leaseReleaseConfirmation
+}
+
+type leaseReleaseConfirmation struct {
+	backend Backend
+	leaseID string
+}
+
+func (lease LeaseTarget) providerReleaseConfirmedBy(backend Backend) bool {
+	return lease.providerRelease != nil && lease.providerRelease.backend == backend && lease.providerRelease.leaseID == lease.LeaseID
 }
 
 type LeaseView = Server
@@ -845,7 +1716,8 @@ type LeaseView = Server
 var providerRegistry = map[string]Provider{}
 
 func RegisterProvider(provider Provider) {
-	names := append([]string{provider.Name()}, provider.Aliases()...)
+	spec := provider.Spec()
+	names := append([]string{spec.Name}, spec.Aliases...)
 	for _, name := range names {
 		key := normalizeProviderName(name)
 		if key == "" {
@@ -861,7 +1733,7 @@ func RegisterProvider(provider Provider) {
 func ProviderFor(name string) (Provider, error) {
 	provider := providerRegistry[normalizeProviderName(name)]
 	if provider == nil {
-		return nil, exit(2, "unknown provider %q", name)
+		return nil, Exit(2, "unknown provider %q", name)
 	}
 	return provider, nil
 }
@@ -870,7 +1742,7 @@ func registeredProviders() []Provider {
 	seen := map[string]struct{}{}
 	providers := make([]Provider, 0, len(providerRegistry))
 	for _, provider := range providerRegistry {
-		name := normalizeProviderName(provider.Name())
+		name := normalizeProviderName(provider.Spec().Name)
 		if _, ok := seen[name]; ok {
 			continue
 		}
@@ -878,9 +1750,19 @@ func registeredProviders() []Provider {
 		providers = append(providers, provider)
 	}
 	sort.Slice(providers, func(i, j int) bool {
-		return providers[i].Name() < providers[j].Name()
+		return providers[i].Spec().Name < providers[j].Spec().Name
 	})
 	return providers
+}
+
+// RegisteredProviderNames returns the canonical names of every registered provider.
+func RegisteredProviderNames() []string {
+	providers := registeredProviders()
+	names := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		names = append(names, provider.Spec().Name)
+	}
+	return names
 }
 
 func normalizeProviderName(name string) string {
@@ -888,7 +1770,7 @@ func normalizeProviderName(name string) string {
 }
 
 func providerHelpAll() string {
-	return "provider: " + strings.Join(providerNamesForHelp(nil), ", ")
+	return "provider: " + strings.Join(providerNamesForHelp(nil), ", ") + " (defaults to configured selection)"
 }
 
 func providerHelpEnvValues() string {
@@ -909,13 +1791,13 @@ func joinProviderNames(names []string) string {
 func providerHelpSSH() string {
 	return "provider: " + strings.Join(providerNamesForHelp(func(spec ProviderSpec) bool {
 		return spec.Features.Has(FeatureSSH)
-	}), ", ")
+	}), ", ") + " (defaults to configured selection)"
 }
 
 func providerHelpCleanup() string {
 	return "provider: " + joinProviderNames(providerNamesForHelp(func(spec ProviderSpec) bool {
 		return spec.Features.Has(FeatureCleanup)
-	}))
+	})) + " (defaults to configured selection)"
 }
 
 func isBlacksmithProvider(provider string) bool {
@@ -924,10 +1806,33 @@ func isBlacksmithProvider(provider string) bool {
 
 type providerFlagValues map[string]any
 
+type providerFlagRegistrationObserver func(provider Provider, flags []*flag.Flag)
+
 func registerProviderFlags(fs *flag.FlagSet, defaults Config) providerFlagValues {
+	return registerProviderFlagsObserved(fs, defaults, nil)
+}
+
+func registerProviderFlagsObserved(fs *flag.FlagSet, defaults Config, observe providerFlagRegistrationObserver) providerFlagValues {
 	values := providerFlagValues{}
 	for _, provider := range registeredProviders() {
-		values[provider.Name()] = provider.RegisterFlags(fs, defaults)
+		var before map[string]bool
+		if observe != nil {
+			before = map[string]bool{}
+			fs.VisitAll(func(item *flag.Flag) { before[item.Name] = true })
+		}
+		values[provider.Spec().Name] = provider.RegisterFlags(fs, defaults)
+		if observe != nil {
+			var added []*flag.Flag
+			fs.VisitAll(func(item *flag.Flag) {
+				if !before[item.Name] {
+					added = append(added, item)
+				}
+			})
+			observe(provider, added)
+		}
+	}
+	if observe == nil {
+		clearFlagAnnotations(fs)
 	}
 	return values
 }
@@ -940,7 +1845,7 @@ func providerNamesForHelp(include func(ProviderSpec) bool) []string {
 		if include != nil && !include(spec) {
 			continue
 		}
-		names = append(names, provider.Name())
+		names = append(names, spec.Name)
 	}
 	return names
 }
@@ -953,13 +1858,16 @@ func applyProviderRoutingFlags(cfg *Config, fs *flag.FlagSet, values providerFla
 	if err != nil {
 		return err
 	}
+	cfg.Provider = provider.Spec().Name
+	if ProviderSelectionIsAuthoritativeRoute(*cfg) {
+		return nil
+	}
 	if router, ok := provider.(ProviderRouter); ok {
-		cfg.Provider = provider.Name()
-		if err := router.RouteConfig(cfg, fs, values[provider.Name()]); err != nil {
+		if err := router.RouteConfig(cfg, fs, values[provider.Spec().Name]); err != nil {
 			return err
 		}
 		if resolved, err := ProviderFor(cfg.Provider); err == nil {
-			cfg.Provider = resolved.Name()
+			cfg.Provider = resolved.Spec().Name
 		}
 	}
 	return nil
@@ -968,6 +1876,7 @@ func applyProviderRoutingFlags(cfg *Config, fs *flag.FlagSet, values providerFla
 func applyProviderFlags(cfg *Config, fs *flag.FlagSet, values providerFlagValues) error {
 	if flagWasSet(fs, "provider") {
 		cfg.providerExplicit = true
+		cfg.providerSelectionSource = providerSelectionFlag
 	}
 	if _, err := routeProviderFlagOverride(cfg, fs, values); err != nil {
 		return err
@@ -976,21 +1885,19 @@ func applyProviderFlags(cfg *Config, fs *flag.FlagSet, values providerFlagValues
 	if err != nil {
 		return err
 	}
-	before := provider.Name()
-	if err := provider.ApplyFlags(cfg, fs, values[provider.Name()]); err != nil {
+	before := provider.Spec().Name
+	if err := provider.ApplyFlags(cfg, fs, values[before]); err != nil {
 		return err
 	}
 	after, err := ProviderFor(cfg.Provider)
-	if err != nil || after.Name() == before {
-		if err == nil {
-			markCredentialDestinationFlagSources(cfg, fs)
-			applyCloudflareDynamicWorkersRepositoryCaps(cfg)
-		}
+	if err != nil {
 		return err
 	}
-	cfg.Provider = after.Name()
-	if err := after.ApplyFlags(cfg, fs, values[after.Name()]); err != nil {
-		return err
+	if after.Spec().Name != before {
+		cfg.Provider = after.Spec().Name
+		if err := after.ApplyFlags(cfg, fs, values[after.Spec().Name]); err != nil {
+			return err
+		}
 	}
 	markCredentialDestinationFlagSources(cfg, fs)
 	applyCloudflareDynamicWorkersRepositoryCaps(cfg)
@@ -1006,21 +1913,11 @@ func validateProviderConfig(cfg Config) error {
 		return err
 	}
 	if validator, ok := provider.(ProviderConfigValidator); ok {
-		return validator.ValidateConfig(cfg)
+		if err := validator.ValidateConfig(cfg); err != nil {
+			return err
+		}
 	}
-	return nil
-}
-
-func providerCommandRoutingArgs(cfg Config, leaseID string) []string {
-	provider, err := ProviderFor(cfg.Provider)
-	if err != nil {
-		return nil
-	}
-	router, ok := provider.(ProviderCommandRoutingArgs)
-	if !ok {
-		return nil
-	}
-	return router.CommandRoutingArgs(cfg, leaseID)
+	return validateProviderClassSelector(provider, cfg)
 }
 
 func routeProviderFlagOverride(cfg *Config, fs *flag.FlagSet, values providerFlagValues) (bool, error) {
@@ -1041,12 +1938,12 @@ func routeProviderFlagOverride(cfg *Config, fs *flag.FlagSet, values providerFla
 		if !ok {
 			continue
 		}
-		cfg.Provider = candidate.Name()
-		if err := router.RouteConfig(cfg, fs, values[candidate.Name()]); err != nil {
+		setProviderSelection(cfg, candidate.Spec().Name, providerSelectionFlag)
+		if err := router.RouteConfig(cfg, fs, values[candidate.Spec().Name]); err != nil {
 			return true, err
 		}
 		if resolved, err := ProviderFor(cfg.Provider); err == nil {
-			cfg.Provider = resolved.Name()
+			cfg.Provider = resolved.Spec().Name
 		}
 		return true, nil
 	}
@@ -1055,7 +1952,7 @@ func routeProviderFlagOverride(cfg *Config, fs *flag.FlagSet, values providerFla
 
 func providerFamily(provider Provider) string {
 	spec := provider.Spec()
-	return firstNonBlank(spec.Family, provider.Name())
+	return firstNonBlank(spec.Family, spec.Name)
 }
 
 func anyFlagWasSet(fs *flag.FlagSet, names []string) bool {
@@ -1072,14 +1969,17 @@ func routeConfiguredProvider(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	cfg.Provider = provider.Name()
+	cfg.Provider = provider.Spec().Name
+	if ProviderSelectionIsAuthoritativeRoute(*cfg) {
+		return nil
+	}
 	if router, ok := provider.(ProviderRouter); ok {
 		if err := router.RouteConfig(cfg, nil, nil); err != nil {
 			return err
 		}
 	}
 	if resolved, err := ProviderFor(cfg.Provider); err == nil {
-		cfg.Provider = resolved.Name()
+		cfg.Provider = resolved.Spec().Name
 	}
 	return nil
 }
@@ -1100,10 +2000,10 @@ func controllerProviderIdentityForConfig(cfg Config) (string, string, bool, erro
 	if err != nil {
 		return "", "", false, err
 	}
-	cfg.Provider = provider.Name()
+	cfg.Provider = provider.Spec().Name
 	contract, ok := provider.(ControllerProviderContract)
 	if !ok {
-		return "", "", false, fmt.Errorf("provider=%s does not expose a controller routing scope", provider.Name())
+		return "", "", false, fmt.Errorf("provider=%s does not expose a controller routing scope", provider.Spec().Name)
 	}
 	scope, err := contract.ControllerProviderScope(cfg)
 	if err != nil {
@@ -1111,9 +2011,9 @@ func controllerProviderIdentityForConfig(cfg Config) (string, string, bool, erro
 	}
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
-		return "", "", false, fmt.Errorf("provider=%s returned an empty controller routing scope", provider.Name())
+		return "", "", false, fmt.Errorf("provider=%s returned an empty controller routing scope", provider.Spec().Name)
 	}
-	return provider.Name(), scope, contract.SupportsControllerFixedLeaseID(cfg), nil
+	return provider.Spec().Name, scope, contract.SupportsControllerFixedLeaseID(cfg), nil
 }
 
 func validateControllerProviderScope(cfg Config) error {
@@ -1126,7 +2026,7 @@ func validateControllerProviderScope(cfg Config) error {
 		return err
 	}
 	if actual != expected {
-		return exit(2, "provider=%s controller routing scope changed; refusing lifecycle operation", provider)
+		return Exit(2, "provider=%s controller routing scope changed; refusing lifecycle operation; restore the original configuration and drain existing workspaces before changing it", provider)
 	}
 	return nil
 }
@@ -1144,12 +2044,15 @@ func validateControllerCoordinatorRegistrationBinding(cfg Config) error {
 		return err
 	}
 	if actual != expected {
-		return exit(4, "coordinator registration binding changed before provider acquisition")
+		return Exit(4, "coordinator registration binding changed before provider acquisition")
 	}
 	return nil
 }
 
 func loadBackend(cfg Config, rt Runtime) (Backend, error) {
+	if !providerSelectionIsActionable(cfg) {
+		return nil, Exit(2, "%s", providerSelectionRequiredDiagnostic)
+	}
 	if rt.Stdout == nil {
 		rt.Stdout = io.Discard
 	}
@@ -1162,22 +2065,32 @@ func loadBackend(cfg Config, rt Runtime) (Backend, error) {
 	if rt.Exec == nil {
 		rt.Exec = execCommandRunner{}
 	}
+	// The merged config can retain trusted External desktop secret names even
+	// when a repository selects another provider. Enforce that boundary at the
+	// shared command runner so every provider-owned local child is covered.
+	rt.Exec = commandRunnerWithChildCredentialBoundary(
+		rt.Exec,
+		externalDesktopChildEnvDenylist(cfg, cfg.TargetOS),
+	)
 	provider, err := ProviderFor(cfg.Provider)
 	if err != nil {
 		return nil, err
 	}
-	cfg.Provider = provider.Name()
+	cfg.Provider = provider.Spec().Name
 	if err := validateControllerProviderScope(cfg); err != nil {
 		return nil, err
 	}
 	if err := validateControllerCoordinatorRegistrationBinding(cfg); err != nil {
 		return nil, err
 	}
+	if !ShouldUseCoordinator(cfg, provider.Spec()) {
+		cfg = clampDirectLeaseDurations(cfg)
+	}
 	backend, err := configureProviderBackend(provider, &cfg, rt)
 	if err != nil {
 		return nil, err
 	}
-	if ssh, ok := backend.(SSHLeaseBackend); ok && shouldUseCoordinator(cfg, provider.Spec()) {
+	if ssh, ok := backend.(SSHLeaseBackend); ok && ShouldUseCoordinator(cfg, provider.Spec()) {
 		coord, _, err := newCoordinatorClient(cfg)
 		if err != nil {
 			return nil, err
@@ -1188,7 +2101,7 @@ func loadBackend(cfg Config, rt Runtime) (Backend, error) {
 }
 
 func configureProviderBackend(provider Provider, cfg *Config, rt Runtime) (Backend, error) {
-	cfg.Provider = provider.Name()
+	cfg.Provider = provider.Spec().Name
 	applySingleProviderTargetDefault(cfg)
 	if err := validateProviderConfig(*cfg); err != nil {
 		return nil, err
@@ -1196,7 +2109,9 @@ func configureProviderBackend(provider Provider, cfg *Config, rt Runtime) (Backe
 	return provider.Configure(*cfg, rt)
 }
 
-func shouldUseCoordinator(cfg Config, spec ProviderSpec) bool {
+// ShouldUseCoordinator reports whether provider allocations use the coordinator.
+// Registered mode keeps allocation with the direct provider.
+func ShouldUseCoordinator(cfg Config, spec ProviderSpec) bool {
 	return cfg.BrokerMode != BrokerModeRegistered &&
 		spec.Coordinator == CoordinatorSupported && strings.TrimSpace(cfg.Coordinator) != ""
 }
@@ -1213,11 +2128,14 @@ func backendCoordinator(backend Backend) *CoordinatorClient {
 }
 
 func leaseOptionsFromConfig(cfg Config) LeaseOptions {
+	if provider, err := ProviderFor(cfg.Provider); err == nil && !ShouldUseCoordinator(cfg, provider.Spec()) {
+		cfg = clampDirectLeaseDurations(cfg)
+	}
 	return LeaseOptions{
 		TargetOS:      cfg.TargetOS,
 		WindowsMode:   cfg.WindowsMode,
 		Class:         cfg.Class,
-		Pond:          normalizePondName(cfg.Pond),
+		Pond:          NormalizePondName(cfg.Pond),
 		ProviderScope: providerClaimScope(canonicalClaimProvider(cfg.Provider), cfg),
 		ServerType:    cfg.ServerType,
 		IdleTimeout:   cfg.IdleTimeout,
@@ -1240,64 +2158,56 @@ func leaseOptionsFromConfig(cfg Config) LeaseOptions {
 
 func validateActionsRunnerCapability(backend Backend, cfg Config) error {
 	if _, ok := backend.(SSHLeaseBackend); !ok {
-		return exit(2, "--actions-runner requires an SSH lease provider")
+		return Exit(2, "--actions-runner requires an SSH lease provider")
 	}
-	if name := backend.Spec().Name; name == "local-container" || name == "apple-container" || name == "multipass" {
-		return exit(2, "--actions-runner is not supported for provider=%s; use normal crabbox run or a remote SSH provider", name)
+	if spec := backend.Spec(); spec.ActionsRunnerUnsupported {
+		return Exit(2, "--actions-runner is not supported for provider=%s; use normal crabbox run or a remote SSH provider", spec.Name)
 	}
 	if !supportsGitHubActionsRunnerTarget(SSHTarget{TargetOS: cfg.TargetOS, WindowsMode: cfg.WindowsMode}) {
-		return exit(2, "--actions-runner requires target=linux or target=windows")
+		return Exit(2, "--actions-runner requires target=linux or target=windows")
 	}
 	return nil
 }
 
-func featureSetHas(features FeatureSet, feature Feature) bool {
-	for _, candidate := range features {
-		if candidate == feature {
-			return true
-		}
-	}
-	return false
-}
-
 func rejectDelegatedSyncOptionsForSpec(spec ProviderSpec, req RunRequest) error {
+	// NoSync is adapter-owned: SDK/CLI transports can skip sync without archive sync.
 	provider := spec.Name
-	archiveSync := featureSetHas(spec.Features, FeatureArchiveSync)
-	moduleRun := featureSetHas(spec.Features, FeatureModuleRun)
+	archiveSync := spec.Features.Has(FeatureArchiveSync)
+	moduleRun := spec.Features.Has(FeatureModuleRun)
 	if req.SyncOnly && !archiveSync {
-		return exit(2, "%s delegates sync; --sync-only is not supported", provider)
+		return Exit(2, "%s delegates sync; --sync-only is not supported", provider)
 	}
 	if req.ChecksumSync {
-		return exit(2, "%s delegates sync; --checksum is not supported", provider)
+		return Exit(2, "%s delegates sync; --checksum is not supported", provider)
 	}
 	if req.ForceSyncLarge && !archiveSync {
-		return exit(2, "%s delegates sync; --force-sync-large is not supported", provider)
+		return Exit(2, "%s delegates sync; --force-sync-large is not supported", provider)
 	}
 	if req.FullResync {
-		return exit(2, "%s delegates sync; --full-resync is not supported", provider)
+		return Exit(2, "%s delegates sync; --full-resync is not supported", provider)
 	}
 	if req.EnvHelper != "" {
-		return exit(2, "%s delegates run execution; --env-helper is not supported", provider)
+		return Exit(2, "%s delegates run execution; --env-helper is not supported", provider)
 	}
 	if req.CaptureStdout != "" {
-		return exit(2, "%s delegates run execution; --capture-stdout is not supported", provider)
+		return Exit(2, "%s delegates run execution; --capture-stdout is not supported", provider)
 	}
 	if req.CaptureStderr != "" {
-		return exit(2, "%s delegates run execution; --capture-stderr is not supported", provider)
+		return Exit(2, "%s delegates run execution; --capture-stderr is not supported", provider)
 	}
 	if req.CaptureOnFail {
-		return exit(2, "%s delegates run execution; --capture-on-fail is not supported", provider)
+		return Exit(2, "%s delegates run execution; --capture-on-fail is not supported", provider)
 	}
-	runArtifacts := featureSetHas(spec.Features, FeatureRunArtifacts)
-	runDownloads := featureSetHas(spec.Features, FeatureRunDownloads)
+	runArtifacts := spec.Features.Has(FeatureRunArtifacts)
+	runDownloads := spec.Features.Has(FeatureRunDownloads)
 	if len(req.Downloads) > 0 && !runDownloads {
-		return exit(2, "%s delegates run execution; --download is not supported", provider)
+		return Exit(2, "%s delegates run execution; --download is not supported", provider)
 	}
 	if len(req.ArtifactGlobs) > 0 && !runArtifacts {
-		return exit(2, "%s delegates run execution; --artifact-glob is not supported", provider)
+		return Exit(2, "%s delegates run execution; --artifact-glob is not supported", provider)
 	}
 	if len(req.RequiredArtifactGlobs) > 0 && !runArtifacts && !runDownloads {
-		return exit(2, "%s delegates run execution; --require-artifact is not supported", provider)
+		return Exit(2, "%s delegates run execution; --require-artifact is not supported", provider)
 	}
 	if runDownloads {
 		if err := validateDelegatedDownloads(req.Downloads); err != nil {
@@ -1309,23 +2219,23 @@ func rejectDelegatedSyncOptionsForSpec(spec ProviderSpec, req RunRequest) error 
 			return err
 		}
 	}
-	if req.EmitProof != "" && !featureSetHas(spec.Features, FeatureRunProof) {
-		return exit(2, "%s delegates run execution; --emit-proof is not supported", provider)
+	if req.EmitProof != "" && !spec.Features.Has(FeatureRunProof) {
+		return Exit(2, "%s delegates run execution; --emit-proof is not supported", provider)
 	}
 	if req.StopAfter != "" {
-		return exit(2, "%s delegates run execution; --stop-after is not supported", provider)
+		return Exit(2, "%s delegates run execution; --stop-after is not supported", provider)
 	}
-	if (req.Script != nil || req.ScriptRequested) && !moduleRun {
-		return exit(2, "%s delegates run execution; --script is not supported", provider)
+	if (req.Script != nil || req.ScriptRequested) && !moduleRun && !spec.Features.Has(FeatureShellScriptRun) {
+		return Exit(2, "%s delegates run execution; --script is not supported", provider)
 	}
 	if moduleRun && len(req.Command) > 0 {
-		return exit(2, "%s executes module source; trailing shell commands are not supported", provider)
+		return Exit(2, "%s executes module source; trailing shell commands are not supported", provider)
 	}
 	if moduleRun && req.ShellMode {
-		return exit(2, "%s executes module source; --shell is not supported", provider)
+		return Exit(2, "%s executes module source; --shell is not supported", provider)
 	}
 	if !req.FreshPR.Empty() {
-		return exit(2, "%s delegates sync; --fresh-pr is not supported", provider)
+		return Exit(2, "%s delegates sync; --fresh-pr is not supported", provider)
 	}
 	return nil
 }
@@ -1334,16 +2244,22 @@ func RejectDelegatedSyncOptionsForSpec(spec ProviderSpec, req RunRequest) error 
 	return rejectDelegatedSyncOptionsForSpec(spec, req)
 }
 
-func renderServerList(stdout io.Writer, servers []Server) {
+func renderServerList(stdout io.Writer, servers []Server) error {
 	for _, s := range servers {
 		extra := ""
 		if orphan := strings.TrimSpace(s.Labels["orphan"]); orphan != "" {
 			extra = " " + orphan
 		}
-		fmt.Fprintf(stdout, "%-20s %-28s %-12s %-14s %-15s lease=%s slug=%s keep=%s target=%s%s\n",
-			s.DisplayID(), s.Name, s.Status, s.ServerType.Name, s.PublicNet.IPv4.IP, s.Labels["lease"], blank(serverSlug(s), "-"), s.Labels["keep"], s.Labels["target"], extra)
+		extra += lifetimePolicySummary(s.LifetimePolicy)
+		if _, err := fmt.Fprintf(stdout, "%-20s %-28s %-12s %-14s %-15s lease=%s slug=%s keep=%s target=%s%s\n",
+			s.DisplayID(), s.Name, s.Status, s.ServerType.Name, s.PublicNet.IPv4.IP, s.Labels["lease"], blank(ServerSlug(s), "-"), s.Labels["keep"], s.Labels["target"], extra); err != nil {
+			return err
+		}
 	}
+	return nil
 }
+
+const bestEffortLeaseTouchTimeout = 20 * time.Second
 
 func (a App) touchLeaseTargetBestEffort(ctx context.Context, cfg Config, lease LeaseTarget, state string) Server {
 	backend, err := loadBackend(cfg, runtimeForApp(a))
@@ -1359,10 +2275,46 @@ func (a App) touchLeaseTargetBestEffort(ctx context.Context, cfg Config, lease L
 	if state == "" {
 		state = blank(lease.Server.Labels["state"], "ready")
 	}
-	server, err := sshBackend.Touch(ctx, TouchRequest{Lease: lease, State: state, IdleTimeout: cfg.IdleTimeout})
+	touchCtx, cancel := context.WithTimeout(ctx, bestEffortLeaseTouchTimeout)
+	defer cancel()
+	server, err := touchLeaseWithGuestExpiry(touchCtx, sshBackend, cfg, TouchRequest{Lease: lease, State: state, IdleTimeout: cfg.IdleTimeout})
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "warning: touch failed for %s: %v\n", lease.LeaseID, err)
 		return lease.Server
 	}
 	return server
+}
+
+// RuntimeForProviderOperation supplies the standard local command runner for
+// provider lifecycle capabilities that are invoked on Provider rather than an
+// already-configured Backend.
+func RuntimeForProviderOperation(stderr io.Writer) Runtime {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	return Runtime{Stdout: io.Discard, Stderr: stderr, Clock: realClock{}, Exec: execCommandRunner{}}
+}
+
+// LeaseExtensionBackend updates provider metadata under the exact lease claim.
+// File-backed guest guards are refreshed after the provider deadline is saved.
+type LeaseExtensionBackend interface {
+	ExtendLease(context.Context, LeaseExtendRequest) (LeaseExtendResult, error)
+}
+
+type LeaseExtendRequest struct {
+	Lease  LeaseTarget
+	TTL    time.Duration
+	By     time.Duration
+	Reason string
+}
+
+type LeaseExtendResult struct {
+	ID                        string `json:"id"`
+	ExpiresAt                 string `json:"expiresAt"`
+	Remaining                 string `json:"remainingLifetime"`
+	MaxLifetime               string `json:"maxLifetime"`
+	RuntimeExtension          bool   `json:"runtimeExtension"`
+	GuestExpiresAt            string `json:"guestExpiresAt,omitempty"`
+	GuestExpiryRefreshPending bool   `json:"guestExpiryRefreshPending,omitempty"`
+	Error                     string `json:"error,omitempty"`
 }

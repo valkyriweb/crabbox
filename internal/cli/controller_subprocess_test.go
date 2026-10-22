@@ -19,7 +19,16 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/openclaw/crabbox/internal/prefixbuffer"
 )
+
+func controllerSubprocessTestTimeout(base time.Duration) time.Duration {
+	if raceEnabled {
+		return 10 * base
+	}
+	return 5 * base
+}
 
 type fixedIdentityExecControllerRunner struct {
 	*execControllerWorkspaceRunner
@@ -28,10 +37,11 @@ type fixedIdentityExecControllerRunner struct {
 type confirmedAbsentCleanupTestBackend struct {
 	cleanupCalls int
 	cleanupErr   error
+	provider     string
 }
 
 func (b *confirmedAbsentCleanupTestBackend) Spec() ProviderSpec {
-	return ProviderSpec{Name: "external"}
+	return ProviderSpec{Name: blank(b.provider, "external")}
 }
 
 func (b *confirmedAbsentCleanupTestBackend) CleanupConfirmedAbsentLocalState(_ context.Context, _ ConfirmedAbsentLocalCleanupRequest) error {
@@ -41,6 +51,39 @@ func (b *confirmedAbsentCleanupTestBackend) CleanupConfirmedAbsentLocalState(_ c
 
 func (r *fixedIdentityExecControllerRunner) ProviderIdentity(context.Context) (controllerProviderIdentity, error) {
 	return controllerProviderIdentity{Route: "external", Scope: "test-provider-scope", IdempotentFixedLeaseID: true}, nil
+}
+
+func TestFreestyleConfigLoadersAgree(t *testing.T) {
+	clearConfigEnv(t)
+	home, repo := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_FREESTYLE_MEMORY_GB", "16")
+	t.Chdir(repo)
+	userPath := userConfigPath()
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte("freestyle:\n  apiUrl: https://user.example.test\n  workdir: user-workdir\n  vcpus: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "crabbox.yaml"), []byte("freestyle:\n  apiUrl: https://repo.example.test\n  workdir: repo-workdir\n  vcpus: 4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := FreestyleConfig{APIURL: "https://user.example.test", Workdir: "repo-workdir", VCPUs: 4, MemoryGB: 16}
+	for _, load := range []func() (Config, error){
+		func() (Config, error) { return loadConfigWithOverrides("", "xcp-ng") },
+		func() (Config, error) { return loadControllerRunnerConfigState("", "xcp-ng", repo) },
+	} {
+		cfg, err := load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Freestyle != want {
+			t.Fatalf("Freestyle configuration = %#v, want %#v", cfg.Freestyle, want)
+		}
+	}
 }
 
 func TestControllerWarmupArgsUseFixedRoutingAndCapabilities(t *testing.T) {
@@ -64,7 +107,7 @@ func TestControllerWarmupArgsUseFixedRoutingAndCapabilities(t *testing.T) {
 
 func TestExecControllerRunnerReadsProviderIdentityContract(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "crabbox")
-	script := "#!/bin/sh\nprintf '%s\\n' '{\"provider\":\"external\",\"providerScope\":\"opaque-scope\",\"idempotentLeaseId\":true,\"coordinatorRegistrationUrl\":\"https://coordinator.example.test/root\"}'\n"
+	script := "#!/bin/sh\ncase \" $* \" in *\" --json \"*) ;; *) exit 42 ;; esac\ncase \" $* \" in *\" --controller-provider-identity \"*) ;; *) exit 42 ;; esac\nprintf '%s\\n' '{\"provider\":\"external\",\"providerScope\":\"opaque-scope\",\"idempotentLeaseId\":true,\"coordinatorRegistrationUrl\":\"https://coordinator.example.test/root\"}'\n"
 	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +196,412 @@ func TestControllerRunnerAddsRuntimeAdapterIdentity(t *testing.T) {
 	}
 }
 
+func TestControllerChildEnvironmentScrubsDesktopPasswordIncludingMacOSOwner(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	base := []string{"PATH=/bin", "TEST_ARD_PASSWORD=operator-secret", "KEEP=value"}
+	for _, test := range []struct {
+		name      string
+		targetOS  string
+		args      []string
+		ownerName string
+	}{
+		{name: "linux daemon start", targetOS: targetLinux, args: []string{"webvnc", "daemon", "start", "--provider", "external"}},
+		{name: "windows daemon start", targetOS: targetWindows, args: []string{"webvnc", "daemon", "start", "--provider", "external"}},
+		{name: "mac status", targetOS: targetMacOS, args: []string{"webvnc", "status", "--provider", "external"}},
+		{name: "mac near match", targetOS: targetMacOS, args: []string{"webvnc", "daemon", "status", "--provider", "external"}},
+		{name: "mac owner", targetOS: targetMacOS, args: []string{"webvnc", "daemon", "start", "--provider", "external"}, ownerName: "TEST_ARD_PASSWORD"},
+		{name: "mac legacy alias owner", targetOS: targetMacOS, args: []string{"webvnc", "daemon", "start", "--provider", "exec-provider"}, ownerName: "TEST_ARD_PASSWORD"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+				Provider: "external", TargetOS: test.targetOS, ExternalDesktopPasswordEnv: "TEST_ARD_PASSWORD",
+			}}
+			policy, err := runner.childCredentialPolicy(controllerWorkspaceRequest{}, test.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if policy.ownerName != test.ownerName {
+				t.Fatalf("credential owner=%q, want %q", policy.ownerName, test.ownerName)
+			}
+			env, err := runner.childEnvironment(base, controllerWorkspaceRequest{}, test.args, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotSecret := strings.Contains(strings.Join(env, "\n"), "TEST_ARD_PASSWORD=operator-secret")
+			if gotSecret {
+				t.Fatalf("environment retained credential: %q", env)
+			}
+			if !slices.Contains(env, "KEEP=value") {
+				t.Fatalf("unrelated environment removed: %q", env)
+			}
+		})
+	}
+}
+
+func TestControllerChildCredentialPolicyUsesConfigOnlyExternalProvider(t *testing.T) {
+	clearConfigEnv(t)
+	root := t.TempDir()
+	workDir := filepath.Join(root, "work")
+	if err := os.Mkdir(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "trusted.yaml")
+	if err := os.WriteFile(configPath, []byte(`provider: external
+target: macos
+external:
+  connection:
+    desktop:
+      username: route-user
+      passwordEnv: CONFIG_ONLY_ARD_PASSWORD
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+		Config: configPath, WorkDir: workDir, ResolveCredentialBoundary: true,
+	}}
+	policy, err := runner.childCredentialPolicy(controllerWorkspaceRequest{}, []string{"webvnc", "daemon", "start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.ownerName != "CONFIG_ONLY_ARD_PASSWORD" {
+		t.Fatalf("config-only external credential owner=%q", policy.ownerName)
+	}
+}
+
+func TestControllerChildEnvironmentUsesPersistedMacOSRouteAndScrubsCurrentName(t *testing.T) {
+	root := privateExternalRoutingTempDir(t)
+	t.Setenv("XDG_CONFIG_HOME", root)
+	leaseID := "cbx_routedmac123"
+	external := ExternalConfig{Connection: ExternalConnectionConfig{Desktop: ExternalDesktopConfig{
+		Username: "route-user", PasswordEnv: "ROUTED_ARD_PASSWORD",
+	}}}
+	SetExternalRoutingTarget(&external, targetMacOS, "")
+	routingPath, err := PersistValidatedExternalRouting(leaseID, external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+		Provider: "external", TargetOS: targetLinux, ExternalDesktopPasswordEnv: "CURRENT_ARD_PASSWORD",
+	}}
+	request := controllerDesktopTestRequest(leaseID)
+	args := []string{
+		"webvnc", "daemon", "start", "--provider", "external",
+		"--external-routing-file", routingPath,
+		"--target", targetMacOS,
+		"--external-desktop-password-env", "ROUTED_ARD_PASSWORD",
+		"--external-desktop-username", "route-user",
+	}
+	env, err := runner.childEnvironment([]string{
+		"CURRENT_ARD_PASSWORD=current-secret",
+		"ROUTED_ARD_PASSWORD=routed-secret",
+		"KEEP=value",
+	}, request, args, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(env, "\n")
+	if strings.Contains(joined, "CURRENT_ARD_PASSWORD=") || strings.Contains(joined, "ROUTED_ARD_PASSWORD=") {
+		t.Fatalf("routed owner environment retained credential=%q", env)
+	}
+
+	statusEnv, err := runner.childEnvironment([]string{
+		"CURRENT_ARD_PASSWORD=current-secret",
+		"ROUTED_ARD_PASSWORD=routed-secret",
+		"KEEP=value",
+	}, request, []string{"webvnc", "status", "--provider", "external", "--external-routing-file", routingPath}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined = strings.Join(statusEnv, "\n"); strings.Contains(joined, "CURRENT_ARD_PASSWORD=") || strings.Contains(joined, "ROUTED_ARD_PASSWORD=") {
+		t.Fatalf("status environment retained credential: %q", statusEnv)
+	}
+}
+
+func TestControllerChildCredentialPolicySkipsInvalidStaleRoutes(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	for _, test := range []struct {
+		leaseID     string
+		passwordEnv string
+	}{
+		{leaseID: "cbx_stalelegacy1", passwordEnv: "CRABBOX_EXTERNAL_DESKTOP_PASSWORD"},
+		{leaseID: "cbx_stalepath001", passwordEnv: "PATH"},
+		{leaseID: "cbx_stalegithub1", passwordEnv: "GH_TOKEN"},
+	} {
+		external := ExternalConfig{Connection: ExternalConnectionConfig{Desktop: ExternalDesktopConfig{
+			PasswordEnv: test.passwordEnv,
+		}}}
+		if _, err := PersistExternalRouting(test.leaseID, external); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{Provider: "aws", TargetOS: targetLinux}}
+	policy, err := runner.childCredentialPolicy(controllerWorkspaceRequest{}, []string{"inspect", "--provider", "aws"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(policy.denied, "CRABBOX_EXTERNAL_DESKTOP_PASSWORD") {
+		t.Fatalf("legacy desktop secret missing from denylist: %v", policy.denied)
+	}
+	for _, invalid := range []string{"PATH", "GH_TOKEN"} {
+		if slices.Contains(policy.denied, invalid) {
+			t.Fatalf("invalid stale route suppressed %s: %v", invalid, policy.denied)
+		}
+	}
+}
+
+func TestControllerChildEnvironmentScrubsTrustedDesktopPasswordForNonExternalProvider(t *testing.T) {
+	clearConfigEnv(t)
+	root := t.TempDir()
+	workDir := filepath.Join(root, "work")
+	if err := os.Mkdir(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	configPath := userConfigPath()
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`external:
+  connection:
+    desktop:
+      passwordEnv: TRUSTED_DESKTOP_PASSWORD
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "crabbox.yaml"), []byte("provider: aws\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	boundary, err := controllerRunnerCredentialBoundary("", "", workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary.CurrentDesktopPasswordEnv != "" {
+		t.Fatalf("non-External provider selected credential owner %q", boundary.CurrentDesktopPasswordEnv)
+	}
+	if !slices.Contains(boundary.DesktopPasswordEnvs, "TRUSTED_DESKTOP_PASSWORD") {
+		t.Fatalf("merged credential denylist=%v", boundary.DesktopPasswordEnvs)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+		WorkDir:                     workDir,
+		ResolveCredentialBoundary:   true,
+		ExternalDesktopPasswordEnvs: boundary.DesktopPasswordEnvs,
+	}}
+	environment, err := runner.childEnvironment(
+		[]string{"TRUSTED_DESKTOP_PASSWORD=operator-secret", "KEEP=value"},
+		controllerWorkspaceRequest{},
+		[]string{"inspect", "--provider", "aws"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(environment, "TRUSTED_DESKTOP_PASSWORD=operator-secret") || !slices.Contains(environment, "KEEP=value") {
+		t.Fatalf("non-External child environment=%q", environment)
+	}
+}
+
+func TestControllerChildCredentialPolicyFailsClosedOnCorruptPersistedRoute(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	dir := filepath.Join(root, "crabbox", "external")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "corrupt.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{Provider: "aws", TargetOS: targetLinux}}
+	_, err := runner.childCredentialPolicy(controllerWorkspaceRequest{}, []string{"inspect", "--provider", "aws"})
+	if err == nil || !strings.Contains(err.Error(), "load persisted external routing corrupt.json") || !strings.Contains(err.Error(), "parse external routing file") {
+		t.Fatalf("corrupt route error=%v", err)
+	}
+}
+
+func TestControllerCredentialOwnerUsesRuntimePasswordOverrideForPersistedMacOSRoute(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_EXTERNAL_ROUTING_FILE", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_USERNAME", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_PASSWORD_ENV", "RUNTIME_SCREEN_PASSWORD")
+	leaseID := "cbx_runtimeard123"
+	external := ExternalConfig{Connection: ExternalConnectionConfig{Desktop: ExternalDesktopConfig{
+		Username: "route-user",
+	}}}
+	SetExternalRoutingTarget(&external, targetMacOS, "")
+	routingPath, err := PersistValidatedExternalRouting(leaseID, external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+		Provider: "external", WorkDir: root, ResolveCredentialBoundary: true,
+	}}
+	request := controllerDesktopTestRequest(leaseID)
+	args, err := runner.pinExternalDesktopCredentialOwnerArgs([]string{
+		"webvnc", "daemon", "start", "--provider", "external", "--external-routing-file", routingPath,
+	}, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := webVNCDaemonStringArg(args, "target"); got != targetMacOS {
+		t.Fatalf("target=%q args=%q", got, args)
+	}
+	if got := webVNCDaemonStringArg(args, "external-desktop-username"); got != "route-user" {
+		t.Fatalf("username=%q args=%q", got, args)
+	}
+	if got := webVNCDaemonStringArg(args, "external-desktop-password-env"); got != "RUNTIME_SCREEN_PASSWORD" {
+		t.Fatalf("password env=%q args=%q", got, args)
+	}
+	environment, err := runner.childEnvironment([]string{
+		"RUNTIME_SCREEN_PASSWORD=runtime-secret",
+		"KEEP=value",
+	}, request, args, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(environment, "RUNTIME_SCREEN_PASSWORD=runtime-secret") || !slices.Contains(environment, "KEEP=value") {
+		t.Fatalf("credential owner environment=%q", environment)
+	}
+}
+
+func TestControllerCredentialOwnerUsesStdinWithoutSecretEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	t.Setenv("SHELLOPTS", "operator-secret")
+	environmentPath := filepath.Join(dir, "environment")
+	stdinPath := filepath.Join(dir, "stdin")
+	argsPath := filepath.Join(dir, "args")
+	binary := filepath.Join(dir, "crabbox")
+	script := "#!/bin/sh\n/usr/bin/env >" + shellQuote(environmentPath) + "\n/bin/cat >" + shellQuote(stdinPath) + "\nprintf '%s\\n' \"$@\" >" + shellQuote(argsPath) + "\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+		Binary: binary, Provider: "external", TargetOS: targetMacOS, ExternalDesktopPasswordEnv: "SHELLOPTS",
+	}}
+	args := []string{
+		"webvnc", "daemon", "start", "--provider", "external", "--target", targetMacOS,
+		"--external-desktop-password-env", "SHELLOPTS",
+	}
+	if err := runner.run(context.Background(), controllerWorkspaceRequest{}, args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	environment, err := os.ReadFile(environmentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(environment), "SHELLOPTS=") || strings.Contains(string(environment), "operator-secret") {
+		t.Fatalf("credential entered child environment: %q", environment)
+	}
+	stdin, err := os.ReadFile(stdinPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stdin) != "operator-secret" {
+		t.Fatalf("credential stdin=%q", stdin)
+	}
+	childArgs, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(childArgs), "--"+webVNCDaemonCredentialStdinFlag) {
+		t.Fatalf("credential stdin flag missing: %q", childArgs)
+	}
+}
+
+func TestControllerExternalRoutingAcceptsLegacyRouteWithTrustedDesktopApproval(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "work")
+	if err := os.Mkdir(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	t.Setenv("CRABBOX_CONFIG", "")
+	t.Setenv("CRABBOX_EXTERNAL_ROUTING_FILE", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_USERNAME", "")
+	t.Setenv("CRABBOX_EXTERNAL_DESKTOP_PASSWORD_ENV", "")
+	configPath := filepath.Join(root, "trusted.yaml")
+	if err := os.WriteFile(configPath, []byte(`provider: external
+target: macos
+external:
+  connection:
+    desktop:
+      username: route-user
+      passwordEnv: LEGACY_SCREEN_PASSWORD
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	external := ExternalConfig{Connection: ExternalConnectionConfig{Desktop: ExternalDesktopConfig{
+		Username: "route-user", PasswordEnv: "LEGACY_SCREEN_PASSWORD",
+	}}}
+	SetExternalRoutingTarget(&external, targetMacOS, "")
+	routingPath, err := PersistExternalRouting("cbx_legacyard123", external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+		Config: configPath, Provider: "external", WorkDir: workDir,
+	}}
+	resolved, err := runner.resolvedExternalRoutingConfig(routingPath, "external", "")
+	if err != nil {
+		t.Fatalf("trusted approval rejected legacy route: %v", err)
+	}
+	if resolved.Config.TargetOS != targetMacOS ||
+		resolved.Config.External.Connection.Desktop.Username != "route-user" ||
+		resolved.Config.External.Connection.Desktop.PasswordEnv != "LEGACY_SCREEN_PASSWORD" {
+		t.Fatalf("resolved route=%#v", resolved.Config.External.Connection.Desktop)
+	}
+}
+
+func TestControllerChildEnvironmentRetainsMonotonicCredentialDenylist(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{Provider: "external", TargetOS: targetLinux, ExternalDesktopPasswordEnv: "PASSWORD_A"}}
+	base := []string{"PASSWORD_A=secret-a", "PASSWORD_B=secret-b", "KEEP=value"}
+	for _, name := range []string{"PASSWORD_A", "PASSWORD_B", ""} {
+		runner.opts.ExternalDesktopPasswordEnv = name
+		env, err := runner.childEnvironment(base, controllerWorkspaceRequest{}, []string{"inspect", "--provider", "external"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(env, "\n")
+		if strings.Contains(joined, "PASSWORD_A=") || (name != "PASSWORD_A" && strings.Contains(joined, "PASSWORD_B=")) {
+			t.Fatalf("name=%q monotonic environment=%q", name, env)
+		}
+	}
+}
+
+func TestControllerCredentialOwnerRejectsTrackedCallbackBeforeSpawn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("controller host is unsupported on Windows")
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "spawned")
+	binary := filepath.Join(dir, "crabbox")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf spawned >"+shellQuote(marker)+"\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{
+		Binary: binary, Provider: "external", TargetOS: targetMacOS,
+		ExternalDesktopPasswordEnv: "TEST_ARD_PASSWORD", StateFile: filepath.Join(t.TempDir(), "state.json"),
+	}}
+	err := runner.runWithStarted(context.Background(), controllerWorkspaceRequest{}, []string{
+		"webvnc", "daemon", "start", "--provider", "external",
+	}, io.Discard, func() error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "cannot use a tracked launch callback") {
+		t.Fatalf("error=%v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("credential owner spawned before rejection: %v", statErr)
+	}
+}
+
 func TestControllerAcquireIdentityGateWaitsForPersistenceAcknowledgment(t *testing.T) {
 	identity := controllerAcquireIdentity{
 		LeaseID: "cbx_123456789abc", Slug: "stable-slug", Provider: "external", ResourceID: "provider/resource-123",
@@ -177,7 +626,7 @@ func TestControllerAcquireIdentityGateWaitsForPersistenceAcknowledgment(t *testi
 	go func() { done <- acknowledgeControllerAcquireIdentity(context.Background(), identity) }()
 	select {
 	case <-callbackStarted:
-	case <-time.After(time.Second):
+	case <-time.After(controllerSubprocessTestTimeout(time.Second)):
 		gate.close()
 		t.Fatal("identity callback did not start")
 	}
@@ -194,7 +643,7 @@ func TestControllerAcquireIdentityGateWaitsForPersistenceAcknowledgment(t *testi
 			gate.close()
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(controllerSubprocessTestTimeout(time.Second)):
 		gate.close()
 		t.Fatal("child did not receive identity acknowledgment")
 	}
@@ -346,7 +795,7 @@ func TestControllerTrackedChildWaitsForDurableLaunchGate(t *testing.T) {
 	}()
 	select {
 	case <-callbackStarted:
-	case <-time.After(time.Second):
+	case <-time.After(controllerSubprocessTestTimeout(time.Second)):
 		t.Fatal("tracked child callback did not start")
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
@@ -365,7 +814,7 @@ func TestControllerTrackedChildWaitsForDurableLaunchGate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(controllerSubprocessTestTimeout(time.Second)):
 		t.Fatal("tracked child did not finish")
 	}
 	if _, err := os.Stat(marker); err != nil {
@@ -405,7 +854,7 @@ func TestControllerTrackedChildTerminatesDescendantsAfterDirectChildExit(t *test
 	if err != nil || pid <= 0 {
 		t.Fatalf("descendant pid=%q err=%v", data, err)
 	}
-	if command, alive := webVNCDaemonProcessCommand(pid); alive && !strings.Contains(strings.ToLower(command), "<defunct>") {
+	if command, alive := LocalProcessCommand(pid); alive && !strings.Contains(strings.ToLower(command), "<defunct>") {
 		t.Fatalf("detached lifecycle descendant survived successful wrapper exit pid=%d command=%q", pid, command)
 	}
 }
@@ -450,7 +899,7 @@ func TestControllerTrackedChildTerminatesDescendantsOnCancellation(t *testing.T)
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("run error=%v", err)
 	}
-	if command, alive := webVNCDaemonProcessCommand(pid); alive && !strings.Contains(strings.ToLower(command), "<defunct>") {
+	if command, alive := LocalProcessCommand(pid); alive && !strings.Contains(strings.ToLower(command), "<defunct>") {
 		t.Fatalf("lifecycle descendant survived cancellation pid=%d command=%q", pid, command)
 	}
 }
@@ -477,7 +926,7 @@ func TestControllerStartupTerminatesTrackedLifecycleChild(t *testing.T) {
 			_ = child.Wait()
 		}
 	})
-	started, err := webVNCDaemonProcessStartIdentity(child.Process.Pid)
+	started, err := LocalProcessStartIdentity(child.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +1009,7 @@ func TestControllerTrackedChildDiesWithControllerProcess(t *testing.T) {
 	if childPID <= 0 {
 		t.Fatal("tracked lifecycle child did not start")
 	}
-	started, err := webVNCDaemonProcessStartIdentity(childPID)
+	started, err := LocalProcessStartIdentity(childPID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,8 +1020,8 @@ func TestControllerTrackedChildDiesWithControllerProcess(t *testing.T) {
 	helperDone = true
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		current, currentErr := webVNCDaemonProcessStartIdentity(childPID)
-		command, alive := webVNCDaemonProcessCommand(childPID)
+		current, currentErr := LocalProcessStartIdentity(childPID)
+		command, alive := LocalProcessCommand(childPID)
 		if currentErr != nil || current != started || !alive || strings.Contains(strings.ToLower(command), "<defunct>") {
 			return
 		}
@@ -598,6 +1047,9 @@ func TestControllerWebVNCURLParser(t *testing.T) {
 	}
 	if got := controllerWebVNCURL("webvnc: run crabbox webvnc --id demo\n"); got != "" {
 		t.Fatalf("command hint parsed as URL: %q", got)
+	}
+	if got := controllerWebVNCURL("webvnc: [redacted]\n"); got != "" {
+		t.Fatalf("redaction marker parsed as URL: %q", got)
 	}
 }
 
@@ -720,7 +1172,7 @@ func TestControllerLifecycleCommandsUsePersistedExternalRoutingWithoutClaim(t *t
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture")
 	}
-	root := t.TempDir()
+	root := privateExternalRoutingTempDir(t)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	leaseID := "cbx_routeonly123"
@@ -728,7 +1180,11 @@ func TestControllerLifecycleCommandsUsePersistedExternalRoutingWithoutClaim(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || exists {
+	routing, err := LoadExternalRouting(routingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
 		t.Fatalf("claim exists=%t err=%v", exists, err)
 	}
 	calls := filepath.Join(root, "calls")
@@ -768,12 +1224,53 @@ func TestControllerLifecycleCommandsUsePersistedExternalRoutingWithoutClaim(t *t
 		t.Fatalf("calls=%q", string(data))
 	}
 	for _, line := range lines {
-		if !strings.Contains(line, "--provider external") || !strings.Contains(line, "--external-routing-file "+routingPath) {
+		if !strings.Contains(line, "--provider external") ||
+			!strings.Contains(line, "--external-routing-file "+routingPath) ||
+			!strings.Contains(line, "--external-routing-digest "+ExternalRoutingDigest(routing)) {
 			t.Fatalf("lifecycle command did not use persisted route: %q", line)
 		}
 	}
 	if !strings.Contains(lines[3], "--expected-coordinator-registration-url https://coordinator.example.test/root") {
 		t.Fatalf("confirmed-absence cleanup omitted coordinator binding: %q", lines[3])
+	}
+}
+
+func TestControllerCredentialOwnerRejectsReplacedPersistedRoute(t *testing.T) {
+	root := privateExternalRoutingTempDir(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	const leaseID = "cbx_route_race123"
+	first := ExternalConfig{
+		Command:  "provider-command",
+		WorkRoot: "/workspace",
+		Connection: ExternalConnectionConfig{Desktop: ExternalDesktopConfig{
+			Username: "first-user", PasswordEnv: "FIRST_SCREEN_PASSWORD",
+		}},
+	}
+	SetExternalRoutingTarget(&first, targetMacOS, windowsModeNormal)
+	if _, err := PersistValidatedExternalRouting(leaseID, first); err != nil {
+		t.Fatal(err)
+	}
+	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{Provider: "external"}}
+	request := controllerDesktopTestRequest(leaseID)
+	args, err := runner.appendPersistedProviderRoutingArgs(
+		[]string{"webvnc", "daemon", "start", "--id", leaseID},
+		request,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest := webVNCDaemonStringArg(args, "external-routing-digest"); len(digest) != sha256.Size*2 {
+		t.Fatalf("routing digest=%q args=%q", digest, args)
+	}
+
+	replacement := first
+	replacement.Connection.Desktop.Username = "replacement-user"
+	replacement.Connection.Desktop.PasswordEnv = "REPLACEMENT_SCREEN_PASSWORD"
+	if _, err := PersistValidatedExternalRouting(leaseID, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.pinExternalDesktopCredentialOwnerArgs(args, request); err == nil || !strings.Contains(err.Error(), "generation changed") {
+		t.Fatalf("replaced route error=%v", err)
 	}
 }
 
@@ -812,12 +1309,147 @@ func TestControllerPreAcquireInventoryUsesPersistedScopeWithoutRoutingFile(t *te
 	}
 }
 
+type confirmedAbsentReceiptTestBackend struct {
+	confirmedAbsentCleanupTestBackend
+	kind        FixedLeaseKind
+	validations int
+	// claimScopes maps a controller scope to its provider's claim scope.
+	claimScopes map[string]string
+}
+
+func (b *confirmedAbsentReceiptTestBackend) ValidateConfirmedAbsentTerminalReceipt(claim LeaseClaim, req ConfirmedAbsentLocalCleanupRequest) error {
+	b.validations++
+	expected := req.ExpectedProviderIdentity
+	claimScope := req.ProviderScope
+	if b.claimScopes != nil {
+		claimScope = b.claimScopes[req.ProviderScope]
+	}
+	if claim.LeaseID != expected.LeaseID || claim.LeaseID != expected.AttemptLeaseID || claim.Slug != expected.Slug || claim.CloudID != expected.ResourceID || claimScope == "" || claim.ProviderScope != claimScope {
+		return errors.New("terminal receipt identity mismatch")
+	}
+	return b.kind.ValidateTerminalClaim(claim, LeaseClaim{}, expected.LeaseID, nil)
+}
+
+func TestConfirmedAbsentTerminalReceiptRetainsDurableClaimAcrossDeregistration(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_abc123abc123"
+	const scope = "receipt-scope"
+	kind := FixedLeaseKind{ClaimProvider: "test-fixed-v1", IntentVersion: 1, Label: "test", TerminalIdentityLabels: []string{"lease"}}
+	acquired := LeaseClaim{LeaseID: leaseID, Slug: "fixed-receipt", Provider: kind.ClaimProvider, ProviderScope: scope, CloudID: "resource-uid", CloudImmutableID: "resource-uid", Labels: map[string]string{"lease": leaseID}, FixedCreateIntent: &FixedCreateIntent{Version: 1, Fingerprint: strings.Repeat("b", 64), ProviderScope: scope, Slug: "fixed-receipt", State: "acquired"}}
+	if err := WithDurableLeaseClaimLock(leaseID, func(claim *LeaseClaim, _ bool, persist func() error) error {
+		*claim = kind.TerminalClaim(acquired, time.Now().UTC())
+		return persist()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path, err := leaseClaimPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &confirmedAbsentReceiptTestBackend{kind: kind}
+	expected := ProviderIdentityExpectation{LeaseID: leaseID, AttemptLeaseID: leaseID, Slug: acquired.Slug, ResourceID: acquired.CloudID}
+	deregistrations := 0
+	if err := finalizeConfirmedAbsentLocalState(t.Context(), backend, expected, scope, func() error {
+		deregistrations++
+		current, err := os.ReadFile(path)
+		if err != nil || string(current) != string(before) {
+			t.Fatalf("receipt changed before deregistration: %v", err)
+		}
+		if backend.validations != 2 {
+			t.Fatalf("pre-deregistration validations=%d", backend.validations)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(before) || deregistrations != 1 || backend.validations != 3 || backend.cleanupCalls != 0 {
+		t.Fatalf("receipt completion err=%v deregistrations=%d validations=%d sidecars=%d", err, deregistrations, backend.validations, backend.cleanupCalls)
+	}
+	if err := cleanupConfirmedAbsentLocalState(t.Context(), backend, expected, scope); err != nil {
+		t.Fatal(err)
+	}
+	after, err = os.ReadFile(path)
+	if err != nil || string(after) != string(before) || backend.cleanupCalls != 0 {
+		t.Fatalf("retry changed receipt: %v", err)
+	}
+}
+
+// A provider may derive its controller scope differently from its claim scope.
+// Its receipt validator owns that comparison; ordinary claims keep core's.
+func TestConfirmedAbsentTerminalReceiptScopeIsProviderOwned(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_abc123abc123"
+	kind := FixedLeaseKind{ClaimProvider: "test-fixed-v1", IntentVersion: 1, Label: "test", TerminalIdentityLabels: []string{"lease"}}
+	acquired := LeaseClaim{LeaseID: leaseID, Slug: "fixed-receipt", Provider: kind.ClaimProvider, ProviderScope: "claim-scope", CloudID: "resource-uid", CloudImmutableID: "resource-uid", Labels: map[string]string{"lease": leaseID}, FixedCreateIntent: &FixedCreateIntent{Version: 1, Fingerprint: strings.Repeat("b", 64), ProviderScope: "claim-scope", Slug: "fixed-receipt", State: "acquired"}}
+	if err := WithDurableLeaseClaimLock(leaseID, func(claim *LeaseClaim, _ bool, persist func() error) error {
+		*claim = kind.TerminalClaim(acquired, time.Now().UTC())
+		return persist()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := readFixedReceiptForTest(t, leaseID)
+	backend := &confirmedAbsentReceiptTestBackend{kind: kind, claimScopes: map[string]string{"controller-scope": "claim-scope"}}
+	expected := ProviderIdentityExpectation{LeaseID: leaseID, AttemptLeaseID: leaseID, Slug: acquired.Slug, ResourceID: acquired.CloudID}
+	if err := cleanupConfirmedAbsentLocalState(t.Context(), backend, expected, "other-controller-scope"); err == nil {
+		t.Fatal("receipt accepted under an unmapped controller scope")
+	}
+	if err := cleanupConfirmedAbsentLocalState(t.Context(), backend, expected, "controller-scope"); err != nil {
+		t.Fatal(err)
+	}
+	if after := readFixedReceiptForTest(t, leaseID); after != before || backend.cleanupCalls != 0 {
+		t.Fatalf("receipt changed or sidecars ran: %d", backend.cleanupCalls)
+	}
+
+	const plainID = "cbx_abc123abc124"
+	server := Server{Provider: "external", CloudID: "provider/resource", Labels: map[string]string{"provider": "external", "slug": "plain-box"}}
+	if err := ClaimLeaseForRepoProviderScopePondEndpoint(plainID, "plain-box", "external", "claim-scope", "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
+		t.Fatal(err)
+	}
+	plain := &confirmedAbsentCleanupTestBackend{}
+	err := cleanupConfirmedAbsentLocalState(t.Context(), plain, ProviderIdentityExpectation{LeaseID: plainID, AttemptLeaseID: plainID, Slug: "plain-box", ResourceID: "provider/resource"}, "controller-scope")
+	if err == nil || !strings.Contains(err.Error(), "provider scope changed") || plain.cleanupCalls != 0 {
+		t.Fatalf("ordinary claim with another scope: err=%v sidecars=%d", err, plain.cleanupCalls)
+	}
+}
+
+func readFixedReceiptForTest(t *testing.T, leaseID string) string {
+	t.Helper()
+	path, err := leaseClaimPath(leaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func TestConfirmedAbsentTerminalReceiptRequiresLocalCustody(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	backend := &confirmedAbsentReceiptTestBackend{}
+	expected := ProviderIdentityExpectation{LeaseID: "cbx_abc123abc123", AttemptLeaseID: "cbx_abc123abc123", Slug: "fixed-receipt", ResourceID: "resource-uid"}
+	deregistered := false
+	err := finalizeConfirmedAbsentLocalState(t.Context(), backend, expected, "receipt-scope", func() error { deregistered = true; return nil })
+	if err == nil || deregistered || backend.validations != 1 || backend.cleanupCalls != 0 {
+		t.Fatalf("missing custody err=%v deregistered=%t validations=%d sidecars=%d", err, deregistered, backend.validations, backend.cleanupCalls)
+	}
+	if _, exists, err := ReadLeaseClaimWithPresence(expected.LeaseID); err != nil || exists {
+		t.Fatalf("missing receipt was manufactured: exists=%t err=%v", exists, err)
+	}
+}
+
 func TestConfirmedAbsentLocalCleanupRemovesOnlyFullyMatchingClaim(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	leaseID := "cbx_abc123abc123"
 	scope := "scope-a"
 	server := Server{Provider: "external", CloudID: "provider/resource", Labels: map[string]string{"provider": "external", "slug": "fast-coral"}}
-	if err := claimLeaseForRepoProviderScopePondEndpoint(leaseID, "fast-coral", "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
+	if err := ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, "fast-coral", "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
 	backend := &confirmedAbsentCleanupTestBackend{}
@@ -830,8 +1462,42 @@ func TestConfirmedAbsentLocalCleanupRemovesOnlyFullyMatchingClaim(t *testing.T) 
 	if backend.cleanupCalls != 1 {
 		t.Fatalf("sidecar cleanup calls=%d", backend.cleanupCalls)
 	}
-	if claim, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || exists || claim.LeaseID != "" {
+	if claim, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || exists || claim.LeaseID != "" {
 		t.Fatalf("claim=%#v exists=%t err=%v", claim, exists, err)
+	}
+}
+
+func TestConfirmedAbsentLocalCleanupFailsClosedForFixedAWSMarker(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const leaseID = "cbx_abcdef123465"
+	const scope = "account:123456789012"
+	err := WithDurableLeaseClaimLock(leaseID, func(claim *leaseClaim, _ bool, persist func() error) error {
+		claim.LeaseID = leaseID
+		claim.Slug = "fixed-confirmed-absent"
+		claim.Provider = FixedAWSClaimProvider
+		claim.ProviderScope = scope
+		claim.CloudID = "i-fixed"
+		claim.FixedCreateIntent = &FixedCreateIntent{
+			Version: 1, Fingerprint: strings.Repeat("b", 64), ProviderScope: scope,
+			Slug: claim.Slug, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), State: "acquired",
+		}
+		return persist()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &confirmedAbsentCleanupTestBackend{provider: "aws"}
+	err = cleanupConfirmedAbsentLocalState(context.Background(), backend, ProviderIdentityExpectation{
+		LeaseID: leaseID, AttemptLeaseID: leaseID, Slug: "fixed-confirmed-absent", ResourceID: "i-fixed",
+	}, scope)
+	if err == nil || !strings.Contains(err.Error(), "claim provider changed") {
+		t.Fatalf("err=%v, want fixed marker fail-closed error", err)
+	}
+	if backend.cleanupCalls != 0 {
+		t.Fatalf("confirmed-absence sidecar cleanup calls=%d, want 0", backend.cleanupCalls)
+	}
+	if claim, exists, readErr := ReadLeaseClaimWithPresence(leaseID); readErr != nil || !exists || claim.Provider != FixedAWSClaimProvider {
+		t.Fatalf("fixed claim was removed: claim=%#v exists=%t err=%v", claim, exists, readErr)
 	}
 }
 
@@ -850,7 +1516,7 @@ func TestConfirmedAbsentLocalCleanupPreservesClaimOnIdentityOrSidecarFailure(t *
 			leaseID := "cbx_abc123abc123"
 			scope := "scope-a"
 			server := Server{Provider: "external", CloudID: "provider/resource", Labels: map[string]string{"provider": "external", "slug": "fast-coral"}}
-			if err := claimLeaseForRepoProviderScopePondEndpoint(leaseID, "fast-coral", "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
+			if err := ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, "fast-coral", "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
 				t.Fatal(err)
 			}
 			backend := &confirmedAbsentCleanupTestBackend{cleanupErr: test.cleanupErr}
@@ -863,7 +1529,7 @@ func TestConfirmedAbsentLocalCleanupPreservesClaimOnIdentityOrSidecarFailure(t *
 			if backend.cleanupCalls != test.wantCleanup {
 				t.Fatalf("sidecar cleanup calls=%d want=%d", backend.cleanupCalls, test.wantCleanup)
 			}
-			if claim, exists, readErr := readLeaseClaimWithPresence(leaseID); readErr != nil || !exists || claim.LeaseID != leaseID {
+			if claim, exists, readErr := ReadLeaseClaimWithPresence(leaseID); readErr != nil || !exists || claim.LeaseID != leaseID {
 				t.Fatalf("claim=%#v exists=%t err=%v", claim, exists, readErr)
 			}
 		})
@@ -882,7 +1548,7 @@ func TestStopConfirmedAbsentLocalCleanupSkipsProviderReleasePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := Server{Provider: "external", CloudID: resourceID, Labels: map[string]string{"provider": "external", "slug": slug}}
-	if err := claimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
+	if err := ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
 	app := App{Stdout: io.Discard, Stderr: io.Discard}
@@ -898,7 +1564,7 @@ func TestStopConfirmedAbsentLocalCleanupSkipsProviderReleasePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claim, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || exists || claim.LeaseID != "" {
+	if claim, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || exists || claim.LeaseID != "" {
 		t.Fatalf("claim=%#v exists=%t err=%v", claim, exists, err)
 	}
 }
@@ -922,7 +1588,7 @@ func TestStopConfirmedAbsentLocalCleanupRejectsCoordinatorBindingDriftBeforeMuta
 		t.Fatal(err)
 	}
 	server := Server{Provider: "external", CloudID: resourceID, Labels: map[string]string{"provider": "external", "slug": slug}}
-	if err := claimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
+	if err := ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, "external", scope, "", "/repo", time.Minute, false, server, SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
 	app := App{Stdout: io.Discard, Stderr: io.Discard}
@@ -938,7 +1604,7 @@ func TestStopConfirmedAbsentLocalCleanupRejectsCoordinatorBindingDriftBeforeMuta
 	if err == nil || !strings.Contains(err.Error(), "coordinator registration binding changed") {
 		t.Fatalf("binding drift error=%v", err)
 	}
-	if _, exists, readErr := readLeaseClaimWithPresence(leaseID); readErr != nil || !exists {
+	if _, exists, readErr := ReadLeaseClaimWithPresence(leaseID); readErr != nil || !exists {
 		t.Fatalf("claim exists=%t err=%v", exists, readErr)
 	}
 	if _, statErr := os.Stat(routingPath); statErr != nil {
@@ -994,7 +1660,7 @@ func TestStopConfirmedAbsentDeregistrationFailureRetainsRouteForRetry(t *testing
 		t.Fatal(err)
 	}
 	serverIdentity := Server{Provider: "external", CloudID: resourceID, Labels: map[string]string{"provider": "external", "slug": slug}}
-	if err := claimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, "external", scope, "", "/repo", time.Minute, false, serverIdentity, SSHTarget{}); err != nil {
+	if err := ClaimLeaseForRepoProviderScopePondEndpoint(leaseID, slug, "external", scope, "", "/repo", time.Minute, false, serverIdentity, SSHTarget{}); err != nil {
 		t.Fatal(err)
 	}
 	args := []string{
@@ -1010,7 +1676,7 @@ func TestStopConfirmedAbsentDeregistrationFailureRetainsRouteForRetry(t *testing
 	if err := app.stop(context.Background(), args); err == nil || !strings.Contains(err.Error(), "deregister coordinator lease") {
 		t.Fatalf("deregistration error=%v", err)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || !exists {
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || !exists {
 		t.Fatalf("claim exists=%t err=%v", exists, err)
 	}
 	if _, err := os.Stat(routingPath); err != nil {
@@ -1024,7 +1690,7 @@ func TestStopConfirmedAbsentDeregistrationFailureRetainsRouteForRetry(t *testing
 	if err := app.stop(context.Background(), args); err != nil {
 		t.Fatalf("retry after provider config drift: %v", err)
 	}
-	if _, exists, err := readLeaseClaimWithPresence(leaseID); err != nil || exists {
+	if _, exists, err := ReadLeaseClaimWithPresence(leaseID); err != nil || exists {
 		t.Fatalf("claim exists after retry=%t err=%v", exists, err)
 	}
 	if _, err := os.Stat(routingPath); !errors.Is(err, os.ErrNotExist) {
@@ -1172,7 +1838,7 @@ func TestControllerAbsenceIdentitySetUsesEveryPersistedIdentity(t *testing.T) {
 			t.Fatalf("lease identities=%q missing %q", identities.LeaseIDs, want)
 		}
 	}
-	for _, want := range []string{"target-slug", leaseProviderName("cbx_target", "target-slug"), leaseProviderName("cbx_attempt", "target-slug")} {
+	for _, want := range []string{"target-slug", LeaseProviderName("cbx_target", "target-slug"), LeaseProviderName("cbx_attempt", "target-slug")} {
 		if !slices.Contains(identities.Names, want) {
 			t.Fatalf("name identities=%q missing %q", identities.Names, want)
 		}
@@ -1182,16 +1848,18 @@ func TestControllerAbsenceIdentitySetUsesEveryPersistedIdentity(t *testing.T) {
 	}
 }
 
-func TestControllerLimitedBufferReportsOverflow(t *testing.T) {
-	var output controllerLimitedBuffer
-	output.limit = 4
-	if n, err := output.Write([]byte("12345")); err != nil || n != 5 {
-		t.Fatalf("write bytes=%d err=%v", n, err)
+func TestControllerOutputReportsOverflow(t *testing.T) {
+	output := prefixbuffer.NewLimited(4)
+	if err := controllerOutputOverflowError(output.Exceeded(), "controller provider inventory", 4); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(&output, struct{ io.Reader }{strings.NewReader("12345")}); err != nil || n != 5 {
+		t.Fatalf("copied bytes=%d err=%v", n, err)
 	}
 	if got := output.String(); got != "1234" {
 		t.Fatalf("retained output=%q", got)
 	}
-	if err := output.overflowError("controller provider inventory"); err == nil || !strings.Contains(err.Error(), "exceeded 4-byte output limit") {
+	if err := controllerOutputOverflowError(output.Exceeded(), "controller provider inventory", 4); err == nil || err.Error() != "controller provider inventory exceeded 4-byte output limit" {
 		t.Fatalf("overflow error=%v", err)
 	}
 }
@@ -1206,6 +1874,16 @@ func controllerDesktopTestRequest(leaseID string) controllerWorkspaceRequest {
 		ProviderAttemptLeaseID: leaseID,
 		ProviderSlug:           "desktop-" + suffix,
 		ProviderResourceID:     "provider/" + suffix,
+	}
+}
+
+func persistControllerDesktopRouteForTest(t *testing.T, root, leaseID, targetOS, passwordEnv string) {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	external := ExternalConfig{Connection: ExternalConnectionConfig{Desktop: ExternalDesktopConfig{PasswordEnv: passwordEnv}}}
+	SetExternalRoutingTarget(&external, targetOS, "")
+	if _, err := PersistValidatedExternalRouting(leaseID, external); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1234,6 +1912,7 @@ func TestControllerDesktopConnectionRestartsDaemonWithoutRecordedPort(t *testing
 	binary := filepath.Join(dir, "crabbox")
 	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{Binary: binary, Provider: "external"}}
 	request := controllerDesktopTestRequest("cbx_legacy123")
+	persistControllerDesktopRouteForTest(t, dir, request.ProviderLeaseID, targetLinux, "")
 	script := `#!/bin/sh
 printf '%s\n' "$*" >>"$CONTROLLER_CALLS"
 if [ "$1 $2 $3" = 'webvnc daemon status' ]; then
@@ -1273,7 +1952,7 @@ fi
 		"webvnc daemon stop --id cbx_legacy123",
 		"webvnc daemon start --id cbx_legacy123 --provider external",
 		"--controller-owned=true",
-		"webvnc status --id cbx_legacy123 --provider external --local-port",
+		"webvnc status --id cbx_legacy123 --redact-credentials=false --provider external --local-port",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("calls missing %q:\n%s", want, got)
@@ -1300,7 +1979,9 @@ exit 0
 	}
 	t.Setenv("CONTROLLER_CALLS", calls)
 	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{Binary: binary, Provider: "external"}}
-	_, err := runner.DesktopConnection(context.Background(), "cbx_missing123", controllerDesktopTestRequest("cbx_missing123"))
+	request := controllerDesktopTestRequest("cbx_missing123")
+	persistControllerDesktopRouteForTest(t, dir, request.ProviderLeaseID, targetLinux, "")
+	_, err := runner.DesktopConnection(context.Background(), "cbx_missing123", request)
 	if err == nil || !strings.Contains(err.Error(), "did not report its supervisor pid") {
 		t.Fatalf("error=%v", err)
 	}
@@ -1331,6 +2012,7 @@ func TestControllerDesktopConnectionReplacesMismatchedDaemonOwnership(t *testing
 		ProviderSlug: "owned-slug", ProviderResourceID: "provider/owned",
 	}
 	runner := execControllerWorkspaceRunner{opts: execControllerRunnerOptions{Binary: binary, Provider: "external", StateFile: filepath.Join(dir, "controller.json")}}
+	persistControllerDesktopRouteForTest(t, dir, request.ProviderLeaseID, targetLinux, "")
 	ownerID := runner.desktopControllerOwnerID(request.ProviderLeaseID, request)
 	legacyOwnerToken := legacyControllerDesktopOwnerTokenForTest(&runner, request.ProviderLeaseID, request)
 	if ownerID == legacyOwnerToken || len(ownerID) != sha256.Size*2 {

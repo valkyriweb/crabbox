@@ -68,7 +68,7 @@ codeSandbox:
   vmTier: ""                      # pico, nano, micro, small, medium, large, xlarge
   privacy: private                # public, unlisted, private, or public-hosts
   hibernationTimeoutSecs: 0       # 0 uses CodeSandbox default
-  automaticWakeupHttp: true       # allow host URL access to wake hibernated sandboxes
+  automaticWakeupHTTP: true       # allow host URL access to wake hibernated sandboxes
   automaticWakeupWebSocket: false
   bridgeCommand: node
   sdkPackage: "@codesandbox/sdk@2.4.2"
@@ -126,6 +126,14 @@ Crabbox rejects broad paths such as `/` and `/project`.
    `pause` hibernates the sandbox and keeps the local claim so `resume`, `run`,
    `status`, and `stop` can target it later.
 
+Run outcomes and timing are finalized after automatic cleanup. A failed deletion
+returns a failure and a retained recovery session instead of success with a
+stopped session. An existing command failure keeps its exit code when cleanup or
+timing output also fails. `--keep-on-failure` includes canceled and timed-out
+commands; their original causes remain available for outcome classification.
+Reused sandboxes are never automatically deleted. Ownership checks and the SDK's
+command, environment-file, and deletion transports remain provider-specific.
+
 ## Ports And Preview URLs
 
 CodeSandbox exposes HTTP ports through provider-owned `csb.app` hosts.
@@ -156,6 +164,9 @@ wake a hibernated sandbox when HTTP wakeup is enabled.
   file before command execution.
 - Pause/resume: yes — `pause` calls CodeSandbox hibernate and `resume` calls
   CodeSandbox resume.
+- Run session: yes, `run` returns a reusable Crabbox lease/session handle for
+  `--lease-output`, retained failure inspection, and later `run --id`,
+  `status`, `ports`, `pause`, `resume`, or `stop`.
 - URL bridge: yes — `ports` returns SDK-owned host URLs for open HTTP ports.
 - Desktop / browser / code: no Crabbox VNC, browser provisioning, or
   code-server surface.
@@ -195,6 +206,10 @@ diagnostic failures.
 - `doctor` is non-mutating. It only checks env auth and a bounded sandbox list.
 - `operationTimeoutSecs` applies to each SDK bridge call. Increase it for slow
   creates, resumes, or port waits.
+  Values that overflow the local timeout budget are rejected during config
+  validation, before authentication or SDK startup. SDK installation keeps its
+  own operation budget; command requests use the larger of that budget and
+  the command timeout plus ten seconds, starting after installation completes.
 - `run` with an existing `--id` validates the local claim before reusing the
   sandbox. Use `--reclaim` only when intentionally updating a repo claim for a
   Crabbox-owned sandbox.

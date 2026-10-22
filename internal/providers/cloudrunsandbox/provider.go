@@ -1,0 +1,74 @@
+package cloudrunsandbox
+
+import (
+	"flag"
+	"os"
+	"strings"
+
+	core "github.com/openclaw/crabbox/internal/cli"
+)
+
+func init() {
+	core.RegisterProvider(Provider{})
+}
+
+type Provider struct{}
+
+func (Provider) DiagnosticSecrets(core.Config) []string {
+	return []string{
+		os.Getenv("CRABBOX_CLOUD_RUN_SANDBOX_SECRET"),
+		os.Getenv("CLOUD_RUN_SANDBOX_SECRET"),
+		os.Getenv("CRABBOX_CLOUD_RUN_SANDBOX_AUTH_TOKEN"),
+		os.Getenv("CLOUD_RUN_AUTH_TOKEN"),
+	}
+}
+
+// ServerTypeForConfig / ServerTypeForClass: Cloud Run sandboxes share the
+// parent service resources; there is no Crabbox class/type surface.
+func (Provider) ServerTypeForConfig(core.Config) string { return "" }
+func (Provider) Spec() core.ProviderSpec {
+	return core.ProviderSpec{
+		Aliases: []string{"gcrun-sandbox", "google-cloud-run-sandbox", "cloudrun-sandbox"},
+		Authentication: core.ProviderAuthentication{
+			{Route: "gateway", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationSharedSecret, core.ProviderAuthenticationIdentityToken}, Description: "The gateway uses a shared secret; a private IAM-protected gateway additionally uses an identity token."},
+			{Route: "embedded-launcher", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationLocalContext}, Description: "The mounted CLI runs in an already provisioned sandbox-launcher service context."},
+		},
+		SyncGuardrailFullCandidate: true,
+		Name:                       providerName,
+		Family:                     providerFamily,
+		Kind:                       core.ProviderKindDelegatedRun,
+		Targets:                    []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:                   core.FeatureSet{core.FeatureArchiveSync, core.FeatureCleanup, core.FeatureRunSession},
+		Coordinator:                core.CoordinatorNever,
+		ClassDisposition:           core.ProviderClassDispositionUnmapped,
+	}
+}
+
+func (Provider) RegisterFlags(fs *flag.FlagSet, defaults core.Config) any {
+	return RegisterCloudRunSandboxProviderFlags(fs, defaults)
+}
+
+func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
+	return ApplyCloudRunSandboxProviderFlags(cfg, fs, values)
+}
+
+func (Provider) ValidateConfig(cfg core.Config) error {
+	return validateConfig(cfg)
+}
+
+func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
+	if err := p.ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
+	return NewBackend(p.Spec(), cfg, rt), nil
+}
+
+func validateConfig(cfg core.Config) error {
+	if workdir := strings.TrimSpace(cfg.CloudRunSandbox.Workdir); workdir != "" && !strings.HasPrefix(workdir, "/") {
+		return core.Exit(2, "cloudRunSandbox.workdir must be an absolute path")
+	}
+	if cli := strings.TrimSpace(cfg.CloudRunSandbox.CLIPath); cli == "" {
+		return core.Exit(2, "cloudRunSandbox.cliPath must not be empty")
+	}
+	return nil
+}

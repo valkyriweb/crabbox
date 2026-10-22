@@ -15,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/openclaw/crabbox/internal/privatefile"
 	"golang.org/x/sys/windows"
 )
 
@@ -112,13 +113,6 @@ func runCommandWithPlatformStreams(cmd *exec.Cmd, stdout, stderr io.Writer) erro
 	}
 }
 
-func sameCommandStreamWriter(left, right io.Writer) bool {
-	defer func() {
-		_ = recover()
-	}()
-	return left == right
-}
-
 func collectCommandStreamResults(results <-chan error, count int) []error {
 	errs := make([]error, 0, count)
 	for range count {
@@ -139,7 +133,7 @@ func newCommandStreamSpool() (*commandStreamSpool, error) {
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(os.TempDir(), "crabbox-ssh-"+strings.TrimPrefix(newLeaseID(), "cbx_")+".tmp")
+	path := filepath.Join(os.TempDir(), "crabbox-ssh-"+strings.TrimPrefix(NewLeaseID(), "cbx_")+".tmp")
 	pathUTF16, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
@@ -385,17 +379,8 @@ func closeCommandThreadHandles(handles []windows.Handle) {
 }
 
 func commandStreamFileSecurity() (*windows.SecurityAttributes, error) {
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
-	if err != nil {
-		return nil, err
-	}
-	sd, err := windows.SecurityDescriptorFromString("D:P(A;;GA;;;" + user.User.Sid.String() + ")")
-	if err != nil {
-		return nil, err
-	}
-	attributes := &windows.SecurityAttributes{SecurityDescriptor: sd}
-	attributes.Length = uint32(unsafe.Sizeof(*attributes))
-	return attributes, nil
+	attributes, _, err := privatefile.WindowsAttributes(false)
+	return attributes, err
 }
 
 func markCommandStreamDeletePending(handle windows.Handle, path *uint16) error {

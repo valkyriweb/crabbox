@@ -2,6 +2,7 @@ package localcontainer
 
 import (
 	"flag"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 	"path/filepath"
 	"strings"
 
@@ -14,20 +15,21 @@ func init() {
 
 type Provider struct{}
 
-func (Provider) Name() string { return providerName }
-
-func (Provider) Aliases() []string {
-	return []string{"docker", "container", "local-docker"}
-}
+func (Provider) BackendCapabilities() core.Backend { return &backend{} }
 
 func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{
-		Name:        providerName,
-		Family:      "container",
-		Kind:        core.ProviderKindSSHLease,
-		Targets:     []core.TargetSpec{{OS: core.TargetLinux}},
-		Features:    core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureDesktop, core.FeatureBrowser, core.FeatureCacheVolume, core.FeatureCheckpoint, core.FeatureFork},
-		Coordinator: core.CoordinatorNever,
+		Aliases:          []string{"docker", "container", "local-docker"},
+		Authentication:   core.DirectProviderAuthentication(core.ProviderAuthenticationLocalContext),
+		Name:             providerName,
+		Family:           "container",
+		Kind:             core.ProviderKindSSHLease,
+		Targets:          []core.TargetSpec{{OS: core.TargetLinux}},
+		Features:         core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync, core.FeatureCleanup, core.FeatureDesktop, core.FeatureBrowser, core.FeatureCacheVolume, core.FeatureCheckpoint, core.FeatureFork, core.FeatureRunSession},
+		Coordinator:      core.CoordinatorNever,
+		ClassDisposition: core.ProviderClassDispositionUnmapped,
+
+		ActionsRunnerUnsupported: true,
 	}
 }
 
@@ -39,8 +41,45 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, values any) error
 	return applyFlags(cfg, fs, values)
 }
 
+func (Provider) SupportsArchitecture(cfg core.Config, architecture string) bool {
+	return cfg.TargetOS == core.TargetLinux && (architecture == core.ArchitectureAMD64 || architecture == core.ArchitectureARM64)
+}
+
+func (Provider) DescribeImplicitArchitecture(core.Config) string {
+	return "native"
+}
+
+func (Provider) NormalizeConfigForShow(cfg core.Config) core.Config {
+	effective := cfg
+	applyDefaults(&effective)
+	// Execution also derives SSH settings and a checkpoint display name. Keep
+	// those out of offline presentation normalization.
+	cfg.LocalContainer = effective.LocalContainer
+	cfg.WorkRoot = effective.WorkRoot
+	return cfg
+}
+
 func (Provider) CreationOnlyFlagNames() []string {
 	return []string{"local-container-volume"}
+}
+
+func (Provider) PrepareLeaseClaimEndpoint(existing core.LeaseClaim, provider, slug string, server core.Server, _ bool) (core.Server, error) {
+	if existing.CloudID != "" && server.CloudID != "" && existing.CloudID != server.CloudID {
+		return core.Server{}, core.Exit(2, "local-container lease %s is bound to container %s; refusing endpoint rewrite to %s", existing.LeaseID, shortID(existing.CloudID), shortID(server.CloudID))
+	}
+	labels := shared.CloneLabels(server.Labels)
+	for _, key := range append([]string{
+		"bootstrap_dir", "bootstrap_owned", "docker_socket", "host_work_root", "keep", "runtime", "runtime_context", "ssh_key_owned", "ssh_user", "work_root",
+	}, checkpointScopeMetadataKeys...) {
+		if strings.TrimSpace(labels[key]) == "" && strings.TrimSpace(existing.Labels[key]) != "" {
+			labels[key] = existing.Labels[key]
+		}
+	}
+	if !strings.EqualFold(labels["state"], "ready") && strings.TrimSpace(labels["recovery"]) == "" {
+		labels["recovery"] = existing.Labels["recovery"]
+	}
+	server.Labels = labels
+	return server, nil
 }
 
 func (p Provider) Configure(cfg core.Config, rt core.Runtime) (core.Backend, error) {
@@ -68,7 +107,7 @@ func (Provider) NativeCheckpointCapability(req core.NativeCheckpointRequest) (co
 	if req.StrategyExplicit {
 		return core.NativeCheckpointCapability{}, false
 	}
-	return core.NativeCheckpointCapability{Kind: core.CheckpointKindDockerCommit, Direct: true}, true
+	return core.NativeCheckpointCapability{Kind: core.CheckpointKindDockerCommit, Direct: true, RetireSource: true}, true
 }
 
 // leaseHasDockerSocket reports whether a resolved lease was created with
@@ -139,7 +178,7 @@ func (Provider) ApplyNativeCheckpointForkConfig(req core.NativeCheckpointForkReq
 }
 
 func (Provider) ApplyNativeCheckpointForkFlags(cfg *core.Config, fs *flag.FlagSet, values any) error {
-	v, ok := values.(flagValues)
+	v, ok := values.(core.LocalContainerConfigFlagValues)
 	if !ok {
 		return nil
 	}
@@ -156,16 +195,4 @@ func (Provider) ApplyNativeCheckpointForkFlags(cfg *core.Config, fs *flag.FlagSe
 		cfg.LocalContainer.Volumes = append([]string(nil), (*v.Volumes)...)
 	}
 	return nil
-}
-
-func (p Provider) ConfigureDoctor(cfg core.Config, rt core.Runtime) (core.DoctorBackend, error) {
-	backend, err := p.Configure(cfg, rt)
-	if err != nil {
-		return nil, err
-	}
-	doctor, ok := backend.(core.DoctorBackend)
-	if !ok {
-		return nil, core.Exit(2, "%s doctor backend unavailable", providerName)
-	}
-	return doctor, nil
 }

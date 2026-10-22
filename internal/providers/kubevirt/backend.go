@@ -11,6 +11,7 @@ import (
 	"time"
 
 	core "github.com/openclaw/crabbox/internal/cli"
+	"github.com/openclaw/crabbox/internal/providers/shared"
 )
 
 type leaseBackend struct {
@@ -23,7 +24,9 @@ func (b *leaseBackend) Spec() core.ProviderSpec { return b.spec }
 
 func (b *leaseBackend) RebindResolvedLeaseTarget(target *core.LeaseTarget, leaseID string) error {
 	if strings.TrimSpace(b.cfg.KubeVirt.SSHKey) == "" {
-		core.UseStoredTestboxKey(&target.SSH, leaseID)
+		if err := core.UseStoredTestboxKey(&target.SSH, leaseID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -141,7 +144,7 @@ func (b *leaseBackend) Status(ctx context.Context, req core.StatusRequest) (core
 	if err != nil {
 		return core.StatusView{}, err
 	}
-	return b.statusView(ctx, item, name, leaseID, slug), nil
+	return b.statusView(ctx, item, name, leaseID, slug)
 }
 
 func (b *leaseBackend) List(ctx context.Context, _ core.ListRequest) ([]core.LeaseView, error) {
@@ -171,6 +174,17 @@ func (b *leaseBackend) Doctor(ctx context.Context, _ core.DoctorRequest) (core.D
 }
 
 func (b *leaseBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRequest) error {
+	_, err := b.ReleaseLeaseWithOutcome(ctx, req)
+	return err
+}
+
+func (b *leaseBackend) ReleaseLeaseWithOutcome(ctx context.Context, req core.ReleaseLeaseRequest) (core.ReleaseLeaseOutcome, error) {
+	var outcome core.ReleaseLeaseOutcome
+	err := b.releaseLease(ctx, req, &outcome)
+	return outcome, err
+}
+
+func (b *leaseBackend) releaseLease(ctx context.Context, req core.ReleaseLeaseRequest, outcome *core.ReleaseLeaseOutcome) error {
 	name := strings.TrimSpace(req.Lease.Server.Name)
 	if name == "" {
 		name, _, _, _ = b.resolveName(req.Lease.LeaseID)
@@ -193,6 +207,7 @@ func (b *leaseBackend) ReleaseLease(ctx context.Context, req core.ReleaseLeaseRe
 	if deleteVM {
 		err = b.deleteVM(ctx, name)
 		if err == nil {
+			outcome.Terminal = true
 			b.removeLeaseClaim(req.Lease.LeaseID)
 			b.removeGeneratedKey(req.Lease.LeaseID)
 		}
@@ -402,44 +417,37 @@ func (b *leaseBackend) waitForVMIReadyForSSH(ctx context.Context, name string, t
 	deadline := start.Add(timeout)
 	var last kubeVirtVMIStatus
 	var lastErr error
-	for {
-		if ctx.Err() != nil {
-			return last, context.Cause(ctx)
-		}
-		item, err := b.getVMI(ctx, name)
-		if err == nil {
-			lastErr = nil
-			last = item.Status
-			if vmiAllowsSSHProbe(last) {
-				return last, nil
-			}
-			if vmiTerminalPhase(last.Phase) {
-				return last, core.Exit(5, "KubeVirt VMI %s reached terminal phase before SSH: %s", name, b.vmiDiagnostics(ctx, name, last, nil))
-			}
-		} else if kubeVirtNotFound(err) {
-			lastErr = err
-		} else {
-			return last, err
-		}
-		if time.Now().After(deadline) {
-			return last, core.Exit(5, "timed out waiting for KubeVirt VMI %s to be scheduled for SSH probing: %s", name, b.vmiDiagnostics(ctx, name, last, lastErr))
-		}
-		if b.rt.Stderr != nil {
-			fmt.Fprintf(b.rt.Stderr, "waiting for KubeVirt VMI %s to be scheduled... elapsed=%s remaining=%s %s\n", name, time.Since(start).Round(time.Second), time.Until(deadline).Round(time.Second), vmiStatusSummary(last, lastErr))
-		}
-		timer := time.NewTimer(5 * time.Second)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+	_, err := shared.Poll(ctx, 0, 5*time.Second, shared.SleepContext,
+		func(observeCtx context.Context) (kubeVirtVMI, error) { return b.getVMI(observeCtx, name) },
+		func(_ context.Context, item kubeVirtVMI, fetchErr error) (bool, error) {
+			if fetchErr == nil {
+				lastErr = nil
+				last = item.Status
+				if vmiAllowsSSHProbe(last) {
+					return true, nil
 				}
+				if vmiTerminalPhase(last.Phase) {
+					return false, core.Exit(5, "KubeVirt VMI %s reached terminal phase before SSH: %s", name, b.vmiDiagnostics(ctx, name, last, nil))
+				}
+			} else if kubeVirtNotFound(fetchErr) {
+				lastErr = fetchErr
+			} else {
+				return false, fetchErr
 			}
-			return last, context.Cause(ctx)
-		case <-timer.C:
-		}
+			if time.Now().After(deadline) {
+				return false, core.Exit(5, "timed out waiting for KubeVirt VMI %s to be scheduled for SSH probing: %s", name, b.vmiDiagnostics(ctx, name, last, lastErr))
+			}
+			return false, nil
+		},
+		func(shared.PollResult[kubeVirtVMI]) {
+			if b.rt.Stderr != nil {
+				fmt.Fprintf(b.rt.Stderr, "waiting for KubeVirt VMI %s to be scheduled... elapsed=%s remaining=%s %s\n", name, time.Since(start).Round(time.Second), time.Until(deadline).Round(time.Second), vmiStatusSummary(last, lastErr))
+			}
+		})
+	if err != nil {
+		return last, err
 	}
+	return last, nil
 }
 
 func (b *leaseBackend) vmiDiagnostics(ctx context.Context, name string, status kubeVirtVMIStatus, lastErr error) string {
@@ -571,7 +579,7 @@ func (b *leaseBackend) sshKey(leaseID string) (string, string, error) {
 
 func kubeVirtPublicKeyValue(value string) (string, error) {
 	value = strings.TrimSpace(value)
-	if value == "" || looksLikeInlineSSHPublicKey(value) {
+	if value == "" || core.LooksLikeInlineSSHPublicKey(value) {
 		return value, nil
 	}
 	if publicKey, err := readKubeVirtPublicKeyFile(value); err == nil {
@@ -591,20 +599,10 @@ func readKubeVirtPublicKeyFile(path string) (string, error) {
 	if publicKey == "" {
 		return "", core.Exit(2, "KubeVirt SSH public key %s is empty", path)
 	}
+	if !core.LooksLikeInlineSSHPublicKey(publicKey) {
+		return "", core.Exit(2, "KubeVirt SSH public key %s is not a supported OpenSSH public key", path)
+	}
 	return publicKey, nil
-}
-
-func looksLikeInlineSSHPublicKey(value string) bool {
-	fields := strings.Fields(value)
-	if len(fields) < 2 {
-		return false
-	}
-	switch fields[0] {
-	case "ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com":
-		return true
-	default:
-		return false
-	}
 }
 
 func looksLikePublicKeyPath(value string) bool {
@@ -621,11 +619,14 @@ func (b *leaseBackend) resolveSSHKey(leaseID string) (string, error) {
 	if keyPath := strings.TrimSpace(b.cfg.KubeVirt.SSHKey); keyPath != "" {
 		return keyPath, nil
 	}
-	keyPath, err := core.TestboxKeyPath(leaseID)
-	if err != nil {
+	keyPath, err := core.StoredTestboxKeyPath(leaseID)
+	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	if _, err := os.Stat(keyPath); err != nil {
+	if err == nil {
+		_, err = os.Stat(keyPath)
+	}
+	if err != nil {
 		if os.IsNotExist(err) {
 			return "", core.Exit(4, "stored SSH key for KubeVirt lease %s is missing; configure kubevirt.sshKey or recreate the VM", leaseID)
 		}
@@ -729,7 +730,7 @@ func (b *leaseBackend) itemToServer(item kubeVirtItem) core.Server {
 	return server
 }
 
-func (b *leaseBackend) statusView(ctx context.Context, item kubeVirtItem, name, leaseID, slug string) core.StatusView {
+func (b *leaseBackend) statusView(ctx context.Context, item kubeVirtItem, name, leaseID, slug string) (core.StatusView, error) {
 	server := b.itemToServer(item)
 	if server.Labels == nil {
 		server.Labels = map[string]string{}
@@ -738,7 +739,11 @@ func (b *leaseBackend) statusView(ctx context.Context, item kubeVirtItem, name, 
 	server.Status = state
 	server.Labels["state"] = state
 	server.PublicNet.IPv4.IP = name
-	target := b.sshTarget(name, b.statusSSHKey(leaseID))
+	keyPath, err := b.statusSSHKey(leaseID)
+	if err != nil {
+		return core.StatusView{}, err
+	}
+	target := b.sshTarget(name, keyPath)
 	ready := false
 	if kubeVirtStatusReady(state) {
 		allowProbe := true
@@ -770,21 +775,24 @@ func (b *leaseBackend) statusView(ctx context.Context, item kubeVirtItem, name, 
 		Labels:           server.Labels,
 		HasHost:          target.Host != "",
 		Ready:            ready,
-	}
+	}, nil
 }
 
-func (b *leaseBackend) statusSSHKey(leaseID string) string {
+func (b *leaseBackend) statusSSHKey(leaseID string) (string, error) {
 	if keyPath := strings.TrimSpace(b.cfg.KubeVirt.SSHKey); keyPath != "" {
-		return keyPath
+		return keyPath, nil
 	}
-	keyPath, err := core.TestboxKeyPath(leaseID)
+	keyPath, err := core.OptionalStoredTestboxKeyPath(leaseID)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
 	}
 	if _, err := os.Stat(keyPath); err == nil {
-		return keyPath
+		return keyPath, nil
 	}
-	return ""
+	return "", nil
 }
 
 func kubeVirtVMState(item kubeVirtItem, server core.Server) string {
@@ -1049,20 +1057,27 @@ func (b *leaseBackend) resolveClaim(identifier string) (core.LeaseClaim, bool, e
 	} else if claim.LeaseID != "" && strings.HasPrefix(identifier, "cbx_") {
 		return core.LeaseClaim{}, false, nil
 	}
+	if core.IsCanonicalLeaseID(identifier) {
+		return core.LeaseClaim{}, false, nil
+	}
 	claims, err := core.ListLeaseClaims()
 	if err != nil {
 		return core.LeaseClaim{}, false, err
 	}
+	var matched core.LeaseClaim
 	slug := core.NormalizeLeaseSlug(identifier)
 	for _, claim := range claims {
 		if !b.claimMatchesScope(claim, scope) {
 			continue
 		}
 		if claim.LeaseID == identifier || (slug != "" && core.NormalizeLeaseSlug(claim.Slug) == slug) {
-			return claim, true, nil
+			if matched.LeaseID != "" {
+				return core.LeaseClaim{}, false, core.Exit(2, "multiple provider=%s claims match identifier %s", providerName, identifier)
+			}
+			matched = claim
 		}
 	}
-	return core.LeaseClaim{}, false, nil
+	return matched, matched.LeaseID != "", nil
 }
 
 func (b *leaseBackend) claimMatchesScope(claim core.LeaseClaim, scope string) bool {
