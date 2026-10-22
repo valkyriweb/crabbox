@@ -1750,6 +1750,7 @@ type ServeConfig struct {
 	SSHPort            int                     `yaml:"sshPort,omitempty"`
 	Machine            string                  `yaml:"machine,omitempty"`
 	Fallback           string                  `yaml:"fallback,omitempty"`
+	NoCapacityWait     bool                    `yaml:"noCapacityWait,omitempty"`
 }
 
 type ServeAvailabilityConfig struct {

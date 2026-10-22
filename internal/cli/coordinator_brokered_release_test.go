@@ -134,3 +134,59 @@ func TestNonBrokeredReleaseNotFoundKeepsLocalClaim(t *testing.T) {
 		t.Fatalf("claim exists=%t err=%v; want kept", exists, err)
 	}
 }
+
+func TestBrokeredAcquisitionWaitsForCapacity(t *testing.T) {
+	oldInitial, oldMax, oldTimeout := coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay, coordinatorCreateLeaseTimeoutForConfig
+	coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay = time.Millisecond, time.Millisecond
+	coordinatorCreateLeaseTimeoutForConfig = func(Config) time.Duration { return time.Minute }
+	t.Cleanup(func() {
+		coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay, coordinatorCreateLeaseTimeoutForConfig = oldInitial, oldMax, oldTimeout
+	})
+	busy := CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable"}`}
+	for _, tc := range []struct {
+		name      string
+		cfg       Config
+		spec      ProviderSpec
+		wantCalls int
+		wantErr   bool
+	}{
+		{name: "brokered waits", spec: brokeredReleaseTestProvider{}.Spec(), wantCalls: 3},
+		{name: "no-wait opt out", cfg: Config{Serve: ServeConfig{NoCapacityWait: true}}, spec: brokeredReleaseTestProvider{}.Spec(), wantCalls: 1, wantErr: true},
+		{name: "fallback skips wait", cfg: Config{Serve: ServeConfig{Fallback: "aws"}}, spec: brokeredReleaseTestProvider{}.Spec(), wantCalls: 1, wantErr: true},
+		{name: "other providers unchanged", spec: ProviderSpec{Name: "aws"}, wantCalls: 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			b := &coordinatorLeaseBackend{cfg: tc.cfg, spec: tc.spec, rt: Runtime{Stderr: &stderr}}
+			calls := 0
+			_, err := b.waitForBrokeredCapacity(t.Context(), func() (LeaseTarget, error) {
+				calls++
+				if calls < 3 {
+					return LeaseTarget{}, busy
+				}
+				return LeaseTarget{LeaseID: "cbx_abcdef123459"}, nil
+			})
+			if calls != tc.wantCalls || (err != nil) != tc.wantErr {
+				t.Fatalf("calls=%d err=%v; want calls=%d err=%t", calls, err, tc.wantCalls, tc.wantErr)
+			}
+			if tc.wantCalls > 1 && !strings.Contains(stderr.String(), `phase="awaiting-capacity"`) {
+				t.Fatalf("missing progress line:\n%s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestBrokeredCapacityWaitStopsAtLeaseTimeout(t *testing.T) {
+	oldInitial, oldTimeout := coordinatorCapacityWaitInitialDelay, coordinatorCreateLeaseTimeoutForConfig
+	coordinatorCapacityWaitInitialDelay = time.Millisecond
+	coordinatorCreateLeaseTimeoutForConfig = func(Config) time.Duration { return 20 * time.Millisecond }
+	t.Cleanup(func() {
+		coordinatorCapacityWaitInitialDelay, coordinatorCreateLeaseTimeoutForConfig = oldInitial, oldTimeout
+	})
+	busy := CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable"}`}
+	b := &coordinatorLeaseBackend{spec: brokeredReleaseTestProvider{}.Spec(), rt: Runtime{Stderr: &bytes.Buffer{}}}
+	_, err := b.waitForBrokeredCapacity(t.Context(), func() (LeaseTarget, error) { return LeaseTarget{}, busy })
+	if !isCoordinatorCapacityUnavailable(err) {
+		t.Fatalf("err=%v; want the capacity rejection after the lease timeout", err)
+	}
+}

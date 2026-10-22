@@ -104,8 +104,12 @@ supported served sizes.
 
 `--type cpu4` requests four CPUs and 8 GiB. Requests must fit the offer and
 remaining reservations. Placement prefers the most free CPU; use
-`--serve-machine <name-or-UUID>` to pin a machine. No capacity fails immediately
-with `serve_capacity_unavailable`, including owner-visible machine capacity.
+`--serve-machine <name-or-UUID>` to pin a machine. When no machine has capacity
+the coordinator returns `serve_capacity_unavailable`; the CLI then waits and
+retries with backoff (5s doubling to 30s) within the coordinator lease timeout,
+printing `phase="awaiting-capacity"` progress. Pass `--serve-no-wait` (or set
+`serve.noCapacityWait: true`) to fail immediately. A configured fallback skips
+the wait and retries on the fallback provider instead.
 
 Optional fallback applies only to that explicit capacity rejection:
 

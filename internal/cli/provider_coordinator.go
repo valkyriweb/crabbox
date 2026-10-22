@@ -237,8 +237,10 @@ func (b *coordinatorLeaseBackend) Acquire(ctx context.Context, req AcquireReques
 		}
 		return acquired, nil
 	}
-	lease, err := acquireAttemptsRetry(b.rt, req.Keep, func() (LeaseTarget, error) {
-		return b.acquireOnce(ctx, req.Keep, req.RequestedSlug)
+	lease, err := b.waitForBrokeredCapacity(ctx, func() (LeaseTarget, error) {
+		return acquireAttemptsRetry(b.rt, req.Keep, func() (LeaseTarget, error) {
+			return b.acquireOnce(ctx, req.Keep, req.RequestedSlug)
+		})
 	})
 	if err == nil {
 		return lease, nil
@@ -1544,4 +1546,41 @@ func (b *coordinatorLeaseBackend) ExtendLease(ctx context.Context, req LeaseExte
 		runtimeExtension = lease.LeasePolicy.RuntimeExtension
 	}
 	return leaseExtendResult(lease.ID, lease.ExpiresAt, maximum, runtimeExtension), nil
+}
+
+var (
+	coordinatorCapacityWaitInitialDelay = 5 * time.Second
+	coordinatorCapacityWaitMaxDelay     = 30 * time.Second
+)
+
+// waitForBrokeredCapacity retries a brokered-only acquisition (serve) while
+// the coordinator reports every donor busy. A 409 serve_capacity_unavailable
+// commits nothing, so each retry is a fresh create. The wait shares the
+// coordinator lease timeout; --serve-fallback or --serve-no-wait opt out.
+func (b *coordinatorLeaseBackend) waitForBrokeredCapacity(ctx context.Context, acquire func() (LeaseTarget, error)) (LeaseTarget, error) {
+	lease, err := acquire()
+	if !b.spec.BrokeredOnly || b.cfg.Serve.Fallback != "" || b.cfg.Serve.NoCapacityWait {
+		return lease, err
+	}
+	started := time.Now()
+	timeout := coordinatorCreateLeaseTimeoutForConfig(b.cfg)
+	delay := coordinatorCapacityWaitInitialDelay
+	for err != nil && isCoordinatorCapacityUnavailable(err) {
+		remaining := timeout - time.Since(started)
+		if remaining <= 0 {
+			return lease, err
+		}
+		wait := min(delay, remaining)
+		fmt.Fprintf(b.rt.Stderr, "waiting for coordinator lease provider=%s elapsed=%s timeout=%s phase=%q retry_in=%s\n", b.spec.Name, time.Since(started).Round(time.Second), timeout, "awaiting-capacity", wait.Round(time.Second))
+		if sleepErr := sleepContext(ctx, wait); sleepErr != nil {
+			return LeaseTarget{}, errors.Join(sleepErr, err)
+		}
+		delay = min(delay*2, coordinatorCapacityWaitMaxDelay)
+		lease, err = acquire()
+	}
+	return lease, err
+}
+
+func isCoordinatorCapacityUnavailable(err error) bool {
+	return coordinatorResponseErrorCode(err, http.StatusConflict) == "serve_capacity_unavailable"
 }
