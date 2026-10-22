@@ -207,7 +207,7 @@ func (w partialRejectionTimingWriter) Write(data []byte) (int, error) {
 func TestCoordinatorHTTPErrorBodyKeepsDiagnosticReadLimit(t *testing.T) {
 	const message = `{"error":"cost_limit_exceeded"}`
 	beyondLimit := &countingReader{}
-	body := io.MultiReader(strings.NewReader(message+strings.Repeat(" ", 600-len(message))), beyondLimit)
+	body := io.MultiReader(strings.NewReader(message+strings.Repeat(" ", coordinatorErrorBodyLimit-len(message))), beyondLimit)
 	err := decodeCoordinatorResponse(http.MethodPut, "/v1/leases/cbx_0123456789ab", http.StatusTooManyRequests, body, nil)
 	var response CoordinatorHTTPError
 	if !errors.As(err, &response) || response.Message != message || response.responseComplete || beyondLimit.reads != 0 {

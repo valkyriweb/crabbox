@@ -65,9 +65,21 @@ type CoordinatorHTTPError struct {
 	responseUnredirected bool
 }
 
+// Message keeps the whole error body so structured rejections stay parseable
+// (serve capacity details list a full view per donor); only the rendered
+// error is capped.
+const (
+	coordinatorErrorBodyLimit    = 64 << 10
+	coordinatorErrorDisplayLimit = 600
+)
+
 func (e CoordinatorHTTPError) Error() string {
 	if e.Message != "" {
-		return fmt.Sprintf("coordinator %s %s: http %d: %s", e.Method, e.Path, e.StatusCode, e.Message)
+		message := e.Message
+		if len(message) > coordinatorErrorDisplayLimit {
+			message = message[:coordinatorErrorDisplayLimit] + "... (truncated)"
+		}
+		return fmt.Sprintf("coordinator %s %s: http %d: %s", e.Method, e.Path, e.StatusCode, message)
 	}
 	return fmt.Sprintf("coordinator %s %s: http %d", e.Method, e.Path, e.StatusCode)
 }
@@ -2983,10 +2995,10 @@ func splitCurlResponse(data []byte) ([]byte, int, error) {
 
 func decodeCoordinatorResponse(method, path string, statusCode int, body io.Reader, out any) error {
 	if statusCode < 200 || statusCode >= 300 {
-		// Do not wait beyond the existing diagnostic cap. Reaching it cannot
-		// establish EOF, so cap-sized bodies remain diagnostic-only.
-		data, readErr := io.ReadAll(io.LimitReader(body, 600))
-		complete := readErr == nil && len(data) < 600
+		// Do not wait beyond the body limit. Reaching it cannot establish EOF,
+		// so cap-sized bodies remain diagnostic-only.
+		data, readErr := io.ReadAll(io.LimitReader(body, coordinatorErrorBodyLimit))
+		complete := readErr == nil && len(data) < coordinatorErrorBodyLimit
 		msg := strings.TrimSpace(string(data))
 		return CoordinatorHTTPError{
 			Method:           method,

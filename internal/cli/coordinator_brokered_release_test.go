@@ -299,6 +299,9 @@ func TestBrokeredAcquisitionWaitsOnFullSizeCapacityRejection(t *testing.T) {
 	if !isCoordinatorCapacityUnavailable(err) {
 		t.Fatalf("err=%v; want the capacity rejection once the budget runs out", err)
 	}
+	if rendered := err.Error(); len(rendered) >= len(body) || !strings.HasSuffix(rendered, "... (truncated)") {
+		t.Fatalf("rendered error must stay capped: %s", rendered)
+	}
 }
 
 func TestBrokeredCapacityWaitStopsAtBudget(t *testing.T) {
