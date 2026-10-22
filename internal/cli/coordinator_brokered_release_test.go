@@ -2,8 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
+	"os"
+	"path/filepath"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -192,34 +196,41 @@ func TestNonBrokeredReleaseNotFoundKeepsLocalClaim(t *testing.T) {
 	}
 }
 
-func TestBrokeredAcquisitionWaitsForCapacity(t *testing.T) {
-	oldInitial, oldMax, oldTimeout := coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay, coordinatorCreateLeaseTimeoutForConfig
+func useFastCapacityWait(t *testing.T) {
+	t.Helper()
+	oldInitial, oldMax := coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay
 	coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay = time.Millisecond, time.Millisecond
-	coordinatorCreateLeaseTimeoutForConfig = func(Config) time.Duration { return time.Minute }
-	t.Cleanup(func() {
-		coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay, coordinatorCreateLeaseTimeoutForConfig = oldInitial, oldMax, oldTimeout
-	})
-	busy := CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable"}`}
+	t.Cleanup(func() { coordinatorCapacityWaitInitialDelay, coordinatorCapacityWaitMaxDelay = oldInitial, oldMax })
+}
+
+var busyCapacityRejection = CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable","details":[{"online":true,"allocatedLeases":8}]}`}
+
+func TestBrokeredAcquisitionWaitsForCapacity(t *testing.T) {
+	useFastCapacityWait(t)
 	for _, tc := range []struct {
 		name      string
 		cfg       Config
 		spec      ProviderSpec
+		busy      error
 		wantCalls int
 		wantErr   bool
 	}{
-		{name: "brokered waits", spec: brokeredReleaseTestProvider{}.Spec(), wantCalls: 3},
-		{name: "no-wait opt out", cfg: Config{Serve: ServeConfig{NoCapacityWait: true}}, spec: brokeredReleaseTestProvider{}.Spec(), wantCalls: 1, wantErr: true},
-		{name: "fallback skips wait", cfg: Config{Serve: ServeConfig{Fallback: "aws"}}, spec: brokeredReleaseTestProvider{}.Spec(), wantCalls: 1, wantErr: true},
-		{name: "other providers unchanged", spec: ProviderSpec{Name: "aws"}, wantCalls: 1, wantErr: true},
+		{name: "brokered waits", spec: brokeredReleaseTestProvider{}.Spec(), busy: busyCapacityRejection, wantCalls: 3},
+		{name: "legacy rejection without details waits", spec: brokeredReleaseTestProvider{}.Spec(), busy: CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable"}`}, wantCalls: 3},
+		{name: "no machines registered fails fast", spec: brokeredReleaseTestProvider{}.Spec(), busy: CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable","details":[]}`}, wantCalls: 1, wantErr: true},
+		{name: "no machine online fails fast", spec: brokeredReleaseTestProvider{}.Spec(), busy: CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable","details":[{"online":false}]}`}, wantCalls: 1, wantErr: true},
+		{name: "no-wait opt out", cfg: Config{Serve: ServeConfig{NoCapacityWait: true}}, spec: brokeredReleaseTestProvider{}.Spec(), busy: busyCapacityRejection, wantCalls: 1, wantErr: true},
+		{name: "fallback skips wait", cfg: Config{Serve: ServeConfig{Fallback: "aws"}}, spec: brokeredReleaseTestProvider{}.Spec(), busy: busyCapacityRejection, wantCalls: 1, wantErr: true},
+		{name: "other providers unchanged", spec: ProviderSpec{Name: "aws"}, busy: busyCapacityRejection, wantCalls: 1, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stderr bytes.Buffer
 			b := &coordinatorLeaseBackend{cfg: tc.cfg, spec: tc.spec, rt: Runtime{Stderr: &stderr}}
 			calls := 0
-			_, err := b.waitForBrokeredCapacity(t.Context(), func() (LeaseTarget, error) {
+			_, err := b.waitForBrokeredCapacity(t.Context(), func(context.Context) (LeaseTarget, error) {
 				calls++
 				if calls < 3 {
-					return LeaseTarget{}, busy
+					return LeaseTarget{}, tc.busy
 				}
 				return LeaseTarget{LeaseID: "cbx_abcdef123459"}, nil
 			})
@@ -233,17 +244,100 @@ func TestBrokeredAcquisitionWaitsForCapacity(t *testing.T) {
 	}
 }
 
-func TestBrokeredCapacityWaitStopsAtLeaseTimeout(t *testing.T) {
-	oldInitial, oldTimeout := coordinatorCapacityWaitInitialDelay, coordinatorCreateLeaseTimeoutForConfig
-	coordinatorCapacityWaitInitialDelay = time.Millisecond
-	coordinatorCreateLeaseTimeoutForConfig = func(Config) time.Duration { return 20 * time.Millisecond }
-	t.Cleanup(func() {
-		coordinatorCapacityWaitInitialDelay, coordinatorCreateLeaseTimeoutForConfig = oldInitial, oldTimeout
+func TestBrokeredCapacityWaitStopsAtBudget(t *testing.T) {
+	useFastCapacityWait(t)
+	b := &coordinatorLeaseBackend{cfg: Config{Serve: ServeConfig{CapacityWait: 20 * time.Millisecond}}, spec: brokeredReleaseTestProvider{}.Spec(), rt: Runtime{Stderr: &bytes.Buffer{}}}
+	var lastDeadline time.Time
+	started := time.Now()
+	_, err := b.waitForBrokeredCapacity(t.Context(), func(ctx context.Context) (LeaseTarget, error) {
+		lastDeadline, _ = ctx.Deadline()
+		return LeaseTarget{}, busyCapacityRejection
 	})
-	busy := CoordinatorHTTPError{StatusCode: http.StatusConflict, Message: `{"error":"serve_capacity_unavailable"}`}
-	b := &coordinatorLeaseBackend{spec: brokeredReleaseTestProvider{}.Spec(), rt: Runtime{Stderr: &bytes.Buffer{}}}
-	_, err := b.waitForBrokeredCapacity(t.Context(), func() (LeaseTarget, error) { return LeaseTarget{}, busy })
 	if !isCoordinatorCapacityUnavailable(err) {
-		t.Fatalf("err=%v; want the capacity rejection after the lease timeout", err)
+		t.Fatalf("err=%v; want the capacity rejection after the budget", err)
+	}
+	if limit := started.Add(20*time.Millisecond + coordinatorCapacityAttemptGrace + time.Second); lastDeadline.IsZero() || lastDeadline.After(limit) {
+		t.Fatalf("last attempt deadline=%v; want bounded by budget plus grace (%v)", lastDeadline, limit)
+	}
+}
+
+func TestBrokeredCapacityWaitDefaultsToTenMinutes(t *testing.T) {
+	useFastCapacityWait(t)
+	b := &coordinatorLeaseBackend{spec: brokeredReleaseTestProvider{}.Spec(), rt: Runtime{Stderr: &bytes.Buffer{}}}
+	ctx, cancel := context.WithCancel(t.Context())
+	var deadline time.Time
+	calls := 0
+	_, _ = b.waitForBrokeredCapacity(ctx, func(attemptCtx context.Context) (LeaseTarget, error) {
+		calls++
+		if calls == 2 {
+			deadline, _ = attemptCtx.Deadline()
+			cancel()
+		}
+		return LeaseTarget{}, busyCapacityRejection
+	})
+	if want := time.Now().Add(10*time.Minute + coordinatorCapacityAttemptGrace); deadline.IsZero() || deadline.After(want) || deadline.Before(want.Add(-time.Minute)) {
+		t.Fatalf("attempt deadline=%v; want about %v", deadline, want)
+	}
+}
+
+func TestBrokeredCapacityWaitHonorsContextCancellation(t *testing.T) {
+	oldInitial := coordinatorCapacityWaitInitialDelay
+	coordinatorCapacityWaitInitialDelay = time.Hour
+	t.Cleanup(func() { coordinatorCapacityWaitInitialDelay = oldInitial })
+	b := &coordinatorLeaseBackend{spec: brokeredReleaseTestProvider{}.Spec(), rt: Runtime{Stderr: &bytes.Buffer{}}}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	calls := 0
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.waitForBrokeredCapacity(ctx, func(context.Context) (LeaseTarget, error) {
+			calls++
+			return LeaseTarget{}, busyCapacityRejection
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) || calls != 1 {
+			t.Fatalf("err=%v calls=%d; want context deadline after one attempt", err, calls)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("capacity wait ignored context cancellation")
+	}
+}
+
+func TestServeCapacityWaitEnvironment(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("CRABBOX_SERVE_CAPACITY_WAIT", "90s")
+	t.Setenv("CRABBOX_SERVE_NO_WAIT", "true")
+	cfg := baseConfig()
+	if err := applyEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Serve.CapacityWait != 90*time.Second || !cfg.Serve.NoCapacityWait {
+		t.Fatalf("serve=%+v; want capacityWait=90s noCapacityWait=true", cfg.Serve)
+	}
+	t.Setenv("CRABBOX_SERVE_CAPACITY_WAIT", "-1s")
+	if err := applyEnv(&cfg); err == nil {
+		t.Fatal("negative CRABBOX_SERVE_CAPACITY_WAIT accepted")
+	}
+}
+
+func TestServeCapacityWaitConfigFile(t *testing.T) {
+	clearConfigEnv(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("serve:\n  capacityWait: 3m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := readFileConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	if err := applyFileConfig(&cfg, file); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Serve.CapacityWait != 3*time.Minute {
+		t.Fatalf("capacityWait=%s; want 3m", cfg.Serve.CapacityWait)
 	}
 }

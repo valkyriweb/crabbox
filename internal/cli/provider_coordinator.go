@@ -238,9 +238,9 @@ func (b *coordinatorLeaseBackend) Acquire(ctx context.Context, req AcquireReques
 		}
 		return acquired, nil
 	}
-	lease, err := b.waitForBrokeredCapacity(ctx, func() (LeaseTarget, error) {
+	lease, err := b.waitForBrokeredCapacity(ctx, func(attemptCtx context.Context) (LeaseTarget, error) {
 		return acquireAttemptsRetry(b.rt, req.Keep, func() (LeaseTarget, error) {
-			return b.acquireOnce(ctx, req.Keep, req.RequestedSlug)
+			return b.acquireOnce(attemptCtx, req.Keep, req.RequestedSlug)
 		})
 	})
 	if err == nil {
@@ -1573,36 +1573,71 @@ func (b *coordinatorLeaseBackend) ExtendLease(ctx context.Context, req LeaseExte
 var (
 	coordinatorCapacityWaitInitialDelay = 5 * time.Second
 	coordinatorCapacityWaitMaxDelay     = 30 * time.Second
+	coordinatorCapacityWaitDefault      = 10 * time.Minute
+	// coordinatorCapacityAttemptGrace lets an attempt that starts near the end
+	// of the wait budget finish provisioning without running a full
+	// coordinator HTTP timeout past the budget.
+	coordinatorCapacityAttemptGrace = 5 * time.Minute
 )
 
 // waitForBrokeredCapacity retries a brokered-only acquisition (serve) while
 // the coordinator reports every donor busy. A 409 serve_capacity_unavailable
-// commits nothing, so each retry is a fresh create. The wait shares the
-// coordinator lease timeout; --serve-fallback or --serve-no-wait opt out.
-func (b *coordinatorLeaseBackend) waitForBrokeredCapacity(ctx context.Context, acquire func() (LeaseTarget, error)) (LeaseTarget, error) {
-	lease, err := acquire()
+// commits nothing, so each retry is a fresh create. serve.capacityWait bounds
+// the wait; --serve-fallback or --serve-no-wait opt out, and a rejection that
+// lists no online machine fails at once because no donor is there to free up.
+func (b *coordinatorLeaseBackend) waitForBrokeredCapacity(ctx context.Context, acquire func(context.Context) (LeaseTarget, error)) (LeaseTarget, error) {
+	lease, err := acquire(ctx)
 	if !b.spec.BrokeredOnly || b.cfg.Serve.Fallback != "" || b.cfg.Serve.NoCapacityWait {
 		return lease, err
 	}
 	started := time.Now()
-	timeout := coordinatorCreateLeaseTimeoutForConfig(b.cfg)
+	budget := b.cfg.Serve.CapacityWait
+	if budget <= 0 {
+		budget = coordinatorCapacityWaitDefault
+	}
+	attemptCtx, cancel := context.WithDeadline(ctx, started.Add(budget+coordinatorCapacityAttemptGrace))
+	defer cancel()
 	delay := coordinatorCapacityWaitInitialDelay
-	for err != nil && isCoordinatorCapacityUnavailable(err) {
-		remaining := timeout - time.Since(started)
+	for err != nil && isCoordinatorCapacityUnavailable(err) && coordinatorCapacityHasOnlineMachine(err) {
+		remaining := budget - time.Since(started)
 		if remaining <= 0 {
 			return lease, err
 		}
 		wait := min(delay, remaining)
-		fmt.Fprintf(b.rt.Stderr, "waiting for coordinator lease provider=%s elapsed=%s timeout=%s phase=%q retry_in=%s\n", b.spec.Name, time.Since(started).Round(time.Second), timeout, "awaiting-capacity", wait.Round(time.Second))
+		fmt.Fprintf(b.rt.Stderr, "waiting for coordinator lease provider=%s elapsed=%s timeout=%s phase=%q retry_in=%s\n", b.spec.Name, time.Since(started).Round(time.Second), budget, "awaiting-capacity", wait.Round(time.Second))
 		if sleepErr := sleepContext(ctx, wait); sleepErr != nil {
 			return LeaseTarget{}, errors.Join(sleepErr, err)
 		}
 		delay = min(delay*2, coordinatorCapacityWaitMaxDelay)
-		lease, err = acquire()
+		lease, err = acquire(attemptCtx)
 	}
 	return lease, err
 }
 
 func isCoordinatorCapacityUnavailable(err error) bool {
 	return coordinatorResponseErrorCode(err, http.StatusConflict) == "serve_capacity_unavailable"
+}
+
+// coordinatorCapacityHasOnlineMachine reads the per-machine views the
+// coordinator attaches to a capacity rejection. Without parseable details it
+// assumes a busy donor so older coordinators keep waiting.
+func coordinatorCapacityHasOnlineMachine(err error) bool {
+	var httpErr CoordinatorHTTPError
+	if !errors.As(err, &httpErr) {
+		return true
+	}
+	var body struct {
+		Details *[]struct {
+			Online bool `json:"online"`
+		} `json:"details"`
+	}
+	if json.Unmarshal([]byte(httpErr.Message), &body) != nil || body.Details == nil {
+		return true
+	}
+	for _, machine := range *body.Details {
+		if machine.Online {
+			return true
+		}
+	}
+	return false
 }
