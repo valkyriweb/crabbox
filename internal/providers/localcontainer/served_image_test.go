@@ -257,6 +257,9 @@ func TestServedPrepare(t *testing.T) {
 						} else {
 							prepRuns++
 							temp = a[2]
+							if unset := strings.Contains(strings.Join(a, " "), "--unsetenv container"); unset != (runtimeName == "podman") {
+								t.Fatalf("runtime=%s unsetenv=%v args=%v", runtimeName, unset, a)
+							}
 							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
 								t.Fatal("invalid preparation script")
 							}

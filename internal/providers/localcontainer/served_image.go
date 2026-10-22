@@ -163,6 +163,11 @@ func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id 
 		}
 	}()
 	args := []string{"run", "--name", name}
+	// Podman injects container=podman into every container's environment and
+	// commit persists it, which fails the base-environment check below.
+	if isPodmanRuntime(r.b.cfg.LocalContainer.Runtime) {
+		args = append(args, "--unsetenv", "container")
+	}
 	// Avoid overriding empty defaults: Docker commit merges empty --change values
 	// back from the temporary container rather than clearing them.
 	if base.Config.User != "" {
