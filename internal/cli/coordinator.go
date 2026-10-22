@@ -66,10 +66,10 @@ type CoordinatorHTTPError struct {
 }
 
 // Message keeps the whole error body so structured rejections stay parseable
-// (serve capacity details list a full view per donor); only the rendered
-// error is capped.
+// (serve capacity details list a full view for each of up to 64 donors); only
+// the rendered error is capped.
 const (
-	coordinatorErrorBodyLimit    = 64 << 10
+	coordinatorErrorBodyLimit    = 1 << 20
 	coordinatorErrorDisplayLimit = 600
 )
 
