@@ -245,6 +245,62 @@ func TestBrokeredAcquisitionWaitsForCapacity(t *testing.T) {
 	}
 }
 
+// The live coordinator attaches a full machine view per donor, so one busy
+// donor already pushes the rejection past the client's diagnostic cap.
+func TestBrokeredAcquisitionWaitsOnFullSizeCapacityRejection(t *testing.T) {
+	isolateTestUserDirs(t)
+	useFastCapacityWait(t)
+	machine := map[string]any{
+		"availability":       map[string]any{"state": "available", "reasons": []string{}, "memoryPressure": "normal", "power": "ac"},
+		"image":              "docker.io/library/ubuntu@sha256:" + strings.Repeat("2", 64),
+		"machineID":          "0572ef29-5f18-4b8e-a1ba-67c1c0b45c22",
+		"frontDoor":          map[string]any{"port": 2222, "hostKey": "ssh-ed25519 " + strings.Repeat("A", 68), "relay": true, "candidates": []map[string]any{{"address": "192.0.2.10", "kind": "external"}}},
+		"name":               "rp-kube-01",
+		"cpus":               8,
+		"memoryMB":           16384,
+		"maxLeases":          1,
+		"online":             true,
+		"freeCPUs":           0,
+		"allocatedLeases":    1,
+		"allocatedLeaseRefs": []map[string]any{{"id": "cbx_0123456789ab", "slug": "golden-shrimp-bfe9c67a", "state": "active"}},
+	}
+	body, err := json.Marshal(struct {
+		Error   string `json:"error"`
+		Details []any  `json:"details"`
+	}{"serve_capacity_unavailable", []any{machine}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) <= 600 {
+		t.Fatalf("fixture body is %d bytes; it must exceed the 600-byte display cap", len(body))
+	}
+	var creates atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/leases" {
+			http.NotFound(w, r)
+			return
+		}
+		creates.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	cfg := baseConfig()
+	cfg.Provider = brokeredReleaseTestProviderName
+	cfg.Coordinator, cfg.CoordToken = server.URL, "synthetic-token"
+	cfg.Serve.CapacityWait = 20 * time.Millisecond
+	var stderr bytes.Buffer
+	b := &coordinatorLeaseBackend{cfg: cfg, spec: brokeredReleaseTestProvider{}.Spec(), coord: mustNewCoordinatorClient(t, cfg), rt: Runtime{Stderr: &stderr}}
+	_, err = b.Acquire(t.Context(), AcquireRequest{})
+	if creates.Load() < 2 || !strings.Contains(stderr.String(), `phase="awaiting-capacity"`) {
+		t.Fatalf("creates=%d; want a capacity wait with retries\nerr=%v\nstderr:\n%s", creates.Load(), err, stderr.String())
+	}
+	if !isCoordinatorCapacityUnavailable(err) {
+		t.Fatalf("err=%v; want the capacity rejection once the budget runs out", err)
+	}
+}
+
 func TestBrokeredCapacityWaitStopsAtBudget(t *testing.T) {
 	useFastCapacityWait(t)
 	b := &coordinatorLeaseBackend{cfg: Config{Serve: ServeConfig{CapacityWait: 20 * time.Millisecond}}, spec: brokeredReleaseTestProvider{}.Spec(), rt: Runtime{Stderr: &bytes.Buffer{}}}
