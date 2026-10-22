@@ -104,8 +104,17 @@ supported served sizes.
 
 `--type cpu4` requests four CPUs and 8 GiB. Requests must fit the offer and
 remaining reservations. Placement prefers the most free CPU; use
-`--serve-machine <name-or-UUID>` to pin a machine. No capacity fails immediately
-with `serve_capacity_unavailable`, including owner-visible machine capacity.
+`--serve-machine <name-or-UUID>` to pin a machine. When no machine has capacity
+the coordinator returns `serve_capacity_unavailable`; the CLI then waits and
+retries with backoff (5s doubling to 30s) for up to 10 minutes, printing
+`phase="awaiting-capacity"` progress. Set `serve.capacityWait` or
+`CRABBOX_SERVE_CAPACITY_WAIT` (a duration such as `3m`) to change the budget.
+After the budget expires, an attempt already in flight may run up to 5 more
+minutes (`grace=5m0s` in the log line), so the worst case is about budget + 5 min.
+Pass `--serve-no-wait` (or set `serve.noCapacityWait: true` or
+`CRABBOX_SERVE_NO_WAIT=1`) to fail immediately. The CLI also fails immediately
+when the rejection lists no online machine, since no busy donor can free up. A
+configured fallback skips the wait and retries on the fallback provider instead.
 
 Optional fallback applies only to that explicit capacity rejection:
 

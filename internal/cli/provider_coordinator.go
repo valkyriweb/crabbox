@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -237,8 +238,10 @@ func (b *coordinatorLeaseBackend) Acquire(ctx context.Context, req AcquireReques
 		}
 		return acquired, nil
 	}
-	lease, err := acquireAttemptsRetry(b.rt, req.Keep, func() (LeaseTarget, error) {
-		return b.acquireOnce(ctx, req.Keep, req.RequestedSlug)
+	lease, err := b.waitForBrokeredCapacity(ctx, func(attemptCtx context.Context) (LeaseTarget, error) {
+		return acquireAttemptsRetry(b.rt, req.Keep, func() (LeaseTarget, error) {
+			return b.acquireOnce(attemptCtx, req.Keep, req.RequestedSlug)
+		})
 	})
 	if err == nil {
 		return lease, nil
@@ -1283,9 +1286,42 @@ func (b *coordinatorLeaseBackend) releaseLease(ctx context.Context, req ReleaseL
 		if err := AuthorizeCheckpointRelease(authority, req.CheckpointID); err != nil {
 			return false, err
 		}
-		return b.releaseLeaseUnderClaimFence(ctx, req, outcome)
+		remove, err := b.releaseLeaseUnderClaimFence(ctx, req, outcome)
+		if err != nil && exists && b.spec.BrokeredOnly && b.brokeredLeaseConfirmedAbsent(ctx, err, req.Lease.LeaseID) {
+			// Brokered-only providers (serve) run only what the coordinator
+			// assigns, so a lease the coordinator no longer has holds nothing remote.
+			fmt.Fprintf(b.rt.Stderr, "coordinator has no %s lease %s; removing local claim\n", b.spec.Name, req.Lease.LeaseID)
+			outcome.ForgottenLocally = true
+			return true, cleanupReleasedCoordinatorLeaseArtifacts(ctx, b.rt.Stderr, req.Lease.LeaseID)
+		}
+		return remove, err
 	}, syncControllerDirectory)
 }
+
+// brokeredLeaseConfirmedAbsent accepts only the lease route's typed
+// not_found answer, then confirms it with a lease read. The serve release
+// handler also answers not_found on an owner or org mismatch after the fleet
+// manage check passed; the lease read still finds such a lease, so the claim
+// stays.
+func (b *coordinatorLeaseBackend) brokeredLeaseConfirmedAbsent(ctx context.Context, err error, leaseID string) bool {
+	if !isCoordinatorLeaseNotFound(err, leaseID) {
+		return false
+	}
+	_, getErr := b.coord.GetLease(ctx, leaseID)
+	return isCoordinatorLeaseNotFound(getErr, leaseID)
+}
+
+func isCoordinatorLeaseNotFound(err error, leaseID string) bool {
+	var httpErr CoordinatorHTTPError
+	if !errors.As(err, &httpErr) || !strings.HasPrefix(httpErr.Path, "/v1/leases/"+url.PathEscape(leaseID)) {
+		return false
+	}
+	return coordinatorResponseErrorCode(err, http.StatusNotFound) == "not_found"
+}
+
+// brokeredReleaseObservationTimeout bounds the deferred-release wait for a
+// serve donor heartbeat to confirm container removal.
+var brokeredReleaseObservationTimeout = 30 * time.Second
 
 func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Context, req ReleaseLeaseRequest, outcome *ReleaseLeaseOutcome) (bool, error) {
 	if req.Lease.LeaseID == "" {
@@ -1387,6 +1423,16 @@ func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Contex
 		}
 		if coordinatorProviderReleaseConfirmed(released) {
 			return finish()
+		}
+		if b.spec.BrokeredOnly && coordinatorReleaseCleanupPending(released) && !coordinatorReleaseCleanupFailed(released) {
+			// Serve donors confirm cleanup on their next heartbeat, so a short
+			// observation usually lets the local claim go with the lease.
+			observeCtx, cancel := context.WithTimeout(ctx, brokeredReleaseObservationTimeout)
+			observed, observeErr := observeCoordinatorReleaseCompletion(observeCtx, observationCoord, released, req.Lease.LeaseID, expectedProvider, release)
+			cancel()
+			if observeErr == nil && coordinatorProviderReleaseConfirmed(observed) {
+				return finish()
+			}
 		}
 		if coordinatorReleaseCleanupFailed(released) || coordinatorReleaseCleanupPending(released) || coordinatorExpiryCleanupCompleted(released) {
 			fmt.Fprintf(b.rt.Stderr, "warning: coordinator accepted release for %s; remote cleanup remains pending and local claim/SSH artifacts were preserved\n", req.Lease.LeaseID)
@@ -1522,4 +1568,76 @@ func (b *coordinatorLeaseBackend) ExtendLease(ctx context.Context, req LeaseExte
 		runtimeExtension = lease.LeasePolicy.RuntimeExtension
 	}
 	return leaseExtendResult(lease.ID, lease.ExpiresAt, maximum, runtimeExtension), nil
+}
+
+var (
+	coordinatorCapacityWaitInitialDelay = 5 * time.Second
+	coordinatorCapacityWaitMaxDelay     = 30 * time.Second
+	coordinatorCapacityWaitDefault      = 10 * time.Minute
+	// coordinatorCapacityAttemptGrace lets an attempt that starts near the end
+	// of the wait budget finish provisioning without running a full
+	// coordinator HTTP timeout past the budget.
+	coordinatorCapacityAttemptGrace = 5 * time.Minute
+)
+
+// waitForBrokeredCapacity retries a brokered-only acquisition (serve) while
+// the coordinator reports every donor busy. A 409 serve_capacity_unavailable
+// commits nothing, so each retry is a fresh create. serve.capacityWait bounds
+// the wait; --serve-fallback or --serve-no-wait opt out, and a rejection that
+// lists no online machine fails at once because no donor is there to free up.
+func (b *coordinatorLeaseBackend) waitForBrokeredCapacity(ctx context.Context, acquire func(context.Context) (LeaseTarget, error)) (LeaseTarget, error) {
+	lease, err := acquire(ctx)
+	if !b.spec.BrokeredOnly || b.cfg.Serve.Fallback != "" || b.cfg.Serve.NoCapacityWait {
+		return lease, err
+	}
+	started := time.Now()
+	budget := b.cfg.Serve.CapacityWait
+	if budget <= 0 {
+		budget = coordinatorCapacityWaitDefault
+	}
+	attemptCtx, cancel := context.WithDeadline(ctx, started.Add(budget+coordinatorCapacityAttemptGrace))
+	defer cancel()
+	delay := coordinatorCapacityWaitInitialDelay
+	for err != nil && isCoordinatorCapacityUnavailable(err) && coordinatorCapacityHasOnlineMachine(err) {
+		remaining := budget - time.Since(started)
+		if remaining <= 0 {
+			return lease, err
+		}
+		wait := min(delay, remaining)
+		fmt.Fprintf(b.rt.Stderr, "waiting for coordinator lease provider=%s elapsed=%s timeout=%s grace=%s phase=%q retry_in=%s\n", b.spec.Name, time.Since(started).Round(time.Second), budget, coordinatorCapacityAttemptGrace, "awaiting-capacity", wait.Round(time.Second))
+		if sleepErr := sleepContext(ctx, wait); sleepErr != nil {
+			return LeaseTarget{}, errors.Join(sleepErr, err)
+		}
+		delay = min(delay*2, coordinatorCapacityWaitMaxDelay)
+		lease, err = acquire(attemptCtx)
+	}
+	return lease, err
+}
+
+func isCoordinatorCapacityUnavailable(err error) bool {
+	return coordinatorResponseErrorCode(err, http.StatusConflict) == "serve_capacity_unavailable"
+}
+
+// coordinatorCapacityHasOnlineMachine reads the per-machine views the
+// coordinator attaches to a capacity rejection. Without parseable details it
+// assumes a busy donor so older coordinators keep waiting.
+func coordinatorCapacityHasOnlineMachine(err error) bool {
+	var httpErr CoordinatorHTTPError
+	if !errors.As(err, &httpErr) {
+		return true
+	}
+	var body struct {
+		Details *[]struct {
+			Online bool `json:"online"`
+		} `json:"details"`
+	}
+	if json.Unmarshal([]byte(httpErr.Message), &body) != nil || body.Details == nil {
+		return true
+	}
+	for _, machine := range *body.Details {
+		if machine.Online {
+			return true
+		}
+	}
+	return false
 }

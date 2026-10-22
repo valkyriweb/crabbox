@@ -1750,6 +1750,8 @@ type ServeConfig struct {
 	SSHPort            int                     `yaml:"sshPort,omitempty"`
 	Machine            string                  `yaml:"machine,omitempty"`
 	Fallback           string                  `yaml:"fallback,omitempty"`
+	NoCapacityWait     bool                    `yaml:"noCapacityWait,omitempty"`
+	CapacityWait       time.Duration           `yaml:"capacityWait,omitempty"`
 }
 
 type ServeAvailabilityConfig struct {
@@ -3991,6 +3993,20 @@ func applyEnv(cfg *Config) error {
 
 	cfg.Serve.Machine = getenv("CRABBOX_SERVE_MACHINE", cfg.Serve.Machine)
 	cfg.Serve.Fallback = getenv("CRABBOX_SERVE_FALLBACK", cfg.Serve.Fallback)
+	if value, ok := os.LookupEnv("CRABBOX_SERVE_CAPACITY_WAIT"); ok {
+		wait, err := time.ParseDuration(strings.TrimSpace(value))
+		if err != nil || wait < 0 {
+			return fmt.Errorf("CRABBOX_SERVE_CAPACITY_WAIT must be a non-negative duration")
+		}
+		cfg.Serve.CapacityWait = wait
+	}
+	if value, ok := os.LookupEnv("CRABBOX_SERVE_NO_WAIT"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("CRABBOX_SERVE_NO_WAIT must be a boolean")
+		}
+		cfg.Serve.NoCapacityWait = parsed
+	}
 	if v := os.Getenv("CRABBOX_SERVE_SSH_PORT"); v != "" {
 		var err error
 		cfg.Serve.SSHPort, err = strconv.Atoi(v)
