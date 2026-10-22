@@ -109,6 +109,8 @@ the coordinator returns `serve_capacity_unavailable`; the CLI then waits and
 retries with backoff (5s doubling to 30s) for up to 10 minutes, printing
 `phase="awaiting-capacity"` progress. Set `serve.capacityWait` or
 `CRABBOX_SERVE_CAPACITY_WAIT` (a duration such as `3m`) to change the budget.
+After the budget expires, an attempt already in flight may run up to 5 more
+minutes (`grace=5m0s` in the log line), so the worst case is about budget + 5 min.
 Pass `--serve-no-wait` (or set `serve.noCapacityWait: true` or
 `CRABBOX_SERVE_NO_WAIT=1`) to fail immediately. The CLI also fails immediately
 when the rejection lists no online machine, since no busy donor can free up. A

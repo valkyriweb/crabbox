@@ -1604,7 +1604,7 @@ func (b *coordinatorLeaseBackend) waitForBrokeredCapacity(ctx context.Context, a
 			return lease, err
 		}
 		wait := min(delay, remaining)
-		fmt.Fprintf(b.rt.Stderr, "waiting for coordinator lease provider=%s elapsed=%s timeout=%s phase=%q retry_in=%s\n", b.spec.Name, time.Since(started).Round(time.Second), budget, "awaiting-capacity", wait.Round(time.Second))
+		fmt.Fprintf(b.rt.Stderr, "waiting for coordinator lease provider=%s elapsed=%s timeout=%s grace=%s phase=%q retry_in=%s\n", b.spec.Name, time.Since(started).Round(time.Second), budget, coordinatorCapacityAttemptGrace, "awaiting-capacity", wait.Round(time.Second))
 		if sleepErr := sleepContext(ctx, wait); sleepErr != nil {
 			return LeaseTarget{}, errors.Join(sleepErr, err)
 		}
