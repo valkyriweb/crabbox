@@ -169,6 +169,12 @@ func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id 
 	if isPodmanRuntime(r.b.cfg.LocalContainer.Runtime) && !slices.ContainsFunc(base.Config.Env, func(env string) bool { return strings.HasPrefix(env, "container=") }) {
 		args = append(args, "--unsetenv", "container")
 	}
+	// Podman also copies the agent's HTTP(S)_PROXY/NO_PROXY variables into the
+	// container (http_proxy=true by default) and commit persists them, which
+	// fails the same check whenever the agent runs behind a proxy.
+	if isPodmanRuntime(r.b.cfg.LocalContainer.Runtime) {
+		args = append(args, "--http-proxy=false")
+	}
 	// Avoid overriding empty defaults: Docker commit merges empty --change values
 	// back from the temporary container rather than clearing them.
 	if base.Config.User != "" {
