@@ -168,3 +168,10 @@ provider, including:
 
 The `--provider` value accepts any registered provider name or alias; run
 [`crabbox providers`](providers.md) to see the full set.
+
+Coordinator leases show who created them: `owner=` is the authenticated
+account, and `session=`, `client_host=`, and `agent=` come from the creating
+client. The CLI reads the session from `CRABBOX_SESSION_ID` (or a common agent
+session variable), the agent from `CRABBOX_AGENT` or `AI_AGENT`, and the host
+from `CRABBOX_CLIENT_HOST` or the hostname. These values are display metadata,
+not authorization. Leases created by older clients omit them.

@@ -30,6 +30,22 @@ import {
 import { gcpProvisioningCandidatesForConfig } from "../src/gcp";
 import { hetznerProvisioningCandidatesForConfig } from "../src/hetzner";
 
+describe("lease client identity", () => {
+  it("keeps bounded printable creator metadata and omits empty identity", () => {
+    const input = { provider: "aws" as const, sshPublicKey: "ssh-ed25519 test" };
+    expect(leaseConfig(input).clientIdentity).toBeUndefined();
+    expect(
+      leaseConfig({
+        ...input,
+        clientIdentity: { session: "s-1", host: "ci host\n", agent: "a".repeat(300) },
+      }).clientIdentity,
+    ).toEqual({ session: "s-1", host: "cihost", agent: "a".repeat(128) });
+    expect(
+      leaseConfig({ ...input, clientIdentity: { session: " " } as never }).clientIdentity,
+    ).toBeUndefined();
+  });
+});
+
 describe("machine class config", () => {
   it("normalizes optional resource minimums without changing unconstrained config", () => {
     const input = { provider: "aws" as const, sshPublicKey: "ssh-ed25519 test" };

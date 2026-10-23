@@ -324,7 +324,7 @@ func (b *coordinatorLeaseBackend) acquireOnceWithLeaseID(ctx context.Context, ke
 	}
 	cfg.AWSSSHCIDRsPinned = len(cfg.AWSSSHCIDRs) > 0
 	ensureAWSSSHCIDRs(ctx, &cfg)
-	fmt.Fprintf(b.rt.Stderr, "coordinator lease class=%s preferred_type=%s keep=%v slug=%s idle_timeout=%s ttl=%s\n", cfg.Class, cfg.ServerType, keep, slug, cfg.IdleTimeout, cfg.TTL)
+	fmt.Fprintf(b.rt.Stderr, "coordinator lease %s keep=%v slug=%s idle_timeout=%s ttl=%s\n", coordinatorLeaseSizeSummary(cfg), keep, slug, cfg.IdleTimeout, cfg.TTL)
 	lease, err := b.createCoordinatorLeaseWithProgressMode(ctx, cfg, publicKey, keep, leaseID, slug, requestedLeaseID != "")
 	if err != nil {
 		if requestedLeaseID == "" {

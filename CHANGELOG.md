@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Coordinator leases record the creating session, host, and agent, and `list`/`status` show them with the owner so long-lived `keep=true` leases are attributable.
+- The coordinator lease log no longer reports the default class as the size when `--type` is explicit; it prints `class=- type=<type> fallback_class=<class>`.
+
 ## 0.79.0 - 2026-10-19
 
 ### Highlights

@@ -218,7 +218,14 @@ export interface CapacityRequirements {
   minMemoryMiB?: number;
 }
 
+export interface LeaseClientIdentity {
+  session?: string;
+  host?: string;
+  agent?: string;
+}
+
 export interface LeaseRequest {
+  clientIdentity?: LeaseClientIdentity;
   serveMachine?: string;
   lifetimePolicy?: import("./lease-lifetime").LeaseLifetimeRequest;
   leaseID?: string;
@@ -503,6 +510,7 @@ export interface HetznerCleanupEvidence {
 export type ProviderCleanupEvidence = HetznerCleanupEvidence;
 
 export interface LeaseRecord {
+  clientIdentity?: LeaseClientIdentity;
   leasePolicy?: import("./config").LeasePolicy;
   policyNotice?: string;
   extensionHistory?: {

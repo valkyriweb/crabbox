@@ -1261,6 +1261,16 @@ describe("fleet cleanup inspection", () => {
       },
     );
 
+    it("keeps fixed lease identity independent of the creating client", async () => {
+      const input = { provider: "aws" as const, sshPublicKey: "ssh-ed25519 test" };
+      expect(
+        await fixedLeaseCreateIntentHash(
+          leaseConfig({ ...input, clientIdentity: { session: "s-1", host: "h" } }),
+          "client-test",
+        ),
+      ).toBe(await fixedLeaseCreateIntentHash(leaseConfig(input), "client-test"));
+    });
+
     it("keeps legacy fixed lease identity when resource minimums are omitted or zero", async () => {
       const input = { provider: "aws" as const, sshPublicKey: "ssh-ed25519 test" };
       const original = await fixedLeaseCreateIntentHash(leaseConfig(input), "capacity-test");

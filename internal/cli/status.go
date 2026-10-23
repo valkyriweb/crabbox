@@ -118,6 +118,7 @@ func (a App) status(ctx context.Context, args []string) error {
 				telemetry += fmt.Sprintf(" provisioning_phase=%q", state.ProvisioningPhase)
 			}
 			telemetry += lifetimePolicySummary(state.LifetimePolicy)
+			telemetry += leaseOwnerSummary(state.Labels)
 			printStatusLifetime(a.Stdout, state)
 			fmt.Fprintf(a.Stdout, "%s slug=%s provider=%s target=%s windows_mode=%s state=%s type=%s host=%s pond=%s network=%s%s ready=%t has_host=%t idle_for=%s idle_timeout=%s expires=%s%s\n", state.ID, blank(state.Slug, "-"), state.Provider, state.TargetOS, blank(state.WindowsMode, "-"), state.State, state.ServerType, state.Host, blank(state.Pond, "-"), state.Network, tailscale, state.Ready, state.HasHost, blank(state.IdleFor, "-"), blank(state.IdleTimeout, "-"), blank(state.ExpiresAt, "-"), telemetry)
 		}
