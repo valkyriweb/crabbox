@@ -160,6 +160,7 @@ type CoordinatorLease struct {
 	SSHFallbackPorts             []string                       `json:"sshFallbackPorts,omitempty"`
 	WorkRoot                     string                         `json:"workRoot"`
 	Keep                         bool                           `json:"keep"`
+	ClientIdentity               *LeaseClientIdentity           `json:"clientIdentity,omitempty"`
 	State                        string                         `json:"state"`
 	TTLSeconds                   int                            `json:"ttlSeconds,omitempty"`
 	IdleTimeoutSeconds           int                            `json:"idleTimeoutSeconds,omitempty"`
@@ -1257,6 +1258,9 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 	}
 	if cfg.LifetimePolicy != nil {
 		req["lifetimePolicy"] = cfg.LifetimePolicy
+	}
+	if identity := currentLeaseClientIdentity(); identity != nil {
+		req["clientIdentity"] = identity
 	}
 	nativePlacement := false
 	if policy, ok := provider.(CoordinatorArchitecturePolicy); ok {
@@ -3129,6 +3133,7 @@ func leaseToServerTarget(lease CoordinatorLease, cfg Config) (Server, SSHTarget,
 			"idle_timeout_secs": fmt.Sprint(lease.IdleTimeoutSeconds),
 		},
 	}
+	applyLeaseOwnerLabels(server.Labels, lease)
 	if market := strings.TrimSpace(lease.Market); market != "" {
 		server.Labels["market"] = market
 	}

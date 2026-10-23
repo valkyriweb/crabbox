@@ -4720,6 +4720,9 @@ export class FleetCoordinator {
       if (config.exposedPorts.length > 0) {
         record.exposedPorts = config.exposedPorts;
       }
+      if (config.clientIdentity) {
+        record.clientIdentity = config.clientIdentity;
+      }
       if (config.tailscale) {
         record.tailscale = {
           enabled: true,
@@ -5480,6 +5483,7 @@ export class FleetCoordinator {
           : {}),
         ...(config.pond ? { pond: config.pond } : {}),
         ...(config.exposedPorts.length ? { exposedPorts: config.exposedPorts } : {}),
+        ...(config.clientIdentity ? { clientIdentity: config.clientIdentity } : {}),
       },
       config,
     );
@@ -20721,6 +20725,7 @@ export class FleetCoordinator {
       browser: lease.browser,
       code: lease.code,
       owner: lease.owner,
+      clientIdentity: lease.clientIdentity,
       org: orgLabelForDisplay(lease.org),
       profile: lease.profile,
       class: lease.class,
@@ -27542,6 +27547,7 @@ export async function fixedLeaseCreateIntentHash(
   delete semanticConfig["sshHostPrivateKey"];
   delete semanticConfig["sshHostPublicKey"];
   delete semanticConfig["sshPublicKey"];
+  delete semanticConfig["clientIdentity"];
   if (!config.awsSSHCIDRsPinned) {
     semanticConfig["awsSSHCIDRs"] = [];
   }
