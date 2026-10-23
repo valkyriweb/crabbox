@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -263,6 +264,9 @@ func TestServedPrepare(t *testing.T) {
 							wantUnset := runtimeName == "podman" && mode != "image-container-env"
 							if unset := len(a) > 4 && a[3] == "--unsetenv" && a[4] == "container"; unset != wantUnset {
 								t.Fatalf("runtime=%s unsetenv=%v args=%v", runtimeName, unset, a)
+							}
+							if noProxy := slices.Contains(a, "--http-proxy=false"); noProxy != (runtimeName == "podman") {
+								t.Fatalf("runtime=%s http-proxy=false=%v args=%v", runtimeName, noProxy, a)
 							}
 							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
 								t.Fatal("invalid preparation script")
