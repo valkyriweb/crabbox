@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Coordinator leases record the creating session, host, and agent, and `list`/`status` show them with the owner so long-lived `keep=true` leases are attributable.
-- The coordinator lease log no longer reports the default class as the size when `--type` is explicit; it prints `class=- type=<type> fallback_class=<class>`.
+- Coordinator leases record the creating session, host, and agent, and `list`/`status` show them with the owner so long-lived `keep=true` leases are attributable. [PR 8](https://github.com/valkyriweb/crabbox/pull/8)
+- The coordinator lease log no longer reports the default class as the size when `--type` is explicit; it prints `class=- type=<type> fallback_class=<class>`. [PR 8](https://github.com/valkyriweb/crabbox/pull/8)
 
 ## 0.79.0 - 2026-10-19
 
