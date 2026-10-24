@@ -255,6 +255,9 @@ func TestServedPrepare(t *testing.T) {
 							if !strings.Contains(a[len(a)-1], bootstrapTools) {
 								t.Fatal("missing tool probe")
 							}
+							if !strings.Contains(a[len(a)-1], "node --version") || !strings.Contains(a[len(a)-1], servedNodeVersion) {
+								t.Fatal("tool probe must require the pinned node version")
+							}
 							if mode == "probe-failure" {
 								return core.LocalCommandResult{}, errors.New("probe failed")
 							}
@@ -476,7 +479,7 @@ func TestServedPrunesImagesEvenWhenCacheVolumeRemovalFails(t *testing.T) {
 }
 
 func TestServedNodeInstallScriptPinsAndVerifies(t *testing.T) {
-	for _, want := range []string{"node_version=v24.", "eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c", "33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3", "https://nodejs.org/dist/", "sha256sum -c -", "/opt/node", "/usr/local/bin"} {
+	for _, want := range []string{"node_version=" + servedNodeVersion, "eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c", "33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3", "https://nodejs.org/dist/", "sha256sum -c -", "/opt/node", "/usr/local/bin"} {
 		if !strings.Contains(servedNodeInstallScript, want) {
 			t.Fatalf("node install script missing %q", want)
 		}

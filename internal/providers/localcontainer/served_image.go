@@ -16,11 +16,15 @@ import (
 // v2 adds the pinned Node.js toolchain; the bump invalidates v1 prepared images.
 const servedPreparationRecipe = "v2"
 
+// servedNodeVersion is the pinned Node.js release; the readiness probe and the
+// install script must agree on it.
+const servedNodeVersion = "v24.22.1"
+
 // servedNodeInstallScript installs the pinned official Node.js tarball under
 // /opt/node and links it into /usr/local/bin, which is on PATH for login and
 // non-login SSH sessions. It is idempotent and fails closed (set -eu) when the
 // architecture is unsupported or the SHA256 does not match.
-const servedNodeInstallScript = `node_version=v24.22.1
+const servedNodeInstallScript = `node_version=` + servedNodeVersion + `
 case "$(uname -m)" in
   x86_64|amd64) node_arch=x64; node_sha256=eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c ;;
   aarch64|arm64) node_arch=arm64; node_sha256=33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3 ;;
@@ -157,7 +161,7 @@ func (r *ServedRuntime) cleanupPreparationContainer(name string) error {
 }
 
 func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id string, err error) {
-	probe := "for tool in " + bootstrapTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; echo ready"
+	probe := "for tool in " + bootstrapTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
 	probeName := "crabbox-serve-probe-" + strings.ToLower(rand.Text())
 	result, err := r.b.docker(ctx, []string{"run", "--rm", "--name", probeName, "--entrypoint", "/bin/sh", base.ID, "-c", probe}, nil, r.b.rt.Stderr)
 	if err != nil {
