@@ -121,7 +121,7 @@ func TestAuthenticatedControllerConfigDiagnosticsStayOffline(t *testing.T) {
 	path := isolatedConfigPath(t)
 	calls := 0
 	p := authenticatedControllerTestProvider{scope: "verified-owner-profile", calls: &calls}
-	RegisterProvider(p)
+	RegisterProvider(&p)
 	t.Cleanup(func() { delete(providerRegistry, p.Spec().Name) })
 	if err := os.WriteFile(path, []byte("provider: test-auth-controller\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -140,5 +140,10 @@ func TestAuthenticatedControllerConfigDiagnosticsStayOffline(t *testing.T) {
 	}
 	if calls != 1 || !strings.Contains(output.String(), "verified-owner-profile") {
 		t.Fatalf("internal admission missing %d %s", calls, output.String())
+	}
+	p.err = errors.New("authenticated identity unavailable")
+	output.Reset()
+	if err := app.configShow([]string{"--json", "--controller-provider-identity"}); !errors.Is(err, p.err) {
+		t.Fatalf("authenticated identity failure was hidden: %v", err)
 	}
 }

@@ -47,7 +47,7 @@ func (a App) configShow(args []string) error {
 		return err
 	}
 	if *controllerIdentityOut {
-		if scopeErr != nil {
+		if scopeErr != nil && authenticatedIdentity {
 			return scopeErr
 		}
 		// This subprocess-only contract is bounded and parsed in-process. Public
