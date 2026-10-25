@@ -29,7 +29,14 @@ func (a App) configShow(args []string) error {
 	if err := validateProviderConfig(cfg); err != nil {
 		return err
 	}
-	provider, providerScope, fixedLeaseID, scopeErr := controllerProviderIdentityForConfig(cfg)
+	provider, providerScope, fixedLeaseID, scopeErr := cfg.Provider, "", false, error(nil)
+	resolved, resolveErr := ProviderFor(cfg.Provider)
+	_, authenticatedIdentity := resolved.(AuthenticatedControllerProviderContract)
+	// Ordinary diagnostics must remain offline. Only the explicit internal
+	// admission contract performs an authenticated remote identity read.
+	if resolveErr == nil && (!authenticatedIdentity || *controllerIdentityOut) {
+		provider, providerScope, fixedLeaseID, scopeErr = controllerProviderIdentityForConfig(cfg)
+	}
 	if scopeErr != nil {
 		provider = cfg.Provider
 		providerScope = ""
@@ -40,6 +47,9 @@ func (a App) configShow(args []string) error {
 		return err
 	}
 	if *controllerIdentityOut {
+		if scopeErr != nil {
+			return scopeErr
+		}
 		// This subprocess-only contract is bounded and parsed in-process. Public
 		// config diagnostics use the redacted view below.
 		return json.NewEncoder(a.Stdout).Encode(map[string]any{
