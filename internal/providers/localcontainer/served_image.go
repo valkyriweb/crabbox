@@ -13,7 +13,34 @@ import (
 	"time"
 )
 
-const servedPreparationRecipe = "v1"
+// v2 adds the pinned Node.js toolchain; the bump invalidates v1 prepared images.
+const servedPreparationRecipe = "v2"
+
+// servedNodeVersion is the pinned Node.js release; the readiness probe and the
+// install script must agree on it.
+const servedNodeVersion = "v24.22.1"
+
+// servedNodeInstallScript installs the pinned official Node.js tarball under
+// /opt/node and links it into /usr/local/bin, which is on PATH for login and
+// non-login SSH sessions. It is idempotent and fails closed (set -eu) when the
+// architecture is unsupported or the SHA256 does not match.
+const servedNodeInstallScript = `node_version=` + servedNodeVersion + `
+case "$(uname -m)" in
+  x86_64|amd64) node_arch=x64; node_sha256=eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c ;;
+  aarch64|arm64) node_arch=arm64; node_sha256=33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3 ;;
+  *) echo "unsupported architecture for Node.js: $(uname -m)" >&2; exit 1 ;;
+esac
+if [ ! -x /opt/node/bin/node ] || [ "$(/opt/node/bin/node --version)" != "$node_version" ]; then
+  node_tmp="$(mktemp -d)"
+  curl -fsSL --retry 3 -o "$node_tmp/node.tgz" "https://nodejs.org/dist/$node_version/node-$node_version-linux-$node_arch.tar.gz"
+  echo "$node_sha256  $node_tmp/node.tgz" | sha256sum -c -
+  rm -rf /opt/node
+  mkdir -p /opt/node
+  tar -xzf "$node_tmp/node.tgz" -C /opt/node --strip-components=1
+  rm -rf "$node_tmp"
+fi
+for node_bin in node npm npx corepack; do ln -sf "/opt/node/bin/$node_bin" "/usr/local/bin/$node_bin"; done
+/usr/local/bin/node --version >/dev/null`
 
 type servedImage struct {
 	ID     string `json:"Id"`
@@ -134,7 +161,7 @@ func (r *ServedRuntime) cleanupPreparationContainer(name string) error {
 }
 
 func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id string, err error) {
-	probe := "for tool in " + bootstrapTools + "; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; echo ready"
+	probe := "for tool in " + bootstrapTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
 	probeName := "crabbox-serve-probe-" + strings.ToLower(rand.Text())
 	result, err := r.b.docker(ctx, []string{"run", "--rm", "--name", probeName, "--entrypoint", "/bin/sh", base.ID, "-c", probe}, nil, r.b.rt.Stderr)
 	if err != nil {
@@ -187,7 +214,7 @@ func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id 
 	if len(base.Config.Entrypoint) == 0 {
 		args = append(args, "/bin/sh")
 	}
-	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + "; rm -f /etc/ssh/ssh_host_*; rm -rf /var/lib/apt/lists/*"
+	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + "; " + servedNodeInstallScript + "; rm -f /etc/ssh/ssh_host_*; rm -rf /var/lib/apt/lists/*"
 	args = append(args, "-c", script)
 	if _, err := r.b.docker(ctx, args, r.b.rt.Stderr, r.b.rt.Stderr); err != nil {
 		return "", err
