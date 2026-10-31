@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 const (
 	herdrPluginContextEnv          = "HERDR_PLUGIN_CONTEXT_JSON"
+	herdrPluginRootEnv             = "HERDR_PLUGIN_ROOT"
 	herdrPluginRefreshIntervalEnv  = "CRABBOX_HERDR_REFRESH_INTERVAL"
 	herdrPluginDefaultRefreshDelay = 3 * time.Second
 )
@@ -88,15 +90,52 @@ func herdrPluginContextCWD(raw string) (string, error) {
 	if err := json.Unmarshal([]byte(raw), &invocation); err != nil {
 		return "", Exit(2, "parse %s: %v", herdrPluginContextEnv, err)
 	}
+	pluginRoot := os.Getenv(herdrPluginRootEnv)
+	skippedPluginRoot := false
 	for _, candidate := range []string{
 		invocation.FocusedPaneCWD,
 		invocation.WorkspaceCWD,
 	} {
-		if strings.TrimSpace(candidate) != "" {
-			return candidate, nil
+		if strings.TrimSpace(candidate) == "" {
+			continue
 		}
+		// A focused Crabbox result pane runs inside the plugin checkout. Using
+		// its cwd would send the next action to the plugin instead of the
+		// project, so fall through to the workspace cwd.
+		if herdrPluginPathWithin(candidate, pluginRoot) {
+			skippedPluginRoot = true
+			continue
+		}
+		return candidate, nil
+	}
+	if skippedPluginRoot {
+		return "", Exit(2, "Herdr plugin context only points at the Crabbox plugin directory %q; focus a project pane and retry", pluginRoot)
 	}
 	return "", Exit(2, "Herdr plugin context has no focused pane or workspace cwd")
+}
+
+// herdrPluginPathWithin reports whether path is root or inside it. Symlinks
+// are resolved when both paths exist, so a linked plugin checkout still matches.
+func herdrPluginPathWithin(path, root string) bool {
+	if strings.TrimSpace(root) == "" {
+		return false
+	}
+	within := func(p, r string) bool {
+		rel, err := filepath.Rel(filepath.Clean(r), filepath.Clean(p))
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	if within(path, root) {
+		return true
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	return within(resolvedPath, resolvedRoot)
 }
 
 func (a App) herdrPluginBoxes(ctx context.Context, args []string) error {
