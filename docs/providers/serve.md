@@ -214,15 +214,23 @@ results remain on stdout.
 
 After the first heartbeat and reconciliation, Serve probes the configured image
 in the background for `sshd`, Git, rsync,
-curl, sudo, and Python 3. If any are missing and `apt-get` is available, it
-installs the shared bootstrap package set once in a temporary container, then
+curl, sudo, Python 3, and the pinned Node.js/npm toolchain. If any are missing
+and `apt-get` is available, it installs the shared bootstrap packages and
+checksum-verified Node.js archive once in a temporary container, then
 commits a local prepared image. This uses ordinary Docker/Podman `run` and
 `commit`; it requires no buildx or Dockerfile. Preparation output goes to stderr.
-Images that already have the tools, or have no `apt-get`, keep the existing
-bootstrap behavior. Heartbeats and existing-lease reconciliation continue during
+Images that already have the tools need no prepared copy. Images without
+`apt-get` skip background preparation and must provide the shared bootstrap
+dependencies themselves. Heartbeats and existing-lease reconciliation continue during
 preparation; new leases use the configured image with lease-time bootstrap until
 the prepared image is ready. If preparation fails, the agent prints a warning and uses
-the configured image, so leases install their tools at startup as before.
+the configured image, so leases install their tools at startup. Every served
+lease runs the same idempotent Node.js installer before starting SSH, including
+base-image fallbacks after preparation is pending, failed, or pruned. Host-key
+readiness waits for the pinned Node.js version and a working npm, so an early
+SSH host key cannot advertise a lease whose toolchain is still missing. An
+unsupported architecture or failed archive verification leaves the lease
+unready. Ordinary local-container leases do not acquire this Node.js policy.
 Failure to pull or inspect the configured image still stops agent startup.
 
 The tag is `crabbox-serve-prepared:<hash>`, where the hash is the first 16 hex

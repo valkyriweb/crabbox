@@ -30,7 +30,7 @@ case "$(uname -m)" in
   aarch64|arm64) node_arch=arm64; node_sha256=33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3 ;;
   *) echo "unsupported architecture for Node.js: $(uname -m)" >&2; exit 1 ;;
 esac
-if [ ! -x /opt/node/bin/node ] || [ "$(/opt/node/bin/node --version)" != "$node_version" ]; then
+if [ ! -x /opt/node/bin/node ] || [ ! -x /opt/node/bin/npm ] || [ "$(/opt/node/bin/node --version)" != "$node_version" ]; then
   node_tmp="$(mktemp -d)"
   curl -fsSL --retry 3 -o "$node_tmp/node.tgz" "https://nodejs.org/dist/$node_version/node-$node_version-linux-$node_arch.tar.gz"
   echo "$node_sha256  $node_tmp/node.tgz" | sha256sum -c -
