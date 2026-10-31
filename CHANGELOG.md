@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Serve base-image fallbacks install the pinned Node.js/npm toolchain before SSH startup and withhold host-key readiness until it works. [PR 14](https://github.com/valkyriweb/crabbox/pull/14). Thanks @valkyriweb.
 - Coordinator leases record the creating session, host, and agent, and `list`/`status` show them with the owner so long-lived `keep=true` leases are attributable. [PR 8](https://github.com/valkyriweb/crabbox/pull/8)
 - The coordinator lease log no longer reports the default class as the size when `--type` is explicit; it prints `class=- type=<type> fallback_class=<class>`. [PR 8](https://github.com/valkyriweb/crabbox/pull/8)
 

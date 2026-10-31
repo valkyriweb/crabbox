@@ -2,6 +2,10 @@ package localcontainer
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +14,62 @@ import (
 )
 
 type servedRecordingRunner struct{ args []string }
+
+func TestServedHostKeyWaitsForNodeToolchain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("container readiness script requires a POSIX shell")
+	}
+	for _, fixture := range []struct {
+		name        string
+		nodeVersion string
+		npm         bool
+		brokenNPM   bool
+		ready       bool
+	}{
+		{name: "missing-node", npm: true},
+		{name: "wrong-node", nodeVersion: "v22.0.0", npm: true},
+		{name: "missing-npm", nodeVersion: servedNodeVersion},
+		{name: "broken-npm", nodeVersion: servedNodeVersion, npm: true, brokenNPM: true},
+		{name: "ready", nodeVersion: servedNodeVersion, npm: true, ready: true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			bin := t.TempDir()
+			tools := map[string]string{"cat": "printf '%s\\n' 'ssh-ed25519 AAAA fixture'"}
+			if fixture.nodeVersion != "" {
+				tools["node"] = "printf '%s\\n' '" + fixture.nodeVersion + "'"
+			}
+			if fixture.npm {
+				tools["npm"] = "exit 0"
+				if fixture.brokenNPM {
+					tools["npm"] = "exit 1"
+				}
+			}
+			for name, script := range tools {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runner := servedRuntimeFunc(func(ctx context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+				if len(req.Args) < 3 || req.Args[0] != "exec" || req.Args[1] != "container" {
+					t.Fatalf("unexpected command: %v", req.Args)
+				}
+				command := exec.CommandContext(ctx, "/bin/sh", append([]string{"-c", `exec "$@"`, "fixture"}, req.Args[2:]...)...)
+				command.Env = []string{"PATH=" + bin}
+				output, err := command.Output()
+				return core.LocalCommandResult{Stdout: string(output)}, err
+			})
+			runtime := NewServedRuntime(core.Config{}, core.Runtime{Exec: runner})
+			key, err := runtime.HostKey(t.Context(), ServedContainer{ID: "container"})
+			if fixture.ready {
+				if err != nil || key != "ssh-ed25519 AAAA fixture" {
+					t.Fatalf("key=%q error=%v", key, err)
+				}
+			} else if err == nil || key != "" {
+				t.Fatalf("toolchain is not ready: key=%q error=%v", key, err)
+			}
+		})
+	}
+}
 
 func (r *servedRecordingRunner) Run(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
 	r.args = append([]string(nil), req.Args...)
@@ -27,7 +87,7 @@ func TestServedCreationUsesSharedBootstrapWithoutHostMounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := strings.Join(runner.args, "\n")
-	for _, expected := range []string{"CRABBOX_MANAGED_HOME=1", "--rm", "--cpu-shares\n2", "--cpus\n3", "--memory\n6g", "127.0.0.1::2222", "provider=serve", "crabbox.serve.machine=machine", bootstrapScript, "umask 022", "CRABBOX_SERVE_DEADLINE=123"} {
+	for _, expected := range []string{"CRABBOX_MANAGED_HOME=1", "--rm", "--cpu-shares\n2", "--cpus\n3", "--memory\n6g", "127.0.0.1::2222", "provider=serve", "crabbox.serve.machine=machine", servedNodeInstallScript, "umask 022", "CRABBOX_SERVE_DEADLINE=123"} {
 		if !strings.Contains(args, expected) {
 			t.Errorf("missing %q", expected)
 		}
