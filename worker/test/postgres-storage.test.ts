@@ -40,6 +40,40 @@ import type {
 } from "../src/types";
 
 describe("PostgresCoordinatorStorage", () => {
+  it("handles idle pool disconnects without logging connection details", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const storage = new PostgresCoordinatorStorage("postgres://unused");
+    try {
+      expect(storage.pool.emit("error", new Error("private connection details"))).toBe(true);
+      expect(warning).toHaveBeenCalledWith(
+        "coordinator database idle connection lost; next query will reconnect",
+      );
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("private connection details");
+    } finally {
+      await storage.close();
+      warning.mockRestore();
+    }
+  });
+
+  it("retries idempotent schema initialization after a transient connection failure", async () => {
+    vi.useFakeTimers();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const pool = fakePool();
+      pool.query.mockRejectedValueOnce(
+        Object.assign(new Error("offline"), { code: "ECONNREFUSED" }),
+      );
+      const storage = new PostgresCoordinatorStorage("postgres://unused", pool);
+      const initialization = storage.initialize();
+      await vi.runAllTimersAsync();
+      await initialization;
+      expect(pool.query).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+      warning.mockRestore();
+    }
+  });
+
   it("initializes its schema and compatibility table", async () => {
     const pool = fakePool();
     const storage = new PostgresCoordinatorStorage("postgres://unused", pool);
