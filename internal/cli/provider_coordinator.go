@@ -562,7 +562,7 @@ func (b *coordinatorLeaseBackend) createCoordinatorLeaseWithProgressMode(ctx con
 	createCtx, cancelCreate := context.WithTimeout(ctx, timeout)
 	defer cancelCreate()
 
-	createAttemptID := ""
+	createAttemptID := controllerFixedCreateAttemptID(cfg, leaseID)
 	if !fixed {
 		createAttemptID = coordinatorCreateAttemptID()
 	}
@@ -620,7 +620,7 @@ func (b *coordinatorLeaseBackend) createCoordinatorLeaseWithProgressMode(ctx con
 		}
 		if err != nil {
 			lease = CoordinatorLease{}
-			if !fixed && cancelOnError {
+			if (!fixed || createAttemptID != "") && cancelOnError {
 				err = b.abandonUnrecoveredCoordinatorLeaseCreate(ctx, leaseID, slug, createAttemptID, err)
 				err = errors.Join(ctx.Err(), err)
 			}
@@ -759,7 +759,7 @@ func (b *coordinatorLeaseBackend) validateCoordinatorLeaseCreateResult(cfg Confi
 func (b *coordinatorLeaseBackend) canceledCoordinatorLeaseCreateError(ctx context.Context, leaseID, slug, createAttemptID string, fixed bool, createErr error) error {
 	callerErr := ctx.Err()
 	definitiveErr := definitiveCoordinatorCreateError(createErr)
-	if fixed {
+	if fixed && createAttemptID == "" {
 		return errors.Join(callerErr, definitiveErr)
 	}
 	recoverCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coordinatorCanceledCreateRecoveryTimeout)
