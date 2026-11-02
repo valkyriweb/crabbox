@@ -30,6 +30,7 @@ import (
 // SSHJump describes an authenticated SSH transport hop; the destination still
 // has its own end-to-end SSH host key and authentication.
 type SSHJump struct {
+	RelayOnly    bool `json:"relayOnly,omitempty"`
 	Relay        bool `json:"relay,omitempty"`
 	useRelay     bool
 	Candidates   []SSHJumpCandidate `json:"candidates,omitempty"`
@@ -1410,7 +1411,19 @@ func (e *gitOriginDiagnosticsTruncatedError) Unwrap() error {
 	return e.err
 }
 
+const gitSeedPublishedReceipt = "crabbox-git-seed published"
+
 func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	out, _, err := runIdempotentSSHGitOriginAttemptCapture(ctx, target, remote, retryDelay, false)
+	return out, err
+}
+
+func runIdempotentSSHGitOriginAttemptWithPublication(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, bool, error) {
+	return runIdempotentSSHGitOriginAttemptCapture(ctx, target, remote, retryDelay, true)
+}
+
+func runIdempotentSSHGitOriginAttemptCapture(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration, capturePublication bool) (string, bool, error) {
+	published := false
 	var (
 		out       synchronizedBuffer
 		lastErr   error
@@ -1418,7 +1431,23 @@ func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, rem
 	)
 	for attempt := 0; attempt < 2; attempt++ {
 		out = newSynchronizedBuffer(gitSeedDiagnosticLimit)
-		lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+		// Keep diagnostics scoped to the last attempt, but retain an observed
+		// publication across transport retries. Origin diagnostics on stderr
+		// cannot supply the native producer's stdout receipt.
+		if capturePublication {
+			stdout := newSynchronizedBuffer(gitSeedDiagnosticLimit)
+			lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", io.MultiWriter(&out, &stdout), &out)
+			if receipt, clipped := stdout.boundedString(); !clipped {
+				for _, line := range strings.Split(receipt, "\n") {
+					if line == gitSeedPublishedReceipt {
+						published = true
+					}
+				}
+			}
+		} else {
+			// The shared writer preserves the ordinary combined-pipe ordering.
+			lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+		}
 		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
 			break
 		}
@@ -1432,7 +1461,7 @@ func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, rem
 	if truncated && lastErr != nil {
 		lastErr = &gitOriginDiagnosticsTruncatedError{err: lastErr}
 	}
-	return output, lastErr
+	return output, published, lastErr
 }
 
 func isSSHCommandExitError(err error) bool {
@@ -1788,29 +1817,68 @@ try {
 exit $code`)
 }
 
+// gitSeedHeartbeatInterval spaces progress lines while a remote Git seed runs
+// with captured output.
+const gitSeedHeartbeatInterval = 15 * time.Second
+
+// startSyncHeartbeat prints periodic "still syncing" progress lines to stderr
+// until the returned stop function is called.
 func startSyncHeartbeat(stderr io.Writer, start time.Time, interval time.Duration) func() {
+	return startProgressHeartbeat(stderr, start, interval, "syncing", " watchdog=sync-quiet next_action=wait, or cancel and retry with --full-resync/fresh lease if no progress")
+}
+
+// startGitSeedHeartbeat prints periodic progress lines while a remote Git
+// seed runs, because the seed's own output is captured until it finishes.
+func startGitSeedHeartbeat(stderr io.Writer, start time.Time, interval time.Duration) func() {
+	return startProgressHeartbeat(stderr, start, interval, "seeding remote Git metadata", "")
+}
+
+// startProgressHeartbeat prints "still <label> after <elapsed>..." every
+// interval, appending quietHint once the step has run for four minutes.
+// A nonpositive interval disables the heartbeat. The returned stop function
+// waits for the heartbeat goroutine to exit, so no progress line is printed
+// after it returns.
+func startProgressHeartbeat(stderr io.Writer, start time.Time, interval time.Duration, label, quietHint string) func() {
 	if interval <= 0 {
 		return func() {}
 	}
+	ticker := time.NewTicker(interval)
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(interval)
+		defer close(exited)
 		defer ticker.Stop()
-		for {
+		writeProgressHeartbeats(stderr, start, ticker.C, done, label, quietHint)
+	}()
+	return func() {
+		close(done)
+		<-exited
+	}
+}
+
+// writeProgressHeartbeats prints one progress line per tick until done is
+// closed. A closed done wins over a tick that is ready at the same time.
+func writeProgressHeartbeats(stderr io.Writer, start time.Time, ticks <-chan time.Time, done <-chan struct{}, label, quietHint string) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticks:
+			// select picks randomly among ready cases; recheck done so a
+			// stop that raced with this tick suppresses the line.
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
-				elapsed := time.Since(start).Round(time.Second)
-				if elapsed >= 4*time.Minute {
-					fmt.Fprintf(stderr, "still syncing after %s... watchdog=sync-quiet next_action=wait, or cancel and retry with --full-resync/fresh lease if no progress\n", elapsed)
-				} else {
-					fmt.Fprintf(stderr, "still syncing after %s...\n", elapsed)
-				}
+			default:
 			}
+			elapsed := time.Since(start).Round(time.Second)
+			hint := ""
+			if elapsed >= 4*time.Minute {
+				hint = quietHint
+			}
+			fmt.Fprintf(stderr, "still %s after %s...%s\n", label, elapsed, hint)
 		}
-	}()
-	return func() { close(done) }
+	}
 }
 
 func ensureTrailingSlash(path string) string {
@@ -2060,18 +2128,15 @@ func shellAbsolutePath(value string) string {
 	return shellQuote(value)
 }
 
-func psQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
 func PowershellCommand(script string) string {
 	script = `$ProgressPreference = "SilentlyContinue"` + "\n" + script
 	encoded := base64.StdEncoding.EncodeToString(utf16LE([]byte(script)))
 	return "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 }
 
-// Win32-OpenSSH inherits an overlapped pipe. Use its asynchronous handle contract
-// so a pending SSH write can complete before the server closes stdin at EOF.
+// Win32-OpenSSH inherits an overlapped pipe; managed endpoints inherit a
+// synchronous pipe. Select the matching FileStream before reading any bytes.
+// Overlapped input must retain async reads so pending SSH writes can complete.
 func windowsPowerShellCopyExactInput(destination string, inputSize int64) string {
 	// An empty frame must not bind stdin, which may already be at EOF.
 	// Disable FileStream read-ahead so bytes after this frame remain on stdin.
@@ -2083,7 +2148,11 @@ if ($remaining -gt 0) {
 	$stdinHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new([Cbx.SshStdin]::GetStdHandle(-10), $false)
 	$stdin = $null
 	try {
-		$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true)
+		try { $stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true) }
+		catch {
+			if ($_.Exception.InnerException -isnot [ArgumentException]) { throw }
+			$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $false)
+		}
 		$buffer = New-Object byte[] 65536
 		while ($remaining -gt 0) {
 			$readSize = [int][Math]::Min([Int64]$buffer.Length, $remaining)
@@ -2361,9 +2430,9 @@ origin_git -C "$tmp" remote add origin "$expected_origin"
 		checkoutGit = "origin_git"
 	}
 	script := `set -e
-printf 'crabbox-git-seed phase=prerequisite\n'
+printf 'crabbox-git-seed phase=prerequisite\n' >&2
 command -v git >/dev/null 2>&1 || exit ` + strconv.Itoa(prerequisiteExitCode) + `
-printf 'crabbox-git-seed phase=prepare\n'
+printf 'crabbox-git-seed phase=prepare\n' >&2
 workdir=` + shellAbsolutePath(workdir) + `
 # Keep clone publication and cleanup anchored across directory changes.
 [ -n "$workdir" ] || { echo 'crabbox-git-seed: missing workspace path' >&2; exit 2; }
@@ -2402,7 +2471,7 @@ require_empty_seed_destination() {
 if [ -d "$workdir" ]; then
   cd "$workdir" || reject_seed_destination
   if usable_git_workspace; then
-    printf 'crabbox-git-seed phase=origin\n'
+    printf 'crabbox-git-seed phase=origin\n' >&2
     repair_origin
     exit 0
   fi
@@ -2414,29 +2483,30 @@ transport_error="$tmp.transport-error"
 cleanup_seed() { rm -rf -- "$tmp"; rm -f -- "$transport_error"; }
 trap cleanup_seed EXIT
 ` + prepare + `
-printf 'crabbox-git-seed phase=clone\n'
+printf 'crabbox-git-seed phase=clone\n' >&2
 if ! { ` + seed + `; } >/dev/null 2>"$transport_error"; then
   cat "$transport_error" >&2
   exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
 fi
-printf 'crabbox-git-seed phase=checkout\n'
+printf 'crabbox-git-seed phase=checkout\n' >&2
 ` + checkoutGit + ` -C "$tmp" checkout --quiet --detach ` + shellQuote(plan.Target) + `
-printf 'crabbox-git-seed phase=verify\n'
+printf 'crabbox-git-seed phase=verify\n' >&2
 [ "$(git -C "$tmp" rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ]
 cd "$tmp"
 usable_git_workspace
 if [ -n "$expected_tree" ]; then
   [ "$(git write-tree)" = "$expected_tree" ]
 fi
-printf 'crabbox-git-seed phase=origin\n'
+printf 'crabbox-git-seed phase=origin\n' >&2
 repair_origin
 ` + seedManifest + `
-printf 'crabbox-git-seed phase=publish\n'
+printf 'crabbox-git-seed phase=publish\n' >&2
 cd /
 require_empty_seed_destination
 # Never recursively remove files that appeared while the clone was prepared.
 if [ -d "$workdir" ]; then rmdir -- "$workdir" || reject_seed_destination; fi
 mv -- "$tmp" "$workdir"
+printf '%s\n' ` + shellQuote(gitSeedPublishedReceipt) + `
 rm -f -- "$transport_error"
 trap - EXIT
 `

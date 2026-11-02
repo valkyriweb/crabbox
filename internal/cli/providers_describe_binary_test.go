@@ -247,8 +247,9 @@ func TestProvidersDescribeBuiltBinaryContract(t *testing.T) {
 	localFlags := descriptionFlagMap(local.ProviderFlags)
 	wantLocal := []string{
 		"local-container-cpus", "local-container-docker-socket", "local-container-image",
-		"local-container-memory", "local-container-network", "local-container-runtime",
-		"local-container-user", "local-container-volume", "local-container-work-root",
+		"local-container-memory", "local-container-network", "local-container-oci-runtime",
+		"local-container-runtime", "local-container-user", "local-container-volume",
+		"local-container-work-root",
 	}
 	if got := sortedDescriptionFlagNames(local.ProviderFlags); !reflect.DeepEqual(got, wantLocal) {
 		t.Fatalf("local-container flags=%v want %v", got, wantLocal)

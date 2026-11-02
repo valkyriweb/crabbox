@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -1410,11 +1411,12 @@ func splitCheckpointForkRunArgs(args []string) ([]string, []string) {
 }
 
 type checkpointForkRunOptions struct {
-	Command []string
-	Index   int
-	Total   int
-	JSON    bool
-	Results *[]checkpointForkResult
+	Command           []string
+	Index             int
+	Total             int
+	JSON              bool
+	Results           *[]checkpointForkResult
+	carryReleaseClaim func(leaseClaim)
 }
 
 type checkpointForkResult struct {
@@ -1481,6 +1483,10 @@ type checkpointForkProvision struct {
 	Lease   LeaseTarget
 	Workdir string
 	Release func(context.Context)
+	// carryReleaseClaim installs an authorized post-run claim snapshot into the
+	// release fence. Shard calls this after run --keep so cleanup fences on the
+	// exact generation the run lifecycle produced (PR #1437), not ClaimedAt.
+	carryReleaseClaim func(leaseClaim)
 }
 
 func (a App) provisionCheckpointFork(ctx context.Context, cfg Config, backend Backend, sshBackend SSHLeaseBackend, repo Repo, record checkpointRecord, paths checkpointPaths, keep, reclaim bool, requestedSlug, workdirOverride string, clear bool) (checkpointForkProvision, error) {
@@ -1603,6 +1609,75 @@ func (a App) provisionManagedCheckpointFork(ctx context.Context, cfg Config, bac
 	return provision, nil
 }
 
+// RefreshAuthorizedForkReleaseClaim confirms the persisted claim still exactly
+// matches the carried acquisition/run snapshot (owner + revision generation).
+// Authorized successors (for example run --keep) must be carried into the
+// snapshot before release via carryReleaseClaim; this refresh never adopts a
+// different revision. ClaimedAt is not used: it is whole-second RFC3339, so a
+// same-second reclaim could collide and let stale cleanup adopt a replacement
+// generation. A replaced, revoked, reclaimed, or ABA claim fails closed. A
+// missing claim leaves the carried snapshot unchanged so the provider
+// ReleaseLease claim check decides (AWS/Hetzner refuse destructive release
+// without an exact local claim).
+func RefreshAuthorizedForkReleaseClaim(server *Server, leaseID string) error {
+	if server == nil {
+		return nil
+	}
+	expected, expectedExists, set := ServerLeaseClaimSnapshot(*server)
+	if !set || !expectedExists {
+		return nil
+	}
+	current, exists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if !authorizedForkReleaseClaimContinuation(expected, current) {
+		return fmt.Errorf("%w: lease %s claim ownership changed after acquisition; refusing automatic release", ErrReleaseLeaseOwnershipChanged, leaseID)
+	}
+	return nil
+}
+
+// authorizedForkReleaseClaimContinuation reports whether current is exactly the
+// carried claim generation (PR #1437). Owner identity and revision must both
+// match; ClaimedAt is ignored because it only has whole-second resolution.
+func authorizedForkReleaseClaimContinuation(expected, current leaseClaim) bool {
+	return reflect.DeepEqual(expected, current)
+}
+
+// CheckpointForkReleaseBindings builds the production release fence used by
+// provisionCheckpointForkWithoutClaim and shard cleanup after run --keep.
+// carryReleaseClaim installs an authorized post-run claim into *server.
+// server, target, and cfg are read at release time so later claim updates,
+// resolveNetworkTarget (--network tailscale), and applyResolvedServerConfig
+// stay visible to shutdown/egress/Tailscale logout — matching the old closure.
+func (a App) CheckpointForkReleaseBindings(server *Server, target *SSHTarget, leaseID string, coordinator *CoordinatorClient, sshBackend SSHLeaseBackend, cfg *Config) (release func(context.Context), carryReleaseClaim func(LeaseClaim)) {
+	return a.checkpointForkReleaseBindings(server, target, leaseID, coordinator, sshBackend, cfg)
+}
+
+func (a App) checkpointForkReleaseBindings(server *Server, target *SSHTarget, leaseID string, coordinator *CoordinatorClient, sshBackend SSHLeaseBackend, cfg *Config) (release func(context.Context), carryReleaseClaim func(leaseClaim)) {
+	var releaseOnce sync.Once
+	carryReleaseClaim = func(claim leaseClaim) {
+		SetServerLeaseClaimSnapshot(server, claim, true)
+	}
+	release = func(releaseCtx context.Context) {
+		releaseOnce.Do(func() {
+			releaseLease := LeaseTarget{Server: *server, SSH: *target, LeaseID: leaseID, Coordinator: coordinator}
+			// Exact generation fence: the carried snapshot (acquisition, or an
+			// authorized successor installed via carryReleaseClaim) must still
+			// match the persisted claim. Never adopt a different revision here.
+			if err := RefreshAuthorizedForkReleaseClaim(&releaseLease.Server, leaseID); err != nil {
+				fmt.Fprintf(a.Stderr, "warning: refusing release for lease %s: %v\n", leaseID, err)
+				return
+			}
+			a.releaseBackendLeaseBestEffort(releaseCtx, sshBackend, *cfg, releaseLease)
+		})
+	}
+	return release, carryReleaseClaim
+}
+
 type managedCheckpointCacheConflict struct{ error }
 
 func writeSafeManagedCheckpointCache(store checkpointStore, record checkpointRecord) error {
@@ -1649,12 +1724,7 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 		onAcquired(lease)
 	}
 	server, target, leaseID := lease.Server, lease.SSH, lease.LeaseID
-	var releaseOnce sync.Once
-	release := func(releaseCtx context.Context) {
-		releaseOnce.Do(func() {
-			a.releaseBackendLeaseBestEffort(releaseCtx, sshBackend, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator})
-		})
-	}
+	release, carryReleaseClaim := a.checkpointForkReleaseBindings(&server, &target, leaseID, lease.Coordinator, sshBackend, &cfg)
 	rollback := func() {
 		// Fixed acquisition can adopt prior work; preserve its known ID for replay.
 		if requestedLeaseID == "" {
@@ -1676,9 +1746,10 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 		}
 	}
 	forkLease := LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator}
+	provision := checkpointForkProvision{Lease: forkLease, Release: release, carryReleaseClaim: carryReleaseClaim}
 	if isNativeCheckpointKind(record.Kind) {
 		if record.TargetOS == targetWindows {
-			return checkpointForkProvision{Lease: forkLease, Release: release}, nil
+			return provision, nil
 		}
 		workdir := nativeCheckpointForkWorkdir(cfg, leaseID, repo.Name, workdirOverride)
 		if err := validateCheckpointForkWorkdirs(ctx, backend, forkLease, record.Workdir, workdir); err != nil {
@@ -1689,7 +1760,8 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 			rollback()
 			return checkpointForkProvision{}, err
 		}
-		return checkpointForkProvision{Lease: forkLease, Workdir: workdir, Release: release}, nil
+		provision.Workdir = workdir
+		return provision, nil
 	}
 	workdir := strings.TrimSpace(workdirOverride)
 	if workdir == "" {
@@ -1703,7 +1775,8 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 		rollback()
 		return checkpointForkProvision{}, err
 	}
-	return checkpointForkProvision{Lease: forkLease, Workdir: workdir, Release: release}, nil
+	provision.Workdir = workdir
+	return provision, nil
 }
 
 func (a App) checkpointForkRecordOnce(ctx context.Context, cfg Config, backend Backend, sshBackend SSHLeaseBackend, repo Repo, store checkpointStore, record *checkpointRecord, paths checkpointPaths, keep, reclaim bool, requestedLeaseID, requestedSlug, workdirOverride string, clear bool, runOpts checkpointForkRunOptions) error {
@@ -1741,6 +1814,7 @@ func (a App) checkpointForkRecordOnce(ctx context.Context, cfg Config, backend B
 	if err != nil {
 		return err
 	}
+	runOpts.carryReleaseClaim = provision.carryReleaseClaim
 	defer func() {
 		if !keep {
 			provision.Release(context.Background())
@@ -1837,6 +1911,15 @@ func (a App) runCheckpointForkCommand(ctx context.Context, leaseID, slug string,
 	command := checkpointForkRunCommand(opts.Command, runCtx)
 	if len(command) == 0 {
 		return nil
+	}
+	if opts.carryReleaseClaim != nil {
+		var outcome shardRunOutcome
+		a.runOutcome = &outcome
+		defer func() {
+			if outcome.AuthorizedClaim != nil {
+				opts.carryReleaseClaim(*outcome.AuthorizedClaim)
+			}
+		}()
 	}
 	if !opts.JSON {
 		fmt.Fprintf(a.Stdout, "checkpoint fork command lease=%s slug=%s index=%d/%d command=%s\n", leaseID, blank(slug, "-"), opts.Index, opts.Total, runCommandDisplay(command, false))

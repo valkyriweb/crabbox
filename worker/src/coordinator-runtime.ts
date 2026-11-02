@@ -1,4 +1,5 @@
 import { AsyncMutex } from "./async-mutex";
+import { recordDurableObjectStorageFailure } from "./durable-object-errors";
 export interface CoordinatorStorageView {
   get<T>(
     key: string,
@@ -21,6 +22,40 @@ export interface CoordinatorStorage extends CoordinatorStorageView {
   // Implementations may retry callbacks after serialization conflicts; callbacks must contain
   // only storage reads/writes and must not perform external or otherwise non-idempotent effects.
   transaction<T>(callback: (transaction: CoordinatorStorageView) => Promise<T>): Promise<T>;
+}
+
+// Runtime flags are not unique to storage errors. Record provenance without wrapping
+// the error so admission retries and provider errors keep their original identity.
+async function storageOperation<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    recordDurableObjectStorageFailure(error);
+    throw error;
+  }
+}
+
+function trackedStorageView<T extends CoordinatorStorageView>(storage: T): T {
+  const operations = new Set<PropertyKey>([
+    "get",
+    "put",
+    "delete",
+    "deleteAll",
+    "list",
+    "getAlarm",
+    "setAlarm",
+    "deleteAlarm",
+  ]);
+  return new Proxy(storage, {
+    get: (target, key) => {
+      const value: unknown = Reflect.get(target, key, target);
+      if (typeof value !== "function") return value;
+      if (operations.has(key)) {
+        return (...args: unknown[]) => storageOperation(() => Reflect.apply(value, target, args));
+      }
+      return value.bind(target);
+    },
+  });
 }
 
 export const provisioningDuePrefix = "provisioning-due:";
@@ -86,15 +121,19 @@ export function coordinatorRequestQueue(request: Request): CoordinatorRequestQue
   const method = request.method.toUpperCase();
   // These routes commit with storage transactions; subscriber authorization may use GitHub.
   if (coordinatorRequestPublishesRunEvents(request)) return "direct";
-  if (path[0] === "v1" && path[1] === "serve") return "direct";
+  if (path[0] === "v1" && (path[1] === "serve" || path[1] === "ssh-hosts")) return "direct";
   if (method === "POST" && path.join("/") === "v1/admin/tailscale-preflight") {
     return "direct";
   }
   if (
     method === "GET" &&
-    ["v1/whoami", "v1/leases", "v1/admin/leases", "v1/admin/retained-reconcile"].includes(
-      path.join("/"),
-    )
+    [
+      "v1/whoami",
+      "v1/capacity",
+      "v1/leases",
+      "v1/admin/leases",
+      "v1/admin/retained-reconcile",
+    ].includes(path.join("/"))
   ) {
     return "direct";
   }
@@ -290,6 +329,9 @@ export interface CoordinatorRuntime {
   readonly storage: CoordinatorStorage;
   readonly ephemeralWebSocketMaxPayloadBytes: number;
   runExclusive<T>(callback: () => Promise<T>): Promise<T>;
+  readSnapshot?<T>(
+    callback: (storage: CoordinatorStorageView) => Promise<T>,
+  ): Promise<T | undefined>;
   createWebSocketUpgrade(options?: CoordinatorWebSocketUpgradeOptions): CoordinatorWebSocketUpgrade;
   getWebSockets(): Iterable<WebSocket>;
   socketAttachment<T>(socket: WebSocket): T | undefined;
@@ -314,13 +356,90 @@ export interface CoordinatorRuntime {
 
 export class CloudflareCoordinatorRuntime implements CoordinatorRuntime {
   readonly provisioning: ProvisioningRuntime = this;
-  readonly storage: CoordinatorStorage;
+  readonly storage: DurableObjectStorage;
   readonly ephemeralWebSocketMaxPayloadBytes = 32 * 1024 * 1024;
   private readonly attachments = new WeakMap<WebSocket, unknown>();
   private readonly exclusive = new AsyncMutex();
+  private storageRevision = 0;
+  private pendingStorageWrites = 0;
 
   constructor(private readonly state: DurableObjectState) {
-    this.storage = state.storage;
+    const mutations = new Set<PropertyKey>([
+      "put",
+      "delete",
+      "deleteAll",
+      "setAlarm",
+      "deleteAlarm",
+    ]);
+    this.storage = new Proxy(trackedStorageView(state.storage), {
+      get: (target, key) => {
+        const value: unknown = Reflect.get(target, key, target);
+        if (typeof value !== "function") return value;
+        if (key === "transaction") {
+          return (callback: (transaction: DurableObjectTransaction) => Promise<unknown>) =>
+            this.observeStorageWrite(() => this.storageTransaction(callback));
+        }
+        if (key === "transactionSync") {
+          return (...args: unknown[]) => {
+            this.storageRevision++;
+            try {
+              return Reflect.apply(value, target, args);
+            } finally {
+              this.storageRevision++;
+            }
+          };
+        }
+        if (mutations.has(key)) {
+          return (...args: unknown[]) =>
+            this.observeStorageWrite(() => Reflect.apply(value, target, args));
+        }
+        return value.bind(target);
+      },
+    });
+  }
+
+  private async storageTransaction<T>(
+    callback: (transaction: DurableObjectTransaction) => Promise<T>,
+  ): Promise<T> {
+    const callbackFailures = new Set<unknown>();
+    try {
+      return await this.state.storage.transaction(async (transaction) => {
+        try {
+          return await callback(trackedStorageView(transaction));
+        } catch (error) {
+          callbackFailures.add(error);
+          throw error;
+        }
+      });
+    } catch (error) {
+      // Callback failures are application errors unless a native call already marked them.
+      if (!callbackFailures.has(error)) recordDurableObjectStorageFailure(error);
+      throw error;
+    }
+  }
+
+  private async observeStorageWrite<T>(operation: () => Promise<T>): Promise<T> {
+    this.storageRevision++;
+    this.pendingStorageWrites++;
+    try {
+      return await operation();
+    } finally {
+      this.pendingStorageWrites--;
+      this.storageRevision++;
+    }
+  }
+
+  async readSnapshot<T>(
+    callback: (storage: CoordinatorStorageView) => Promise<T>,
+  ): Promise<T | undefined> {
+    // Native async transactions close the DO input gate for the whole callback.
+    // Concurrent diagnostic reads instead fail closed if any write overlaps.
+    if (this.pendingStorageWrites > 0) return undefined;
+    const revision = this.storageRevision;
+    const result = await callback(this.storage);
+    return this.pendingStorageWrites === 0 && revision === this.storageRevision
+      ? result
+      : undefined;
   }
 
   runExclusive<T>(callback: () => Promise<T>): Promise<T> {
@@ -392,11 +511,11 @@ export class CloudflareCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   async getAlarm(): Promise<number | undefined> {
-    return (await this.state.storage.getAlarm()) ?? undefined;
+    return (await this.storage.getAlarm()) ?? undefined;
   }
 
   take<T>(key: string): Promise<T | undefined> {
-    return this.state.storage.transaction(async (transaction) => {
+    return this.storage.transaction(async (transaction) => {
       const value = await transaction.get<T>(key);
       if (value !== undefined) {
         await transaction.delete(key);
@@ -408,7 +527,7 @@ export class CloudflareCoordinatorRuntime implements CoordinatorRuntime {
   async commitAndWake<T>(
     callback: (transaction: CoordinatorStorageView) => Promise<T>,
   ): Promise<T> {
-    return this.state.storage.transaction(async (transaction) => {
+    return this.storage.transaction(async (transaction) => {
       const currentAlarm = await transaction.getAlarm();
       if ((await transaction.get(legacyAlarmKey)) === undefined) {
         if (currentAlarm !== null) await transaction.put(legacyAlarmKey, currentAlarm);
