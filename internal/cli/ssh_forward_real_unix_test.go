@@ -1283,8 +1283,6 @@ func TestStaticExplicitPortBlocksRealSSHFallback(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Provider, cfg.Static.Host, cfg.Static.User, cfg.Static.Port = "ssh", "127.0.0.1", "synthetic-static", port
 	cfg.SSHFallbackPorts = []string{strconv.Itoa(server.port())}
-	cfg.sshFallbackPortsExplicit = true
-	cfg.explicitSSHFallbackPorts = cfg.SSHFallbackPorts
 	_, target, _, err := staticLease(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1302,8 +1300,10 @@ func TestStaticExplicitPortBlocksRealSSHFallback(t *testing.T) {
 		t.Fatalf("wrong SSH server: connections=%d commands=%d", connections, ran)
 	}
 
-	// Without an explicit port, this same reachable fallback remains supported.
-	cfg.Static.Port, cfg.SSHPort = "", port
+	// The fork permits fallback only after an explicit operator opt-in, even
+	// while the selected static port remains unavailable.
+	cfg.sshFallbackPortsExplicit = true
+	cfg.explicitSSHFallbackPorts = cfg.SSHFallbackPorts
 	_, target, _, err = staticLease(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1317,5 +1317,5 @@ func TestStaticExplicitPortBlocksRealSSHFallback(t *testing.T) {
 	if target.Port != strconv.Itoa(server.port()) {
 		t.Fatalf("fallback selected %s", target.Port)
 	}
-	t.Log("real SSH: explicit unavailable port made zero fallback connections; automatic selection authenticated the fallback")
+	t.Log("real SSH: explicit unavailable port made zero implicit fallback connections; explicit opt-in authenticated the fallback")
 }
