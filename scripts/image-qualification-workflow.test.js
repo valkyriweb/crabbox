@@ -184,6 +184,31 @@ test("reaper is protected, serialized, and artifact-independent", () => {
   assert.match(reaper, /image-qualification-control\.mjs reap/);
 });
 
+test("fork schedules require opt-in without disabling explicit recovery", () => {
+  const gate = reaper.match(/^    if: \$\{\{ (.+) \}\}$/m)?.[1];
+  assert.equal(
+    gate,
+    "github.event_name != 'schedule' || !github.event.repository.fork || vars.IMAGE_QUALIFICATION_REAPER_ENABLED == 'true'",
+  );
+  // This expression uses only operators shared by JavaScript and Actions.
+  const enabled = new Function("github", "vars", `return ${gate};`);
+  for (const fork of [true, false]) {
+    for (const event of ["schedule", "workflow_dispatch", "workflow_run"]) {
+      for (const setting of ["", "false", "true"]) {
+        assert.equal(
+          enabled(
+            { event_name: event, event: { repository: { fork } } },
+            { IMAGE_QUALIFICATION_REAPER_ENABLED: setting },
+          ),
+          event !== "schedule" || !fork || setting === "true",
+          `${event}, fork=${fork}, opt-in=${setting}`,
+        );
+      }
+    }
+  }
+  assert.ok(reaper.indexOf(`    if: `) < reaper.indexOf("    environment:"));
+});
+
 test("control tool fixes the reviewed policy and recovery boundary", () => {
   assert.match(control, /instanceTypes: \["t3\.small", "t3a\.small"\]/);
   assert.match(control, /maxMinutes: retainedImage \? 38 : 120/);
