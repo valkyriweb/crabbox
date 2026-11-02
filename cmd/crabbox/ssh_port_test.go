@@ -7,7 +7,8 @@ import (
 	"github.com/openclaw/crabbox/internal/cli"
 )
 
-// These adapters bootstrap cloud and local VMs with the shared 2222/22 policy.
+// These adapters share the remote 2222/22 policy, with the fork's loopback
+// exclusion so forwarded endpoints cannot fall back to the operator's sshd.
 func TestCloudProvidersRetainSSHPortFallback(t *testing.T) {
 	for _, name := range []string{"aws", "azure", "gcp", "hetzner", "ovh", "nebius", "xcp-ng", "incus", "proxmox"} {
 		t.Run(name, func(t *testing.T) {
@@ -22,9 +23,13 @@ func TestCloudProvidersRetainSSHPortFallback(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			for _, host := range []string{"192.0.2.10", "127.0.0.1"} {
+			for _, host := range []string{"192.0.2.10", "127.0.0.1", "::1", "localhost"} {
 				target := cli.SSHTargetFromConfig(cfg, host)
-				if target.Port != "2222" || !slices.Equal(target.FallbackPorts, []string{"22"}) {
+				var wantFallbacks []string
+				if host == "192.0.2.10" {
+					wantFallbacks = []string{"22"}
+				}
+				if target.Port != "2222" || !slices.Equal(target.FallbackPorts, wantFallbacks) {
 					t.Fatalf("%s target port=%s fallbacks=%v", host, target.Port, target.FallbackPorts)
 				}
 			}
