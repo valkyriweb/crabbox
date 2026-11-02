@@ -12,11 +12,16 @@ import (
 )
 
 func TestStaticClaimCannotRestoreExcludedSSHPort(t *testing.T) {
-	for _, source := range []string{"static", "ssh", "implicit"} {
+	for _, source := range []string{"static", "ssh", "implicit", "implicit-remote"} {
 		t.Run(source, func(t *testing.T) {
 			cfg := core.BaseConfig()
 			cfg.Provider, cfg.Static.Host = "ssh", "localhost"
-			want := "22"
+			// The fork excludes implicit port 22 on loopback: a persisted
+			// claim must not resurrect a route to the operator's own sshd.
+			want := "2222"
+			if source == "implicit-remote" {
+				cfg.Static.Host, want = "build.example", "22"
+			}
 			if source == "static" {
 				cfg.Static.Port, want = "2224", "2224"
 			}
