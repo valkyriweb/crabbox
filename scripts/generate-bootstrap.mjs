@@ -120,7 +120,7 @@ export function validateCatalog(document) {
   }
   return document;
 }
-export const psQuote = (value) => `'${value.replaceAll("'", "''")}'`;
+export const psQuote = (value) => `'${value.replace(/['\u2018-\u201b]/gu, (quote) => quote + quote)}'`;
 // Bash ANSI-C escapes keep embedded READY here-documents safe for multiline values.
 export const shellQuote = (value) => `'${value.replaceAll("'", "'\\''").replaceAll("\n", () => "'$'\\n''").replaceAll("\r", () => "'$'\\r''")}'`;
 
@@ -156,6 +156,17 @@ export function fragmentTokens(fragment, constants) {
   }
   return merged.length ? merged : [{ literal: "" }];
 }
+export function expandFragmentIncludes(fragment, fragments) {
+  return fragment.source.replace(/\{\{include:([^{}]+)\}\}/gu, (_match, name) => {
+    const included = fragments.find((candidate) => candidate.name === name);
+    if (!included || included.literal !== true || Object.keys(included.parameters).length ||
+        included.source.includes("{{include:")) {
+      throw new Error(`${fragment.name}: include ${name} must be a declared, parameter-free literal fragment without nested includes`);
+    }
+    return included.source.replace(/\n$/u, "");
+  });
+}
+
 export async function loadSources(root = repoRoot) {
   const directory = resolve(root, sourceDirectory);
   const json = async (name) => parseStrictJSON(await readFile(resolve(directory, name), "utf8"), name);
@@ -178,8 +189,11 @@ export async function loadSources(root = repoRoot) {
     const source = await readFile(resolve(directory, fragment.file), "utf8");
     if (!source || source.includes("\r") || source.includes("\0")) throw new Error(`${fragment.name}: use nonempty LF text without NUL`);
     const loaded = { ...fragment, source };
-    fragmentTokens(loaded, constants);
     fragments.push(loaded);
+  }
+  for (const fragment of fragments) {
+    fragment.source = expandFragmentIncludes(fragment, fragments);
+    fragmentTokens(fragment, constants);
   }
   // Ship the canonical installer with its Node-only entrypoint; never fetch mutable script bytes at boot.
   const installer = await readFile(resolve(root, "scripts/install-linux-developer-tools.sh"), "utf8");
@@ -221,7 +235,7 @@ function gofmt(source) {
   return result.stdout;
 }
 const functionName = (name) => "shared" + name[0].toUpperCase() + name.slice(1);
-const quoteFunction = (type) => type.startsWith("ps") ? "bootstrapPSQuote" : "bootstrapShellQuote";
+const quoteFunction = (type) => type.startsWith("ps") ? "psQuote" : "bootstrapShellQuote";
 function fragmentFunction(fragment, constants, language) {
   const go = language === "go";
   const params = Object.entries(fragment.parameters).map(([name, type]) => {
@@ -245,7 +259,6 @@ export function generateSources({ constants, catalog, fragments }) {
     ts += `// prettier-ignore\nexport const ${name} = ${JSON.stringify(value)};\n`;
   }
   go += `
-func bootstrapPSQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
 func bootstrapShellQuote(value string) string { return "'" + strings.NewReplacer("'", "'\\\\''", "\\n", "'$'\\\\n''", "\\r", "'$'\\\\r''").Replace(value) + "'" }
 func bootstrapQuoteWords(values []string, quote func(string) string, separator string) string {
   quoted := make([]string, len(values))
@@ -254,8 +267,8 @@ func bootstrapQuoteWords(values []string, quote func(string) string, separator s
 }
 `;
   ts += `
-function bootstrapPSQuote(value: string): string {
-  return "'" + value.replaceAll("'", "''") + "'";
+export function psQuote(value: string): string {
+  return "'" + value.replace(/['\\u2018-\\u201b]/gu, (quote) => quote + quote) + "'";
 }
 
 // prettier-ignore

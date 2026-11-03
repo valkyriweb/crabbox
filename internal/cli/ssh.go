@@ -30,6 +30,7 @@ import (
 // SSHJump describes an authenticated SSH transport hop; the destination still
 // has its own end-to-end SSH host key and authentication.
 type SSHJump struct {
+	RelayOnly    bool `json:"relayOnly,omitempty"`
 	Relay        bool `json:"relay,omitempty"`
 	useRelay     bool
 	Candidates   []SSHJumpCandidate `json:"candidates,omitempty"`
@@ -139,7 +140,9 @@ func sshTargetForLeaseConnection(cfg Config, host, user, port, hostKey string, j
 // A loopback endpoint is a port-forward, so the implicit port 22 fallback
 // would reach the operator's own sshd. Explicit ssh.fallbackPorts still apply.
 func loopbackSafeFallbackPorts(cfg Config, host string, fallback []string) []string {
-	if cfg.sshFallbackPortsExplicit || !isLoopbackSSHHost(host) {
+	// Static SSH keeps upstream's policy: an explicit port is exclusive and
+	// the default port keeps its fallback (see staticSSHFallbackPorts).
+	if cfg.Provider == staticProvider || cfg.sshFallbackPortsExplicit || !isLoopbackSSHHost(host) {
 		return fallback
 	}
 	return []string{}
@@ -340,6 +343,7 @@ func sshCommandContext(ctx context.Context, target SSHTarget, args ...string) *e
 	// drain so cancellation cannot strand the caller in Cmd.Wait.
 	cmd.WaitDelay = sshCommandWaitDelay
 	applyTargetChildEnvironment(cmd, target)
+	applyNativeSSHChildEnvironment(cmd)
 	return cmd
 }
 
@@ -803,11 +807,11 @@ func probeSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Dura
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	if scope, _ := ctx.Value(nativeRuntimeScopeKey{}).(*nativeRuntimeScope); scope != nil && scope.selected() && isWindowsWSL2Target(*target) {
+	if scope, _ := ctx.Value(nativeRuntimeScopeKey{}).(*nativeRuntimeScope); scope != nil && scope.selected() && nativeSupervisorTarget(*target) {
 		if err := scope.validateLocal(ctx, *target); err != nil {
 			return false
 		}
-		// Route selection precedes admission. Probe only SSH/WSL transport;
+		// Route selection precedes admission. Probe only raw transport;
 		// staging here would require an installation on the unselected route.
 		for _, port := range resolvedSSHPortCandidates(*target) {
 			if context.Cause(ctx) != nil {
@@ -815,7 +819,10 @@ func probeSSHTransport(ctx context.Context, target *SSHTarget, timeout time.Dura
 			}
 			probe := *target
 			probe.Port, probe.FallbackPorts, probe.NoControlMaster = port, []string{}, true
-			command := wsl2ProbeCommand("exit 0", "/usr/bin/env BASH_ENV=/dev/null ENV=/dev/null /bin/sh -c")
+			command := remotePOSIXControlCommand("exit 0")
+			if isWindowsWSL2Target(probe) {
+				command = wsl2ProbeCommand("exit 0", "/usr/bin/env BASH_ENV=/dev/null ENV=/dev/null /bin/sh -c")
+			}
 			err := runWSLReadinessTransport(ctx, probe, command, "2", "1")
 			if err == nil {
 				target.recordPreparedEndpoint(port)
@@ -967,10 +974,13 @@ func resolveSSHPortNoInput(ctx context.Context, target *SSHTarget, connectTimeou
 type sshTransportPreparation struct {
 	// retirementUnconfirmed records dispatch evidence independently of joined errors.
 	retirementUnconfirmed bool
+	dispatched            bool
 	command               string
 	setupMarker           string
 	direct                io.ReadSeeker
 	stage                 *wslStageSpool
+	native                *remoteNativeRuntime
+	nativeNonce           string
 	// replay borrows a finite input owner; its caller closes it after dispatch.
 	replay *replayableSSHInput
 }
@@ -1040,6 +1050,17 @@ func prepareSSHTransport(ctx context.Context, target SSHTarget, command string, 
 		}
 		return sshTransportPreparation{stage: spool}, err
 	}
+	// Finite owner metadata already has its own control lifetime. Do not turn
+	// renewals or cleanup into another supervised workload on Linux.
+	if target.TargetOS == targetLinux && !limit.control {
+		native, err := admittedNativeRuntime(ctx, target)
+		if err != nil {
+			return sshTransportPreparation{}, err
+		}
+		if native != nil {
+			return native.prepareCommand(command, input, size, limit)
+		}
+	}
 	return sshTransportPreparation{command: wrapRemoteForTarget(target, command), direct: input}, nil
 }
 
@@ -1049,6 +1070,9 @@ func (p *sshTransportPreparation) run(ctx context.Context, target *SSHTarget, co
 		return err
 	}
 	*target = preparedTarget
+	if p.native != nil {
+		return p.runNative(ctx, *target, connectTimeout, connectionAttempts, stdout, stderr)
+	}
 	if p.stage != nil {
 		p.retirementUnconfirmed = true
 		p.stage.setupMarker = p.setupMarker
@@ -1100,12 +1124,20 @@ func (p *sshTransportPreparation) runOnce(ctx context.Context, target SSHTarget,
 		return false, err
 	}
 	cmd.Stdin = input
+	if p.native != nil {
+		closeInput, inputErr := nativeCommandInput(cmd, input)
+		if inputErr != nil {
+			return false, inputErr
+		}
+		defer func() { err = errors.Join(err, closeInput()) }()
+	}
 	p.retirementUnconfirmed = true
 	defer func() {
 		// Inspect the command we own, never an arbitrary ExitError found in a
 		// joined error. OpenSSH reserves 255 for transport failure; a normal
 		// exit below that reports remote command completion. Cancellation and
 		// signaled termination cannot establish remote retirement.
+		p.dispatched = cmd.Process != nil
 		if cmd.Process == nil {
 			p.retirementUnconfirmed = false // local Start failed: no dispatch
 		} else if ctx.Err() == nil && cmd.ProcessState != nil && cmd.ProcessState.Exited() && cmd.ProcessState.ExitCode() >= 0 && cmd.ProcessState.ExitCode() < 255 {
@@ -1143,6 +1175,9 @@ func (p *sshTransportPreparation) close() error {
 	var err error
 	if p.stage != nil {
 		err = errors.Join(err, p.stage.close())
+	}
+	if p.native != nil {
+		err = errors.Join(err, p.replay.close())
 	}
 	return err
 }
@@ -1410,7 +1445,19 @@ func (e *gitOriginDiagnosticsTruncatedError) Unwrap() error {
 	return e.err
 }
 
+const gitSeedPublishedReceipt = "crabbox-git-seed published"
+
 func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, error) {
+	out, _, err := runIdempotentSSHGitOriginAttemptCapture(ctx, target, remote, retryDelay, false)
+	return out, err
+}
+
+func runIdempotentSSHGitOriginAttemptWithPublication(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration) (string, bool, error) {
+	return runIdempotentSSHGitOriginAttemptCapture(ctx, target, remote, retryDelay, true)
+}
+
+func runIdempotentSSHGitOriginAttemptCapture(ctx context.Context, target SSHTarget, remote string, retryDelay time.Duration, capturePublication bool) (string, bool, error) {
+	published := false
 	var (
 		out       synchronizedBuffer
 		lastErr   error
@@ -1418,7 +1465,23 @@ func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, rem
 	)
 	for attempt := 0; attempt < 2; attempt++ {
 		out = newSynchronizedBuffer(gitSeedDiagnosticLimit)
-		lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+		// Keep diagnostics scoped to the last attempt, but retain an observed
+		// publication across transport retries. Origin diagnostics on stderr
+		// cannot supply the native producer's stdout receipt.
+		if capturePublication {
+			stdout := newSynchronizedBuffer(gitSeedDiagnosticLimit)
+			lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", io.MultiWriter(&out, &stdout), &out)
+			if receipt, clipped := stdout.boundedString(); !clipped {
+				for _, line := range strings.Split(receipt, "\n") {
+					if line == gitSeedPublishedReceipt {
+						published = true
+					}
+				}
+			}
+		} else {
+			// The shared writer preserves the ordinary combined-pipe ordering.
+			lastErr = executeSSH(ctx, &target, remote, nil, 0, 0, "10", "3", &out, &out)
+		}
 		if lastErr == nil || !shouldRetrySSHPort(lastErr) || attempt == 1 {
 			break
 		}
@@ -1432,7 +1495,7 @@ func runIdempotentSSHGitOriginAttempt(ctx context.Context, target SSHTarget, rem
 	if truncated && lastErr != nil {
 		lastErr = &gitOriginDiagnosticsTruncatedError{err: lastErr}
 	}
-	return output, lastErr
+	return output, published, lastErr
 }
 
 func isSSHCommandExitError(err error) bool {
@@ -1788,29 +1851,68 @@ try {
 exit $code`)
 }
 
+// gitSeedHeartbeatInterval spaces progress lines while a remote Git seed runs
+// with captured output.
+const gitSeedHeartbeatInterval = 15 * time.Second
+
+// startSyncHeartbeat prints periodic "still syncing" progress lines to stderr
+// until the returned stop function is called.
 func startSyncHeartbeat(stderr io.Writer, start time.Time, interval time.Duration) func() {
+	return startProgressHeartbeat(stderr, start, interval, "syncing", " watchdog=sync-quiet next_action=wait, or cancel and retry with --full-resync/fresh lease if no progress")
+}
+
+// startGitSeedHeartbeat prints periodic progress lines while a remote Git
+// seed runs, because the seed's own output is captured until it finishes.
+func startGitSeedHeartbeat(stderr io.Writer, start time.Time, interval time.Duration) func() {
+	return startProgressHeartbeat(stderr, start, interval, "seeding remote Git metadata", "")
+}
+
+// startProgressHeartbeat prints "still <label> after <elapsed>..." every
+// interval, appending quietHint once the step has run for four minutes.
+// A nonpositive interval disables the heartbeat. The returned stop function
+// waits for the heartbeat goroutine to exit, so no progress line is printed
+// after it returns.
+func startProgressHeartbeat(stderr io.Writer, start time.Time, interval time.Duration, label, quietHint string) func() {
 	if interval <= 0 {
 		return func() {}
 	}
+	ticker := time.NewTicker(interval)
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(interval)
+		defer close(exited)
 		defer ticker.Stop()
-		for {
+		writeProgressHeartbeats(stderr, start, ticker.C, done, label, quietHint)
+	}()
+	return func() {
+		close(done)
+		<-exited
+	}
+}
+
+// writeProgressHeartbeats prints one progress line per tick until done is
+// closed. A closed done wins over a tick that is ready at the same time.
+func writeProgressHeartbeats(stderr io.Writer, start time.Time, ticks <-chan time.Time, done <-chan struct{}, label, quietHint string) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticks:
+			// select picks randomly among ready cases; recheck done so a
+			// stop that raced with this tick suppresses the line.
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
-				elapsed := time.Since(start).Round(time.Second)
-				if elapsed >= 4*time.Minute {
-					fmt.Fprintf(stderr, "still syncing after %s... watchdog=sync-quiet next_action=wait, or cancel and retry with --full-resync/fresh lease if no progress\n", elapsed)
-				} else {
-					fmt.Fprintf(stderr, "still syncing after %s...\n", elapsed)
-				}
+			default:
 			}
+			elapsed := time.Since(start).Round(time.Second)
+			hint := ""
+			if elapsed >= 4*time.Minute {
+				hint = quietHint
+			}
+			fmt.Fprintf(stderr, "still %s after %s...%s\n", label, elapsed, hint)
 		}
-	}()
-	return func() { close(done) }
+	}
 }
 
 func ensureTrailingSlash(path string) string {
@@ -2060,18 +2162,15 @@ func shellAbsolutePath(value string) string {
 	return shellQuote(value)
 }
 
-func psQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
 func PowershellCommand(script string) string {
 	script = `$ProgressPreference = "SilentlyContinue"` + "\n" + script
 	encoded := base64.StdEncoding.EncodeToString(utf16LE([]byte(script)))
 	return "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded
 }
 
-// Win32-OpenSSH inherits an overlapped pipe. Use its asynchronous handle contract
-// so a pending SSH write can complete before the server closes stdin at EOF.
+// Win32-OpenSSH inherits an overlapped pipe; managed endpoints inherit a
+// synchronous pipe. Select the matching FileStream before reading any bytes.
+// Overlapped input must retain async reads so pending SSH writes can complete.
 func windowsPowerShellCopyExactInput(destination string, inputSize int64) string {
 	// An empty frame must not bind stdin, which may already be at EOF.
 	// Disable FileStream read-ahead so bytes after this frame remain on stdin.
@@ -2083,7 +2182,11 @@ if ($remaining -gt 0) {
 	$stdinHandle = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new([Cbx.SshStdin]::GetStdHandle(-10), $false)
 	$stdin = $null
 	try {
-		$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true)
+		try { $stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $true) }
+		catch {
+			if ($_.Exception.InnerException -isnot [ArgumentException]) { throw }
+			$stdin = [IO.FileStream]::new($stdinHandle, [IO.FileAccess]::Read, 1, $false)
+		}
 		$buffer = New-Object byte[] 65536
 		while ($remaining -gt 0) {
 			$readSize = [int][Math]::Min([Int64]$buffer.Length, $remaining)
@@ -2105,7 +2208,48 @@ const windowsPowerShellPathRefresh = `$env:Path = [Environment]::GetEnvironmentV
 `
 
 func windowsPowerShellStdinScriptCommand(inputSize int) string {
-	return PowershellCommand(windowsPowerShellPathRefresh + `$ErrorActionPreference = "Stop"
+	return windowsPowerShellStdinScriptCommandMode(inputSize, false)
+}
+
+// windowsPowerShellRawStdoutStdinScriptCommand preserves the script's stdout bytes exactly.
+func windowsPowerShellRawStdoutStdinScriptCommand(inputSize int) string {
+	return windowsPowerShellStdinScriptCommandMode(inputSize, true)
+}
+
+// A nested native command's stdout is decoded to text by the outer PowerShell host,
+// which corrupts binary payloads; copy the child's raw stdout stream instead.
+const windowsPowerShellRawFileInvoker = `function Invoke-CrabboxRawPowerShellFile([string]$File) {
+	$psi = New-Object System.Diagnostics.ProcessStartInfo
+	$psi.FileName = 'powershell.exe'
+	$psi.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $File + '"'
+	$psi.UseShellExecute = $false
+	$psi.RedirectStandardOutput = $true
+	$process = [System.Diagnostics.Process]::Start($psi)
+	$stdout = [Console]::OpenStandardOutput()
+	try {
+		$process.StandardOutput.BaseStream.CopyTo($stdout)
+		$stdout.Flush()
+	} finally {
+		$stdout.Dispose()
+	}
+	$process.WaitForExit()
+	return $process.ExitCode
+}
+`
+
+func windowsPowerShellFileInvocation(path string, rawStdout bool) string {
+	if rawStdout {
+		return "$code = Invoke-CrabboxRawPowerShellFile " + path + "\n"
+	}
+	return "& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " + path + "\n\t$code = $LASTEXITCODE\n"
+}
+
+func windowsPowerShellStdinScriptCommandMode(inputSize int, rawStdout bool) string {
+	prelude := ""
+	if rawStdout {
+		prelude = windowsPowerShellRawFileInvoker
+	}
+	return PowershellCommand(windowsPowerShellPathRefresh + prelude + `$ErrorActionPreference = "Stop"
 $path = Join-Path $env:TEMP ("crabbox-stdin-command-" + [Guid]::NewGuid().ToString("N") + ".ps1")
 try {
 	$scriptFile = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -2116,9 +2260,7 @@ try {
 	} finally {
 		$scriptFile.Dispose()
 	}
-	& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path
-	$code = $LASTEXITCODE
-} finally {
+	` + windowsPowerShellFileInvocation("$path", rawStdout) + `} finally {
 	Remove-Item -Force -LiteralPath $path -ErrorAction SilentlyContinue
 }
 if ($null -eq $code) { $code = 0 }
@@ -2361,9 +2503,9 @@ origin_git -C "$tmp" remote add origin "$expected_origin"
 		checkoutGit = "origin_git"
 	}
 	script := `set -e
-printf 'crabbox-git-seed phase=prerequisite\n'
+printf 'crabbox-git-seed phase=prerequisite\n' >&2
 command -v git >/dev/null 2>&1 || exit ` + strconv.Itoa(prerequisiteExitCode) + `
-printf 'crabbox-git-seed phase=prepare\n'
+printf 'crabbox-git-seed phase=prepare\n' >&2
 workdir=` + shellAbsolutePath(workdir) + `
 # Keep clone publication and cleanup anchored across directory changes.
 [ -n "$workdir" ] || { echo 'crabbox-git-seed: missing workspace path' >&2; exit 2; }
@@ -2402,7 +2544,7 @@ require_empty_seed_destination() {
 if [ -d "$workdir" ]; then
   cd "$workdir" || reject_seed_destination
   if usable_git_workspace; then
-    printf 'crabbox-git-seed phase=origin\n'
+    printf 'crabbox-git-seed phase=origin\n' >&2
     repair_origin
     exit 0
   fi
@@ -2414,29 +2556,31 @@ transport_error="$tmp.transport-error"
 cleanup_seed() { rm -rf -- "$tmp"; rm -f -- "$transport_error"; }
 trap cleanup_seed EXIT
 ` + prepare + `
-printf 'crabbox-git-seed phase=clone\n'
+printf 'crabbox-git-seed phase=clone\n' >&2
 if ! { ` + seed + `; } >/dev/null 2>"$transport_error"; then
   cat "$transport_error" >&2
   exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
 fi
-printf 'crabbox-git-seed phase=checkout\n'
-` + checkoutGit + ` -C "$tmp" checkout --quiet --detach ` + shellQuote(plan.Target) + `
-printf 'crabbox-git-seed phase=verify\n'
+printf 'crabbox-git-seed phase=checkout\n' >&2
+# Use Git baseline modes; the later sync preserves explicit local permissions.
+(umask 022; ` + checkoutGit + ` -C "$tmp" checkout --quiet --detach ` + shellQuote(plan.Target) + `)
+printf 'crabbox-git-seed phase=verify\n' >&2
 [ "$(git -C "$tmp" rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ]
 cd "$tmp"
 usable_git_workspace
 if [ -n "$expected_tree" ]; then
   [ "$(git write-tree)" = "$expected_tree" ]
 fi
-printf 'crabbox-git-seed phase=origin\n'
+printf 'crabbox-git-seed phase=origin\n' >&2
 repair_origin
 ` + seedManifest + `
-printf 'crabbox-git-seed phase=publish\n'
+printf 'crabbox-git-seed phase=publish\n' >&2
 cd /
 require_empty_seed_destination
 # Never recursively remove files that appeared while the clone was prepared.
 if [ -d "$workdir" ]; then rmdir -- "$workdir" || reject_seed_destination; fi
 mv -- "$tmp" "$workdir"
+printf '%s\n' ` + shellQuote(gitSeedPublishedReceipt) + `
 rm -f -- "$transport_error"
 trap - EXIT
 `

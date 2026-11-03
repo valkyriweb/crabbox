@@ -605,7 +605,7 @@ func TestLocalContainerOrdinarySourceLayering(t *testing.T) {
 	settings := func(text string, cpus int, enabled bool) LocalContainerConfig {
 		return LocalContainerConfig{
 			Runtime: text, Image: text, User: text, WorkRoot: text,
-			CPUs: cpus, Memory: text, Network: text, DockerSocket: enabled, NoHostname: enabled,
+			CPUs: cpus, Memory: text, Network: text, DockerSocket: enabled, NoHostname: enabled, OCIRuntime: text,
 		}
 	}
 	for _, source := range []string{"file", "env"} {
@@ -645,13 +645,13 @@ func TestLocalContainerOrdinarySourceLayering(t *testing.T) {
 					}
 					if err := applyFileConfig(&cfg, fileConfig{LocalContainer: &fileLocalContainerConfig{
 						Runtime: tc.text, Image: tc.text, User: tc.text, WorkRoot: tc.text,
-						CPUs: cpu, Memory: tc.text, Network: tc.text, DockerSocket: boolean, NoHostname: boolean,
+						CPUs: cpu, Memory: tc.text, Network: tc.text, DockerSocket: boolean, NoHostname: boolean, OCIRuntime: tc.text,
 					}}); err != nil {
 						t.Fatal(err)
 					}
 				} else {
 					wantCPU = tc.envCPU
-					for _, key := range []string{"RUNTIME", "IMAGE", "USER", "WORK_ROOT", "MEMORY", "NETWORK"} {
+					for _, key := range []string{"RUNTIME", "IMAGE", "USER", "WORK_ROOT", "MEMORY", "NETWORK", "OCI_RUNTIME"} {
 						t.Setenv("CRABBOX_LOCAL_CONTAINER_"+key, tc.text)
 					}
 					t.Setenv("CRABBOX_LOCAL_CONTAINER_CPUS", tc.cpu)
@@ -740,6 +740,7 @@ func clearConfigEnv(t *testing.T) {
 		"CRABBOX_COORDINATOR_TOKEN_COMMAND",
 		"CRABBOX_STATIC_START_COMMAND",
 		"CRABBOX_STATIC_STOP_COMMAND",
+		"CRABBOX_STATIC_NO_CONTROL_MASTER",
 		"CRABBOX_WEBVNC_AGENT_BASE_URL",
 		"CRABBOX_COORDINATOR_ADMIN_TOKEN",
 		"CRABBOX_ADMIN_TOKEN",
@@ -5564,18 +5565,34 @@ anthropicSandboxRuntime:
 func TestAsciiBoxConfigDefaultsFileAndEnv(t *testing.T) {
 	clearConfigEnv(t)
 	cfg := baseConfig()
+	if cfg.AsciiBox.NoEnv {
+		t.Fatal("noEnv must default to false")
+	}
+	noEnv := true
 	applyFileConfig(&cfg, fileConfig{
 		Provider: "ascii-box",
 		AsciiBox: &fileAsciiBoxConfig{
+			NoEnv:   &noEnv,
 			BaseURL: "https://box.example.test",
 			CLIPath: "/tmp/box",
 			Workdir: "/home/user/project",
 		},
 	})
-	if cfg.Provider != "ascii-box" || cfg.AsciiBox.BaseURL != "https://box.example.test" || cfg.AsciiBox.CLIPath != "/tmp/box" || cfg.AsciiBox.Workdir != "/home/user/project" {
+	if !cfg.AsciiBox.NoEnv || cfg.Provider != "ascii-box" || cfg.AsciiBox.BaseURL != "https://box.example.test" || cfg.AsciiBox.CLIPath != "/tmp/box" || cfg.AsciiBox.Workdir != "/home/user/project" {
 		t.Fatalf("file asciiBox config not applied: %#v", cfg.AsciiBox)
 	}
 
+	if got := configShowView(cfg)["asciiBox"].(map[string]any)["noEnv"]; got != true {
+		t.Fatalf("config show noEnv=%v, want true", got)
+	}
+	var shown bytes.Buffer
+	if err := writeConfigShowText(&shown, cfg); err != nil || !strings.Contains(shown.String(), "no_env=true") {
+		t.Fatalf("text config show lost noEnv: %v", err)
+	}
+	noEnv = false
+	if err := applyFileConfig(&cfg, fileConfig{AsciiBox: &fileAsciiBoxConfig{NoEnv: &noEnv}}); err != nil || cfg.AsciiBox.NoEnv {
+		t.Fatalf("explicit false did not override noEnv: %v", err)
+	}
 	t.Setenv("ASCII_BOX_API_KEY", "fallback-key")
 	t.Setenv("ASCII_BOX_BASE_URL", "https://fallback.example.test")
 	t.Setenv("CRABBOX_ASCII_BOX_API_KEY", "override-key")
@@ -11073,6 +11090,7 @@ results:
     - junit.xml
 shard:
   maxCount: 12
+  maxConcurrency: 4
 run:
   preflightTools:
     - node
@@ -11247,7 +11265,7 @@ ssh:
 	if len(cfg.Results.JUnit) != 1 || cfg.Results.JUnit[0] != "junit.xml" || !cfg.Results.Auto || !cfg.Results.FailOnFailures {
 		t.Fatalf("results config not loaded: %#v", cfg.Results)
 	}
-	if cfg.Shard.MaxCount != 12 {
+	if cfg.Shard.MaxCount != 12 || cfg.Shard.MaxConcurrency != 4 {
 		t.Fatalf("shard config not loaded: %#v", cfg.Shard)
 	}
 	if len(cfg.Run.PreflightTools) != 2 || cfg.Run.PreflightTools[0] != "node" || cfg.Run.PreflightTools[1] != "bun" {
@@ -17475,6 +17493,8 @@ func TestConfigInputGenericFileGroups(t *testing.T) {
 		{"results-clear", "results: {junit: []}", true, false},
 		{"results-false", "results: {auto: false}", true, false},
 		{"shard-zero", "shard: {maxCount: 0}", true, false},
+		{"shard-concurrency-zero", "shard: {maxConcurrency: 0}", true, false},
+		{"shard-concurrency", "shard: {maxConcurrency: 4}", true, false},
 		{"cache-false", "cache: {pnpm: false}", true, false},
 		{"cache-clear", "cache: {volumes: []}", true, false},
 		{"cache-invalid", "cache: {volumes: [{key: fixture}]}", false, true},

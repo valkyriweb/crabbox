@@ -32,6 +32,41 @@ crabbox admin delete cbx_... --force
 
 `release` and `delete` accept either a canonical `cbx_...` lease ID or an active slug, given positionally or via `--id`. Prefer the canonical ID when a slug lookup could be ambiguous. Add `--json` to any subcommand to print the structured record instead of the human-readable line.
 
+## retire-create
+
+Recover an interrupted ordinary create after its private cancellation token was
+lost. Start with a read-only preview of the canonical requested ID:
+
+```sh
+crabbox admin retire-create --id cbx_abcdef123456 --json
+```
+
+The preview returns an opaque `revision`, binding state, original owner and
+canonical org key when present, cancellation fence, and cleanup state. An absent
+record means `cleanup: "unproven"`; absence alone never proves cleanup.
+
+After checking the original request identity and creation time, explicitly retire
+that ID with the preview revision:
+
+```sh
+crabbox admin retire-create --id cbx_abcdef123456 --force \
+  --revision <preview-revision> --owner alice@example.com --org <canonical-org-key> \
+  --created-before 2026-10-01T12:00:00Z --reason 'interrupted creation; token lost' --json
+```
+
+The coordinator rejects a changed preview, another owner or org, a newer attempt,
+workspace reservations, and inconsistent bindings. An absent or unbound request
+receives a permanent cancellation fence; never reuse the retired ID. A bound
+request uses the existing generation-checked cleanup path. Its cleanup may remain
+`pending`; the CLI exits nonzero until cleanup is `confirmed`. An unbound retired
+request reports `not-allocated`. Reinspect after a conflict or pending outcome;
+do not replay creation. Tokens are never returned by this command.
+
+This requires coordinator support for retirement. Older coordinators reject the
+route; a 404 is not a successful retirement. The fence is compatible with
+coordinators that recognize version-2 create attempts. Checkpoint-backed
+attempts require their existing checkpoint recovery path.
+
 ## leases
 
 List coordinator lease records.
@@ -86,6 +121,14 @@ crabbox admin lifetime-readback --id cbx_abcdef123456 --json
 `rootVolumePresent: false`. Missing or failed observations are not proof of
 deletion. The coordinator verifies recorded ownership and resource identity
 before reporting provider state. This operation is admin-only and read-only.
+
+When the coordinator resolves the original root identity from a matching
+provider allocation event, JSON also contains `rootIdentityEvidence` with only
+the original `eventID` and `eventTime`. The field is omitted when no such evidence
+is returned; the CLI does not infer or create it. Raw provider event payloads
+are not included. This provenance is not proof of remote child termination,
+private artifact custody, or a trial score. Those require their own original
+records and verification.
 
 ## lease-audit
 

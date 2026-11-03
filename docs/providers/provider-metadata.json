@@ -537,8 +537,8 @@
     "gpu": "no",
     "lifecycle": "Crabbox",
     "cleanup": "VM delete",
-    "bestFit": "Local native Windows VM",
-    "caveat": "Windows host with Hyper-V required",
+    "bestFit": "Local native Windows Generation 2 VM",
+    "caveat": "Windows Hyper-V host, VM-management permissions, and Windows-ready VHDX required",
     "docs": "hyperv.md"
   },
   "incus": {
@@ -1213,5 +1213,34 @@
     "bestFit": "Trusted owner workloads on spare machine capacity",
     "caveat": "Brokered only; clients must reach the advertised SSH address; containers are not hostile-tenant isolation",
     "docs": "serve.md"
+  },
+  "ssh-host": {
+    "status": "built-in",
+    "category": "byo-ssh",
+    "substrate": "Exclusive existing Linux or Windows host",
+    "location": "byo",
+    "ssh": "crabbox-managed",
+    "sync": "crabbox-sync",
+    "gpu": "optional",
+    "lifecycle": "Coordinator and outbound host agent",
+    "cleanup": "Confirmed lease account/session teardown; never physical host deletion",
+    "bestFit": "Organization-shared existing test machines behind NAT",
+    "caveat": "Linux namespaces required; Windows MXC interactive-context integration needs hardware qualification; no network isolation",
+    "docs": "ssh-host.md"
+  },
+  "warpbuild": {
+    "status": "built-in",
+    "category": "delegated-sandbox",
+    "substrate": "WarpBuild macOS sandbox",
+    "location": "provider-managed",
+    "ssh": "no",
+    "sync": "archive-sync",
+    "gpu": "unknown",
+    "lifecycle": "WarpBuild standalone sandbox",
+    "cleanup": "explicit sandbox deletion",
+    "bestFit": "Standalone macOS command execution and resumable workspaces",
+    "caveat": "Seven-day native lifetime; no configurable provider TTL or idle timeout; disconnect does not confirm command termination",
+    "auth": "CI-scoped API key via WB_TOKEN",
+    "docs": "warpbuild.md"
   }
 }
