@@ -65,9 +65,22 @@ type CoordinatorHTTPError struct {
 	responseUnredirected bool
 }
 
+// Message keeps the whole error body so structured rejections stay parseable;
+// only the rendered error is capped. A serve capacity rejection lists views of
+// up to 64 donors, each mostly heartbeat data capped at 32 KiB; 4 MiB leaves
+// twice that.
+const (
+	coordinatorErrorBodyLimit    = 4 << 20
+	coordinatorErrorDisplayLimit = 600
+)
+
 func (e CoordinatorHTTPError) Error() string {
 	if e.Message != "" {
-		return fmt.Sprintf("coordinator %s %s: http %d: %s", e.Method, e.Path, e.StatusCode, e.Message)
+		message := e.Message
+		if len(message) > coordinatorErrorDisplayLimit {
+			message = message[:coordinatorErrorDisplayLimit] + "... (truncated)"
+		}
+		return fmt.Sprintf("coordinator %s %s: http %d: %s", e.Method, e.Path, e.StatusCode, message)
 	}
 	return fmt.Sprintf("coordinator %s %s: http %d", e.Method, e.Path, e.StatusCode)
 }
@@ -147,6 +160,7 @@ type CoordinatorLease struct {
 	SSHFallbackPorts             []string                       `json:"sshFallbackPorts,omitempty"`
 	WorkRoot                     string                         `json:"workRoot"`
 	Keep                         bool                           `json:"keep"`
+	ClientIdentity               *LeaseClientIdentity           `json:"clientIdentity,omitempty"`
 	State                        string                         `json:"state"`
 	TTLSeconds                   int                            `json:"ttlSeconds,omitempty"`
 	IdleTimeoutSeconds           int                            `json:"idleTimeoutSeconds,omitempty"`
@@ -1244,6 +1258,9 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 	}
 	if cfg.LifetimePolicy != nil {
 		req["lifetimePolicy"] = cfg.LifetimePolicy
+	}
+	if identity := currentLeaseClientIdentity(); identity != nil {
+		req["clientIdentity"] = identity
 	}
 	nativePlacement := false
 	if policy, ok := provider.(CoordinatorArchitecturePolicy); ok {
@@ -2983,10 +3000,10 @@ func splitCurlResponse(data []byte) ([]byte, int, error) {
 
 func decodeCoordinatorResponse(method, path string, statusCode int, body io.Reader, out any) error {
 	if statusCode < 200 || statusCode >= 300 {
-		// Do not wait beyond the existing diagnostic cap. Reaching it cannot
-		// establish EOF, so cap-sized bodies remain diagnostic-only.
-		data, readErr := io.ReadAll(io.LimitReader(body, 600))
-		complete := readErr == nil && len(data) < 600
+		// Do not wait beyond the body limit. Reaching it cannot establish EOF,
+		// so cap-sized bodies remain diagnostic-only.
+		data, readErr := io.ReadAll(io.LimitReader(body, coordinatorErrorBodyLimit))
+		complete := readErr == nil && len(data) < coordinatorErrorBodyLimit
 		msg := strings.TrimSpace(string(data))
 		return CoordinatorHTTPError{
 			Method:           method,
@@ -3116,6 +3133,7 @@ func leaseToServerTarget(lease CoordinatorLease, cfg Config) (Server, SSHTarget,
 			"idle_timeout_secs": fmt.Sprint(lease.IdleTimeoutSeconds),
 		},
 	}
+	applyLeaseOwnerLabels(server.Labels, lease)
 	if market := strings.TrimSpace(lease.Market); market != "" {
 		server.Labels["market"] = market
 	}
@@ -3141,6 +3159,11 @@ func leaseToServerTarget(lease CoordinatorLease, cfg Config) (Server, SSHTarget,
 	}
 	cfg.Provider = provider
 	target := sshTargetForLeaseConnection(cfg, lease.Host, lease.SSHUser, lease.SSHPort, lease.SSHHostKey, lease.SSHJump)
+	if lease.SSHFallbackPorts != nil {
+		// The coordinator advertisement is provider policy, so it survives the
+		// loopback rule for implicit fallbacks, except for port 22.
+		target.FallbackPorts = loopbackSafeAdvertisedFallbackPorts(cfg, lease.Host, lease.SSHFallbackPorts)
+	}
 	if server.Provider == "daytona" {
 		target.Key = ""
 		target.ReadyCheck = "command -v git >/dev/null && command -v rsync >/dev/null && command -v tar >/dev/null"

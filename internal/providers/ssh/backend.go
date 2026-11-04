@@ -224,7 +224,9 @@ func (b *staticLeaseBackend) List(_ context.Context, req core.ListRequest) ([]co
 		return []core.LeaseView{lease.Server}, nil
 	}
 	if claim, ok, err := staticLeaseClaimForConfig(b.Cfg); err != nil {
-		return nil, err
+		// List is read-only: an ambiguous or unreadable local claim must not hide
+		// the configured target. Stop and claims prune still fail closed.
+		fmt.Fprintf(b.RT.Stderr, "warning: listing configured static target without its local claim: %v; run crabbox claims list to inspect\n", err)
 	} else if ok {
 		server, _, _, err := staticLeaseFromClaim(b.Cfg, claim)
 		if err != nil {

@@ -44,7 +44,7 @@ func TestWarmupCreationRejectedTiming(t *testing.T) {
 		{name: "missing exact code key", provider: "aws", body: `{"Error":"cost_limit_exceeded"}`},
 		{name: "redirect changes method", provider: "aws", redirect: http.StatusFound},
 		{name: "redirect changes path", provider: "aws", redirect: http.StatusTemporaryRedirect},
-		{name: "truncated response", provider: "aws", body: `{"error":"cost_limit_exceeded"}` + strings.Repeat(" ", 600) + `invalid`},
+		{name: "truncated response", provider: "aws", body: `{"error":"cost_limit_exceeded"}` + strings.Repeat(" ", coordinatorErrorBodyLimit) + `invalid`},
 		{name: "incomplete response", provider: "aws", shortBody: true},
 		{name: "ambiguous then denied", provider: "aws", ambiguousFirst: true},
 		{name: "accepted then denied", provider: "aws", acceptedFirst: true},
@@ -134,8 +134,8 @@ func TestWarmupCreationRejectedTiming(t *testing.T) {
 			err := (App{Stdout: timingSink, Stderr: &stderr}).warmup(context.Background(), args)
 			var response CoordinatorHTTPError
 			wantMessage := body
-			if len(wantMessage) > 600 {
-				wantMessage = strings.TrimSpace(wantMessage[:600])
+			if len(wantMessage) > coordinatorErrorBodyLimit {
+				wantMessage = strings.TrimSpace(wantMessage[:coordinatorErrorBodyLimit])
 			}
 			if !errors.As(err, &response) || response.StatusCode != status || response.Message != wantMessage {
 				t.Fatalf("original rejection lost: %v; stderr=%s", err, stderr.String())
@@ -207,7 +207,7 @@ func (w partialRejectionTimingWriter) Write(data []byte) (int, error) {
 func TestCoordinatorHTTPErrorBodyKeepsDiagnosticReadLimit(t *testing.T) {
 	const message = `{"error":"cost_limit_exceeded"}`
 	beyondLimit := &countingReader{}
-	body := io.MultiReader(strings.NewReader(message+strings.Repeat(" ", 600-len(message))), beyondLimit)
+	body := io.MultiReader(strings.NewReader(message+strings.Repeat(" ", coordinatorErrorBodyLimit-len(message))), beyondLimit)
 	err := decodeCoordinatorResponse(http.MethodPut, "/v1/leases/cbx_0123456789ab", http.StatusTooManyRequests, body, nil)
 	var response CoordinatorHTTPError
 	if !errors.As(err, &response) || response.Message != message || response.responseComplete || beyondLimit.reads != 0 {

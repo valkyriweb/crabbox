@@ -35,6 +35,7 @@ export const awsMacOSInstanceTypeCandidates = [
 export const workspaceProviderKeyPrefix = "crabbox-workspace-";
 
 export interface LeaseConfig {
+  clientIdentity?: import("./types").LeaseClientIdentity;
   lifetimePolicy?: LeaseRequest["lifetimePolicy"];
   policyNotice?: string;
   leasePolicy?: LeasePolicy;
@@ -468,7 +469,31 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     sshHostPublicKey: "",
     pond: requestedPondName(input.pond ?? ""),
     exposedPorts: normalizeExposedPorts(input.exposedPorts ?? []),
+    ...clientIdentityField(input.clientIdentity),
   };
+}
+
+const maxClientIdentityValueLength = 128;
+
+// normalizeClientIdentity keeps the self-reported creating session as bounded,
+// printable display metadata. It is never used for authorization.
+export function normalizeClientIdentity(
+  input: unknown,
+): import("./types").LeaseClientIdentity | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const output: import("./types").LeaseClientIdentity = {};
+  for (const key of ["session", "host", "agent"] as const) {
+    const value = (input as Record<string, unknown>)[key];
+    if (typeof value !== "string") continue;
+    const cleaned = value.replace(/[^\x21-\x7e]/g, "").slice(0, maxClientIdentityValueLength);
+    if (cleaned) output[key] = cleaned;
+  }
+  return Object.keys(output).length ? output : undefined;
+}
+
+function clientIdentityField(input: unknown): Pick<LeaseConfig, "clientIdentity"> {
+  const clientIdentity = normalizeClientIdentity(input);
+  return clientIdentity ? { clientIdentity } : {};
 }
 
 // normalizePondName mirrors the Go-side helper in internal/cli/pond.go. The

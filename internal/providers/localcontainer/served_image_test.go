@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -168,7 +169,7 @@ func servedImageFixture(id string) string {
 
 func TestServedPrepare(t *testing.T) {
 	for _, runtimeName := range []string{"docker", "podman"} {
-		for _, mode := range []string{"ready", "skip", "prepare", "reuse", "pull", "base-pull-failure", "base-inspect-failure", "probe-failure", "probe-output", "run-failure", "commit-failure", "inspect-failure", "config-mismatch", "cleanup-failure", "tag-cleanup-failure", "cancel", "nil-cmd", "empty-cmd", "nil-entrypoint", "empty-entrypoint"} {
+		for _, mode := range []string{"ready", "skip", "prepare", "reuse", "pull", "base-pull-failure", "base-inspect-failure", "probe-failure", "probe-output", "run-failure", "commit-failure", "inspect-failure", "config-mismatch", "cleanup-failure", "tag-cleanup-failure", "cancel", "nil-cmd", "empty-cmd", "nil-entrypoint", "empty-entrypoint", "image-container-env"} {
 			t.Run(runtimeName+"/"+mode, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
@@ -186,6 +187,9 @@ func TestServedPrepare(t *testing.T) {
 						if mode == "empty-"+field {
 							result = strings.Replace(result, `"`+name+`":`+value, `"`+name+`":[]`, 1)
 						}
+					}
+					if mode == "image-container-env" {
+						result = strings.Replace(result, `"Env":[`, `"Env":["container=oci",`, 1)
 					}
 					return result
 				}
@@ -251,13 +255,23 @@ func TestServedPrepare(t *testing.T) {
 							if !strings.Contains(a[len(a)-1], bootstrapTools) {
 								t.Fatal("missing tool probe")
 							}
+							if !strings.Contains(a[len(a)-1], "node --version") || !strings.Contains(a[len(a)-1], servedNodeVersion) {
+								t.Fatal("tool probe must require the pinned node version")
+							}
 							if mode == "probe-failure" {
 								return core.LocalCommandResult{}, errors.New("probe failed")
 							}
 						} else {
 							prepRuns++
 							temp = a[2]
-							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
+							wantUnset := runtimeName == "podman" && mode != "image-container-env"
+							if unset := len(a) > 4 && a[3] == "--unsetenv" && a[4] == "container"; unset != wantUnset {
+								t.Fatalf("runtime=%s unsetenv=%v args=%v", runtimeName, unset, a)
+							}
+							if noProxy := slices.Contains(a, "--http-proxy=false"); noProxy != (runtimeName == "podman") {
+								t.Fatalf("runtime=%s http-proxy=false=%v args=%v", runtimeName, noProxy, a)
+							}
+							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], servedNodeInstallScript) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
 								t.Fatal("invalid preparation script")
 							}
 							if req.Stdout != &warning || req.Stderr != &warning {
@@ -461,5 +475,16 @@ func TestServedPrunesImagesEvenWhenCacheVolumeRemovalFails(t *testing.T) {
 	}
 	if got := runner.calls[len(runner.calls)-1].Args; len(got) < 2 || got[0] != "image" || got[1] != "ls" {
 		t.Fatalf("prepared images were not considered: %v", got)
+	}
+}
+
+func TestServedNodeInstallScriptPinsAndVerifies(t *testing.T) {
+	for _, want := range []string{"node_version=" + servedNodeVersion, "eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c", "33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3", "https://nodejs.org/dist/", "sha256sum -c -", "/opt/node", "/usr/local/bin"} {
+		if !strings.Contains(servedNodeInstallScript, want) {
+			t.Fatalf("node install script missing %q", want)
+		}
+	}
+	if strings.Contains(servedNodeInstallScript, "apt-key") || strings.Contains(servedNodeInstallScript, "nodesource") {
+		t.Fatal("node install must not use external apt repositories")
 	}
 }

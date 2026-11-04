@@ -104,8 +104,17 @@ supported served sizes.
 
 `--type cpu4` requests four CPUs and 8 GiB. Requests must fit the offer and
 remaining reservations. Placement prefers the most free CPU; use
-`--serve-machine <name-or-UUID>` to pin a machine. No capacity fails immediately
-with `serve_capacity_unavailable`, including owner-visible machine capacity.
+`--serve-machine <name-or-UUID>` to pin a machine. When no machine has capacity
+the coordinator returns `serve_capacity_unavailable`; the CLI then waits and
+retries with backoff (5s doubling to 30s) for up to 10 minutes, printing
+`phase="awaiting-capacity"` progress. Set `serve.capacityWait` or
+`CRABBOX_SERVE_CAPACITY_WAIT` (a duration such as `3m`) to change the budget.
+After the budget expires, an attempt already in flight may run up to 5 more
+minutes (`grace=5m0s` in the log line), so the worst case is about budget + 5 min.
+Pass `--serve-no-wait` (or set `serve.noCapacityWait: true` or
+`CRABBOX_SERVE_NO_WAIT=1`) to fail immediately. The CLI also fails immediately
+when the rejection lists no online machine, since no busy donor can free up. A
+configured fallback skips the wait and retries on the fallback provider instead.
 
 Optional fallback applies only to that explicit capacity rejection:
 
@@ -147,6 +156,14 @@ sysfs power information. Linux console idle time is unknown: enabling an idle
 requirement there conservatively prevents availability. Unsupported or failed
 required measurements are unknown, never treated as idle. Unknown form factor
 uses laptop defaults.
+
+Sandboxed agents, such as one inside gVisor, read a `/proc/stat` that covers
+only their sandbox, so they cannot see load beside them. For these, pass
+`--host-cpu-file <path>` (or `CRABBOX_SERVE_HOST_CPU_FILE`). An external sampler
+writes one line, `<used cores> <total cores>`, for the whole host. The agent
+uses that line as total host utilization and divides its owned containers' CPU
+by the file's core count. If the file is missing, malformed or older than 30
+seconds, host CPU is unknown, so the machine is not available.
 
 If the agent cannot read its container inventory or CPU stats, it uses raw host
 CPU without subtracting container usage. This conservatively overestimates load;
@@ -205,15 +222,23 @@ results remain on stdout.
 
 After the first heartbeat and reconciliation, Serve probes the configured image
 in the background for `sshd`, Git, rsync,
-curl, sudo, and Python 3. If any are missing and `apt-get` is available, it
-installs the shared bootstrap package set once in a temporary container, then
+curl, sudo, Python 3, and the pinned Node.js/npm toolchain. If any are missing
+and `apt-get` is available, it installs the shared bootstrap packages and
+checksum-verified Node.js archive once in a temporary container, then
 commits a local prepared image. This uses ordinary Docker/Podman `run` and
 `commit`; it requires no buildx or Dockerfile. Preparation output goes to stderr.
-Images that already have the tools, or have no `apt-get`, keep the existing
-bootstrap behavior. Heartbeats and existing-lease reconciliation continue during
+Images that already have the tools need no prepared copy. Images without
+`apt-get` skip background preparation and must provide the shared bootstrap
+dependencies themselves. Heartbeats and existing-lease reconciliation continue during
 preparation; new leases use the configured image with lease-time bootstrap until
 the prepared image is ready. If preparation fails, the agent prints a warning and uses
-the configured image, so leases install their tools at startup as before.
+the configured image, so leases install their tools at startup. Every served
+lease runs the same idempotent Node.js installer before starting SSH, including
+base-image fallbacks after preparation is pending, failed, or pruned. Host-key
+readiness waits for the pinned Node.js version and a working npm, so an early
+SSH host key cannot advertise a lease whose toolchain is still missing. An
+unsupported architecture or failed archive verification leaves the lease
+unready. Ordinary local-container leases do not acquire this Node.js policy.
 Failure to pull or inspect the configured image still stops agent startup.
 
 The tag is `crabbox-serve-prepared:<hash>`, where the hash is the first 16 hex

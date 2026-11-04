@@ -22,10 +22,13 @@ func (Provider) Spec() core.ProviderSpec {
 	return core.ProviderSpec{Authentication: core.ProviderAuthentication{{Route: "brokered", Methods: []core.ProviderAuthenticationMethod{core.ProviderAuthenticationCoordinator}, Description: "Owner-scoped coordinator login for donated machines."}}, Name: "serve", Family: "serve", Kind: core.ProviderKindSSHLease, ClassDisposition: core.ProviderClassDispositionUnmapped, Targets: []core.TargetSpec{{OS: core.TargetLinux}}, Features: core.FeatureSet{core.FeatureSSH, core.FeatureCrabboxSync}, BrokeredOnly: true, Coordinator: core.CoordinatorSupported, ActionsRunnerUnsupported: true}
 }
 
-type flags struct{ machine, fallback *string }
+type flags struct {
+	machine, fallback *string
+	noWait            *bool
+}
 
 func (Provider) RegisterFlags(fs *flag.FlagSet, cfg core.Config) any {
-	return flags{fs.String("serve-machine", cfg.Serve.Machine, "Pin a served machine by name or UUID"), fs.String("serve-fallback", cfg.Serve.Fallback, "Retry capacity-unavailable acquisition once on this provider")}
+	return flags{fs.String("serve-machine", cfg.Serve.Machine, "Pin a served machine by name or UUID"), fs.String("serve-fallback", cfg.Serve.Fallback, "Retry capacity-unavailable acquisition once on this provider"), fs.Bool("serve-no-wait", cfg.Serve.NoCapacityWait, "Fail immediately instead of waiting when every served machine is busy")}
 }
 func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, v any) error {
 	f := v.(flags)
@@ -35,9 +38,14 @@ func (Provider) ApplyFlags(cfg *core.Config, fs *flag.FlagSet, v any) error {
 	if core.FlagWasSet(fs, "serve-fallback") {
 		cfg.Serve.Fallback = *f.fallback
 	}
+	if core.FlagWasSet(fs, "serve-no-wait") {
+		cfg.Serve.NoCapacityWait = *f.noWait
+	}
 	return nil
 }
-func (Provider) CreationOnlyFlagNames() []string { return []string{"serve-machine", "serve-fallback"} }
+func (Provider) CreationOnlyFlagNames() []string {
+	return []string{"serve-machine", "serve-fallback", "serve-no-wait"}
+}
 func (Provider) ApplyConfigDefaults(cfg *core.Config) error {
 	if cfg.Class != "" && cfg.Class != "beast" && !cfg.ServerTypeExplicit {
 		found := false

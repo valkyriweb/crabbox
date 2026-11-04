@@ -189,6 +189,9 @@ func TestHeartbeatCoordinatorOmitsIdleTimeoutWithoutOverride(t *testing.T) {
 }
 
 func TestHeartbeatCoordinatorWaitsForAccessRefresh(t *testing.T) {
+	if runParallelCLIContract(t, 50*time.Second) {
+		return
+	}
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
