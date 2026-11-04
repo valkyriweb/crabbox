@@ -100,8 +100,10 @@ describe("managed host allocation", () => {
     );
     expect(results.filter((r) => r.status === 202)).toHaveLength(1);
     expect(results.filter((r) => r.status === 409)).toHaveLength(11);
-    expect((await f.create("cbx_000000000001", "borrower-0@example.com")).status).toBe(202);
-    expect((await f.create("cbx_000000000001", "other@example.com")).status).toBe(409);
+    const winner = results.findIndex((r) => r.status === 202);
+    const winnerID = `cbx_${(winner + 1).toString(16).padStart(12, "0")}`;
+    expect((await f.create(winnerID, `borrower-${winner}@example.com`)).status).toBe(202);
+    expect((await f.create(winnerID, "other@example.com")).status).toBe(409);
   });
   it("matches organization, platform, architecture, and capability", async () => {
     const f = fixture();
