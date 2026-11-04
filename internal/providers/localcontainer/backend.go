@@ -1943,7 +1943,7 @@ func (b *backend) createContainerWithOptions(ctx context.Context, cfg core.Confi
 		args = append(args, "-v", vol)
 	}
 	if served != nil {
-		script := servedWatchdog + "\n" + bootstrapScript
+		script := servedWatchdog + "\n" + containerBootstrapScript(servedNodeInstallScript)
 		runtimeImage := cfg.LocalContainer.Image
 		if served.runtimeImage != "" {
 			runtimeImage = served.runtimeImage
@@ -3208,7 +3208,10 @@ fi
 const bootstrapTools = "/usr/sbin/sshd git rsync curl sudo python3"
 const bootstrapPackages = "openssh-server ca-certificates git rsync curl sudo python3"
 
-var bootstrapScript = `
+var bootstrapScript = containerBootstrapScript("")
+
+func containerBootstrapScript(beforeSSHD string) string {
+	return `
 set -eu
 image_path="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 export DEBIAN_FRONTEND=noninteractive
@@ -3672,8 +3675,10 @@ if [ "${CRABBOX_BROWSER:-0}" = "1" ]; then
   chown "$user" /var/lib/crabbox/browser.env
   chmod 0644 /var/lib/crabbox/browser.env
 fi
+` + beforeSSHD + `
 exec /usr/sbin/sshd -D -e -p "$ssh_port"
 `
+}
 
 const validateCheckpointForkWorkdirScript = `
 set -eu

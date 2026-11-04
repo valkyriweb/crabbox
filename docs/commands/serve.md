@@ -34,6 +34,7 @@ crabbox serve uninstall
 | `--require-user-idle` | Minimum console idle duration, default `0` on desktops or `10m` on laptops |
 | `--require-ac-power` | Require AC on laptops, default `true`; ignored on desktops |
 | `--max-memory-pressure` | Busy at `warn` or `critical`, default `critical` |
+| `--host-cpu-file` | Read host CPU as `<used cores> <total cores>` from this file instead of `/proc/stat` or Mach counters; env `CRABBOX_SERVE_HOST_CPU_FILE`. For sandboxed agents. |
 | `--probe` | Read-only local availability sampling (`status` only); no coordinator needed |
 | `--probe-duration` | Probe observation period, `1m`–`1h`, default `7m` |
 

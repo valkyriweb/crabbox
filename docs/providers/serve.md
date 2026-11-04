@@ -157,6 +157,14 @@ requirement there conservatively prevents availability. Unsupported or failed
 required measurements are unknown, never treated as idle. Unknown form factor
 uses laptop defaults.
 
+Sandboxed agents, such as one inside gVisor, read a `/proc/stat` that covers
+only their sandbox, so they cannot see load beside them. For these, pass
+`--host-cpu-file <path>` (or `CRABBOX_SERVE_HOST_CPU_FILE`). An external sampler
+writes one line, `<used cores> <total cores>`, for the whole host. The agent
+uses that line as total host utilization and divides its owned containers' CPU
+by the file's core count. If the file is missing, malformed or older than 30
+seconds, host CPU is unknown, so the machine is not available.
+
 If the agent cannot read its container inventory or CPU stats, it uses raw host
 CPU without subtracting container usage. This conservatively overestimates load;
 `serve container CPU unknown` is an informational reason, not an unknown host
@@ -214,15 +222,23 @@ results remain on stdout.
 
 After the first heartbeat and reconciliation, Serve probes the configured image
 in the background for `sshd`, Git, rsync,
-curl, sudo, and Python 3. If any are missing and `apt-get` is available, it
-installs the shared bootstrap package set once in a temporary container, then
+curl, sudo, Python 3, and the pinned Node.js/npm toolchain. If any are missing
+and `apt-get` is available, it installs the shared bootstrap packages and
+checksum-verified Node.js archive once in a temporary container, then
 commits a local prepared image. This uses ordinary Docker/Podman `run` and
 `commit`; it requires no buildx or Dockerfile. Preparation output goes to stderr.
-Images that already have the tools, or have no `apt-get`, keep the existing
-bootstrap behavior. Heartbeats and existing-lease reconciliation continue during
+Images that already have the tools need no prepared copy. Images without
+`apt-get` skip background preparation and must provide the shared bootstrap
+dependencies themselves. Heartbeats and existing-lease reconciliation continue during
 preparation; new leases use the configured image with lease-time bootstrap until
 the prepared image is ready. If preparation fails, the agent prints a warning and uses
-the configured image, so leases install their tools at startup as before.
+the configured image, so leases install their tools at startup. Every served
+lease runs the same idempotent Node.js installer before starting SSH, including
+base-image fallbacks after preparation is pending, failed, or pruned. Host-key
+readiness waits for the pinned Node.js version and a working npm, so an early
+SSH host key cannot advertise a lease whose toolchain is still missing. An
+unsupported architecture or failed archive verification leaves the lease
+unready. Ordinary local-container leases do not acquire this Node.js policy.
 Failure to pull or inspect the configured image still stops agent startup.
 
 The tag is `crabbox-serve-prepared:<hash>`, where the hash is the first 16 hex
