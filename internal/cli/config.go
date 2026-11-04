@@ -1761,6 +1761,7 @@ type ServeAvailabilityConfig struct {
 	RequireUserIdle   string   `yaml:"requireUserIdle,omitempty"`
 	RequireACPower    *bool    `yaml:"requireACPower,omitempty"`
 	MaxMemoryPressure string   `yaml:"maxMemoryPressure,omitempty"`
+	HostCPUFile       string   `yaml:"hostCPUFile,omitempty"`
 }
 
 type fileConfig struct {

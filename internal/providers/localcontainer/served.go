@@ -145,7 +145,8 @@ func (r *ServedRuntime) Refresh(ctx context.Context, c ServedContainer, machineI
 	return err
 }
 func (r *ServedRuntime) HostKey(ctx context.Context, c ServedContainer) (string, error) {
-	result, err := r.b.docker(ctx, []string{"exec", c.ID, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"}, nil, nil)
+	script := `[ "$(node --version 2>/dev/null)" = "` + servedNodeVersion + `" ] && npm --version >/dev/null 2>&1 && cat /etc/ssh/ssh_host_ed25519_key.pub`
+	result, err := r.b.docker(ctx, []string{"exec", c.ID, "/bin/sh", "-c", script}, nil, nil)
 	return strings.TrimSpace(result.Stdout), err
 }
 func (r *ServedRuntime) Version(ctx context.Context) (string, error) {
