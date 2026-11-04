@@ -157,6 +157,14 @@ requirement there conservatively prevents availability. Unsupported or failed
 required measurements are unknown, never treated as idle. Unknown form factor
 uses laptop defaults.
 
+Sandboxed agents, such as one inside gVisor, read a `/proc/stat` that covers
+only their sandbox, so they cannot see load beside them. For these, pass
+`--host-cpu-file <path>` (or `CRABBOX_SERVE_HOST_CPU_FILE`). An external sampler
+writes one line, `<used cores> <total cores>`, for the whole host. The agent
+uses that line as total host utilization and divides its owned containers' CPU
+by the file's core count. If the file is missing, malformed or older than 30
+seconds, host CPU is unknown, so the machine is not available.
+
 If the agent cannot read its container inventory or CPU stats, it uses raw host
 CPU without subtracting container usage. This conservatively overestimates load;
 `serve container CPU unknown` is an informational reason, not an unknown host
