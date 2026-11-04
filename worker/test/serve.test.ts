@@ -1051,3 +1051,53 @@ describe.each([false, true])("serve availability durable=%s", (durable) => {
     expect((await f.route("/v1/serve/heartbeat", { ...machine(), availability })).status).toBe(400);
   });
 });
+
+it("replays fixed controller acquisition and fences late creates after cancellation", async () => {
+  const f = fixture(true);
+  const fleet = new FleetCoordinator(f.runtime, env);
+  const send = (path: string, data?: unknown, owner = "alice@example.com", method = "POST") =>
+    routeCoordinatorRequest(new Request(req(path, data, owner), { method }), env, (r) =>
+      fleet.fetch(r),
+    );
+  expect((await send("/v1/serve/heartbeat", machine())).status).toBe(200);
+  const id = "cbx_0000000000c1";
+  const attempt = "cat_" + "c".repeat(32);
+  const body = {
+    provider: "serve",
+    class: "standard",
+    sshPublicKey: key,
+    createAttemptID: attempt,
+  };
+  // Discard the first response as if transport failed after commit; replay and
+  // concurrent replay must retain exactly one donor reservation.
+  await send(`/v1/leases/${id}`, body, undefined, "PUT");
+  const responses = await Promise.all([
+    send(`/v1/leases/${id}`, body, undefined, "PUT"),
+    send(`/v1/leases/${id}`, body, undefined, "PUT"),
+  ]);
+  expect(responses.map((r) => r.status)).toEqual([202, 202]);
+  expect((await f.storage.list({ prefix: "lease:" })).size).toBe(1);
+  expect(
+    (await send(`/v1/leases/${id}`, { ...body, class: "fast" }, undefined, "PUT")).status,
+  ).toBe(409);
+  // Shared auth fixes its principal and deliberately ignores spoofed owner headers.
+  // Exercise the storage boundary with a different already-authenticated owner.
+  expect(
+    (await f.serve.create(req(`/v1/leases/${id}`, {}, "bob@example.com"), body, id)).status,
+  ).toBe(409);
+  expect((await send(`/v1/leases/${id}/cancel-create`, { createAttemptID: attempt })).status).toBe(
+    200,
+  );
+  expect((await send(`/v1/leases/${id}/cancel-create`, { createAttemptID: attempt })).status).toBe(
+    200,
+  );
+  expect((await send(`/v1/leases/${id}`, body, undefined, "PUT")).status).toBe(409);
+  expect((await f.storage.get<LeaseRecord>(`lease:${id}`))?.state).toBe("released");
+
+  const late = "cbx_0000000000c2";
+  expect(
+    (await send(`/v1/leases/${late}/cancel-create`, { createAttemptID: attempt })).status,
+  ).toBe(200);
+  expect((await send(`/v1/leases/${late}`, body, undefined, "PUT")).status).toBe(409);
+  expect(await f.storage.get(`lease:${late}`)).toBeUndefined();
+});

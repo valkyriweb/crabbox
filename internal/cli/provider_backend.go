@@ -174,6 +174,13 @@ type ControllerProviderContract interface {
 	SupportsControllerFixedLeaseID(Config) bool
 }
 
+// AuthenticatedControllerProviderContract resolves a remote principal before
+// controller admission and each lifecycle scope check. It must have no native
+// resource effects and must not return credentials in its opaque scope.
+type AuthenticatedControllerProviderContract interface {
+	ControllerProviderIdentity(context.Context, Config) (scope string, fixedLeaseID bool, err error)
+}
+
 type ProviderRoutingFlagProvider interface {
 	RoutingFlagNames() []string
 }
@@ -2001,6 +2008,18 @@ func controllerProviderIdentityForConfig(cfg Config) (string, string, bool, erro
 		return "", "", false, err
 	}
 	cfg.Provider = provider.Spec().Name
+	if contract, ok := provider.(AuthenticatedControllerProviderContract); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		scope, fixed, err := contract.ControllerProviderIdentity(ctx, cfg)
+		if err != nil {
+			return "", "", false, err
+		}
+		if strings.TrimSpace(scope) == "" {
+			return "", "", false, fmt.Errorf("provider=%s returned an empty authenticated controller scope", cfg.Provider)
+		}
+		return cfg.Provider, strings.TrimSpace(scope), fixed, nil
+	}
 	contract, ok := provider.(ControllerProviderContract)
 	if !ok {
 		return "", "", false, fmt.Errorf("provider=%s does not expose a controller routing scope", provider.Spec().Name)
@@ -2016,17 +2035,24 @@ func controllerProviderIdentityForConfig(cfg Config) (string, string, bool, erro
 	return provider.Spec().Name, scope, contract.SupportsControllerFixedLeaseID(cfg), nil
 }
 
-func validateControllerProviderScope(cfg Config) error {
+func validateControllerProviderScope(cfg *Config) error {
 	expected := strings.TrimSpace(os.Getenv(controllerProviderScopeEnv))
 	if expected == "" {
 		return nil
 	}
-	provider, actual, _, err := controllerProviderIdentityForConfig(cfg)
+	provider, actual, _, err := controllerProviderIdentityForConfig(*cfg)
 	if err != nil {
 		return err
 	}
 	if actual != expected {
 		return Exit(2, "provider=%s controller routing scope changed; refusing lifecycle operation; restore the original configuration and drain existing workspaces before changing it", provider)
+	}
+	resolved, err := ProviderFor(cfg.Provider)
+	if err != nil {
+		return err
+	}
+	if _, authenticated := resolved.(AuthenticatedControllerProviderContract); authenticated {
+		cfg.controllerProviderScope = actual
 	}
 	return nil
 }
@@ -2077,7 +2103,7 @@ func loadBackend(cfg Config, rt Runtime) (Backend, error) {
 		return nil, err
 	}
 	cfg.Provider = provider.Spec().Name
-	if err := validateControllerProviderScope(cfg); err != nil {
+	if err := validateControllerProviderScope(&cfg); err != nil {
 		return nil, err
 	}
 	if err := validateControllerCoordinatorRegistrationBinding(cfg); err != nil {

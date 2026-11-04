@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1164,7 +1166,17 @@ func (c *CoordinatorClient) CreateLeaseWithAttempt(ctx context.Context, cfg Conf
 }
 
 func (c *CoordinatorClient) EnsureLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug string) (CoordinatorLease, error) {
-	return c.createLease(ctx, cfg, publicKey, keep, leaseID, slug, "", true)
+	return c.createLease(ctx, cfg, publicKey, keep, leaseID, slug, controllerFixedCreateAttemptID(cfg, leaseID), true)
+}
+
+// Bind cancellation/replay to one controller custody scope, without secrets.
+// Ordinary fixed-ID callers retain their existing protocol.
+func controllerFixedCreateAttemptID(cfg Config, leaseID string) string {
+	if cfg.controllerProviderScope == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("controller-create-v1\x00" + cfg.controllerProviderScope + "\x00" + leaseID))
+	return "cat_" + hex.EncodeToString(sum[:16])
 }
 
 func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicKey string, keep bool, leaseID, slug, createAttemptID string, fixed bool) (CoordinatorLease, error) {
@@ -1253,7 +1265,7 @@ func (c *CoordinatorClient) createLease(ctx context.Context, cfg Config, publicK
 		"pond":                            cfg.Pond,
 		"exposedPorts":                    cfg.ExposedPorts,
 	}
-	if !fixed {
+	if !fixed || createAttemptID != "" {
 		req["createAttemptID"] = createAttemptID
 	}
 	if cfg.LifetimePolicy != nil {

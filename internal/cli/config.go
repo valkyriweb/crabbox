@@ -18,6 +18,7 @@ import (
 )
 
 type Config struct {
+	controllerProviderScope       string // authenticated runtime-only lifecycle binding
 	DirectLeases                  string
 	DirectLeaseAllow              []string
 	guestLeaseExpiry              *GuestLeaseExpiryFields
