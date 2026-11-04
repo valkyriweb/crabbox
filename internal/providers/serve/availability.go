@@ -31,6 +31,8 @@ type availabilityPolicy struct {
 	requireACPower    bool
 	maxMemoryPressure string
 	laptop            bool
+	// hostCPUFile replaces /proc/stat as the host CPU source. See readHostCPUFile.
+	hostCPUFile string
 }
 type availabilitySample struct {
 	at                  time.Time
@@ -77,16 +79,18 @@ func availabilityFlags(fs *flag.FlagSet, cfg core.ServeAvailabilityConfig, lapto
 	if cfg.MaxMemoryPressure != "" {
 		p.maxMemoryPressure = cfg.MaxMemoryPressure
 	}
+	p.hostCPUFile = cfg.HostCPUFile
 	envFlags := []struct{ name, flag string }{
 		{"CRABBOX_SERVE_AVAILABILITY", "availability"}, {"CRABBOX_SERVE_MAX_HOST_CPU", "max-host-cpu"},
 		{"CRABBOX_SERVE_REQUIRE_USER_IDLE", "require-user-idle"}, {"CRABBOX_SERVE_REQUIRE_AC_POWER", "require-ac-power"},
-		{"CRABBOX_SERVE_MAX_MEMORY_PRESSURE", "max-memory-pressure"},
+		{"CRABBOX_SERVE_MAX_MEMORY_PRESSURE", "max-memory-pressure"}, {"CRABBOX_SERVE_HOST_CPU_FILE", "host-cpu-file"},
 	}
 	fs.StringVar(&p.mode, "availability", p.mode, "Availability gating: auto or always")
 	fs.Float64Var(&p.maxHostCPU, "max-host-cpu", p.maxHostCPU, "Maximum non-serve host CPU fraction (0-1)")
 	fs.DurationVar(&p.requireUserIdle, "require-user-idle", p.requireUserIdle, "Required console idle time; 0 disables")
 	fs.BoolVar(&p.requireACPower, "require-ac-power", p.requireACPower, "Require AC power on laptops")
 	fs.StringVar(&p.maxMemoryPressure, "max-memory-pressure", p.maxMemoryPressure, "Busy at memory pressure: warn or critical")
+	fs.StringVar(&p.hostCPUFile, "host-cpu-file", p.hostCPUFile, "Read host CPU as \"<used cores> <total cores>\" from this file instead of /proc/stat (sandboxed hosts)")
 	for _, e := range envFlags {
 		if value, ok := os.LookupEnv(e.name); ok {
 			if err := fs.Set(e.flag, value); err != nil {
@@ -103,10 +107,14 @@ func (p availabilityPolicy) validate() error {
 	return nil
 }
 func subtractOwnedCPU(total, ownedCores float64, cores int) *float64 {
-	if cores <= 0 || math.IsNaN(total) || math.IsInf(total, 0) || math.IsNaN(ownedCores) || math.IsInf(ownedCores, 0) || total < 0 || total > 1 || ownedCores < 0 {
+	return subtractOwnedCPUFrom(total, ownedCores, float64(cores))
+}
+
+func subtractOwnedCPUFrom(total, ownedCores, cores float64) *float64 {
+	if !(cores > 0) || math.IsInf(cores, 0) || math.IsNaN(total) || math.IsInf(total, 0) || math.IsNaN(ownedCores) || math.IsInf(ownedCores, 0) || total < 0 || total > 1 || ownedCores < 0 {
 		return nil
 	}
-	n := math.Max(0, total-ownedCores/float64(cores))
+	n := math.Max(0, total-ownedCores/cores)
 	return &n
 }
 
@@ -247,7 +255,7 @@ func (w *availabilityWindow) evaluate(p availabilityPolicy, s availabilitySample
 // Sampling runs independently of heartbeat/deadline enforcement.
 func (a *agent) monitorAvailability(ctx context.Context) {
 	var window availabilityWindow
-	sampler := hostSampler{exec: availabilityRunner(a.rt), debug: a.rt.Stderr}
+	sampler := hostSampler{exec: availabilityRunner(a.rt), debug: a.rt.Stderr, cpuFile: a.opts.availability.hostCPUFile}
 	stats, _ := a.containers.(containerCPUStats)
 	id := a.state.Machine.MachineID
 	for {
@@ -316,7 +324,7 @@ func probeAvailability(ctx context.Context, cfg core.Config, rt core.Runtime, o 
 	}
 	cfg.LocalContainer.Runtime = o.runtime
 	rt.Exec = availabilityRunner(rt)
-	sampler := hostSampler{exec: rt.Exec, debug: rt.Stderr}
+	sampler := hostSampler{exec: rt.Exec, debug: rt.Stderr, cpuFile: o.availability.hostCPUFile}
 	containers := localcontainer.NewServedRuntime(cfg, rt)
 	var window availabilityWindow
 	end := time.Now().Add(duration)
