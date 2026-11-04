@@ -283,6 +283,7 @@ Catalog category: `delegated-sandbox`.
 | [tensorlake](docs/providers/tensorlake.md) | Hosted Firecracker-backed delegated execution. |
 | [upstash-box](docs/providers/upstash-box.md) | Hosted short-lived delegated sandbox. |
 | [vercel-sandbox](docs/providers/vercel-sandbox.md) | Hosted delegated Linux microVM execution. |
+| [warpbuild](docs/providers/warpbuild.md) | Standalone macOS sandboxes through the WarpBuild CLI. |
 
 ### Local virtual machines
 
@@ -308,6 +309,7 @@ Catalog category: `self-hosted-virtualization`.
 | [incus](docs/providers/incus.md) | Self-hosted Linux containers or VMs. |
 | [kubevirt](docs/providers/kubevirt.md) | Kubernetes-hosted Linux VM. |
 | [proxmox](docs/providers/proxmox.md) | Self-hosted Linux VM fleet. |
+| [serve](docs/providers/serve.md) | Owner-only donated container capacity through a coordinator. |
 | [xcp-ng](docs/providers/xcp-ng.md) | Self-hosted Linux VM pool over XAPI. |
 
 ### GPU clouds
@@ -340,7 +342,6 @@ Catalog category: `local-runtime`.
 | Provider | Best fit |
 | --- | --- |
 | [apple-container](docs/providers/apple-container.md) | Local Linux containers on Apple silicon. |
-| [serve](docs/providers/serve.md) | Owner-only donated container capacity through a coordinator. |
 | [local-container](docs/providers/local-container.md) | Local Linux tests through Docker or Podman; no cloud account needed. |
 
 ### CI proof runners
@@ -358,6 +359,7 @@ Catalog category: `byo-ssh`.
 
 | Provider | Best fit |
 | --- | --- |
+| [ssh-host](docs/providers/ssh-host.md) | Coordinator-managed exclusive hosts with outbound SSH relay and confirmed cleanup. |
 | [ssh](docs/providers/ssh.md) | Your existing Linux, macOS, or Windows host; Crabbox never deletes the machine. |
 
 ### Service control
@@ -532,7 +534,7 @@ release installations do not compile replacement companions from source.
 For a CLI-only source install, pin a supported release (v0.44.0 or later):
 
 ```sh
-GOTOOLCHAIN=go1.27.2 go install github.com/openclaw/crabbox/cmd/crabbox@v0.70.0
+GOTOOLCHAIN=go1.27.3 go install github.com/openclaw/crabbox/cmd/crabbox@v0.70.0
 ```
 
 The module minimum remains Go 1.26. Use the explicit patched toolchain above

@@ -227,6 +227,8 @@ export interface LeaseClientIdentity {
 export interface LeaseRequest {
   clientIdentity?: LeaseClientIdentity;
   serveMachine?: string;
+  sshHost?: string;
+  hostCapabilities?: string[];
   lifetimePolicy?: import("./lease-lifetime").LeaseLifetimeRequest;
   leaseID?: string;
   createAttemptID?: string;
@@ -333,6 +335,7 @@ export interface CreateAttemptRecord {
   checkpointUseClaimHash?: string;
   createdAt: string;
   updatedAt: string;
+  retirement?: { at: string; actor: string; reason: string; createdBefore: string };
 }
 
 export interface ImageCapabilities {
@@ -388,6 +391,14 @@ export interface LeaseRegistrationRequest {
 }
 
 export const coordinatorProviderRegistry = [
+  {
+    runtimeExtension: true,
+    provider: "ssh-host",
+    label: "Managed SSH hosts",
+    requiredSecrets: [],
+    adminAudit: false,
+    supportsCapacityMarket: false,
+  },
   {
     runtimeExtension: true,
     provider: "serve",
@@ -509,6 +520,16 @@ export interface HetznerCleanupEvidence {
 
 export type ProviderCleanupEvidence = HetznerCleanupEvidence;
 
+// Provider-observed acquisition identity, not process or artifact closure evidence.
+export interface AWSRootDiskIdentity {
+  leaseID: string;
+  instanceID: string;
+  volumeID: string;
+  deviceName: string;
+  region: string;
+  providerScope: string;
+}
+
 export interface LeaseRecord {
   clientIdentity?: LeaseClientIdentity;
   leasePolicy?: import("./config").LeasePolicy;
@@ -531,6 +552,7 @@ export interface LeaseRecord {
   cleanupConfirmedBy?: "retained-reconcile" | "retained-reconcile-legacy-attested";
   serve?: import("./serve").ServeAssignment;
   serveIntent?: string;
+  sshHostAllocation?: import("./ssh-host").HostAllocation;
   serveUsageRecordedAt?: string;
   sshHostKeyFingerprint?: string;
   imageEvidence?: {
@@ -594,6 +616,7 @@ export interface LeaseRecord {
   awsSSMCommandID?: string;
   awsSSMCommandStatus?: string;
   awsSSMLogGroup?: string;
+  awsOriginalRootDisk?: AWSRootDiskIdentity;
   capacityHints?: CapacityHint[];
   serverID: number;
   providerResourceID?: string;
@@ -608,6 +631,7 @@ export interface LeaseRecord {
   sshFallbackPorts?: string[];
   serveRelaySessions?: string[];
   sshJump?: {
+    relayOnly?: boolean;
     host: string;
     port: number;
     hostKey: string;
@@ -1368,6 +1392,7 @@ export interface ProviderMachine {
   awsMetadataHttpTokens?: string;
   awsMetadataHttpPutResponseHopLimit?: number;
   awsMetadataInstanceTags?: string;
+  awsRootDeviceName?: string;
   awsRootVolumeID?: string;
   awsRootDeleteOnTermination?: boolean;
   labels: Record<string, string>;

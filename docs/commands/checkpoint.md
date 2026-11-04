@@ -18,12 +18,13 @@ Subcommands: `create`, `abandon`, `list`, `inspect`, `policy`, `restore`, `fork`
 ## Two checkpoint kinds
 
 **Native (provider snapshot or image)** — captures the whole machine: packages,
-tools, caches, services. Stored in the provider account, so it incurs provider
-storage costs. Recorded as one of `aws-ami`, `aws-ebs-snapshot`,
+tools, caches, services. Stored in provider-managed or provider-specific
+artifact storage; cloud backends may incur storage costs. Recorded as one of
+`aws-ami`, `aws-ebs-snapshot`,
 `azure-managed-image`, `azure-os-disk-snapshot`, `gcp-machine-image`,
 `gcp-disk-snapshot`, `hetzner-snapshot`, `machine0-image`,
 `parallels-snapshot`, `daytona-snapshot`, `incus-image`, or
-`cloudflare-container-snapshot`.
+`cloudflare-container-snapshot`; Hyper-V uses `hyperv-vhdx`.
 
 **Archive (workspace tarball)** — captures only the contents of the remote
 workdir as `workspace.tar.gz`. Portable across any POSIX SSH lease, but it does
@@ -376,11 +377,12 @@ native records with missing image references are also held: a blank reference
 does not prove that submission never happened. Inspect and reconcile the
 original provider operation before removing any ownership evidence.
 
-An ordinary Machine0 capture that returns an error before attempting image
-submission removes its uncommitted reservation, so the source can still be
-released normally. A process interruption or attempted submission without a
-returned image identity remains unresolved; this does not unlock historical
-blank records.
+An ordinary Machine0 or local-container capture that returns an error before
+attempting image submission removes its uncommitted reservation, so the source
+can still be released normally. For local-container, this includes a missing
+workspace or a rejected workspace mount before `docker commit`. A process
+interruption or attempted submission without a returned image identity remains
+unresolved; this does not unlock historical blank records.
 
 For an ordinary Machine0 record without an image identity, `abandon` can dispose
 of the exact source while retaining the unresolved image obligation. It does not
@@ -537,14 +539,19 @@ checkpoints; their lifecycle belongs exclusively to coordinator retention.
 
 ## restore
 
-Restore brings a checkpoint back onto a lease in place. This is for **archive
-checkpoints** (and Parallels VM snapshots) — a native image checkpoint cannot be
-restored in place; fork it instead.
+Restore brings a checkpoint back onto a lease in place. Archive checkpoints and
+Parallels VM snapshots support restore. Hyper-V production checkpoints also
+support provider-native restore, but only onto the original source lease with
+its exact local claim. Other native image or disk-snapshot checkpoints cannot
+be restored in place; fork them instead.
 
 ```sh
 # Archive checkpoint -> existing lease
 crabbox checkpoint restore chk_abc123 --id target-lease
 crabbox checkpoint restore chk_abc123 --id target-lease --clear=false
+
+# Hyper-V production checkpoint -> original source lease
+crabbox checkpoint restore chk_hyperv123 --provider hyperv --id source-lease
 
 # Parallels VM snapshot, in place
 crabbox checkpoint restore --provider parallels --id "macOS Tahoe" --snapshot "macOS 26.3.1 LATEST"
@@ -839,6 +846,7 @@ See [Checkpoints](../features/checkpoints.md#lifecycle-and-expiry).
 | Daytona Linux (direct only) | Filesystem snapshot (`--no-reboot=false` for a running source) | Same filesystem snapshot |
 | Incus Linux containers (direct only, `--mode native`) | Private root-disk image | Same snapshot-to-image capture |
 | Parallels | VM snapshot | — |
+| Hyper-V Windows (direct only) | Production checkpoint, exported locally (`hyperv-vhdx`); also the `--mode auto` choice; create needs the guest password ([details](../providers/hyperv.md#checkpoints)) | not supported |
 | Cloudflare containers | Container filesystem snapshot | not supported |
 
 Brokered native checkpoints (through a configured coordinator) cover AWS

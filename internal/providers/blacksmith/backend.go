@@ -160,9 +160,7 @@ func (b *blacksmithBackend) Run(ctx context.Context, req core.RunRequest) (runRe
 			return nil
 		}
 		cleanupAttempted = true
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), blacksmithCleanupTimeout)
-		defer cancel()
-		if err := b.stopClaimedTestbox(cleanupCtx, leaseID, claim); err != nil {
+		if err := b.stopClaimedTestbox(context.Background(), leaseID, claim); err != nil {
 			shouldStop = false
 			fmt.Fprintf(b.rt.Stderr, "warning: blacksmith cleanup failed stage=cleanup lease=%s retry_likely=true: %v\n", leaseID, err)
 			return err
@@ -277,6 +275,10 @@ func (b *blacksmithBackend) Run(ctx context.Context, req core.RunRequest) (runRe
 	}
 	// Close both streams before publishing evidence, even if one close fails.
 	appendFailure("failure capture close", errors.Join(stdoutCapture.Close(), stderrCapture.Close()), 2)
+	// The command streams have settled; freeze one proof snapshot for every
+	// reporting destination instead of repeatedly cloning the bounded tails.
+	stdoutData, stderrData := stdoutProof.Bytes(), stderrProof.Bytes()
+	proofOutput := string(stdoutData) + "\n" + string(stderrData)
 	code = result.ExitCode
 	finished := b.rt.Clock.Now()
 	if commandEnd.IsZero() {
@@ -286,13 +288,16 @@ func (b *blacksmithBackend) Run(ctx context.Context, req core.RunRequest) (runRe
 	commandPhases := core.FinishCommandPhaseTracker(phaseTracker, commandEnd)
 	total := finished.Sub(started)
 	actionsURL := shared.FirstNonBlank(stdoutProof.ActionsURL(), stderrProof.ActionsURL())
+	if actionsURL == "" {
+		actionsURL = firstBlacksmithActionsURL(proofOutput)
+	}
 	result = core.RunResult{
 		Provider:      blacksmithTestboxProvider,
 		LeaseID:       leaseID,
 		Slug:          slug,
 		CommandText:   blacksmithCommandString(req.Command, req.ShellMode),
-		LogExcerpt:    core.SelectProofLogExcerpt(strings.TrimSpace(string(stdoutProof.Bytes()) + "\n" + string(stderrProof.Bytes()))),
-		ActionsURL:    shared.FirstNonBlank(actionsURL, firstBlacksmithActionsURL(string(stdoutProof.Bytes())+"\n"+string(stderrProof.Bytes()))),
+		LogExcerpt:    core.SelectProofLogExcerpt(strings.TrimSpace(proofOutput)),
+		ActionsURL:    actionsURL,
 		ExitCode:      code,
 		Status:        result.Status,
 		ErrorKind:     result.ErrorKind,
@@ -326,6 +331,12 @@ func (b *blacksmithBackend) Run(ctx context.Context, req core.RunRequest) (runRe
 		RunID:          blacksmithActionsRunID(result.ActionsURL),
 		CleanupCommand: fmt.Sprintf("crabbox stop --provider %s %s", blacksmithTestboxProvider, leaseID),
 	}
+	if cleanupErr != nil {
+		// Cleanup recovery must not replay the command. Its observed exit remains
+		// separate from workload confirmation and the final failed run outcome.
+		_, err := fmt.Fprintf(b.rt.Stderr, "blacksmith cleanup recovery observed_run_exit=%d workload_exit_confirmed=%t; retry cleanup only: %s\n", outcome.code, outcome.workloadObserved, result.Session.CleanupCommand)
+		appendFailure("cleanup recovery report", err, 1)
+	}
 	total = b.rt.Clock.Now().Sub(started)
 	result.Total = total
 	code = result.ExitCode
@@ -333,7 +344,7 @@ func (b *blacksmithBackend) Run(ctx context.Context, req core.RunRequest) (runRe
 	if outcome.syncTimedOut {
 		report.BlockedStage, report.RetryLikely = "sync", "true"
 	} else if code != 0 {
-		classificationInput := string(stdoutProof.Bytes()) + "\n" + string(stderrProof.Bytes())
+		classificationInput := proofOutput
 		failurePhases := commandPhases
 		if artifactFailedSuccess {
 			classificationInput = artifactErr.Error()
@@ -359,16 +370,12 @@ func (b *blacksmithBackend) Run(ctx context.Context, req core.RunRequest) (runRe
 	if req.TimingJSON {
 		appendFailure("timing report", core.WriteTimingJSON(b.rt.Stderr, currentReport()), 1)
 	}
-	proof, proofErr := b.blacksmithProofResult(req, leaseID, slug, result.ExitCode, commandDuration, total, currentReport(), stdoutProof.Bytes(), stderrProof.Bytes(), actionsURL)
-	appendFailure("proof", proofErr, core.ExitCodeForError(proofErr, 1))
-	if proofErr == nil {
-		result.Provider = proof.Provider
-		result.LeaseID = proof.LeaseID
-		result.Slug = proof.Slug
-		result.CommandText = proof.CommandText
-		result.LogExcerpt = proof.LogExcerpt
-		result.ActionsURL = proof.ActionsURL
-		result.Artifacts = append(result.Artifacts, proof.Artifacts...)
+	if strings.TrimSpace(req.EmitProof) != "" {
+		artifacts, proofErr := persistBlacksmithRunArtifacts(req.Repo.Root, leaseID, result.ExitCode, commandDuration, total, currentReport(), stdoutData, stderrData, result)
+		appendFailure("proof", proofErr, core.ExitCodeForError(proofErr, 1))
+		if proofErr == nil {
+			result.Artifacts = append(result.Artifacts, artifacts...)
+		}
 	}
 	if result.ExitCode != 0 {
 		local, bytes, bundleErr := core.CaptureLocalFailureBundle(leaseID, core.FailureCaptureMetadata{
@@ -455,11 +462,12 @@ func (b *blacksmithProofTailBuffer) Write(p []byte) (int, error) {
 func (b *blacksmithProofTailBuffer) Bytes() []byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	data := bytes.Clone(b.data.Bytes())
+	data := b.data.Bytes()
 	if !b.fullChunk && !b.data.Exceeded() {
-		return data
+		return bytes.Clone(data)
 	}
 	prefix := fmt.Appendf(nil, "[crabbox: proof stream kept last %d bytes]\n", blacksmithProofStreamCaptureBytes)
+	// Append copies the borrowed tail while the mutex still excludes writers.
 	return append(prefix, data...)
 }
 
@@ -467,27 +475,6 @@ func (b *blacksmithProofTailBuffer) ActionsURL() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.actionsURL
-}
-
-func (b *blacksmithBackend) blacksmithProofResult(req core.RunRequest, leaseID, slug string, exitCode int, commandDuration, total time.Duration, report core.TimingReport, stdoutData, stderrData []byte, actionsURL string) (core.RunResult, error) {
-	combined := strings.TrimSpace(string(stdoutData) + "\n" + string(stderrData))
-	result := core.RunResult{
-		Provider:    blacksmithTestboxProvider,
-		LeaseID:     leaseID,
-		Slug:        slug,
-		CommandText: blacksmithCommandString(req.Command, req.ShellMode),
-		LogExcerpt:  core.SelectProofLogExcerpt(combined),
-		ActionsURL:  shared.FirstNonBlank(actionsURL, firstBlacksmithActionsURL(combined)),
-	}
-	if strings.TrimSpace(req.EmitProof) == "" {
-		return result, nil
-	}
-	artifacts, err := persistBlacksmithRunArtifacts(req.Repo.Root, leaseID, exitCode, commandDuration, total, report, stdoutData, stderrData, result)
-	if err != nil {
-		return core.RunResult{}, err
-	}
-	result.Artifacts = artifacts
-	return result, nil
 }
 
 func firstBlacksmithActionsURL(text string) string {
@@ -704,6 +691,9 @@ func (b *blacksmithBackend) Stop(ctx context.Context, req core.StopRequest) erro
 	return b.stopClaimedTestbox(ctx, claim.LeaseID, claim)
 }
 
+var errBlacksmithReconciliationDeadline = errors.New("Blacksmith cleanup reconciliation deadline")
+var errBlacksmithNativeStatusDeadline = errors.New("native status command interrupted by deadline")
+
 func (b *blacksmithBackend) stopClaimedTestbox(ctx context.Context, leaseID string, claim core.LeaseClaim) (stopErr error) {
 	defer func() { stopErr = blacksmithExitDiagnostics(stopErr) }()
 	_, _, err := blacksmithClaimBinding(claim)
@@ -713,31 +703,42 @@ func (b *blacksmithBackend) stopClaimedTestbox(ctx context.Context, leaseID stri
 	if claim.LeaseID != leaseID {
 		return core.Exit(2, "Blacksmith exact claim identifier mismatch")
 	}
-	ctx, cancel := context.WithTimeout(ctx, blacksmithCleanupTimeout)
+	reconciliationCtx, cancel := context.WithTimeoutCause(ctx, blacksmithCleanupTimeout, errBlacksmithReconciliationDeadline)
 	defer cancel()
 	var bound *blacksmithBackend
 	var reconciled *blacksmithReconciledStop
 	phase := "reconciliation-admission"
-	if err := core.WithLeaseClaimUnchangedShared(ctx, leaseID, claim, func() error {
+	reconciliationErr := core.WithLeaseClaimUnchangedShared(reconciliationCtx, leaseID, claim, func() error {
 		phase = "reconciliation"
 		var err error
-		bound, err = b.withRoute(ctx)
+		bound, err = b.withRoute(reconciliationCtx)
 		if err != nil {
 			return fmt.Errorf("Blacksmith cleanup phase=%s: %w", phase, err)
 		}
-		reconciled, err = bound.terminateTestbox(ctx, claim, true)
+		reconciled, err = bound.terminateTestbox(reconciliationCtx, claim, true)
 		return err
-	}); err != nil {
+	})
+	if reconciliationErr != nil {
 		if phase == "reconciliation-admission" {
-			return fmt.Errorf("Blacksmith cleanup phase=%s: %w", phase, err)
+			return fmt.Errorf("Blacksmith cleanup phase=%s: %w", phase, reconciliationErr)
 		}
-		return err
+		// An interrupted post-stop observation may use fresh verification, never
+		// stop output as completion. Ordinary errors and caller cancellation retain custody.
+		if reconciled == nil || !(reconciled.nativeCompleted && errors.Is(reconciliationErr, errBlacksmithGitHubDeadline) ||
+			reconciled.nativeStopReturned && errors.Is(reconciliationErr, errBlacksmithNativeStatusDeadline)) ||
+			context.Cause(reconciliationCtx) != errBlacksmithReconciliationDeadline || ctx.Err() != nil {
+			return reconciliationErr
+		}
 	}
 	// Release the shared fence before taking the exclusive one. A replacement
 	// published in between must survive: only the original snapshot authorizes
 	// finalization, and a stuck command must not make this wait unbounded.
 	// Callback entry distinguishes admission from verification. Failure before
 	// entry does not by itself establish lock contention.
+	// Reserve a full status-read budget after reconciliation's 30 seconds, still
+	// subordinate to the original caller. Only this fresh positive pair releases custody.
+	ctx, cancelFinalization := context.WithTimeout(ctx, blacksmithStatusReadTimeout)
+	defer cancelFinalization()
 	phase = "finalization-admission"
 	err = core.CleanupLeaseClaimIfUnchangedAfterContext(ctx, leaseID, claim, true, func() error {
 		phase = "final-verification"
@@ -754,12 +755,16 @@ func (b *blacksmithBackend) stopClaimedTestbox(ctx context.Context, leaseID stri
 		return nil
 	})
 	if err != nil && reconciled != nil {
-		bound.printStopOutput(reconciled.result)
-		return errors.Join(reconciled.err, fmt.Errorf("Blacksmith cleanup phase=%s: %w", phase, err))
+		cause := reconciliationErr
+		if reconciliationErr == nil {
+			bound.printStopOutput(reconciled.result)
+			cause = reconciled.err
+		}
+		return errors.Join(cause, fmt.Errorf("Blacksmith cleanup phase=%s: %w", phase, err))
 	}
 	if reconciled != nil && reconciled.err != nil {
 		fmt.Fprintf(b.rt.Stderr, "blacksmith cleanup reconciled lease=%s state=completed: stop failed; native status and exact GitHub run confirmed completion conclusion=%s\n", leaseID, reconciled.conclusion)
-	} else if reconciled != nil {
+	} else if reconciled != nil && reconciliationErr == nil {
 		bound.printStopOutput(reconciled.result)
 	}
 	return err
@@ -999,6 +1004,11 @@ func (b *blacksmithBackend) runCommandCaptureInDir(ctx context.Context, args []s
 	result, err = b.rt.Exec.Run(ctx, request)
 	if operation != "" && (err != nil || result.ExitCode != 0) {
 		diagnostic := blacksmithCommandDiagnostic(ctx, operation, issued, time.Since(issued), ctx.Err(), result, err)
+		// Preserve the child watcher's cause before inspectTestbox joins expiry;
+		// an ordinary status failure returned late must not authorize fresh verification.
+		if operation == "blacksmith testbox status" && errors.Is(err, context.DeadlineExceeded) {
+			err = errors.Join(err, errBlacksmithNativeStatusDeadline)
+		}
 		return result, blacksmithCommandError{ExitError: core.ExitError{Code: result.ExitCode, Message: diagnostic}, cause: err}
 	}
 	if err != nil {

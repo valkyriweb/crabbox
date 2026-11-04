@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,7 @@ const (
 	checkpointKindDaytona      = "daytona-snapshot"
 	checkpointKindIncus        = "incus-image"
 	checkpointKindCloudflare   = "cloudflare-container-snapshot"
+	checkpointKindHyperV       = "hyperv-vhdx"
 
 	checkpointStrategyAuto         = "auto"
 	checkpointStrategyImage        = "image"
@@ -48,6 +50,7 @@ const (
 )
 
 type checkpointRecord struct {
+	artifactDir        string
 	CaptureEstablished bool                            `json:"captureEstablished,omitempty"`
 	Capture            *NativeCheckpointCapture        `json:"capture,omitempty"`
 	ID                 string                          `json:"id"`
@@ -272,12 +275,10 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	switch createKind {
-	case checkpointKindRecipe, checkpointKindAWSAMI, checkpointKindAWSEBS, checkpointKindAzure, checkpointKindAzureOS, checkpointKindGCP, checkpointKindGCPDisk, checkpointKindHetzner, checkpointKindMachine0, checkpointKindParallels, checkpointKindDockerCommit, checkpointKindDaytona, checkpointKindIncus, checkpointKindCloudflare, checkpointKindArchive:
-		record.Kind = createKind
-	default:
+	if createKind != checkpointKindRecipe && createKind != checkpointKindArchive && !isNativeCheckpointKind(createKind) {
 		return Exit(2, "checkpoint mode must be auto, native, or archive")
 	}
+	record.Kind = createKind
 	// All observers and final writes share deletion/prune's operation lock.
 	// Take checkpoint before source-claim locks, as retirement does.
 	return store.WithLock(record.ID, func() (err error) {
@@ -323,7 +324,7 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 		}()
 		switch createKind {
 		case checkpointKindRecipe:
-		case checkpointKindAWSAMI, checkpointKindAWSEBS, checkpointKindAzure, checkpointKindAzureOS, checkpointKindGCP, checkpointKindGCPDisk, checkpointKindHetzner, checkpointKindMachine0, checkpointKindParallels, checkpointKindDockerCommit, checkpointKindDaytona, checkpointKindIncus, checkpointKindCloudflare:
+		case checkpointKindAWSAMI, checkpointKindAWSEBS, checkpointKindAzure, checkpointKindAzureOS, checkpointKindGCP, checkpointKindGCPDisk, checkpointKindHetzner, checkpointKindMachine0, checkpointKindParallels, checkpointKindDockerCommit, checkpointKindDaytona, checkpointKindIncus, checkpointKindCloudflare, checkpointKindHyperV:
 			createStrategy := checkpointCreateStrategy(*mode, *strategy, createKind)
 			retention := checkpointRetentionFromDuration(retentionDuration)
 			createContext := withCheckpointCreateContext(ctx, record, retention, func(managed bool) error {
@@ -338,6 +339,7 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 			})
 			image, metadata, err := operationApp.createNativeCheckpointRequest(createContext, NativeCheckpointCreateRequest{
 				Config: cfg, Server: server, Target: target, CheckpointID: record.ID,
+				Runtime: runtimeForApp(operationApp), ArtifactDir: paths.Dir,
 				LeaseID: leaseID, Name: record.Name, RepoName: repo.Name, Workdir: workdir,
 				Strategy: createStrategy, NoReboot: *noReboot, Wait: *wait,
 				WaitTimeout: *waitTimeout, Stderr: operationApp.Stderr,
@@ -359,12 +361,12 @@ func (a App) checkpointCreate(ctx context.Context, args []string) (err error) {
 				}
 			}
 			if err != nil {
-				var unsubmitted NativeCheckpointNotSubmittedError
-				if record.Native.ImageID == "" && errors.As(err, &unsubmitted) && !record.coordinatorManaged() {
+				// A provider may persist its cleanup journal and then fail before
+				// submitting anything; the attestation resolves that journal too.
+				if nativeCreateNotSubmitted(image, err, record) {
 					recordWritten = false
 					notSubmitted = true
-				}
-				if record.Native.ImageID != "" {
+				} else if record.Native.ImageID != "" {
 					if writeErr := store.Write(record); writeErr != nil {
 						return writeErr
 					}
@@ -1118,6 +1120,51 @@ func (a App) checkpointRestore(ctx context.Context, args []string) error {
 	}
 	if record.Kind != checkpointKindArchive {
 		if isNativeCheckpointKind(record.Kind) {
+			restoreProvider, err := ProviderFor(record.nativeProvider())
+			if err != nil {
+				return err
+			}
+			if restorer, ok := restoreProvider.(NativeCheckpointRestoreProvider); ok {
+				if record.nativeResourceID() == "" {
+					return Exit(2, "checkpoint %s is pending; native provider resource is not recorded yet", record.ID)
+				}
+				cfg, err := loadLeaseTargetConfig(fs, record.nativeProvider(), targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
+				if err != nil {
+					return err
+				}
+				if err := requireLeaseID(*id, "crabbox checkpoint restore <checkpoint-id> --id <lease-id-or-slug>", cfg); err != nil {
+					return err
+				}
+				leaseID := strings.TrimSpace(*id)
+				if claim, exists, err := ResolveLeaseClaimForProvider(leaseID, cfg.Provider); err != nil {
+					return err
+				} else if exists {
+					leaseID = claim.LeaseID
+				}
+				if *dryRun {
+					fmt.Fprintf(a.Stdout, "would restore checkpoint id=%s lease=%s snapshot=%s\n", record.ID, leaseID, record.nativeResourceID())
+					return nil
+				}
+				if err := applyNativeCheckpointForkConfigAndFlags(&cfg, fs, record, providerFlags); err != nil {
+					return err
+				}
+				repo, err := findRepo()
+				if err != nil {
+					return err
+				}
+				result, err := restorer.RestoreNativeCheckpoint(ctx, NativeCheckpointRestoreRequest{
+					Config: cfg, Runtime: runtimeForApp(a), Record: nativeCheckpointForkRecord(record),
+					LeaseID: leaseID, Repo: repo, Reclaim: *reclaim,
+				})
+				if err != nil {
+					return err
+				}
+				if err := recordCheckpointUse(store, &record); err != nil {
+					return err
+				}
+				fmt.Fprintf(a.Stdout, "checkpoint restored id=%s lease=%s snapshot=%s\n", record.ID, result.Lease.LeaseID, record.nativeResourceID())
+				return nil
+			}
 			if record.Kind == checkpointKindParallels {
 				cfg, err := loadLeaseTargetConfig(fs, *provider, targetFlags, networkFlags, leaseTargetConfigOptions{LeaseID: *id})
 				if err != nil {
@@ -1410,11 +1457,12 @@ func splitCheckpointForkRunArgs(args []string) ([]string, []string) {
 }
 
 type checkpointForkRunOptions struct {
-	Command []string
-	Index   int
-	Total   int
-	JSON    bool
-	Results *[]checkpointForkResult
+	Command           []string
+	Index             int
+	Total             int
+	JSON              bool
+	Results           *[]checkpointForkResult
+	carryReleaseClaim func(leaseClaim)
 }
 
 type checkpointForkResult struct {
@@ -1481,6 +1529,10 @@ type checkpointForkProvision struct {
 	Lease   LeaseTarget
 	Workdir string
 	Release func(context.Context)
+	// carryReleaseClaim installs an authorized post-run claim snapshot into the
+	// release fence. Shard calls this after run --keep so cleanup fences on the
+	// exact generation the run lifecycle produced (PR #1437), not ClaimedAt.
+	carryReleaseClaim func(leaseClaim)
 }
 
 func (a App) provisionCheckpointFork(ctx context.Context, cfg Config, backend Backend, sshBackend SSHLeaseBackend, repo Repo, record checkpointRecord, paths checkpointPaths, keep, reclaim bool, requestedSlug, workdirOverride string, clear bool) (checkpointForkProvision, error) {
@@ -1603,6 +1655,75 @@ func (a App) provisionManagedCheckpointFork(ctx context.Context, cfg Config, bac
 	return provision, nil
 }
 
+// RefreshAuthorizedForkReleaseClaim confirms the persisted claim still exactly
+// matches the carried acquisition/run snapshot (owner + revision generation).
+// Authorized successors (for example run --keep) must be carried into the
+// snapshot before release via carryReleaseClaim; this refresh never adopts a
+// different revision. ClaimedAt is not used: it is whole-second RFC3339, so a
+// same-second reclaim could collide and let stale cleanup adopt a replacement
+// generation. A replaced, revoked, reclaimed, or ABA claim fails closed. A
+// missing claim leaves the carried snapshot unchanged so the provider
+// ReleaseLease claim check decides (AWS/Hetzner refuse destructive release
+// without an exact local claim).
+func RefreshAuthorizedForkReleaseClaim(server *Server, leaseID string) error {
+	if server == nil {
+		return nil
+	}
+	expected, expectedExists, set := ServerLeaseClaimSnapshot(*server)
+	if !set || !expectedExists {
+		return nil
+	}
+	current, exists, err := ReadLeaseClaimWithPresence(leaseID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if !authorizedForkReleaseClaimContinuation(expected, current) {
+		return fmt.Errorf("%w: lease %s claim ownership changed after acquisition; refusing automatic release", ErrReleaseLeaseOwnershipChanged, leaseID)
+	}
+	return nil
+}
+
+// authorizedForkReleaseClaimContinuation reports whether current is exactly the
+// carried claim generation (PR #1437). Owner identity and revision must both
+// match; ClaimedAt is ignored because it only has whole-second resolution.
+func authorizedForkReleaseClaimContinuation(expected, current leaseClaim) bool {
+	return reflect.DeepEqual(expected, current)
+}
+
+// CheckpointForkReleaseBindings builds the production release fence used by
+// provisionCheckpointForkWithoutClaim and shard cleanup after run --keep.
+// carryReleaseClaim installs an authorized post-run claim into *server.
+// server, target, and cfg are read at release time so later claim updates,
+// resolveNetworkTarget (--network tailscale), and applyResolvedServerConfig
+// stay visible to shutdown/egress/Tailscale logout — matching the old closure.
+func (a App) CheckpointForkReleaseBindings(server *Server, target *SSHTarget, leaseID string, coordinator *CoordinatorClient, sshBackend SSHLeaseBackend, cfg *Config) (release func(context.Context), carryReleaseClaim func(LeaseClaim)) {
+	return a.checkpointForkReleaseBindings(server, target, leaseID, coordinator, sshBackend, cfg)
+}
+
+func (a App) checkpointForkReleaseBindings(server *Server, target *SSHTarget, leaseID string, coordinator *CoordinatorClient, sshBackend SSHLeaseBackend, cfg *Config) (release func(context.Context), carryReleaseClaim func(leaseClaim)) {
+	var releaseOnce sync.Once
+	carryReleaseClaim = func(claim leaseClaim) {
+		SetServerLeaseClaimSnapshot(server, claim, true)
+	}
+	release = func(releaseCtx context.Context) {
+		releaseOnce.Do(func() {
+			releaseLease := LeaseTarget{Server: *server, SSH: *target, LeaseID: leaseID, Coordinator: coordinator}
+			// Exact generation fence: the carried snapshot (acquisition, or an
+			// authorized successor installed via carryReleaseClaim) must still
+			// match the persisted claim. Never adopt a different revision here.
+			if err := RefreshAuthorizedForkReleaseClaim(&releaseLease.Server, leaseID); err != nil {
+				fmt.Fprintf(a.Stderr, "warning: refusing release for lease %s: %v\n", leaseID, err)
+				return
+			}
+			a.releaseBackendLeaseBestEffort(releaseCtx, sshBackend, *cfg, releaseLease)
+		})
+	}
+	return release, carryReleaseClaim
+}
+
 type managedCheckpointCacheConflict struct{ error }
 
 func writeSafeManagedCheckpointCache(store checkpointStore, record checkpointRecord) error {
@@ -1634,6 +1755,7 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 	var source *NativeCheckpointForkRecord
 	if isNativeCheckpointKind(record.Kind) {
 		native := nativeCheckpointForkRecord(record)
+		native.ArtifactDir = paths.Dir
 		source = &native
 	}
 	a.reportDirectLeasePolicyNotice(cfg)
@@ -1649,12 +1771,7 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 		onAcquired(lease)
 	}
 	server, target, leaseID := lease.Server, lease.SSH, lease.LeaseID
-	var releaseOnce sync.Once
-	release := func(releaseCtx context.Context) {
-		releaseOnce.Do(func() {
-			a.releaseBackendLeaseBestEffort(releaseCtx, sshBackend, cfg, LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator})
-		})
-	}
+	release, carryReleaseClaim := a.checkpointForkReleaseBindings(&server, &target, leaseID, lease.Coordinator, sshBackend, &cfg)
 	rollback := func() {
 		// Fixed acquisition can adopt prior work; preserve its known ID for replay.
 		if requestedLeaseID == "" {
@@ -1676,9 +1793,10 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 		}
 	}
 	forkLease := LeaseTarget{Server: server, SSH: target, LeaseID: leaseID, Coordinator: lease.Coordinator}
+	provision := checkpointForkProvision{Lease: forkLease, Release: release, carryReleaseClaim: carryReleaseClaim}
 	if isNativeCheckpointKind(record.Kind) {
 		if record.TargetOS == targetWindows {
-			return checkpointForkProvision{Lease: forkLease, Release: release}, nil
+			return provision, nil
 		}
 		workdir := nativeCheckpointForkWorkdir(cfg, leaseID, repo.Name, workdirOverride)
 		if err := validateCheckpointForkWorkdirs(ctx, backend, forkLease, record.Workdir, workdir); err != nil {
@@ -1689,7 +1807,8 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 			rollback()
 			return checkpointForkProvision{}, err
 		}
-		return checkpointForkProvision{Lease: forkLease, Workdir: workdir, Release: release}, nil
+		provision.Workdir = workdir
+		return provision, nil
 	}
 	workdir := strings.TrimSpace(workdirOverride)
 	if workdir == "" {
@@ -1703,7 +1822,8 @@ func (a App) provisionCheckpointForkWithoutClaim(ctx context.Context, cfg Config
 		rollback()
 		return checkpointForkProvision{}, err
 	}
-	return checkpointForkProvision{Lease: forkLease, Workdir: workdir, Release: release}, nil
+	provision.Workdir = workdir
+	return provision, nil
 }
 
 func (a App) checkpointForkRecordOnce(ctx context.Context, cfg Config, backend Backend, sshBackend SSHLeaseBackend, repo Repo, store checkpointStore, record *checkpointRecord, paths checkpointPaths, keep, reclaim bool, requestedLeaseID, requestedSlug, workdirOverride string, clear bool, runOpts checkpointForkRunOptions) error {
@@ -1741,6 +1861,7 @@ func (a App) checkpointForkRecordOnce(ctx context.Context, cfg Config, backend B
 	if err != nil {
 		return err
 	}
+	runOpts.carryReleaseClaim = provision.carryReleaseClaim
 	defer func() {
 		if !keep {
 			provision.Release(context.Background())
@@ -1837,6 +1958,15 @@ func (a App) runCheckpointForkCommand(ctx context.Context, leaseID, slug string,
 	command := checkpointForkRunCommand(opts.Command, runCtx)
 	if len(command) == 0 {
 		return nil
+	}
+	if opts.carryReleaseClaim != nil {
+		var outcome shardRunOutcome
+		a.runOutcome = &outcome
+		defer func() {
+			if outcome.AuthorizedClaim != nil {
+				opts.carryReleaseClaim(*outcome.AuthorizedClaim)
+			}
+		}()
 	}
 	if !opts.JSON {
 		fmt.Fprintf(a.Stdout, "checkpoint fork command lease=%s slug=%s index=%d/%d command=%s\n", leaseID, blank(slug, "-"), opts.Index, opts.Total, runCommandDisplay(command, false))
@@ -2169,7 +2299,7 @@ func deleteCheckpoint(ctx context.Context, store checkpointStore, id string, loc
 
 func deleteCheckpointRecord(ctx context.Context, store checkpointStore, record checkpointRecord, localOnly bool) error {
 	id := record.ID
-	if unresolvedCheckpoint(record) && (!record.coordinatorManaged() || record.Capture != nil) {
+	if unresolvedCheckpointJournal(record) && (!record.coordinatorManaged() || record.Capture != nil) {
 		return Exit(2, "checkpoint %s is unresolved; retain its record and source and reconcile the original capture", id)
 	}
 	if !localOnly {
@@ -2685,6 +2815,11 @@ func newCheckpointRecord(repo Repo, cfg Config, server Server, target SSHTarget,
 	return record, dir, nil
 }
 
+func nativeCreateNotSubmitted(image CoordinatorImage, err error, record checkpointRecord) bool {
+	var unsubmitted NativeCheckpointNotSubmittedError
+	return image.ID == "" && errors.As(err, &unsubmitted) && !record.coordinatorManaged()
+}
+
 func cleanupUncommittedCheckpointDir(dir string, committed bool, err error) error {
 	if err == nil || committed || dir == "" {
 		return nil
@@ -2747,6 +2882,9 @@ func checkpointCreateMode(mode, strategy string, cfg Config, server Server, targ
 	}
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "", "auto":
+		if capability, ok := providerNativeCheckpointCapability(cfg, server, target, strategy); ok && capability.PreferredForAuto {
+			return capability.Kind
+		}
 		if kind, ok := nativeCheckpointKind(cfg, server, target, strategy); ok {
 			return kind
 		}
@@ -2857,7 +2995,7 @@ func nativeCheckpointForkWorkdir(cfg Config, leaseID, repoName, override string)
 }
 
 func isNativeCheckpointKind(kind string) bool {
-	return kind == checkpointKindAWSAMI || kind == checkpointKindAWSEBS || kind == checkpointKindAzure || kind == checkpointKindAzureOS || kind == checkpointKindGCP || kind == checkpointKindGCPDisk || kind == checkpointKindHetzner || kind == checkpointKindMachine0 || kind == checkpointKindParallels || kind == checkpointKindDockerCommit || kind == checkpointKindDaytona || kind == checkpointKindIncus || kind == checkpointKindCloudflare
+	return kind == checkpointKindAWSAMI || kind == checkpointKindAWSEBS || kind == checkpointKindAzure || kind == checkpointKindAzureOS || kind == checkpointKindGCP || kind == checkpointKindGCPDisk || kind == checkpointKindHetzner || kind == checkpointKindMachine0 || kind == checkpointKindParallels || kind == checkpointKindDockerCommit || kind == checkpointKindDaytona || kind == checkpointKindIncus || kind == checkpointKindCloudflare || kind == checkpointKindHyperV
 }
 
 func checkpointProviderForKind(kind string) string {
@@ -2874,6 +3012,8 @@ func checkpointProviderForKind(kind string) string {
 		return "machine0"
 	case checkpointKindParallels:
 		return "parallels"
+	case checkpointKindHyperV:
+		return "hyperv"
 	case checkpointKindDockerCommit:
 		return "local-container"
 	case checkpointKindDaytona:
