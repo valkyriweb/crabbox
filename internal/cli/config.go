@@ -18,6 +18,8 @@ import (
 )
 
 type Config struct {
+	ManagedHost                   string
+	HostCapabilities              []string
 	DirectLeases                  string
 	DirectLeaseAllow              []string
 	guestLeaseExpiry              *GuestLeaseExpiryFields
@@ -455,6 +457,9 @@ type ParallelsConfig struct {
 	Templates        map[string]ParallelsTemplateConfig
 	Hosts            []ParallelsHostConfig
 	SelectedHost     string
+	// Separate from explicitSSHUser: provider overrides must not become generic
+	// connection settings when switching to another provider.
+	UserExplicit bool
 	// MaxVMs caps concurrent Crabbox VMs on the direct host. A selected fleet
 	// entry's own MaxVMs always wins, and this is not a default for fleet
 	// entries that omit it.
@@ -501,7 +506,8 @@ type ResultsConfig struct {
 }
 
 type ShardConfig struct {
-	MaxCount int
+	MaxCount       int
+	MaxConcurrency int
 }
 
 type CacheConfig struct {
@@ -1091,7 +1097,7 @@ func applyProviderConfigDefaultValues(cfg *Config) error {
 				return err
 			}
 		}
-		if cfg.Parallels.User != "" {
+		if cfg.Parallels.User != "" && (cfg.Parallels.UserExplicit || !IsSSHUserExplicit(cfg)) {
 			cfg.SSHUser = cfg.Parallels.User
 		}
 		if cfg.Parallels.WorkRoot != "" {
@@ -2205,7 +2211,8 @@ type fileResultsConfig struct {
 }
 
 type fileShardConfig struct {
-	MaxCount *int `yaml:"maxCount,omitempty"`
+	MaxCount       *int `yaml:"maxCount,omitempty"`
+	MaxConcurrency *int `yaml:"maxConcurrency,omitempty"`
 }
 
 type fileCacheConfig struct {
@@ -2906,6 +2913,9 @@ func applyFileConfigWithTrustAndProviderSource(cfg *Config, file fileConfig, tru
 			recordConfigInput(cfg, "parallels", inputSource, true)
 		}
 		configInputFileString(cfg, "parallels", inputSource, &cfg.Parallels.User, file.Parallels.User)
+		if file.Parallels.User != "" {
+			cfg.Parallels.UserExplicit = true
+		}
 		// The macOS account password authenticates the local ARD viewer. A
 		// repository must not supply or replace it; use trusted user config or
 		// the environment, matching the Tart desktop credential boundary.
@@ -3661,9 +3671,15 @@ func applyFileConfigWithTrustAndProviderSource(cfg *Config, file fileConfig, tru
 		recordConfigInput(cfg, configInputGeneric, inputSource, applyOptional(&cfg.Results.Auto, file.Results.Auto))
 		recordConfigInput(cfg, configInputGeneric, inputSource, applyOptional(&cfg.Results.FailOnFailures, file.Results.FailOnFailures))
 	}
-	if file.Shard != nil && file.Shard.MaxCount != nil {
-		cfg.Shard.MaxCount = *file.Shard.MaxCount
-		recordConfigInput(cfg, configInputGeneric, inputSource, true)
+	if file.Shard != nil {
+		if file.Shard.MaxCount != nil {
+			cfg.Shard.MaxCount = *file.Shard.MaxCount
+			recordConfigInput(cfg, configInputGeneric, inputSource, true)
+		}
+		if file.Shard.MaxConcurrency != nil {
+			cfg.Shard.MaxConcurrency = *file.Shard.MaxConcurrency
+			recordConfigInput(cfg, configInputGeneric, inputSource, true)
+		}
 	}
 	if file.Cache != nil {
 		recordConfigInput(cfg, configInputGeneric, inputSource, applyOptional(&cfg.Cache.Pnpm, file.Cache.Pnpm))
@@ -4335,6 +4351,9 @@ func applyEnv(cfg *Config) error {
 	cfg.Parallels.BootstrapKey = strings.TrimSpace(configInputEnvString(cfg, "parallels", cfg.Parallels.BootstrapKey, "CRABBOX_PARALLELS_BOOTSTRAP_KEY"))
 	cfg.Parallels.VMRoot = expandUserPath(configInputEnvString(cfg, "parallels", cfg.Parallels.VMRoot, "CRABBOX_PARALLELS_VM_ROOT"))
 	cfg.Parallels.User = configInputEnvString(cfg, "parallels", cfg.Parallels.User, "CRABBOX_PARALLELS_USER")
+	if _, ok := firstNonEmptyEnv("CRABBOX_PARALLELS_USER"); ok {
+		cfg.Parallels.UserExplicit = true
+	}
 	cfg.Parallels.Password = configInputEnvString(cfg, "parallels", cfg.Parallels.Password, "CRABBOX_PARALLELS_PASSWORD")
 	cfg.Parallels.WorkRoot = configInputEnvString(cfg, "parallels", cfg.Parallels.WorkRoot, "CRABBOX_PARALLELS_WORK_ROOT")
 	cfg.Parallels.MaxVMs = configInputEnvInt(cfg, "parallels", cfg.Parallels.MaxVMs, "CRABBOX_PARALLELS_MAX_VMS")
@@ -5307,6 +5326,7 @@ func ApplyParallelsTemplateConfig(cfg *Config, name string) error {
 	}
 	if template.User != "" {
 		cfg.Parallels.User = template.User
+		cfg.Parallels.UserExplicit = true
 		cfg.SSHUser = template.User
 	}
 	if template.WorkRoot != "" {

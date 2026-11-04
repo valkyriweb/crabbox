@@ -19,12 +19,14 @@ func staticPortCandidates(t *testing.T, cfg Config) []string {
 }
 
 func TestStaticLeaseExplicitStaticPortNeverFallsBack(t *testing.T) {
-	cfg := baseConfig()
-	cfg.Provider = staticProvider
-	cfg.Static.Host = "127.0.0.1"
-	cfg.Static.Port = "2224"
-	if got, want := staticPortCandidates(t, cfg), []string{"2224"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates=%v want %v", got, want)
+	for _, host := range []string{"127.0.0.1", "localhost", "::1", "build.example"} {
+		for _, port := range []string{"2224", "2222", "22"} {
+			cfg := baseConfig()
+			cfg.Provider, cfg.Static.Host, cfg.Static.Port = staticProvider, host, port
+			if got, want := staticPortCandidates(t, cfg), []string{port}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("host=%s candidates=%v want %v", host, got, want)
+			}
+		}
 	}
 }
 
@@ -187,6 +189,53 @@ func TestLeaseTargetDropsAdvertisedPort22ForLoopback(t *testing.T) {
 			}, cfg)
 			if !reflect.DeepEqual(target.FallbackPorts, tc.want) {
 				t.Fatalf("fallback ports=%v, want %v", target.FallbackPorts, tc.want)
+			}
+		})
+	}
+}
+
+func TestStaticPortInputs(t *testing.T) {
+	for _, source := range []string{"flag", "environment", "user config", "repo config"} {
+		t.Run(source, func(t *testing.T) {
+			clearConfigEnv(t)
+			isolateTestUserDirs(t)
+			cfg := baseConfig()
+			cfg.Provider, cfg.Static.Host = staticProvider, "localhost"
+			switch source {
+			case "flag":
+				fs := newFlagSet("run", io.Discard)
+				flags := registerLeaseCreateFlags(fs, cfg)
+				if err := parseFlags(fs, []string{"--static-port", "2224"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := applyLeaseCreateFlagsForLease(&cfg, fs, flags, "static_test"); err != nil {
+					t.Fatal(err)
+				}
+			case "environment":
+				t.Setenv("CRABBOX_STATIC_PORT", "2224")
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				if err := os.WriteFile(path, []byte("static:\n  port: '2224'\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				file, err := readFileConfig(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if source == "repo config" {
+					err = applyFileConfigWithTrust(&cfg, file, false)
+				} else {
+					err = applyFileConfig(&cfg, file)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := staticPortCandidates(t, cfg); !reflect.DeepEqual(got, []string{"2224"}) {
+				t.Fatalf("candidates=%v", got)
 			}
 		})
 	}

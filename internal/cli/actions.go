@@ -707,6 +707,42 @@ func invalidateActionsHydrationWorkspaces(ctx context.Context, target SSHTarget,
 	return nil
 }
 
+// An unavailable detached commit can still use the same genuine Git baseline
+// as a warm Actions workspace. Only origin supplies objects; the full manifest
+// remains authoritative for selected files, without certifying the selected HEAD.
+func (a App) seedLocalActionsAncestor(ctx context.Context, cfg Config, repo Repo, target SSHTarget, workdir string) (bool, error) {
+	base := gitHydrateBaseSHA(repo, firstNonBlank(cfg.Sync.BaseRef, repo.BaseRef))
+	if base == "" {
+		return false, nil
+	}
+	ancestor := gitOutput(repo.Root, "merge-base", repo.Head, base)
+	if !validGitObjectID(ancestor) || ancestor == repo.Head {
+		return false, nil
+	}
+	baseline := repo
+	baseline.Head = ancestor
+	plan, blocked := syncGitCoherencePlan(cfg, baseline)
+	// A verified exact-SHA seed needs no local origin-tracking branch.
+	// Keep the tree requirement without enabling branch coherence or reuse.
+	if blocked || !plan.seedEnabled() || plan.Tree == "" {
+		return false, nil
+	}
+	stopSeedHeartbeat := startGitSeedHeartbeat(a.Stderr, time.Now(), gitSeedHeartbeatInterval)
+	out, published, err := runIdempotentSSHGitOriginAttemptWithPublication(ctx, target, remoteGitSeed(workdir, plan), idempotentSSHRetryDelay)
+	stopSeedHeartbeat()
+	if err != nil {
+		if _, fallback := gitSeedRuntimeFallbackResult(plan, out, err); fallback {
+			return false, nil
+		}
+		reportRemoteGitSeedFailure(ctx, a.Stderr, out, err, "aborting before file sync")
+		return false, Exit(6, "local Actions ancestor seed failed: %v", err)
+	}
+	fmt.Fprintf(a.Stderr, "local Actions Git baseline=%s; selected source=%s uses full manifest sync\n", ancestor, repo.Head)
+	// Only an observed publication into an empty destination owns the seeded
+	// files. Existing roots and missing receipts retain deletion limits.
+	return published, nil
+}
+
 func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Repo, target SSHTarget, workdir string, plainManifest bool) (bool, error) {
 	if cfg.Sync.BaseRef == "" {
 		cfg.Sync.BaseRef = repo.BaseRef
@@ -733,13 +769,21 @@ func (a App) syncLocalActionsWorkspace(ctx context.Context, cfg Config, repo Rep
 		coherence = gitCoherencePlan{}
 	}
 	if !plainManifest && coherence.seedEnabled() {
-		if out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay); err != nil {
+		stopSeedHeartbeat := startGitSeedHeartbeat(a.Stderr, time.Now(), gitSeedHeartbeatInterval)
+		out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteGitSeed(workdir, coherence), idempotentSSHRetryDelay)
+		stopSeedHeartbeat()
+		if err != nil {
 			if reason, fallback := gitSeedRuntimeFallbackResult(coherence, out, err); fallback {
+				if reason == "exact_commit_unavailable" {
+					if _, err := a.seedLocalActionsAncestor(ctx, cfg, repo, target, workdir); err != nil {
+						return plainManifest, err
+					}
+				}
 				plainManifest = true
 				coherence = gitCoherencePlan{}
 				fmt.Fprintf(a.Stderr, "git origin fallback reason=%s; using plain manifest sync\n", reason)
 			} else {
-				reportRemoteGitSeedFailure(a.Stderr, out, err, "aborting before file sync")
+				reportRemoteGitSeedFailure(ctx, a.Stderr, out, err, "aborting before file sync")
 				return plainManifest, Exit(6, "remote git seed failed: %v", err)
 			}
 		}
@@ -2429,6 +2473,8 @@ func readActionsHydrationState(ctx context.Context, target SSHTarget, leaseID st
 	return normalizeActionsHydrationStateForTarget(target, parseActionsHydrationState(out)), nil
 }
 
+var localActionsHydrationPollInterval = 5 * time.Second
+
 func waitForLocalActionsHydration(ctx context.Context, target SSHTarget, leaseID, expectedJob, pid string, timeout time.Duration, stderr io.Writer) (actionsHydrationState, error) {
 	if timeout <= 0 {
 		timeout = 20 * time.Minute
@@ -2459,7 +2505,7 @@ func waitForLocalActionsHydration(ctx context.Context, target SSHTarget, leaseID
 			return actionsHydrationState{}, Exit(5, "timed out waiting for local Actions hydration marker for %s", leaseID)
 		}
 		fmt.Fprintf(stderr, "waiting for local Actions hydration marker id=%s...\n", leaseID)
-		if err := sleepContext(ctx, 5*time.Second); err != nil {
+		if err := sleepContext(ctx, localActionsHydrationPollInterval); err != nil {
 			return actionsHydrationState{}, err
 		}
 	}
@@ -3086,10 +3132,10 @@ def seed():
         directory(runner / "_work")
         directory(cache)
         slots = (
-            ("node", "24.19.0", "node-v24.19.0-linux-x64.tar.xz",
-             "14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647"),
-            ("go", "1.27.0", "go1.27.0.linux-amd64.tar.gz",
-             "675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685"),
+            ("node", "24.22.1", "node-v24.22.1-linux-x64.tar.xz",
+             "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"),
+            ("go", "1.27.3", "go1.27.3.linux-amd64.tar.gz",
+             "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"),
         )
         for tool, version, filename, pin in slots:
             source = image / tool / version / "x64"

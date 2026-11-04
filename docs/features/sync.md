@@ -281,6 +281,12 @@ enumerating sibling files. This also supports Unix socket and FIFO entries
 without opening them, while preserving object-identity and namespace checks.
 Crowded temporary directories do not block sync preparation.
 
+On Windows, managed-state path spelling compares handle-based file identities,
+including the volume and full file ID, so case aliases work when
+`XDG_STATE_HOME` is set. Inspection reads metadata without requiring file-content
+access, preserves symlink and junction identities, and rejects a path replaced
+between metadata observations.
+
 Native transports without subtree filtering require the selected managed
 namespace to be outside their shared source scope. This includes Blacksmith's
 native repository sync, Docker Sandbox's repository and extra workspaces, Apple
@@ -487,6 +493,20 @@ deletions, and excludes. Missing runner Git and a refused or unavailable exact
 commit fetch fall back to plain file sync; commit or tree verification failures
 abort before transfer. With `sync.delete: false`, this optimization stays off so
 the seed cannot introduce excluded files that sync would then retain.
+When local Actions hydration is required and the detached commit is unavailable,
+Crabbox can seed a verified published ancestor shared with the configured or
+inferred `sync.baseRef`. The full manifest still applies the exact selected working
+files and exclusions. Remote Git HEAD honestly remains that published ancestor;
+Crabbox does not transfer private Git history or certify it as the selected commit.
+A local base ref is sufficient; origin-tracking refs are not required. The
+ancestor must have an eligible tree and be fetchable and verifiable from the same
+origin. Without a containing origin-tracking branch, `sync.delete: true` remains
+required. Seeding requires an empty cold workspace and does not adopt a populated
+raw directory or bypass repository and lease checks. When this operation publishes
+a fresh ancestor seed, pruning may remove all excluded files it just imported;
+the deletion policy for pre-existing workspace contents remains unchanged.
+`--no-hydrate` and ordinary file-only sync retain their existing behavior.
+
 These seeds do not enable branch-based coherence, reusable fingerprints, or Git
 overlay. Native Windows retains branch-only seeding because it transfers the
 complete archive. Submodules and filter-managed trees retain file sync when no
@@ -614,8 +634,12 @@ is available locally.
 The combined full file payload and uncompressed Git objects count against ordinary
 sync size guardrails, even when the dirty delta is small. The existing allow-large
 override affects those soft limits only. Separate hard bounds limit each of the
-uncompressed object total and bundle to 512 MiB, control output to 16 MiB, and
-selected objects to one million; a control-output limit may be reached first.
+uncompressed object total and bundle to 512 MiB and selected objects to one million.
+Object enumeration is streamed as exact object IDs followed by newlines, with at
+most one million records including duplicates and at most 41 million bytes for
+SHA-1 or 65 million bytes for SHA-256. Other control output, tag listings, and
+individual graph metadata remain limited to 16 MiB. Enumeration does not buffer
+the complete ID list or bypass object validation and uncompressed-byte accounting.
 Metadata preparation and import each have a five-minute deadline. `sync-plan`
 reports selected identities, object count, object bytes, bundle bytes, and digest;
 timing JSON adds `syncMode: "git-local"` and `syncSeedBytes`.
