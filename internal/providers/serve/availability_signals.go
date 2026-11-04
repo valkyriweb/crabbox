@@ -22,6 +22,11 @@ type hostSampler struct {
 	exec        core.CommandRunner
 	debug       io.Writer
 	total, idle uint64
+	// cpuFile, when set, is the host CPU source instead of /proc/stat.
+	// fileCores is the host core count from its latest valid read.
+	cpuFile   string
+	fileCores float64
+	now       func() time.Time
 }
 
 func signalCommand(ctx context.Context, exec core.CommandRunner, name string, args ...string) (string, bool) {
@@ -183,7 +188,7 @@ func (h *hostSampler) sampleSignals(ctx context.Context, inventory containerInve
 	wg.Wait()
 	s.cpu = cpu
 	if cpu != nil && !s.containerCPUUnknown {
-		s.cpu = subtractOwnedCPU(*cpu, cores, runtime.NumCPU())
+		s.cpu = subtractOwnedCPUFrom(*cpu, cores, h.hostCores())
 	}
 	s.at = time.Now()
 	return s
@@ -205,7 +210,56 @@ func (h *hostSampler) userIdle(ctx context.Context) *float64 {
 	return nil
 }
 
+// hostCores is the denominator for owned container CPU. A host CPU file
+// describes the whole host, which can have more cores than this process sees.
+func (h *hostSampler) hostCores() float64 {
+	if h.cpuFile != "" && h.fileCores > 0 {
+		return h.fileCores
+	}
+	return float64(runtime.NumCPU())
+}
+
+// hostCPUFileMaxAge bounds how old an external host CPU sample may be.
+// An older file means its writer stopped, so the reading is unknown.
+const hostCPUFileMaxAge = 30 * time.Second
+
+// readHostCPUFile reads "<used cores> <total cores>" written by an external
+// sampler. Sandboxed agents (for example gVisor) see only their own
+// /proc/stat, so an operator can feed node-level CPU here instead.
+func readHostCPUFile(path string, now time.Time) (fraction, cores float64, ok bool) {
+	info, err := os.Stat(path)
+	if err != nil || now.Sub(info.ModTime()) > hostCPUFileMaxAge {
+		return 0, 0, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) != 2 {
+		return 0, 0, false
+	}
+	used, err1 := strconv.ParseFloat(fields[0], 64)
+	total, err2 := strconv.ParseFloat(fields[1], 64)
+	if err1 != nil || err2 != nil || math.IsNaN(used) || math.IsInf(used, 0) || math.IsInf(total, 0) || used < 0 || !(total > 0) {
+		return 0, 0, false
+	}
+	return math.Min(1, used/total), total, true
+}
+
 func (h *hostSampler) hostCPU(ctx context.Context) *float64 {
+	if h.cpuFile != "" {
+		now := time.Now
+		if h.now != nil {
+			now = h.now
+		}
+		fraction, cores, ok := readHostCPUFile(h.cpuFile, now())
+		if !ok {
+			return nil
+		}
+		h.fileCores = cores
+		return &fraction
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return h.darwinCPU(ctx)
