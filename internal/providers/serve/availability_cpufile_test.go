@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -38,6 +39,9 @@ func TestReadHostCPUFile(t *testing.T) {
 		{"over capacity clamps", "44 40", 0, true, 1, 40},
 		{"idle", "0 40", 0, true, 0, 40},
 		{"stale writer", "12 40", 31 * time.Second, false, 0, 0},
+		{"just fresh", "12 40", 29 * time.Second, true, 0.3, 40},
+		{"small future skew", "12 40", -3 * time.Second, true, 0.3, 40},
+		{"far future mtime", "12 40", -time.Hour, false, 0, 0},
 		{"zero cores", "1 0", 0, false, 0, 0},
 		{"negative usage", "-1 40", 0, false, 0, 0},
 		{"one field", "12", 0, false, 0, 0},
@@ -73,6 +77,12 @@ func TestHostCPUFileSubtractsOwnedCPUFromHostCores(t *testing.T) {
 	}
 	if want := 0.5 - 12.0/40; *s.cpu != want {
 		t.Fatalf("non-serve CPU %v, want %v", *s.cpu, want)
+	}
+}
+
+func TestNoHostCPUFileKeepsNumCPUDenominator(t *testing.T) {
+	if got, want := (&hostSampler{}).hostCores(), float64(runtime.NumCPU()); got != want {
+		t.Fatalf("cores %v, want %v", got, want)
 	}
 }
 

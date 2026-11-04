@@ -223,12 +223,19 @@ func (h *hostSampler) hostCores() float64 {
 // An older file means its writer stopped, so the reading is unknown.
 const hostCPUFileMaxAge = 30 * time.Second
 
+// hostCPUFileMaxSkew bounds a future-dated mtime, so a bad clock or touch
+// cannot make one sample valid forever.
+const hostCPUFileMaxSkew = 5 * time.Second
+
 // readHostCPUFile reads "<used cores> <total cores>" written by an external
 // sampler. Sandboxed agents (for example gVisor) see only their own
 // /proc/stat, so an operator can feed node-level CPU here instead.
 func readHostCPUFile(path string, now time.Time) (fraction, cores float64, ok bool) {
 	info, err := os.Stat(path)
-	if err != nil || now.Sub(info.ModTime()) > hostCPUFileMaxAge {
+	if err != nil {
+		return 0, 0, false
+	}
+	if age := now.Sub(info.ModTime()); age > hostCPUFileMaxAge || age < -hostCPUFileMaxSkew {
 		return 0, 0, false
 	}
 	b, err := os.ReadFile(path)
