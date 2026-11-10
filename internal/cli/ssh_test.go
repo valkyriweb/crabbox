@@ -6919,6 +6919,7 @@ func TestRemoteGitCoherenceFinalizeLabelsMassDeletions(t *testing.T) {
 	for i := 0; i < 205; i++ {
 		mustWriteTestFile(t, filepath.Join(fixture.source, "bulk", fmt.Sprintf("file-%03d.txt", i)), "bulk\n")
 	}
+	mustWriteTestFile(t, filepath.Join(fixture.source, "bulk", "a spaced file.txt"), "bulk\n")
 	runGit(t, fixture.source, "add", ".")
 	runGit(t, fixture.source, "commit", "-m", "bulk")
 	bulk := gitOutput(fixture.source, "rev-parse", "HEAD")
@@ -6945,7 +6946,7 @@ func TestRemoteGitCoherenceFinalizeLabelsMassDeletions(t *testing.T) {
 		if got := exitCode(err); got != 67 {
 			t.Fatalf("mass deletion finalize exit=%d, want 67: %v\n%s", got, err, out)
 		}
-		for _, want := range []string{"205 tracked deletions", "CRABBOX_ALLOW_MASS_DELETIONS=1", "bulk/file-000.txt"} {
+		for _, want := range []string{"206 tracked deletions", "CRABBOX_ALLOW_MASS_DELETIONS=1", "  bulk/a spaced file.txt\n", "bulk/file-000.txt"} {
 			if !strings.Contains(string(out), want) {
 				t.Fatalf("mass deletion output missing %q:\n%s", want, out)
 			}

@@ -3157,7 +3157,7 @@ else
   deletions=$(awk '$1 == "D" { n++ } END { print n+0 }' "$git_status")
   if [ ` + shellQuote(allowMassDeletions) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
     echo "remote sync finalize failed: $deletions tracked deletions against the target commit (limit 200); set CRABBOX_ALLOW_MASS_DELETIONS=1 if intended" >&2
-    awk '$1 == "D" { print "  " $2 }' "$git_status" | head -20 >&2 || true
+    awk -F '\t' '$1 == "D" { print "  " $2 }' "$git_status" | head -20 >&2 || true
     exit 67
   fi
   (set -C; printf %s "$index_marker" > "$index_lock") || { echo "remote sync finalize failed: Git index is busy" >&2; exit 67; }
