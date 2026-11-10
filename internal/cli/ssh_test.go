@@ -4632,6 +4632,15 @@ func coherenceFailureTools(t *testing.T, target string) string {
 case "$CRABBOX_FAIL_GIT:$1" in
   read-tree:read-tree|write-tree:write-tree|diff-files:diff-files) exit 91 ;;
 esac
+if [ "$CRABBOX_FAIL_GIT" = fetched-commit ] && [ "$1" = rev-parse ] && [ "$2" = --verify ]; then case "$3" in refs/crabbox/*) exit 81 ;; esac; fi
+if [ "$CRABBOX_FAIL_GIT" = current-head ] && [ "$1" = rev-parse ] && [ "$2" = --verify ] && [ "$3" = 'HEAD^{commit}' ] && [ ! -e "$CRABBOX_FAULT_STATE.head-read" ]; then : > "$CRABBOX_FAULT_STATE.head-read"; exit 82; fi
+if [ "$CRABBOX_FAIL_GIT" = index-lock ] && [ "$1" = diff-files ]; then printf foreign > "$CRABBOX_INDEX_LOCK"; fi
+if [ "$CRABBOX_FAIL_GIT" = installed-index ] && [ "$1" = write-tree ]; then case "$GIT_INDEX_FILE" in *index.crabbox.*.verify) exit 83 ;; esac; fi
+if [ "$CRABBOX_FAIL_GIT" = head-verify ] && [ "$1" = rev-parse ] && [ "$2" = --verify ] && [ "$3" = 'HEAD^{commit}' ] && [ -e "$CRABBOX_FAULT_STATE.head-updated" ] && [ ! -e "$CRABBOX_FAULT_STATE.head-verified" ]; then : > "$CRABBOX_FAULT_STATE.head-verified"; exit 85; fi
+if [ "$CRABBOX_FAIL_GIT" = head-verify ] && [ "$1" = update-ref ] && [ "$2" = --no-deref ] && [ "$3" = HEAD ] && [ ! -e "$CRABBOX_FAULT_STATE.head-updated" ]; then
+  ` + shellQuote(gitOutput("", "--exec-path")+"/git") + ` "$@" || exit $?
+  : > "$CRABBOX_FAULT_STATE.head-updated"; exit 0
+fi
 if [ "$CRABBOX_FAIL_GIT" = index-path ] && [ "$1" = rev-parse ] && [ "$2" = --git-path ] && [ "$3" = index ]; then exit 95; fi
 if [ "$CRABBOX_FAIL_GIT" = cas ] && [ "$1" = update-ref ] && [ "$2" = --no-deref ] && [ "$3" = HEAD ]; then exit 92; fi
 if [ "$CRABBOX_FAIL_GIT" = raw ] && [ "$1" = fetch ]; then
@@ -4662,12 +4671,24 @@ exec /bin/mv "$@"
 last=
 for arg do last="$arg"; done
 if [ "$CRABBOX_FAIL_CP" = backup ]; then case "$last" in *index.crabbox.*.backup) exit 96 ;; esac; fi
+if [ "$CRABBOX_FAIL_CP" = verify-copy ]; then case "$last" in *index.crabbox.*.verify) exit 84 ;; esac; fi
 exec /bin/cp "$@"
 `
 	awkScript := `#!/bin/sh
 if [ "$CRABBOX_FAIL_AWK" = count ]; then case "$*" in *n+0*) exit 97 ;; esac; fi
 exec ` + shellQuote(awkPath) + ` "$@"
 `
+	cmpPath, err := exec.LookPath("cmp")
+	if err != nil {
+		t.Fatalf("cmp unavailable: %v", err)
+	}
+	cmpScript := `#!/bin/sh
+if [ "$CRABBOX_FAIL_CMP" = concurrent-compare ]; then case "$3" in *index.crabbox.*.backup) exit 2 ;; esac; fi
+exec ` + shellQuote(cmpPath) + ` "$@"
+`
+	if err := os.WriteFile(filepath.Join(dir, "cmp"), []byte(cmpScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(gitScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -4690,17 +4711,24 @@ func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 		exit  int
 		label string
 	}{
-		"index-path":  {95, "remote sync finalize failed: Git index path could not be resolved"},
-		"backup":      {96, "remote sync finalize failed: Git index backup failed"},
-		"read-tree":   {91, "remote sync finalize failed: candidate Git index build failed"},
-		"write-tree":  {1, "remote sync finalize failed: candidate Git index tree mismatch"},
-		"diff-files":  {91, "remote sync finalize failed: candidate Git index inspection failed"},
-		"count":       {97, "remote sync finalize failed: tracked deletion count failed"},
-		"cas":         {92, "remote sync finalize failed: HEAD update failed"},
-		"fingerprint": {94, ""},
-		"complete":    {94, ""},
+		"index-path":         {95, "remote sync finalize failed: Git index path could not be resolved"},
+		"backup":             {96, "remote sync finalize failed: Git index backup failed"},
+		"read-tree":          {91, "remote sync finalize failed: candidate Git index build failed"},
+		"write-tree":         {91, "remote sync finalize failed: candidate Git index tree mismatch"},
+		"diff-files":         {91, "remote sync finalize failed: candidate Git index inspection failed"},
+		"count":              {97, "remote sync finalize failed: tracked deletion count failed"},
+		"cas":                {92, "remote sync finalize failed: HEAD update failed"},
+		"fetched-commit":     {81, "remote sync finalize failed: fetched commit could not be resolved"},
+		"current-head":       {82, "remote sync finalize failed: current HEAD could not be resolved"},
+		"index-lock":         {1, "remote sync finalize failed: Git index is busy"},
+		"concurrent-compare": {2, "remote sync finalize failed: Git index changed concurrently"},
+		"verify-copy":        {84, "remote sync finalize failed: Git index verify copy failed"},
+		"installed-index":    {83, "remote sync finalize failed: installed Git index verification failed"},
+		"head-verify":        {85, "remote sync finalize failed: HEAD verification after update failed"},
+		"fingerprint":        {94, ""},
+		"complete":           {94, ""},
 	}
-	for _, failure := range []string{"index-path", "backup", "read-tree", "write-tree", "diff-files", "count", "cas", "fingerprint", "complete"} {
+	for _, failure := range []string{"index-path", "backup", "read-tree", "write-tree", "diff-files", "count", "cas", "fingerprint", "complete", "fetched-commit", "current-head", "index-lock", "concurrent-compare", "verify-copy", "installed-index", "head-verify"} {
 		t.Run(failure, func(t *testing.T) {
 			workdir := f.workspace(t, f.a, true)
 			plan := f.plan(t, f.b)
@@ -4709,11 +4737,17 @@ func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 			stageCoherenceFinalize(t, workdir, token)
 			beforeIndex := coherenceIndexBytes(t, workdir)
 			tools := coherenceFailureTools(t, plan.Target)
-			env := []string{"PATH=" + tools + string(os.PathListSeparator) + os.Getenv("PATH")}
+			env := []string{"PATH=" + tools + string(os.PathListSeparator) + os.Getenv("PATH"), "CRABBOX_FAULT_STATE=" + filepath.Join(t.TempDir(), "fault")}
+			lockPath := coherenceIndexPath(t, workdir) + ".lock"
 			switch failure {
+			case "index-lock":
+				// A foreign lock appears after the candidate build, so noclobber lock creation fails.
+				env = append(env, "CRABBOX_FAIL_GIT="+failure, "CRABBOX_INDEX_LOCK="+lockPath)
+			case "concurrent-compare":
+				env = append(env, "CRABBOX_FAIL_CMP="+failure)
 			case "fingerprint", "complete":
 				env = append(env, "CRABBOX_FAIL_MV="+failure)
-			case "backup":
+			case "backup", "verify-copy":
 				env = append(env, "CRABBOX_FAIL_CP="+failure)
 			case "count":
 				env = append(env, "CRABBOX_FAIL_AWK="+failure)
@@ -4738,6 +4772,14 @@ func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 			}
 			if got := readCoherentFingerprint(t, workdir, plan); got != "" {
 				t.Fatalf("failed finalization certified fingerprint %q", got)
+			}
+			if failure == "index-lock" {
+				if _, err := os.Stat(lockPath); err != nil {
+					t.Fatalf("foreign index lock removed: %v", err)
+				}
+				if err := os.Remove(lockPath); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if out, err := runCoherenceFinalize(workdir, plan, token, "fp-"+failure); err != nil {
 				t.Fatalf("retry: %v\n%s", err, out)
