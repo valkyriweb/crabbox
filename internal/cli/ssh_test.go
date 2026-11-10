@@ -6908,3 +6908,59 @@ func TestCommandIntentShellSourceKeepsExistingShell(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoteGitCoherenceFinalizeLabelsMassDeletions(t *testing.T) {
+	for _, tool := range []string{"git", "bash"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s unavailable: %v", tool, err)
+		}
+	}
+	fixture := newGitCoherenceFixture(t)
+	for i := 0; i < 205; i++ {
+		mustWriteTestFile(t, filepath.Join(fixture.source, "bulk", fmt.Sprintf("file-%03d.txt", i)), "bulk\n")
+	}
+	runGit(t, fixture.source, "add", ".")
+	runGit(t, fixture.source, "commit", "-m", "bulk")
+	bulk := gitOutput(fixture.source, "rev-parse", "HEAD")
+	runGit(t, fixture.source, "push", "-q", "origin", "HEAD:refs/heads/main")
+	runGit(t, fixture.source, "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*")
+
+	run := func(t *testing.T, token string, allow bool) (string, []byte, error) {
+		t.Helper()
+		workdir := fixture.workspace(t, fixture.c, true)
+		plan := fixture.plan(t, bulk)
+		stageCoherenceFinalize(t, workdir, token)
+		cmd := exec.Command("/bin/sh", "-c", remoteFinalizeSync(workdir, remoteSyncFinalizeOptions{
+			Token:              token,
+			Fingerprint:        "fp-mass",
+			Coherence:          plan,
+			AllowMassDeletions: allow,
+		}))
+		out, err := cmd.CombinedOutput()
+		return workdir, out, err
+	}
+
+	t.Run("blocked", func(t *testing.T) {
+		workdir, out, err := run(t, "61616161616161616161616161616161", false)
+		if got := exitCode(err); got != 67 {
+			t.Fatalf("mass deletion finalize exit=%d, want 67: %v\n%s", got, err, out)
+		}
+		for _, want := range []string{"205 tracked deletions", "CRABBOX_ALLOW_MASS_DELETIONS=1", "bulk/file-000.txt"} {
+			if !strings.Contains(string(out), want) {
+				t.Fatalf("mass deletion output missing %q:\n%s", want, out)
+			}
+		}
+		if lines := strings.Count(string(out), "  bulk/"); lines != 20 {
+			t.Fatalf("listed %d deleted paths, want 20:\n%s", lines, out)
+		}
+		requireGitOutput(t, workdir, fixture.c, "rev-parse", "HEAD")
+	})
+
+	t.Run("override", func(t *testing.T) {
+		workdir, out, err := run(t, "62626262626262626262626262626262", true)
+		if err != nil {
+			t.Fatalf("override finalize returned %v\n%s", err, out)
+		}
+		requireGitOutput(t, workdir, bulk, "rev-parse", "HEAD")
+	})
+}
