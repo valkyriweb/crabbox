@@ -223,7 +223,8 @@ results remain on stdout.
 After the first heartbeat and reconciliation, Serve probes the configured image
 in the background for `sshd`, Git, rsync,
 curl, sudo, Python 3, the pinned Node.js/npm toolchain, a C toolchain (`cc`,
-`make`, `pkg-config`, `xz`, `unzip`) and Rust (`cargo`, `rustc`). If any are
+`make`, `pkg-config`, `xz`, `unzip`, OpenSSL headers via `pkg-config openssl`)
+and working Rust (`cargo`, `rustc`). If any are
 missing and `apt-get` is available, it installs the shared bootstrap packages,
 `build-essential pkg-config libssl-dev xz-utils unzip`, the checksum-verified
 Node.js archive and the stable Rust toolchain once in a temporary container, then
@@ -254,7 +255,7 @@ bounded to 20 minutes.
 Failure to pull or inspect the configured image still stops agent startup.
 
 The tag is `crabbox-serve-prepared:<hash>`, where the hash is the first 16 hex
-digits of SHA-256 over the base runtime image ID, package list, and recipe
+digits of SHA-256 over the base runtime image ID, package lists, and recipe
 version. Subsequent agent starts reuse that tag. The image has labels
 `crabbox.serve.prepared=true`, `crabbox.serve.base-reference`, and
 `crabbox.serve.base-image-id`. Preparation preserves the base command,

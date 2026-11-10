@@ -256,7 +256,7 @@ func TestServedPrepare(t *testing.T) {
 							if !strings.Contains(a[len(a)-1], bootstrapTools) {
 								t.Fatal("missing tool probe")
 							}
-							if !strings.Contains(a[len(a)-1], " cargo rustc ") || !strings.Contains(a[len(a)-1], " cc make pkg-config xz ") {
+							if !strings.Contains(a[len(a)-1], "pkg-config --exists openssl && cargo --version && rustc --version") || !strings.Contains(a[len(a)-1], " cargo rustc ") || !strings.Contains(a[len(a)-1], " cc make pkg-config xz ") {
 								t.Fatal("tool probe must require the C and Rust toolchains")
 							}
 							if !strings.Contains(a[len(a)-1], "node --version") || !strings.Contains(a[len(a)-1], servedNodeVersion) {

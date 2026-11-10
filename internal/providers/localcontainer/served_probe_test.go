@@ -23,6 +23,8 @@ func TestServedNodeReadinessExecutesProbe(t *testing.T) {
 		nodeVersion string
 		nodeFails   bool
 		noRust      bool
+		noOpenSSL   bool
+		brokenRust  bool
 		apt         bool
 		want        string
 	}{
@@ -32,6 +34,8 @@ func TestServedNodeReadinessExecutesProbe(t *testing.T) {
 		{name: "missing", apt: true, want: "prepare"},
 		{name: "broken", nodeVersion: servedNodeVersion, nodeFails: true, apt: true, want: "prepare"},
 		{name: "missing rust", nodeVersion: servedNodeVersion, noRust: true, apt: true, want: "prepare"},
+		{name: "missing openssl headers", nodeVersion: servedNodeVersion, noOpenSSL: true, apt: true, want: "prepare"},
+		{name: "broken rust", nodeVersion: servedNodeVersion, brokenRust: true, apt: true, want: "prepare"},
 		{name: "unsupported package manager", nodeVersion: "v22.0.0", want: "skip"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,7 +50,14 @@ func TestServedNodeReadinessExecutesProbe(t *testing.T) {
 				if tc.noRust && (tool == "cargo" || tool == "rustc") {
 					continue
 				}
-				writeTool(tool, "exit 0")
+				switch {
+				case tool == "pkg-config" && tc.noOpenSSL:
+					writeTool(tool, "exit 1")
+				case (tool == "cargo" || tool == "rustc") && tc.brokenRust:
+					writeTool(tool, "exit 1")
+				default:
+					writeTool(tool, "exit 0")
+				}
 			}
 			if tc.apt {
 				writeTool("apt-get", "exit 91") // Installation must never run in this fixture.

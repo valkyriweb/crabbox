@@ -22,7 +22,8 @@ const servedPreparationRecipe = "v3"
 const servedToolchainPackages = "build-essential pkg-config libssl-dev xz-utils unzip"
 
 // servedToolchainTools are the commands the readiness probe requires before it
-// treats a base image as already prepared.
+// treats a base image as already prepared; it also requires OpenSSL headers
+// (pkg-config openssl) and working cargo/rustc.
 const servedToolchainTools = "cc make pkg-config xz unzip cargo rustc"
 
 // servedRustupVersion pins rustup-init; the stable toolchain it installs is
@@ -206,7 +207,7 @@ func (r *ServedRuntime) cleanupPreparationContainer(name string) error {
 }
 
 func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id string, err error) {
-	probe := "for tool in " + bootstrapTools + " " + servedToolchainTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
+	probe := "for tool in " + bootstrapTools + " " + servedToolchainTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; { pkg-config --exists openssl && cargo --version && rustc --version; } >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
 	probeName := "crabbox-serve-probe-" + strings.ToLower(rand.Text())
 	result, err := r.b.docker(ctx, []string{"run", "--rm", "--name", probeName, "--entrypoint", "/bin/sh", base.ID, "-c", probe}, nil, r.b.rt.Stderr)
 	if err != nil {
