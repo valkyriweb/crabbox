@@ -2,6 +2,7 @@ package localcontainer
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -255,6 +256,9 @@ func TestServedPrepare(t *testing.T) {
 							if !strings.Contains(a[len(a)-1], bootstrapTools) {
 								t.Fatal("missing tool probe")
 							}
+							if !strings.Contains(a[len(a)-1], " cargo rustc ") || !strings.Contains(a[len(a)-1], " cc make pkg-config xz ") {
+								t.Fatal("tool probe must require the C and Rust toolchains")
+							}
 							if !strings.Contains(a[len(a)-1], "node --version") || !strings.Contains(a[len(a)-1], servedNodeVersion) {
 								t.Fatal("tool probe must require the pinned node version")
 							}
@@ -271,7 +275,7 @@ func TestServedPrepare(t *testing.T) {
 							if noProxy := slices.Contains(a, "--http-proxy=false"); noProxy != (runtimeName == "podman") {
 								t.Fatalf("runtime=%s http-proxy=false=%v args=%v", runtimeName, noProxy, a)
 							}
-							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], servedNodeInstallScript) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
+							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], servedNodeInstallScript) || !strings.Contains(a[len(a)-1], servedRustInstallScript) || !strings.Contains(a[len(a)-1], servedToolchainPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
 								t.Fatal("invalid preparation script")
 							}
 							if req.Stdout != &warning || req.Stderr != &warning {
@@ -486,5 +490,41 @@ func TestServedNodeInstallScriptPinsAndVerifies(t *testing.T) {
 	}
 	if strings.Contains(servedNodeInstallScript, "apt-key") || strings.Contains(servedNodeInstallScript, "nodesource") {
 		t.Fatal("node install must not use external apt repositories")
+	}
+}
+
+func TestServedRustInstallScriptPinsAndVerifies(t *testing.T) {
+	for _, want := range []string{
+		"rustup_version=" + servedRustupVersion,
+		"b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55",
+		"9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282",
+		"https://static.rust-lang.org/rustup/archive/$rustup_version/$rust_target/rustup-init",
+		"sha256sum -c -",
+		"--profile minimal --default-toolchain stable",
+		"RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo",
+		"/usr/local/bin/$rust_tool",
+		"chmod -R a+rX,go-w /opt/rust",
+	} {
+		if !strings.Contains(servedRustInstallScript, want) {
+			t.Fatalf("rust install script missing %q", want)
+		}
+	}
+	if strings.Contains(servedRustInstallScript, "sh.rustup.rs") || strings.Contains(servedRustInstallScript, "| sh -") {
+		t.Fatal("rust install must not pipe an unverified installer to a shell")
+	}
+	for _, pkg := range []string{"build-essential", "pkg-config", "libssl-dev", "xz-utils", "unzip"} {
+		if !strings.Contains(servedToolchainPackages, pkg) {
+			t.Fatalf("toolchain packages missing %q", pkg)
+		}
+	}
+	if servedPreparationRecipe != "v3" {
+		t.Fatalf("recipe=%q, want v3", servedPreparationRecipe)
+	}
+}
+
+func TestServedPreparedTagCoversToolchainRecipe(t *testing.T) {
+	sum := sha256.Sum256([]byte("sha256:base\n" + bootstrapPackages + " " + servedToolchainPackages + "\nv3"))
+	if got, want := servedPreparedTag("sha256:base"), fmt.Sprintf("crabbox-serve-prepared:%x", sum[:8]); got != want {
+		t.Fatalf("tag=%s want %s", got, want)
 	}
 }

@@ -222,9 +222,11 @@ results remain on stdout.
 
 After the first heartbeat and reconciliation, Serve probes the configured image
 in the background for `sshd`, Git, rsync,
-curl, sudo, Python 3, and the pinned Node.js/npm toolchain. If any are missing
-and `apt-get` is available, it installs the shared bootstrap packages and
-checksum-verified Node.js archive once in a temporary container, then
+curl, sudo, Python 3, the pinned Node.js/npm toolchain, a C toolchain (`cc`,
+`make`, `pkg-config`, `xz`, `unzip`) and Rust (`cargo`, `rustc`). If any are
+missing and `apt-get` is available, it installs the shared bootstrap packages,
+`build-essential pkg-config libssl-dev xz-utils unzip`, the checksum-verified
+Node.js archive and the stable Rust toolchain once in a temporary container, then
 commits a local prepared image. This uses ordinary Docker/Podman `run` and
 `commit`; it requires no buildx or Dockerfile. Preparation output goes to stderr.
 Images that already have the tools need no prepared copy. Images without
@@ -239,6 +241,16 @@ readiness waits for the pinned Node.js version and a working npm, so an early
 SSH host key cannot advertise a lease whose toolchain is still missing. An
 unsupported architecture or failed archive verification leaves the lease
 unready. Ordinary local-container leases do not acquire this Node.js policy.
+
+Rust is installed as root with a SHA256-pinned `rustup-init` (minimal profile,
+stable toolchain) under `/opt/rust` (`RUSTUP_HOME=/opt/rust/rustup`,
+`CARGO_HOME=/opt/rust/cargo`). The toolchain's `cargo`, `rustc`, `rustdoc` and
+`rustfmt` (when present) are linked into `/usr/local/bin`, and `rustup` is linked
+too. The image environment is unchanged, so lease users keep their own
+`~/.cargo` for the registry and build cache; `/opt/rust` is world-readable and
+not writable by lease users. Rust and the C toolchain exist only in prepared
+images: lease-time fallback bootstrap does not install them. Preparation is
+bounded to 20 minutes.
 Failure to pull or inspect the configured image still stops agent startup.
 
 The tag is `crabbox-serve-prepared:<hash>`, where the hash is the first 16 hex
