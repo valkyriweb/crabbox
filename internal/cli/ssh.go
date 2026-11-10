@@ -3162,7 +3162,9 @@ else
   fi
   (set -C; printf %s "$index_marker" > "$index_lock") || { echo "remote sync finalize failed: Git index is busy" >&2; exit 67; }
   cmp -s "$index_path" "$index_backup" || { echo "remote sync finalize failed: Git index changed concurrently" >&2; exit 67; }
-  cp -p "$index_candidate" "$index_verify"; mv "$index_candidate" "$index_path"; index_changed=1; coherence_mutated=1
+  cp -p "$index_candidate" "$index_verify" || { rc=$?; echo "remote sync finalize failed: Git index verify copy failed" >&2; exit $rc; }
+  mv "$index_candidate" "$index_path" || { rc=$?; echo "remote sync finalize failed: Git index install failed" >&2; exit $rc; }
+  index_changed=1; coherence_mutated=1
   cmp -s "$index_path" "$index_verify" && [ "$(GIT_INDEX_FILE="$index_verify" git write-tree)" = ` + shellQuote(plan.Tree) + ` ] || { echo "remote sync finalize failed: installed Git index verification failed" >&2; exit 67; }
   git update-ref --no-deref HEAD ` + shellQuote(plan.Target) + ` "$old_head" || { echo "remote sync finalize failed: HEAD update failed" >&2; exit 67; }
   head_changed=1

@@ -4479,6 +4479,28 @@ func TestRemoteGitCoherenceExitTrapBehavior(t *testing.T) {
 		}
 		assertCleanup(t, workdir, token)
 	})
+
+	t.Run("index install failure", func(t *testing.T) {
+		workdir := fixture.workspace(t, fixture.a, true)
+		plan := fixture.plan(t, fixture.b)
+		mustWriteTestFile(t, filepath.Join(workdir, "tracked.txt"), "B\n")
+		const token = "53535353535353535353535353535353"
+		stageCoherenceFinalize(t, workdir, token)
+		beforeIndex := coherenceIndexBytes(t, workdir)
+		tools := coherenceFailureTools(t, plan.Target)
+		out, err := runCoherenceFinalize(workdir, plan, token, "fp-index-install",
+			"PATH="+tools+string(os.PathListSeparator)+os.Getenv("PATH"), "CRABBOX_FAIL_MV=index-install")
+		if got := exitCode(err); got != 94 {
+			t.Fatalf("index install failure exit=%d, want original exit 94: %v\n%s", got, err, out)
+		}
+		if !strings.Contains(string(out), "remote sync finalize failed: Git index install failed") {
+			t.Fatalf("index install failure missing label:\n%s", out)
+		}
+		requireGitOutput(t, workdir, fixture.a, "rev-parse", "HEAD")
+		if afterIndex := coherenceIndexBytes(t, workdir); !bytes.Equal(afterIndex, beforeIndex) {
+			t.Fatal("index install failure did not preserve the Git index")
+		}
+	})
 }
 
 func TestRemoteGitCoherenceRepairsReuseBeforeFingerprintSkip(t *testing.T) {
@@ -4627,6 +4649,7 @@ fi
 if [ "$CRABBOX_FAIL_MV" = concurrent-branch ]; then
   case "$last" in */sync-fingerprint) ` + shellQuote(gitOutput("", "--exec-path")+"/git") + ` -C "$CRABBOX_CONCURRENT_WORKDIR" update-ref refs/heads/workspace "$CRABBOX_CONCURRENT_HEAD" "$CRABBOX_OLD_HEAD"; exit 94 ;; esac
 fi
+if [ "$CRABBOX_FAIL_MV" = index-install ]; then case "$1" in *index.crabbox.*.new) exit 94 ;; esac; fi
 if [ "$CRABBOX_FAIL_MV" = post-install-index ]; then case "$1" in *index.crabbox*) /bin/mv "$@"; printf post-install-index > "$last"; exit 0 ;; esac; fi
 exec /bin/mv "$@"
 `
