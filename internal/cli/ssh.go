@@ -3094,14 +3094,21 @@ fi
 	return script + remoteGitCoherenceFinalizeScript(plan, allowMassDeletions)
 }
 
+// remoteGitCoherenceFinalizeScript keeps shell comments out of the script because
+// the workspace-owner transport is size-bounded. Notes: an existing shallow
+// boundary can hide ancestors of the advertised branch, so coherence_fetch
+// unshallows; Bash 5.2 can corrupt function context when a successful EXIT
+// handler re-exits, so coherence_cleanup only exits on failure. ffail reads $?
+// on entry, so `cmd || ffail "label"` exits with cmd's own status.
 func remoteGitCoherenceFinalizeScript(plan gitCoherencePlan, allowMassDeletions string) string {
 	return `
 coherence_committed=; coherence_mutated=; head_changed=; index_changed=
+ffail() { s=$?; echo "remote sync finalize failed: $1" >&2; exit $s; }
+want_head=` + shellQuote(plan.Target) + `; want_tree=` + shellQuote(plan.Tree) + `
 tmp_ref="refs/crabbox/sync-$expected_token"; advertised_branch=` + shellQuote(plan.Branch) + `; expected_origin=` + shellQuote(plan.RemoteURL) + `
 ` + remoteGitOriginTransportFunctions() + `
 coherence_fetch() {
   set -- --quiet --filter=blob:none --no-tags
-  # An existing shallow boundary can hide ancestors of the advertised branch.
   if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
     set -- "$@" --unshallow
   fi
@@ -3117,16 +3124,16 @@ elif transport_error="$meta_dir/sync-fetch-error.$expected_token.$$"; ! coherenc
 	cat "$transport_error" >&2
 	cleanup_finalize_lock
 	exit ` + strconv.Itoa(gitOriginRuntimeFallbackExitCode) + `
-elif ! git merge-base --is-ancestor ` + shellQuote(plan.Target) + ` "$tmp_ref" >/dev/null 2>&1; then
+elif ! git merge-base --is-ancestor "$want_head" "$tmp_ref" >/dev/null 2>&1; then
 	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: requested commit is not on advertised branch" >&2; cleanup_finalize_lock; exit 67
-elif [ "$(git rev-parse --verify ` + shellQuote(plan.Target+"^{tree}") + ` 2>/dev/null || true)" != ` + shellQuote(plan.Tree) + ` ]; then
+elif [ "$(git rev-parse --verify "$want_head^{tree}" 2>/dev/null || true)" != "$want_tree" ]; then
 	git update-ref -d "$tmp_ref" >/dev/null 2>&1 || true; echo "remote sync finalize failed: requested Git tree verification failed" >&2; cleanup_finalize_lock; exit 67
 else
   coherence_cleanup() {
     status=$?
     if [ -z "$coherence_committed" ] && [ -n "$coherence_mutated" ]; then
       if [ -n "$head_changed" ]; then
-        if git update-ref --no-deref HEAD "$old_head" ` + shellQuote(plan.Target) + `; then
+        if git update-ref --no-deref HEAD "$old_head" "$want_head"; then
           if [ -n "$old_sym" ] && ! git symbolic-ref -q HEAD >/dev/null 2>&1 &&
              [ "$(git rev-parse --verify HEAD^{commit} 2>/dev/null || true)" = "$old_head" ] &&
              [ "$(git rev-parse --verify "$old_sym^{commit}" 2>/dev/null || true)" = "$old_head" ]; then git symbolic-ref HEAD "$old_sym" || status=67; fi
@@ -3138,41 +3145,35 @@ else
     fi
     git update-ref -d "$tmp_ref" "$fetched_head" >/dev/null 2>&1 || true; rm -f "${index_backup:-}" "${index_candidate:-}" "${index_verify:-}" "${index_restore:-}"
     if [ -n "${index_lock:-}" ] && [ "$(cat "$index_lock" 2>/dev/null || true)" = "${index_marker:-}" ]; then rm -f "$index_lock"; fi
-    # Bash 5.2 can corrupt function context when a successful EXIT handler re-exits.
     cleanup_finalize_lock; trap - EXIT; if [ "$status" -ne 0 ]; then exit "$status"; fi
   }
   trap coherence_cleanup EXIT
-  fetched_head="$(git rev-parse --verify "$tmp_ref^{commit}")" || { rc=$?; echo "remote sync finalize failed: fetched commit could not be resolved" >&2; exit $rc; }
-  old_head="$(git rev-parse --verify HEAD^{commit})" || { rc=$?; echo "remote sync finalize failed: current HEAD could not be resolved" >&2; exit $rc; }
+  fetched_head="$(git rev-parse --verify "$tmp_ref^{commit}")" || ffail "fetched commit could not be resolved"
+  old_head="$(git rev-parse --verify HEAD^{commit})" || ffail "current HEAD could not be resolved"
   old_sym="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
-  index_path="$(git rev-parse --git-path index)" || { rc=$?; echo "remote sync finalize failed: Git index path could not be resolved" >&2; exit $rc; }
+  index_path="$(git rev-parse --git-path index)" || ffail "Git index path could not be resolved"
   case "$index_path" in /*) ;; *) index_path="$PWD/$index_path" ;; esac
   index_lock="$index_path.lock"; index_marker="$expected_token.$$"
   index_backup="$index_path.crabbox.$$.backup"; index_candidate="$index_path.crabbox.$$.new"; index_verify="$index_path.crabbox.$$.verify"; index_restore="$index_path.crabbox.$$.restore"
-  cp -p "$index_path" "$index_backup" || { rc=$?; echo "remote sync finalize failed: Git index backup failed" >&2; exit $rc; }
-  git read-tree --reset --index-output="$index_candidate" ` + shellQuote(plan.Target) + ` || { rc=$?; echo "remote sync finalize failed: candidate Git index build failed" >&2; exit $rc; }
-  candidate_tree="$(GIT_INDEX_FILE="$index_candidate" git write-tree)" || { rc=$?; echo "remote sync finalize failed: candidate Git index tree mismatch" >&2; exit $rc; }
-  [ "$candidate_tree" = ` + shellQuote(plan.Tree) + ` ] || { rc=$?; echo "remote sync finalize failed: candidate Git index tree mismatch" >&2; exit $rc; }
-  GIT_INDEX_FILE="$index_candidate" git diff-files --name-status >"$git_status" 2>/dev/null ||
-    { rc=$?; echo "remote sync finalize failed: candidate Git index inspection failed" >&2; exit $rc; }
-  deletions=$(awk '$1 == "D" { n++ } END { print n+0 }' "$git_status") || { rc=$?; echo "remote sync finalize failed: tracked deletion count failed" >&2; exit $rc; }
-  if [ ` + shellQuote(allowMassDeletions) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
-    echo "remote sync finalize failed: $deletions tracked deletions against the target commit (limit 200); set CRABBOX_ALLOW_MASS_DELETIONS=1 if intended" >&2
-    awk -F '\t' '$1 == "D" { print "  " $2 }' "$git_status" | head -20 >&2 || true
+  cp -p "$index_path" "$index_backup" || ffail "Git index backup failed"
+  git read-tree --reset --index-output="$index_candidate" "$want_head" || ffail "candidate Git index build failed"
+  t="$(GIT_INDEX_FILE="$index_candidate" git write-tree)" && [ "$t" = "$want_tree" ] || ffail "candidate Git index tree mismatch"
+  GIT_INDEX_FILE="$index_candidate" git diff-files --name-status >"$git_status" 2>/dev/null || ffail "candidate Git index inspection failed"
+  deletions=$(awk "/^D\t/{n++}END{print n+0}" "$git_status") || ffail "tracked deletion count failed"
+  if [ ` + shellQuote(allowMassDeletions) + ` != 1 ] && [ "$deletions" -ge 200 ]; then
+    echo "remote sync finalize failed: $deletions tracked deletions (limit 200); set CRABBOX_ALLOW_MASS_DELETIONS=1 if intended" >&2
+    awk -F"\t" "/^D\t/{print \"  \" \$2}" "$git_status" | head -20 >&2 || true
     exit 67
   fi
-  (set -C; printf %s "$index_marker" > "$index_lock") || { rc=$?; echo "remote sync finalize failed: Git index is busy" >&2; exit $rc; }
-  cmp -s "$index_path" "$index_backup" || { rc=$?; echo "remote sync finalize failed: Git index changed concurrently" >&2; exit $rc; }
-  cp -p "$index_candidate" "$index_verify" || { rc=$?; echo "remote sync finalize failed: Git index verify copy failed" >&2; exit $rc; }
-  mv "$index_candidate" "$index_path" || { rc=$?; echo "remote sync finalize failed: Git index install failed" >&2; exit $rc; }
+  (set -C; printf %s "$index_marker" > "$index_lock") || ffail "Git index is busy"
+  cmp -s "$index_path" "$index_backup" || ffail "Git index changed concurrently"
+  cp -p "$index_candidate" "$index_verify" || ffail "Git index verify copy failed"
+  mv "$index_candidate" "$index_path" || ffail "Git index install failed"
   index_changed=1; coherence_mutated=1
-  cmp -s "$index_path" "$index_verify" || { rc=$?; echo "remote sync finalize failed: installed Git index verification failed" >&2; exit $rc; }
-  installed_tree="$(GIT_INDEX_FILE="$index_verify" git write-tree)" || { rc=$?; echo "remote sync finalize failed: installed Git index verification failed" >&2; exit $rc; }
-  [ "$installed_tree" = ` + shellQuote(plan.Tree) + ` ] || { rc=$?; echo "remote sync finalize failed: installed Git index verification failed" >&2; exit $rc; }
-  git update-ref --no-deref HEAD ` + shellQuote(plan.Target) + ` "$old_head" || { rc=$?; echo "remote sync finalize failed: HEAD update failed" >&2; exit $rc; }
+  cmp -s "$index_path" "$index_verify" && t="$(GIT_INDEX_FILE="$index_verify" git write-tree)" && [ "$t" = "$want_tree" ] || ffail "installed Git index verification failed"
+  git update-ref --no-deref HEAD "$want_head" "$old_head" || ffail "HEAD update failed"
   head_changed=1
-  new_head="$(git rev-parse --verify HEAD^{commit})" || { rc=$?; echo "remote sync finalize failed: HEAD verification after update failed" >&2; exit $rc; }
-  [ "$new_head" = ` + shellQuote(plan.Target) + ` ] || { rc=$?; echo "remote sync finalize failed: HEAD verification after update failed" >&2; exit $rc; }
+  t="$(git rev-parse --verify HEAD^{commit})" && [ "$t" = "$want_head" ] || ffail "HEAD verification after update failed"
 fi
 `
 }

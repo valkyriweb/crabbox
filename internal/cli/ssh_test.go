@@ -4704,6 +4704,20 @@ exec ` + shellQuote(cmpPath) + ` "$@"
 	return dir
 }
 
+// hostNoclobberStatus measures the host /bin/sh status for a failed noclobber
+// redirect (dash exits 2, macOS sh exits 1).
+func hostNoclobberStatus(t *testing.T) int {
+	t.Helper()
+	existing := filepath.Join(t.TempDir(), "existing")
+	mustWriteTestFile(t, existing, "")
+	err := exec.Command("/bin/sh", "-c", `set -C; : > "$1"`, "sh", existing).Run()
+	if code := exitCode(err); code != 0 {
+		return code
+	}
+	t.Fatal("noclobber redirect unexpectedly succeeded")
+	return 0
+}
+
 func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 	f := newGitCoherenceFixture(t)
 	// Each labelled finalize step must keep the failing command's own exit status.
@@ -4720,7 +4734,7 @@ func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 		"cas":                {92, "remote sync finalize failed: HEAD update failed"},
 		"fetched-commit":     {81, "remote sync finalize failed: fetched commit could not be resolved"},
 		"current-head":       {82, "remote sync finalize failed: current HEAD could not be resolved"},
-		"index-lock":         {1, "remote sync finalize failed: Git index is busy"},
+		"index-lock":         {hostNoclobberStatus(t), "remote sync finalize failed: Git index is busy"},
 		"concurrent-compare": {2, "remote sync finalize failed: Git index changed concurrently"},
 		"verify-copy":        {84, "remote sync finalize failed: Git index verify copy failed"},
 		"installed-index":    {83, "remote sync finalize failed: installed Git index verification failed"},
