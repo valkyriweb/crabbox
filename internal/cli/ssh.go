@@ -3142,33 +3142,33 @@ else
     cleanup_finalize_lock; trap - EXIT; if [ "$status" -ne 0 ]; then exit "$status"; fi
   }
   trap coherence_cleanup EXIT
-  fetched_head="$(git rev-parse --verify "$tmp_ref^{commit}")" || { echo "remote sync finalize failed: fetched commit could not be resolved" >&2; exit 67; }
-  old_head="$(git rev-parse --verify HEAD^{commit})" || { echo "remote sync finalize failed: current HEAD could not be resolved" >&2; exit 67; }
+  fetched_head="$(git rev-parse --verify "$tmp_ref^{commit}")" || { rc=$?; echo "remote sync finalize failed: fetched commit could not be resolved" >&2; exit $rc; }
+  old_head="$(git rev-parse --verify HEAD^{commit})" || { rc=$?; echo "remote sync finalize failed: current HEAD could not be resolved" >&2; exit $rc; }
   old_sym="$(git symbolic-ref -q HEAD 2>/dev/null || true)"
-  index_path="$(git rev-parse --git-path index)"
+  index_path="$(git rev-parse --git-path index)" || { rc=$?; echo "remote sync finalize failed: Git index path could not be resolved" >&2; exit $rc; }
   case "$index_path" in /*) ;; *) index_path="$PWD/$index_path" ;; esac
   index_lock="$index_path.lock"; index_marker="$expected_token.$$"
   index_backup="$index_path.crabbox.$$.backup"; index_candidate="$index_path.crabbox.$$.new"; index_verify="$index_path.crabbox.$$.verify"; index_restore="$index_path.crabbox.$$.restore"
-  cp -p "$index_path" "$index_backup" || { echo "remote sync finalize failed: Git index backup failed" >&2; exit 67; }
-  git read-tree --reset --index-output="$index_candidate" ` + shellQuote(plan.Target) + ` || { echo "remote sync finalize failed: candidate Git index build failed" >&2; exit 67; }
-  [ "$(GIT_INDEX_FILE="$index_candidate" git write-tree)" = ` + shellQuote(plan.Tree) + ` ] || { echo "remote sync finalize failed: candidate Git index tree mismatch" >&2; exit 67; }
+  cp -p "$index_path" "$index_backup" || { rc=$?; echo "remote sync finalize failed: Git index backup failed" >&2; exit $rc; }
+  git read-tree --reset --index-output="$index_candidate" ` + shellQuote(plan.Target) + ` || { rc=$?; echo "remote sync finalize failed: candidate Git index build failed" >&2; exit $rc; }
+  [ "$(GIT_INDEX_FILE="$index_candidate" git write-tree)" = ` + shellQuote(plan.Tree) + ` ] || { rc=$?; echo "remote sync finalize failed: candidate Git index tree mismatch" >&2; exit $rc; }
   GIT_INDEX_FILE="$index_candidate" git diff-files --name-status >"$git_status" 2>/dev/null ||
-    { echo "remote sync sanity failed: candidate Git index inspection failed" >&2; exit 67; }
-  deletions=$(awk '$1 == "D" { n++ } END { print n+0 }' "$git_status")
+    { rc=$?; echo "remote sync finalize failed: candidate Git index inspection failed" >&2; exit $rc; }
+  deletions=$(awk '$1 == "D" { n++ } END { print n+0 }' "$git_status") || { rc=$?; echo "remote sync finalize failed: tracked deletion count failed" >&2; exit $rc; }
   if [ ` + shellQuote(allowMassDeletions) + ` != '1' ] && [ "$deletions" -ge 200 ]; then
     echo "remote sync finalize failed: $deletions tracked deletions against the target commit (limit 200); set CRABBOX_ALLOW_MASS_DELETIONS=1 if intended" >&2
     awk -F '\t' '$1 == "D" { print "  " $2 }' "$git_status" | head -20 >&2 || true
     exit 67
   fi
-  (set -C; printf %s "$index_marker" > "$index_lock") || { echo "remote sync finalize failed: Git index is busy" >&2; exit 67; }
-  cmp -s "$index_path" "$index_backup" || { echo "remote sync finalize failed: Git index changed concurrently" >&2; exit 67; }
+  (set -C; printf %s "$index_marker" > "$index_lock") || { rc=$?; echo "remote sync finalize failed: Git index is busy" >&2; exit $rc; }
+  cmp -s "$index_path" "$index_backup" || { rc=$?; echo "remote sync finalize failed: Git index changed concurrently" >&2; exit $rc; }
   cp -p "$index_candidate" "$index_verify" || { rc=$?; echo "remote sync finalize failed: Git index verify copy failed" >&2; exit $rc; }
   mv "$index_candidate" "$index_path" || { rc=$?; echo "remote sync finalize failed: Git index install failed" >&2; exit $rc; }
   index_changed=1; coherence_mutated=1
-  cmp -s "$index_path" "$index_verify" && [ "$(GIT_INDEX_FILE="$index_verify" git write-tree)" = ` + shellQuote(plan.Tree) + ` ] || { echo "remote sync finalize failed: installed Git index verification failed" >&2; exit 67; }
-  git update-ref --no-deref HEAD ` + shellQuote(plan.Target) + ` "$old_head" || { echo "remote sync finalize failed: HEAD update failed" >&2; exit 67; }
+  cmp -s "$index_path" "$index_verify" && [ "$(GIT_INDEX_FILE="$index_verify" git write-tree)" = ` + shellQuote(plan.Tree) + ` ] || { rc=$?; echo "remote sync finalize failed: installed Git index verification failed" >&2; exit $rc; }
+  git update-ref --no-deref HEAD ` + shellQuote(plan.Target) + ` "$old_head" || { rc=$?; echo "remote sync finalize failed: HEAD update failed" >&2; exit $rc; }
   head_changed=1
-  [ "$(git rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ] || { echo "remote sync finalize failed: HEAD verification after update failed" >&2; exit 67; }
+  [ "$(git rev-parse --verify HEAD^{commit})" = ` + shellQuote(plan.Target) + ` ] || { rc=$?; echo "remote sync finalize failed: HEAD verification after update failed" >&2; exit $rc; }
 fi
 `
 }

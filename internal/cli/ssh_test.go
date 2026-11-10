@@ -4624,10 +4624,15 @@ func TestRemoteGitCoherenceSupportsDetachedSparseSplitAndLinkedIndexes(t *testin
 func coherenceFailureTools(t *testing.T, target string) string {
 	t.Helper()
 	dir := t.TempDir()
+	awkPath, err := exec.LookPath("awk")
+	if err != nil {
+		t.Fatalf("awk unavailable: %v", err)
+	}
 	gitScript := `#!/bin/sh
 case "$CRABBOX_FAIL_GIT:$1" in
   read-tree:read-tree|write-tree:write-tree|diff-files:diff-files) exit 91 ;;
 esac
+if [ "$CRABBOX_FAIL_GIT" = index-path ] && [ "$1" = rev-parse ] && [ "$2" = --git-path ] && [ "$3" = index ]; then exit 95; fi
 if [ "$CRABBOX_FAIL_GIT" = cas ] && [ "$1" = update-ref ] && [ "$2" = --no-deref ] && [ "$3" = HEAD ]; then exit 92; fi
 if [ "$CRABBOX_FAIL_GIT" = raw ] && [ "$1" = fetch ]; then
   for arg do case "$arg" in +` + target + `:refs/crabbox/*) exit 93 ;; esac; done
@@ -4653,7 +4658,23 @@ if [ "$CRABBOX_FAIL_MV" = index-install ]; then case "$1" in *index.crabbox.*.ne
 if [ "$CRABBOX_FAIL_MV" = post-install-index ]; then case "$1" in *index.crabbox*) /bin/mv "$@"; printf post-install-index > "$last"; exit 0 ;; esac; fi
 exec /bin/mv "$@"
 `
+	cpScript := `#!/bin/sh
+last=
+for arg do last="$arg"; done
+if [ "$CRABBOX_FAIL_CP" = backup ]; then case "$last" in *index.crabbox.*.backup) exit 96 ;; esac; fi
+exec /bin/cp "$@"
+`
+	awkScript := `#!/bin/sh
+if [ "$CRABBOX_FAIL_AWK" = count ]; then case "$*" in *n+0*) exit 97 ;; esac; fi
+exec ` + shellQuote(awkPath) + ` "$@"
+`
 	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(gitScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cp"), []byte(cpScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "awk"), []byte(awkScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "mv"), []byte(mvScript), 0o755); err != nil {
@@ -4664,7 +4685,22 @@ exec /bin/mv "$@"
 
 func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 	f := newGitCoherenceFixture(t)
-	for _, failure := range []string{"read-tree", "write-tree", "diff-files", "cas", "fingerprint", "complete"} {
+	// Each labelled finalize step must keep the failing command's own exit status.
+	steps := map[string]struct {
+		exit  int
+		label string
+	}{
+		"index-path":  {95, "remote sync finalize failed: Git index path could not be resolved"},
+		"backup":      {96, "remote sync finalize failed: Git index backup failed"},
+		"read-tree":   {91, "remote sync finalize failed: candidate Git index build failed"},
+		"write-tree":  {1, "remote sync finalize failed: candidate Git index tree mismatch"},
+		"diff-files":  {91, "remote sync finalize failed: candidate Git index inspection failed"},
+		"count":       {97, "remote sync finalize failed: tracked deletion count failed"},
+		"cas":         {92, "remote sync finalize failed: HEAD update failed"},
+		"fingerprint": {94, ""},
+		"complete":    {94, ""},
+	}
+	for _, failure := range []string{"index-path", "backup", "read-tree", "write-tree", "diff-files", "count", "cas", "fingerprint", "complete"} {
 		t.Run(failure, func(t *testing.T) {
 			workdir := f.workspace(t, f.a, true)
 			plan := f.plan(t, f.b)
@@ -4674,13 +4710,26 @@ func TestRemoteGitCoherenceRollsBackFailuresAndRetries(t *testing.T) {
 			beforeIndex := coherenceIndexBytes(t, workdir)
 			tools := coherenceFailureTools(t, plan.Target)
 			env := []string{"PATH=" + tools + string(os.PathListSeparator) + os.Getenv("PATH")}
-			if failure == "fingerprint" || failure == "complete" {
+			switch failure {
+			case "fingerprint", "complete":
 				env = append(env, "CRABBOX_FAIL_MV="+failure)
-			} else {
+			case "backup":
+				env = append(env, "CRABBOX_FAIL_CP="+failure)
+			case "count":
+				env = append(env, "CRABBOX_FAIL_AWK="+failure)
+			default:
 				env = append(env, "CRABBOX_FAIL_GIT="+failure)
 			}
-			if out, err := runCoherenceFinalize(workdir, plan, token, "fp-"+failure, env...); err == nil {
+			out, err := runCoherenceFinalize(workdir, plan, token, "fp-"+failure, env...)
+			if err == nil {
 				t.Fatalf("fault %s unexpectedly succeeded\n%s", failure, out)
+			}
+			want := steps[failure]
+			if got := exitCode(err); got != want.exit {
+				t.Fatalf("fault %s exit=%d, want own status %d\n%s", failure, got, want.exit, out)
+			}
+			if want.label != "" && !strings.Contains(string(out), want.label) {
+				t.Fatalf("fault %s missing label %q:\n%s", failure, want.label, out)
 			}
 			requireGitOutput(t, workdir, f.a, "rev-parse", "HEAD")
 			requireGitOutput(t, workdir, "refs/heads/workspace", "symbolic-ref", "-q", "HEAD")

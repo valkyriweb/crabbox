@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Git coherence sync finalization now labels every failure with a `remote sync finalize failed: ...` message and exit 67; the mass-deletion guard reports the deletion count, up to 20 paths, and the `CRABBOX_ALLOW_MASS_DELETIONS=1` override instead of a bare `exit status 1`.
+- Git coherence sync finalization now labels every failure with a `remote sync finalize failed: ...` message and keeps the failing command's own exit status; the mass-deletion guard exits 67 and reports the deletion count, up to 20 paths, and the `CRABBOX_ALLOW_MASS_DELETIONS=1` override instead of a bare `exit status 1`.
 - Serve base-image fallbacks install the pinned Node.js/npm toolchain before SSH startup and withhold host-key readiness until it works. [PR 14](https://github.com/valkyriweb/crabbox/pull/14). Thanks @valkyriweb.
 - Coordinator leases record the creating session, host, and agent, and `list`/`status` show them with the owner so long-lived `keep=true` leases are attributable. [PR 8](https://github.com/valkyriweb/crabbox/pull/8)
 - The coordinator lease log no longer reports the default class as the size when `--type` is explicit; it prints `class=- type=<type> fallback_class=<class>`. [PR 8](https://github.com/valkyriweb/crabbox/pull/8)
