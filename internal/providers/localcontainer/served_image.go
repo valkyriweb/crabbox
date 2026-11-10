@@ -13,8 +13,54 @@ import (
 	"time"
 )
 
-// v2 adds the pinned Node.js toolchain; the bump invalidates v1 prepared images.
-const servedPreparationRecipe = "v2"
+// v2 adds the pinned Node.js toolchain; v3 adds the C and Rust toolchains.
+// Each bump invalidates older prepared images.
+const servedPreparationRecipe = "v3"
+
+// servedToolchainPackages are installed only into prepared serve images, on
+// top of bootstrapPackages, so leases can build C and Rust code.
+const servedToolchainPackages = "build-essential pkg-config libssl-dev xz-utils unzip"
+
+// servedToolchainTools are the commands the readiness probe requires before it
+// treats a base image as already prepared; it also requires OpenSSL headers
+// (pkg-config openssl) and working cargo/rustc.
+const servedToolchainTools = "cc make pkg-config xz unzip cargo rustc"
+
+// servedRustupVersion pins rustup-init; the stable toolchain it installs is
+// shared read-only under /opt/rust.
+const servedRustupVersion = "1.29.3"
+
+// servedRustInstallScript installs a pinned, SHA256-verified rustup-init and
+// the minimal stable toolchain under /opt/rust as root. The toolchain binaries
+// themselves (not rustup proxies) are linked into /usr/local/bin, so lease users
+// run cargo and rustc without RUSTUP_HOME and keep a per-user ~/.cargo for the
+// registry and build cache. The image environment is left unchanged. It is
+// idempotent and fails closed (set -eu).
+const servedRustInstallScript = `rustup_version=` + servedRustupVersion + `
+case "$(uname -m)" in
+  x86_64|amd64) rust_target=x86_64-unknown-linux-gnu; rustup_sha256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;;
+  aarch64|arm64) rust_target=aarch64-unknown-linux-gnu; rustup_sha256=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
+  *) echo "unsupported architecture for Rust: $(uname -m)" >&2; exit 1 ;;
+esac
+export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+if ! /opt/rust/cargo/bin/rustup which cargo >/dev/null 2>&1; then
+  rust_tmp="$(mktemp -d)"
+  curl -fsSL --retry 3 -o "$rust_tmp/rustup-init" "https://static.rust-lang.org/rustup/archive/$rustup_version/$rust_target/rustup-init"
+  echo "$rustup_sha256  $rust_tmp/rustup-init" | sha256sum -c -
+  chmod 0755 "$rust_tmp/rustup-init"
+  "$rust_tmp/rustup-init" -y --no-modify-path --profile minimal --default-toolchain stable
+  rm -rf "$rust_tmp"
+fi
+rust_bin="$(dirname "$(/opt/rust/cargo/bin/rustup which cargo)")"
+for rust_tool in cargo rustc rustdoc rustfmt; do
+  if [ -x "$rust_bin/$rust_tool" ]; then ln -sf "$rust_bin/$rust_tool" "/usr/local/bin/$rust_tool"; fi
+done
+ln -sf /opt/rust/cargo/bin/rustup /usr/local/bin/rustup
+rm -rf /opt/rust/cargo/registry /opt/rust/cargo/git
+chmod -R a+rX,go-w /opt/rust
+unset RUSTUP_HOME CARGO_HOME
+/usr/local/bin/cargo --version >/dev/null
+/usr/local/bin/rustc --version >/dev/null`
 
 // servedNodeVersion is the pinned Node.js release; the readiness probe and the
 // install script must agree on it.
@@ -68,7 +114,7 @@ func (r *ServedRuntime) inspectImage(ctx context.Context, ref string) (servedIma
 }
 
 func servedPreparedTag(baseID string) string {
-	sum := sha256.Sum256([]byte(baseID + "\n" + bootstrapPackages + "\n" + servedPreparationRecipe))
+	sum := sha256.Sum256([]byte(baseID + "\n" + bootstrapPackages + " " + servedToolchainPackages + "\n" + servedPreparationRecipe))
 	return fmt.Sprintf("crabbox-serve-prepared:%x", sum[:8])
 }
 
@@ -119,7 +165,7 @@ func (r *ServedRuntime) StartPreparation(ctx context.Context) {
 	base, done := r.baseImage, r.preparationDone
 	r.imageMu.Unlock()
 	go func() {
-		bounded, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		bounded, cancel := context.WithTimeout(ctx, 20*time.Minute)
 		defer cancel()
 		id, err := r.prepareImage(bounded, base)
 		if err != nil && r.b.rt.Stderr != nil {
@@ -161,7 +207,7 @@ func (r *ServedRuntime) cleanupPreparationContainer(name string) error {
 }
 
 func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id string, err error) {
-	probe := "for tool in " + bootstrapTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
+	probe := "for tool in " + bootstrapTools + " " + servedToolchainTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; { pkg-config --exists openssl && cargo --version && rustc --version; } >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
 	probeName := "crabbox-serve-probe-" + strings.ToLower(rand.Text())
 	result, err := r.b.docker(ctx, []string{"run", "--rm", "--name", probeName, "--entrypoint", "/bin/sh", base.ID, "-c", probe}, nil, r.b.rt.Stderr)
 	if err != nil {
@@ -214,7 +260,7 @@ func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id 
 	if len(base.Config.Entrypoint) == 0 {
 		args = append(args, "/bin/sh")
 	}
-	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + "; " + servedNodeInstallScript + "; rm -f /etc/ssh/ssh_host_*; rm -rf /var/lib/apt/lists/*"
+	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + " " + servedToolchainPackages + "; " + servedNodeInstallScript + "\n" + servedRustInstallScript + "\nrm -f /etc/ssh/ssh_host_*; rm -rf /var/lib/apt/lists/*"
 	args = append(args, "-c", script)
 	if _, err := r.b.docker(ctx, args, r.b.rt.Stderr, r.b.rt.Stderr); err != nil {
 		return "", err
