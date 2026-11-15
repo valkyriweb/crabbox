@@ -256,7 +256,7 @@ func TestServedPrepare(t *testing.T) {
 							if !strings.Contains(a[len(a)-1], bootstrapTools) {
 								t.Fatal("missing tool probe")
 							}
-							if !strings.Contains(a[len(a)-1], "pkg-config --exists openssl && cargo --version && rustc --version") || !strings.Contains(a[len(a)-1], " cargo rustc ") || !strings.Contains(a[len(a)-1], " cc make pkg-config xz ") {
+							if !strings.Contains(a[len(a)-1], "pkg-config --exists openssl && cargo --version && rustc --version") || !strings.Contains(a[len(a)-1], " cargo rustc ") || !strings.Contains(a[len(a)-1], " cc make pkg-config xz unzip jq ") {
 								t.Fatal("tool probe must require the C and Rust toolchains")
 							}
 							if !strings.Contains(a[len(a)-1], "node --version") || !strings.Contains(a[len(a)-1], servedNodeVersion) {
@@ -512,18 +512,18 @@ func TestServedRustInstallScriptPinsAndVerifies(t *testing.T) {
 	if strings.Contains(servedRustInstallScript, "sh.rustup.rs") || strings.Contains(servedRustInstallScript, "| sh -") {
 		t.Fatal("rust install must not pipe an unverified installer to a shell")
 	}
-	for _, pkg := range []string{"build-essential", "pkg-config", "libssl-dev", "xz-utils", "unzip"} {
+	for _, pkg := range []string{"build-essential", "pkg-config", "libssl-dev", "xz-utils", "unzip", "jq"} {
 		if !strings.Contains(servedToolchainPackages, pkg) {
 			t.Fatalf("toolchain packages missing %q", pkg)
 		}
 	}
-	if servedPreparationRecipe != "v3" {
-		t.Fatalf("recipe=%q, want v3", servedPreparationRecipe)
+	if servedPreparationRecipe != "v4" {
+		t.Fatalf("recipe=%q, want v4", servedPreparationRecipe)
 	}
 }
 
 func TestServedPreparedTagCoversToolchainRecipe(t *testing.T) {
-	sum := sha256.Sum256([]byte("sha256:base\n" + bootstrapPackages + " " + servedToolchainPackages + "\nv3"))
+	sum := sha256.Sum256([]byte("sha256:base\n" + bootstrapPackages + " " + servedToolchainPackages + "\nv4"))
 	if got, want := servedPreparedTag("sha256:base"), fmt.Sprintf("crabbox-serve-prepared:%x", sum[:8]); got != want {
 		t.Fatalf("tag=%s want %s", got, want)
 	}
