@@ -223,10 +223,10 @@ results remain on stdout.
 After the first heartbeat and reconciliation, Serve probes the configured image
 in the background for `sshd`, Git, rsync,
 curl, sudo, Python 3, the pinned Node.js/npm toolchain, a C toolchain (`cc`,
-`make`, `pkg-config`, `xz`, `unzip`, OpenSSL headers via `pkg-config openssl`)
+`make`, `pkg-config`, `xz`, `unzip`, `jq`, OpenSSL headers via `pkg-config openssl`)
 and working Rust (`cargo`, `rustc`). If any are
 missing and `apt-get` is available, it installs the shared bootstrap packages,
-`build-essential pkg-config libssl-dev xz-utils unzip`, the checksum-verified
+`build-essential pkg-config libssl-dev xz-utils unzip jq`, the checksum-verified
 Node.js archive and the stable Rust toolchain once in a temporary container, then
 commits a local prepared image. This uses ordinary Docker/Podman `run` and
 `commit`; it requires no buildx or Dockerfile. Preparation output goes to stderr.

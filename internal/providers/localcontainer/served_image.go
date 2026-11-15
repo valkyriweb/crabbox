@@ -13,18 +13,19 @@ import (
 	"time"
 )
 
-// v2 adds the pinned Node.js toolchain; v3 adds the C and Rust toolchains.
+// v2 adds the pinned Node.js toolchain; v3 adds the C and Rust toolchains;
+// v4 adds jq.
 // Each bump invalidates older prepared images.
-const servedPreparationRecipe = "v3"
+const servedPreparationRecipe = "v4"
 
 // servedToolchainPackages are installed only into prepared serve images, on
-// top of bootstrapPackages, so leases can build C and Rust code.
-const servedToolchainPackages = "build-essential pkg-config libssl-dev xz-utils unzip"
+// top of bootstrapPackages, so leases can build C and Rust code and process JSON with jq.
+const servedToolchainPackages = "build-essential pkg-config libssl-dev xz-utils unzip jq"
 
 // servedToolchainTools are the commands the readiness probe requires before it
 // treats a base image as already prepared; it also requires OpenSSL headers
 // (pkg-config openssl) and working cargo/rustc.
-const servedToolchainTools = "cc make pkg-config xz unzip cargo rustc"
+const servedToolchainTools = "cc make pkg-config xz unzip jq cargo rustc"
 
 // servedRustupVersion pins rustup-init; the stable toolchain it installs is
 // shared read-only under /opt/rust.
