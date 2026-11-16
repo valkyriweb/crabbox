@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Serve prepared images (recipe `v5`) add Go, `pip3`, `python3-venv`, `pytest`, a SHA256-pinned pnpm and the shared libraries headless Chromium needs; the readiness probe requires them, so older prepared images are rebuilt. Browser binaries stay out of the image.
+- Serve agents add default cache volumes for the pip cache, downloaded test browsers (`~/.cache/ms-playwright`) and a general tool cache (`~/.cache/crabbox-tools`).
+- `crabbox history reap` closes runs that still say `running` after their client died: silent for `--older-than` (default 1h) with no live lease. Closed runs are `failed`, exit 1, `blockedStage=client-orphaned`.
+- `crabbox serve machines` prints `availability=offline` or `availability=draining` for machines that cannot take a lease, and `--json` always includes `online`.
 - Serve prepared images (recipe `v4`) add `jq`; the readiness probe requires it, so older prepared images are rebuilt.
 - Git coherence sync finalization now labels every failure with a `remote sync finalize failed: ...` message and keeps the failing command's own exit status; the mass-deletion guard exits 67 and reports the deletion count, up to 20 paths, and the `CRABBOX_ALLOW_MASS_DELETIONS=1` override instead of a bare `exit status 1`.
 - Serve prepared images (recipe `v3`) add `build-essential`, `pkg-config`, `libssl-dev`, `xz-utils`, `unzip` and a SHA256-pinned rustup stable toolchain under `/opt/rust`, linked into `/usr/local/bin` without changing the image environment, so leases can run `cargo build` as non-root users. Preparation timeout rises to 20 minutes.

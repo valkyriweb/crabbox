@@ -13,6 +13,9 @@ func (a App) history(ctx context.Context, args []string) error {
 	if len(args) > 0 && (args[0] == "prune" || args[0] == "delete") {
 		return a.localHistoryMaintenance(args)
 	}
+	if len(args) > 0 && args[0] == "reap" {
+		return a.historyReap(ctx, args[1:])
+	}
 	fs := newFlagSet("history", a.Stderr)
 	source := fs.String("source", "", "record source: local, coordinator, or all")
 	leaseID := fs.String("lease", "", "filter by lease id")

@@ -223,12 +223,17 @@ results remain on stdout.
 After the first heartbeat and reconciliation, Serve probes the configured image
 in the background for `sshd`, Git, rsync,
 curl, sudo, Python 3, the pinned Node.js/npm toolchain, a C toolchain (`cc`,
-`make`, `pkg-config`, `xz`, `unzip`, `jq`, OpenSSL headers via `pkg-config openssl`)
-and working Rust (`cargo`, `rustc`). If any are
+`make`, `pkg-config`, `xz`, `unzip`, `jq`, OpenSSL headers via `pkg-config openssl`),
+working Rust (`cargo`, `rustc`), Go, `pip3`, `pytest`, a Python that can create
+a venv, and the pinned pnpm. If any are
 missing and `apt-get` is available, it installs the shared bootstrap packages,
-`build-essential pkg-config libssl-dev xz-utils unzip jq`, the checksum-verified
-Node.js archive and the stable Rust toolchain once in a temporary container, then
-commits a local prepared image. This uses ordinary Docker/Podman `run` and
+`build-essential pkg-config libssl-dev xz-utils unzip jq golang-go python3-pip
+python3-venv python3-pytest`, the shared libraries headless Chromium needs, the
+checksum-verified Node.js archive, the checksum-verified pnpm tarball and the
+stable Rust toolchain once in a temporary container, then
+commits a local prepared image. Go, pip and pytest are the base distribution's
+versions. Browser binaries are not in the image: a lease downloads the build its
+test framework pins, and the `browsers` cache volume keeps it for the next lease. This uses ordinary Docker/Podman `run` and
 `commit`; it requires no buildx or Dockerfile. Preparation output goes to stderr.
 Images that already have the tools need no prepared copy. Images without
 `apt-get` skip background preparation and must provide the shared bootstrap
@@ -300,7 +305,12 @@ Never manually reuse an agent state directory concurrently on two machines.
 ## Cache volumes and macOS runtimes
 
 The agent reuses machine-scoped named volumes for the pnpm store, npm cache,
-Go build cache, and Go module cache. Existing `cache.volumes` configuration
+Go build cache, Go module cache, pip cache, downloaded test browsers
+(`~/.cache/ms-playwright`), and a general tool cache (`~/.cache/crabbox-tools`)
+where client tooling can keep large content-addressed artifacts between leases.
+Every lease on the machine can write to these volumes, so tooling must verify
+what it reads from the tool cache, for example by SHA-256. Existing
+`cache.volumes` configuration
 customizes these paths; names remain scoped to the machine. Use
 `--no-cache-volumes` to disable or `crabbox serve cache prune` while the agent is
 stopped to remove its cache volumes and local prepared images that are not
