@@ -69,6 +69,12 @@ lease it used is released, expired, failed or gone. A run on a live lease is
 kept, however long it has been silent. A run that never got a lease is kept
 until it has been silent for 6 hours. If a lease lookup fails, the run is kept.
 
+Just before the close, the command reads the run again. It keeps the run if the
+run finished or got a new event since the first read. The broker cannot close a
+run on a condition, so a client that reports in the moment between that second
+read and the close still loses its record; keep `--older-than` well above the
+longest silence of a healthy command.
+
 A closed run becomes `failed` with exit code 1 and `blockedStage`
 `client-orphaned`; its log says that the command's real exit status is unknown.
 The command never stops a lease. It reads and closes only the runs your token

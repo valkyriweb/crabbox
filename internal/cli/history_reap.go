@@ -66,7 +66,13 @@ func (a App) historyReap(ctx context.Context, args []string) error {
 		result.Action, result.Reason = "skipped", orphanedRunSkipReason(ctx, coord, run, now, *olderThan)
 		if result.Reason == "" {
 			result.Action, result.Reason = "would-reap", "silent and no live lease"
+			changed := ""
 			if !*dryRun {
+				changed = orphanedRunChangeReason(ctx, coord, run)
+			}
+			if changed != "" {
+				result.Action, result.Reason = "skipped", changed
+			} else if !*dryRun {
 				message := fmt.Sprintf("crabbox history reap: the client never finished this run; no event since %s and no live lease. The command's real exit status is unknown.\n", result.LastEventAt)
 				if _, err := coord.FinishRun(ctx, run.ID, 1, 0, 0, message, false, nil, nil, FailureClassification{BlockedStage: orphanedRunBlockedStage}, nil); err != nil {
 					result.Action, result.Reason = "error", err.Error()
@@ -122,6 +128,25 @@ func orphanedRunSkipReason(ctx context.Context, coord *CoordinatorClient, run Co
 		if !statusTerminalState(lease.State) {
 			return "lease " + id + " is " + blank(lease.State, "live")
 		}
+	}
+	return ""
+}
+
+// orphanedRunChangeReason reads the run again just before it is closed and
+// returns why it must now be left alone. The coordinator cannot close a run on
+// a condition, so this second read narrows the time in which a client that is
+// still alive could report between the inspection and the close.
+func orphanedRunChangeReason(ctx context.Context, coord *CoordinatorClient, seen CoordinatorRun) string {
+	fresh, err := coord.Run(ctx, seen.ID)
+	if err != nil {
+		return "second read failed"
+	}
+	if fresh.State != "running" {
+		return "already " + blank(fresh.State, "closed")
+	}
+	if fresh.LastEventAt != seen.LastEventAt || fresh.EventCount != seen.EventCount || fresh.Phase != seen.Phase ||
+		fresh.LeaseID != seen.LeaseID || len(fresh.LeaseIDs) != len(seen.LeaseIDs) {
+		return "changed during inspection"
 	}
 	return ""
 }
