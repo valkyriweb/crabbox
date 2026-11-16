@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -145,7 +146,7 @@ func orphanedRunChangeReason(ctx context.Context, coord *CoordinatorClient, seen
 		return "already " + blank(fresh.State, "closed")
 	}
 	if fresh.LastEventAt != seen.LastEventAt || fresh.EventCount != seen.EventCount || fresh.Phase != seen.Phase ||
-		fresh.LeaseID != seen.LeaseID || len(fresh.LeaseIDs) != len(seen.LeaseIDs) {
+		fresh.LeaseID != seen.LeaseID || !slices.Equal(fresh.LeaseIDs, seen.LeaseIDs) {
 		return "changed during inspection"
 	}
 	return ""

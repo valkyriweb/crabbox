@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// reapFixture serves nine running runs. Three are orphans; two more look like
+// reapFixture serves ten running runs. Three are orphans; three more look like
 // orphans until the second read shows that their client is still alive.
 func reapFixture(t *testing.T, finishStatus int) (*atomic.Int32, func() map[string]map[string]any) {
 	t.Helper()
@@ -30,11 +30,13 @@ func reapFixture(t *testing.T, finishStatus int) (*atomic.Int32, func() map[stri
 		{"id": "run_lookup_fails", "leaseID": "cbx_error", "state": "running", "phase": "command", "startedAt": at(3 * time.Hour), "lastEventAt": at(3 * time.Hour)},
 		{"id": "run_never_leased", "state": "running", "phase": "leasing", "startedAt": at(7 * time.Hour), "lastEventAt": at(7 * time.Hour)},
 		{"id": "run_client_reports_late", "leaseID": "cbx_released", "state": "running", "phase": "command", "startedAt": at(5 * time.Hour), "lastEventAt": at(3 * time.Hour), "eventCount": 4},
+		{"id": "run_client_changes_lease", "leaseID": "cbx_released", "leaseIDs": []string{"cbx_gone", "cbx_released"}, "state": "running", "phase": "command", "startedAt": at(5 * time.Hour), "lastEventAt": at(3 * time.Hour)},
 		{"id": "run_client_finishes_late", "leaseID": "cbx_released", "state": "running", "phase": "command", "startedAt": at(5 * time.Hour), "lastEventAt": at(3 * time.Hour)},
 	}
 	// The second read sees what a client that is still alive did meanwhile.
 	secondRead := map[string]map[string]any{
 		"run_client_reports_late":  {"id": "run_client_reports_late", "leaseID": "cbx_released", "state": "running", "phase": "command", "startedAt": at(5 * time.Hour), "lastEventAt": at(0), "eventCount": 5},
+		"run_client_changes_lease": {"id": "run_client_changes_lease", "leaseID": "cbx_released", "leaseIDs": []string{"cbx_active", "cbx_released"}, "state": "running", "phase": "command", "startedAt": at(5 * time.Hour), "lastEventAt": at(3 * time.Hour)},
 		"run_client_finishes_late": {"id": "run_client_finishes_late", "leaseID": "cbx_released", "state": "succeeded", "phase": "command", "startedAt": at(5 * time.Hour), "lastEventAt": at(3 * time.Hour)},
 	}
 	for _, run := range runs {
@@ -134,6 +136,7 @@ func TestHistoryReapClosesOnlyOrphanedRuns(t *testing.T) {
 		"run_lookup_fails":         "skipped",
 		"run_client_reports_late":  "skipped",
 		"run_client_finishes_late": "skipped",
+		"run_client_changes_lease": "skipped",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("results = %#v", got)
@@ -148,6 +151,9 @@ func TestHistoryReapClosesOnlyOrphanedRuns(t *testing.T) {
 	}
 	if reason := got["run_client_reports_late"].Reason; reason != "changed during inspection" {
 		t.Errorf("late report reason = %q", reason)
+	}
+	if reason := got["run_client_changes_lease"].Reason; reason != "changed during inspection" {
+		t.Errorf("changed lease reason = %q", reason)
 	}
 	if reason := got["run_client_finishes_late"].Reason; reason != "already succeeded" {
 		t.Errorf("late finish reason = %q", reason)
@@ -176,7 +182,7 @@ func TestHistoryReapDryRunChangesNothing(t *testing.T) {
 		t.Fatalf("dry run finished runs: %v, second reads: %d", finished(), secondReads.Load())
 	}
 	out := stdout.String()
-	if strings.Count(out, "would-reap ") != 5 || strings.Count(out, "skipped ") != 4 || !strings.Contains(out, "would-reap run_orphan_gone lease=cbx_gone phase=sync") {
+	if strings.Count(out, "would-reap ") != 6 || strings.Count(out, "skipped ") != 4 || !strings.Contains(out, "would-reap run_orphan_gone lease=cbx_gone phase=sync") {
 		t.Fatalf("dry run output:\n%s", out)
 	}
 }
@@ -186,7 +192,7 @@ func TestHistoryReapReportsRunsItCouldNotClose(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	app := App{Stdout: &stdout, Stderr: &stderr}
 	err := app.history(context.Background(), []string{"reap", "--json"})
-	if err == nil || !strings.Contains(err.Error(), "3 of 9 runs could not be closed") {
+	if err == nil || !strings.Contains(err.Error(), "3 of 10 runs could not be closed") {
 		t.Fatalf("err = %v", err)
 	}
 	if got := reapActions(t, stdout.Bytes()); got["run_orphan_gone"].Action != "error" || got["run_recent"].Action != "skipped" {
