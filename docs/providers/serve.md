@@ -240,7 +240,10 @@ Images that already have the tools need no prepared copy. Images without
 dependencies themselves. Heartbeats and existing-lease reconciliation continue during
 preparation; new leases use the configured image with lease-time bootstrap until
 the prepared image is ready. If preparation fails, the agent prints a warning and uses
-the configured image, so leases install their tools at startup. Every served
+the configured image, so leases install their tools at startup. The agent tries
+the preparation again every 10 minutes until it succeeds or the agent stops, so
+a package mirror that was down at agent start does not leave the machine
+without its prepared image. Every served
 lease runs the same idempotent Node.js installer before starting SSH, including
 base-image fallbacks after preparation is pending, failed, or pruned. Host-key
 readiness waits for the pinned Node.js version and a working npm, so an early

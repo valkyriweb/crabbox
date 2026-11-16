@@ -195,6 +195,10 @@ func (r *ServedRuntime) EnsureImage(ctx context.Context) error {
 	return nil
 }
 
+// servedPreparationRetryInterval is the pause between a failed preparation and
+// the next attempt.
+var servedPreparationRetryInterval = 10 * time.Minute
+
 // StartPreparation uses the agent lifetime, never a single lease's deadline.
 // Only one preparation runs per agent; image selection remains nonblocking.
 func (r *ServedRuntime) StartPreparation(ctx context.Context) {
@@ -222,7 +226,24 @@ func (r *ServedRuntime) StartPreparation(ctx context.Context) {
 		r.preparing = false
 		close(done)
 		r.imageMu.Unlock()
+		// A package mirror that was down at agent start must not leave the
+		// machine without its prepared image until the next agent restart.
+		if err != nil && ctx.Err() == nil {
+			time.AfterFunc(servedPreparationRetryInterval, func() { r.retryPreparation(ctx) })
+		}
 	}()
+}
+
+// retryPreparation runs after a failed preparation. It does nothing when the
+// agent stopped, the base image changed hands to a newer preparation, or
+// another path already produced the prepared image.
+func (r *ServedRuntime) retryPreparation(ctx context.Context) {
+	r.imageMu.RLock()
+	current := r.preparationCtx == ctx && r.preparedImageID == ""
+	r.imageMu.RUnlock()
+	if current {
+		r.StartPreparation(ctx)
+	}
 }
 
 func (r *ServedRuntime) WaitPreparation() {
