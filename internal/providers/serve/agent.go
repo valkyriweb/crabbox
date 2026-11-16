@@ -49,10 +49,14 @@ type machine struct {
 	Leases         []leaseView       `json:"leases"`
 }
 
-// machineListing is a machine as "serve machines --json" prints it.
+// machineListing is a machine as "serve machines --json" prints it. The
+// allocation figures are the broker's own; an older broker sends none.
 type machineListing struct {
 	machine
-	Online bool `json:"online"`
+	Online          bool `json:"online"`
+	FreeCPUs        *int `json:"freeCPUs,omitempty"`
+	AllocatedCPUs   *int `json:"allocatedCPUs,omitempty"`
+	AllocatedLeases *int `json:"allocatedLeases,omitempty"`
 }
 
 // machineAvailabilityText says whether a listed machine can take a lease now.
@@ -273,23 +277,19 @@ func (Provider) RunAgent(ctx context.Context, cfg core.Config, rt core.Runtime, 
 		}
 	}
 	if command == "machines" {
-		var result struct {
-			Machines []machine `json:"machines"`
-		}
-		if err := coord.AgentRequest(ctx, "GET", "/v1/serve/machines", nil, &result); err != nil {
+		// The heartbeat type omits a false "online"; a listing must state it.
+		listing := struct {
+			Machines []machineListing `json:"machines"`
+		}{Machines: []machineListing{}}
+		if err := coord.AgentRequest(ctx, "GET", "/v1/serve/machines", nil, &listing); err != nil {
 			return err
 		}
 		if *jsonOutput {
-			// The heartbeat type omits a false "online"; a listing must state it.
-			listing := struct {
-				Machines []machineListing `json:"machines"`
-			}{Machines: make([]machineListing, 0, len(result.Machines))}
-			for _, m := range result.Machines {
-				listing.Machines = append(listing.Machines, machineListing{machine: m, Online: m.Online})
-			}
 			return json.NewEncoder(rt.Stdout).Encode(listing)
 		}
-		for _, m := range result.Machines {
+		for _, listed := range listing.Machines {
+			m := listed.machine
+			m.Online = listed.Online
 			usage := ""
 			if m.Usage != nil {
 				usage = fmt.Sprintf(" month=%s served=%d runtime=%s cpu-hours=%.2f", m.Usage.Month, m.Usage.Leases, time.Duration(m.Usage.RuntimeSeconds)*time.Second, float64(m.Usage.CPUSeconds)/3600)

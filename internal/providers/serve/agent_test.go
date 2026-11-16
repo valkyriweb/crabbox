@@ -25,7 +25,7 @@ func TestServeMachinesMonthlyUsage(t *testing.T) {
 				if r.URL.Path != "/v1/serve/machines" {
 					t.Errorf("unexpected path %s", r.URL.Path)
 				}
-				fmt.Fprint(w, `{"machines":[{"machineID":"machine-a","name":"build-mac","online":true,"cpus":8,"memoryMB":16384,"usage":{"month":"2026-05","leases":3,"activeLeases":1,"runtimeSeconds":5400,"cpuSeconds":21600}},{"machineID":"machine-b","name":"legacy"},{"machineID":"machine-c","name":"leaving","online":true,"draining":true}]}`)
+				fmt.Fprint(w, `{"machines":[{"machineID":"machine-a","name":"build-mac","online":true,"cpus":8,"memoryMB":16384,"freeCPUs":6,"allocatedCPUs":2,"allocatedLeases":1,"usage":{"month":"2026-05","leases":3,"activeLeases":1,"runtimeSeconds":5400,"cpuSeconds":21600}},{"machineID":"machine-b","name":"legacy"},{"machineID":"machine-c","name":"leaving","online":true,"draining":true}]}`)
 			}))
 			defer server.Close()
 			var out bytes.Buffer
@@ -51,6 +51,9 @@ func TestServeMachinesMonthlyUsage(t *testing.T) {
 				}
 				if !strings.Contains(out.String(), `"name":"legacy"`) || strings.Count(out.String(), `"online":false`) != 1 || strings.Count(out.String(), `"online":true`) != 2 {
 					t.Fatalf("listing must state online for every machine: %s", &out)
+				}
+				if strings.Count(out.String(), `"freeCPUs":6,"allocatedCPUs":2,"allocatedLeases":1`) != 1 || strings.Count(out.String(), `"freeCPUs"`) != 1 {
+					t.Fatalf("listing must pass on the broker's allocation figures and invent none: %s", &out)
 				}
 			} else {
 				for _, want := range []string{"machine-a build-mac", "month=2026-05 served=3 runtime=1h30m0s cpu-hours=6.00", "machine-a build-mac online=true cpus=8 memoryMB=16384 availability=available", "machine-b legacy online=false cpus=0 memoryMB=0 availability=offline", "machine-c leaving online=true cpus=0 memoryMB=0 availability=draining"} {
