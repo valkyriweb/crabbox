@@ -591,3 +591,124 @@ func TestServedPreparedTagCoversToolchainRecipe(t *testing.T) {
 		t.Fatalf("tag=%s want %s", got, want)
 	}
 }
+
+func TestServedPreparationRetriesAfterFailure(t *testing.T) {
+	previous := servedPreparationRetryInterval
+	servedPreparationRetryInterval = 5 * time.Millisecond
+	t.Cleanup(func() { servedPreparationRetryInterval = previous })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	tag := servedPreparedTag("sha256:base")
+	image := servedImageFixture
+	var mu sync.Mutex
+	var warning strings.Builder
+	prepRuns, committed := 0, false
+	failures := 2
+	runner := &recordingRunner{runContext: func(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		a := req.Args
+		switch {
+		case a[0] == "image" && a[1] == "inspect" && a[2] == "configured:stable":
+			return core.LocalCommandResult{Stdout: image("sha256:base")}, nil
+		case a[0] == "image" && a[1] == "inspect" && a[2] == tag:
+			if !committed {
+				return core.LocalCommandResult{}, errors.New("no such image")
+			}
+			return core.LocalCommandResult{Stdout: image("sha256:prepared")}, nil
+		case a[0] == "run" && a[1] == "--rm":
+			return core.LocalCommandResult{Stdout: "prepare"}, nil
+		case a[0] == "run":
+			prepRuns++
+			if prepRuns <= failures {
+				return core.LocalCommandResult{}, errors.New("package mirror unreachable")
+			}
+		case a[0] == "commit":
+			committed = true
+		}
+		return core.LocalCommandResult{}, nil
+	}}
+	r := NewServedRuntime(core.Config{LocalContainer: core.LocalContainerConfig{Runtime: "docker", Image: "configured:stable"}}, core.Runtime{Exec: runner, Stderr: &lockedWriter{mu: &mu, w: &warning}})
+	if err := r.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Prepare returns after the first attempt: a failure never blocks leases.
+	r.imageMu.RLock()
+	first := r.preparedImageID
+	r.imageMu.RUnlock()
+	if first != "" {
+		t.Fatalf("prepared image after a failed first attempt: %q", first)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.imageMu.RLock()
+		id := r.preparedImageID
+		r.imageMu.RUnlock()
+		if id == "sha256:prepared" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("preparation was not retried until it succeeded: id=%q", id)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// No further attempt follows a success.
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if prepRuns != failures+1 {
+		t.Fatalf("preparation runs=%d want=%d", prepRuns, failures+1)
+	}
+	if got := strings.Count(warning.String(), "warning: serve image preparation failed"); got != failures {
+		t.Fatalf("warnings=%d want=%d: %q", got, failures, warning.String())
+	}
+}
+
+func TestServedPreparationRetryStopsWithTheAgent(t *testing.T) {
+	previous := servedPreparationRetryInterval
+	servedPreparationRetryInterval = 5 * time.Millisecond
+	t.Cleanup(func() { servedPreparationRetryInterval = previous })
+	ctx, cancel := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	prepRuns := 0
+	runner := &recordingRunner{runContext: func(_ context.Context, req core.LocalCommandRequest) (core.LocalCommandResult, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		a := req.Args
+		switch {
+		case a[0] == "image" && a[1] == "inspect" && a[2] == "configured:stable":
+			return core.LocalCommandResult{Stdout: servedImageFixture("sha256:base")}, nil
+		case a[0] == "image" && a[1] == "inspect":
+			return core.LocalCommandResult{}, errors.New("no such image")
+		case a[0] == "run" && a[1] == "--rm":
+			return core.LocalCommandResult{Stdout: "prepare"}, nil
+		case a[0] == "run":
+			prepRuns++
+			cancel()
+			return core.LocalCommandResult{}, errors.New("package mirror unreachable")
+		}
+		return core.LocalCommandResult{}, nil
+	}}
+	r := NewServedRuntime(core.Config{LocalContainer: core.LocalContainerConfig{Runtime: "docker", Image: "configured:stable"}}, core.Runtime{Exec: runner, Stderr: io.Discard})
+	if err := r.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if prepRuns != 1 {
+		t.Fatalf("preparation runs after the agent stopped=%d want=1", prepRuns)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+// Write is called by the runtime outside the fake runner, so it takes the lock itself.
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
