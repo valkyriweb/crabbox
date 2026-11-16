@@ -26,6 +26,9 @@ func TestServedNodeReadinessExecutesProbe(t *testing.T) {
 		noRust      bool
 		noOpenSSL   bool
 		brokenRust  bool
+		noGo        bool
+		noVenv      bool
+		pnpmVersion string
 		apt         bool
 		want        string
 	}{
@@ -38,6 +41,9 @@ func TestServedNodeReadinessExecutesProbe(t *testing.T) {
 		{name: "missing rust", nodeVersion: servedNodeVersion, noRust: true, apt: true, want: "prepare"},
 		{name: "missing openssl headers", nodeVersion: servedNodeVersion, noOpenSSL: true, apt: true, want: "prepare"},
 		{name: "broken rust", nodeVersion: servedNodeVersion, brokenRust: true, apt: true, want: "prepare"},
+		{name: "v4 image without go", nodeVersion: servedNodeVersion, noGo: true, apt: true, want: "prepare"},
+		{name: "python without venv", nodeVersion: servedNodeVersion, noVenv: true, apt: true, want: "prepare"},
+		{name: "other pnpm", nodeVersion: servedNodeVersion, pnpmVersion: "9.0.0", apt: true, want: "prepare"},
 		{name: "unsupported package manager", nodeVersion: "v22.0.0", want: "skip"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -48,8 +54,11 @@ func TestServedNodeReadinessExecutesProbe(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			for _, tool := range []string{"sshd", "git", "rsync", "curl", "sudo", "python3", "npm", "cc", "make", "pkg-config", "xz", "unzip", "jq", "cargo", "rustc"} {
+			for _, tool := range []string{"sshd", "git", "rsync", "curl", "sudo", "python3", "npm", "cc", "make", "pkg-config", "xz", "unzip", "jq", "cargo", "rustc", "go", "pip3", "pytest"} {
 				if tc.noJQ && tool == "jq" {
+					continue
+				}
+				if tc.noGo && tool == "go" {
 					continue
 				}
 				if tc.noRust && (tool == "cargo" || tool == "rustc") {
@@ -60,10 +69,17 @@ func TestServedNodeReadinessExecutesProbe(t *testing.T) {
 					writeTool(tool, "exit 1")
 				case (tool == "cargo" || tool == "rustc") && tc.brokenRust:
 					writeTool(tool, "exit 1")
+				case tool == "python3" && tc.noVenv:
+					writeTool(tool, "exit 1")
 				default:
 					writeTool(tool, "exit 0")
 				}
 			}
+			pnpmVersion := tc.pnpmVersion
+			if pnpmVersion == "" {
+				pnpmVersion = servedPnpmVersion
+			}
+			writeTool("pnpm", fmt.Sprintf("printf '%%s\\n' '%s'", pnpmVersion))
 			if tc.apt {
 				writeTool("apt-get", "exit 91") // Installation must never run in this fixture.
 			}

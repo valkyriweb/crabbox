@@ -25,7 +25,7 @@ func TestServeMachinesMonthlyUsage(t *testing.T) {
 				if r.URL.Path != "/v1/serve/machines" {
 					t.Errorf("unexpected path %s", r.URL.Path)
 				}
-				fmt.Fprint(w, `{"machines":[{"machineID":"machine-a","name":"build-mac","online":true,"cpus":8,"memoryMB":16384,"usage":{"month":"2026-05","leases":3,"activeLeases":1,"runtimeSeconds":5400,"cpuSeconds":21600}},{"machineID":"machine-b","name":"legacy"}]}`)
+				fmt.Fprint(w, `{"machines":[{"machineID":"machine-a","name":"build-mac","online":true,"cpus":8,"memoryMB":16384,"freeCPUs":6,"allocatedCPUs":2,"allocatedLeases":1,"usage":{"month":"2026-05","leases":3,"activeLeases":1,"runtimeSeconds":5400,"cpuSeconds":21600}},{"machineID":"machine-b","name":"legacy"},{"machineID":"machine-c","name":"leaving","online":true,"draining":true}]}`)
 			}))
 			defer server.Close()
 			var out bytes.Buffer
@@ -46,11 +46,17 @@ func TestServeMachinesMonthlyUsage(t *testing.T) {
 				if err := json.Unmarshal(out.Bytes(), &result); err != nil {
 					t.Fatal(err)
 				}
-				if len(result.Machines) != 2 || result.Machines[0].Usage == nil || result.Machines[0].Usage.CPUSeconds != 21600 || result.Machines[1].Usage != nil {
+				if len(result.Machines) != 3 || result.Machines[0].Usage == nil || result.Machines[0].Usage.CPUSeconds != 21600 || result.Machines[1].Usage != nil {
 					t.Fatalf("monthly usage lost: %s", &out)
 				}
+				if !strings.Contains(out.String(), `"name":"legacy"`) || strings.Count(out.String(), `"online":false`) != 1 || strings.Count(out.String(), `"online":true`) != 2 {
+					t.Fatalf("listing must state online for every machine: %s", &out)
+				}
+				if strings.Count(out.String(), `"freeCPUs":6,"allocatedCPUs":2,"allocatedLeases":1`) != 1 || strings.Count(out.String(), `"freeCPUs"`) != 1 {
+					t.Fatalf("listing must pass on the broker's allocation figures and invent none: %s", &out)
+				}
 			} else {
-				for _, want := range []string{"machine-a build-mac", "month=2026-05 served=3 runtime=1h30m0s cpu-hours=6.00", "machine-b legacy"} {
+				for _, want := range []string{"machine-a build-mac", "month=2026-05 served=3 runtime=1h30m0s cpu-hours=6.00", "machine-a build-mac online=true cpus=8 memoryMB=16384 availability=available", "machine-b legacy online=false cpus=0 memoryMB=0 availability=offline", "machine-c leaving online=true cpus=0 memoryMB=0 availability=draining"} {
 					if !strings.Contains(out.String(), want) {
 						t.Fatalf("missing %q in %s", want, &out)
 					}
@@ -495,5 +501,33 @@ func TestAgentRunPacesHeartbeatReceipts(t *testing.T) {
 		if gap < interval {
 			t.Errorf("heartbeat gap %d = %s, want >= %s", i, gap, interval)
 		}
+	}
+}
+
+func TestCacheVolumesDefaultsAndMachineScope(t *testing.T) {
+	got := cacheVolumes("m1", nil)
+	paths := map[string]string{}
+	for _, volume := range got {
+		paths[volume.Key] = volume.Path
+	}
+	for key, path := range map[string]string{
+		"serve-m1-pnpm":     "/home/crabbox/.local/share/pnpm/store",
+		"serve-m1-npm":      "/home/crabbox/.npm",
+		"serve-m1-go-build": "/home/crabbox/.cache/go-build",
+		"serve-m1-go-mod":   "/home/crabbox/go/pkg/mod",
+		"serve-m1-pip":      "/home/crabbox/.cache/pip",
+		"serve-m1-browsers": "/home/crabbox/.cache/ms-playwright",
+		"serve-m1-tools":    "/home/crabbox/.cache/crabbox-tools",
+	} {
+		if paths[key] != path {
+			t.Errorf("default cache volume %s = %q, want %q", key, paths[key], path)
+		}
+	}
+	if len(got) != 7 {
+		t.Fatalf("default cache volumes = %v", got)
+	}
+	configured := []core.CacheVolumeConfig{{Key: "own", Path: "/cache"}}
+	if got := cacheVolumes("m2", configured); len(got) != 1 || got[0].Key != "serve-m2-own" || configured[0].Key != "own" {
+		t.Fatalf("configured cache volumes = %v (input %v)", got, configured)
 	}
 }

@@ -49,6 +49,30 @@ type machine struct {
 	Leases         []leaseView       `json:"leases"`
 }
 
+// machineListing is a machine as "serve machines --json" prints it. The
+// allocation figures are the broker's own; an older broker sends none.
+type machineListing struct {
+	machine
+	Online          bool `json:"online"`
+	FreeCPUs        *int `json:"freeCPUs,omitempty"`
+	AllocatedCPUs   *int `json:"allocatedCPUs,omitempty"`
+	AllocatedLeases *int `json:"allocatedLeases,omitempty"`
+}
+
+// machineAvailabilityText says whether a listed machine can take a lease now.
+// A machine that stopped sending heartbeats, or that is draining, gets no
+// lease, whatever availability it last reported.
+func machineAvailabilityText(m machine) string {
+	switch {
+	case !m.Online:
+		return "offline"
+	case m.Draining:
+		return "draining"
+	default:
+		return availabilityText(m.Availability)
+	}
+}
+
 type machineUsage struct {
 	Month          string `json:"month"`
 	Leases         int    `json:"leases"`
@@ -253,21 +277,24 @@ func (Provider) RunAgent(ctx context.Context, cfg core.Config, rt core.Runtime, 
 		}
 	}
 	if command == "machines" {
-		var result struct {
-			Machines []machine `json:"machines"`
-		}
-		if err := coord.AgentRequest(ctx, "GET", "/v1/serve/machines", nil, &result); err != nil {
+		// The heartbeat type omits a false "online"; a listing must state it.
+		listing := struct {
+			Machines []machineListing `json:"machines"`
+		}{Machines: []machineListing{}}
+		if err := coord.AgentRequest(ctx, "GET", "/v1/serve/machines", nil, &listing); err != nil {
 			return err
 		}
 		if *jsonOutput {
-			return json.NewEncoder(rt.Stdout).Encode(result)
+			return json.NewEncoder(rt.Stdout).Encode(listing)
 		}
-		for _, m := range result.Machines {
+		for _, listed := range listing.Machines {
+			m := listed.machine
+			m.Online = listed.Online
 			usage := ""
 			if m.Usage != nil {
 				usage = fmt.Sprintf(" month=%s served=%d runtime=%s cpu-hours=%.2f", m.Usage.Month, m.Usage.Leases, time.Duration(m.Usage.RuntimeSeconds)*time.Second, float64(m.Usage.CPUSeconds)/3600)
 			}
-			fmt.Fprintf(rt.Stdout, "%s %s online=%t cpus=%d memoryMB=%d availability=%s%s\n", m.MachineID, m.Name, m.Online, m.CPUs, m.MemoryMB, availabilityText(m.Availability), usage)
+			fmt.Fprintf(rt.Stdout, "%s %s online=%t cpus=%d memoryMB=%d availability=%s%s\n", m.MachineID, m.Name, m.Online, m.CPUs, m.MemoryMB, machineAvailabilityText(m), usage)
 		}
 		return nil
 	}
@@ -412,9 +439,26 @@ func parseMemory(s string) (int, error) {
 	}
 	return n * factor, nil
 }
+
+// defaultCacheVolumes are the per-machine caches a lease gets when the
+// operator configures none. "tools" is for client tooling that keeps large,
+// content-addressed artifacts between leases; every lease on the machine can
+// write to it, so a reader must verify what it reads (for example by SHA-256).
+func defaultCacheVolumes() []core.CacheVolumeConfig {
+	return []core.CacheVolumeConfig{
+		{Key: "pnpm", Path: "/home/crabbox/.local/share/pnpm/store"},
+		{Key: "npm", Path: "/home/crabbox/.npm"},
+		{Key: "go-build", Path: "/home/crabbox/.cache/go-build"},
+		{Key: "go-mod", Path: "/home/crabbox/go/pkg/mod"},
+		{Key: "pip", Path: "/home/crabbox/.cache/pip"},
+		{Key: "browsers", Path: "/home/crabbox/.cache/ms-playwright"},
+		{Key: "tools", Path: "/home/crabbox/.cache/crabbox-tools"},
+	}
+}
+
 func cacheVolumes(id string, configured []core.CacheVolumeConfig) []core.CacheVolumeConfig {
 	if len(configured) == 0 {
-		configured = []core.CacheVolumeConfig{{Key: "pnpm", Path: "/home/crabbox/.local/share/pnpm/store"}, {Key: "npm", Path: "/home/crabbox/.npm"}, {Key: "go-build", Path: "/home/crabbox/.cache/go-build"}, {Key: "go-mod", Path: "/home/crabbox/go/pkg/mod"}}
+		configured = defaultCacheVolumes()
 	}
 	result := append([]core.CacheVolumeConfig(nil), configured...)
 	for i := range result {

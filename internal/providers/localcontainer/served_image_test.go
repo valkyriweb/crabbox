@@ -7,7 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -259,6 +263,9 @@ func TestServedPrepare(t *testing.T) {
 							if !strings.Contains(a[len(a)-1], "pkg-config --exists openssl && cargo --version && rustc --version") || !strings.Contains(a[len(a)-1], " cargo rustc ") || !strings.Contains(a[len(a)-1], " cc make pkg-config xz unzip jq ") {
 								t.Fatal("tool probe must require the C and Rust toolchains")
 							}
+							if !strings.Contains(a[len(a)-1], " go pip3 pytest pnpm ") || !strings.Contains(a[len(a)-1], "import ensurepip, venv") || !strings.Contains(a[len(a)-1], `"$(pnpm --version 2>/dev/null)" = "`+servedPnpmVersion+`"`) {
+								t.Fatal("tool probe must require Go, the Python test tools and the pinned pnpm")
+							}
 							if !strings.Contains(a[len(a)-1], "node --version") || !strings.Contains(a[len(a)-1], servedNodeVersion) {
 								t.Fatal("tool probe must require the pinned node version")
 							}
@@ -275,7 +282,7 @@ func TestServedPrepare(t *testing.T) {
 							if noProxy := slices.Contains(a, "--http-proxy=false"); noProxy != (runtimeName == "podman") {
 								t.Fatalf("runtime=%s http-proxy=false=%v args=%v", runtimeName, noProxy, a)
 							}
-							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], servedNodeInstallScript) || !strings.Contains(a[len(a)-1], servedRustInstallScript) || !strings.Contains(a[len(a)-1], servedToolchainPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
+							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], servedNodeInstallScript) || !strings.Contains(a[len(a)-1], servedRustInstallScript) || !strings.Contains(a[len(a)-1], servedPnpmInstallScript) || !strings.Contains(a[len(a)-1], servedBrowserLibrariesInstallScript) || !strings.Contains(a[len(a)-1], servedToolchainPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
 								t.Fatal("invalid preparation script")
 							}
 							if req.Stdout != &warning || req.Stderr != &warning {
@@ -512,18 +519,74 @@ func TestServedRustInstallScriptPinsAndVerifies(t *testing.T) {
 	if strings.Contains(servedRustInstallScript, "sh.rustup.rs") || strings.Contains(servedRustInstallScript, "| sh -") {
 		t.Fatal("rust install must not pipe an unverified installer to a shell")
 	}
-	for _, pkg := range []string{"build-essential", "pkg-config", "libssl-dev", "xz-utils", "unzip", "jq"} {
+	for _, pkg := range []string{"build-essential", "pkg-config", "libssl-dev", "xz-utils", "unzip", "jq", "golang-go", "python3-pip", "python3-venv", "python3-pytest"} {
 		if !strings.Contains(servedToolchainPackages, pkg) {
 			t.Fatalf("toolchain packages missing %q", pkg)
 		}
 	}
-	if servedPreparationRecipe != "v4" {
-		t.Fatalf("recipe=%q, want v4", servedPreparationRecipe)
+	if servedPreparationRecipe != "v5" {
+		t.Fatalf("recipe=%q, want v5", servedPreparationRecipe)
+	}
+}
+
+func TestServedPnpmInstallScriptPinsAndVerifies(t *testing.T) {
+	for _, want := range []string{
+		"pnpm_version=" + servedPnpmVersion,
+		"pnpm_sha256=d0c42f9232c9685056b432f8b07631bbabd245d40ede9a982919c7a7ada40aa7",
+		"https://registry.npmjs.org/pnpm/-/pnpm-$pnpm_version.tgz",
+		"sha256sum -c -",
+		"--ignore-scripts",
+		"/usr/local/bin/$pnpm_bin",
+		`[ "$(/usr/local/bin/pnpm --version)" = "$pnpm_version" ]`,
+	} {
+		if !strings.Contains(servedPnpmInstallScript, want) {
+			t.Fatalf("pnpm install script missing %q", want)
+		}
+	}
+	if strings.Contains(servedPnpmInstallScript, "corepack") || strings.Contains(servedPnpmInstallScript, "| sh -") {
+		t.Fatal("pnpm install must use the verified tarball, not a download at first use or a piped installer")
+	}
+}
+
+func TestServedBrowserLibrariesInstallScriptResolvesRenamedPackages(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the install script needs a POSIX shell")
+	}
+	bin := t.TempDir()
+	// Only two packages have a t64 variant in this fixture distribution.
+	aptCache := "#!/bin/sh\ncase \"$2\" in libasound2t64|libglib2.0-0t64) exit 0 ;; *) exit 100 ;; esac\n"
+	aptGet := "#!/bin/sh\nprintf '%s\\n' \"$*\"\n"
+	for name, body := range map[string]string{"apt-cache": aptCache, "apt-get": aptGet} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", "set -eu\n"+servedBrowserLibrariesInstallScript)
+	cmd.Env = []string{"PATH=" + bin}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install script failed: %v: %s", err, out)
+	}
+	got := strings.Fields(strings.TrimSpace(string(out)))
+	want := []string{"install", "-y", "--no-install-recommends"}
+	for _, pkg := range strings.Fields(servedBrowserLibraries) {
+		if pkg == "libasound2" || pkg == "libglib2.0-0" {
+			pkg += "t64"
+		}
+		want = append(want, pkg)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("apt-get arguments = %v, want %v", got, want)
+	}
+	for _, need := range []string{"libnss3", "libgbm1", "libasound2", "fonts-liberation"} {
+		if !slices.Contains(strings.Fields(servedBrowserLibraries), need) {
+			t.Fatalf("browser libraries missing %q", need)
+		}
 	}
 }
 
 func TestServedPreparedTagCoversToolchainRecipe(t *testing.T) {
-	sum := sha256.Sum256([]byte("sha256:base\n" + bootstrapPackages + " " + servedToolchainPackages + "\nv4"))
+	sum := sha256.Sum256([]byte("sha256:base\n" + bootstrapPackages + " " + servedToolchainPackages + "\nv5"))
 	if got, want := servedPreparedTag("sha256:base"), fmt.Sprintf("crabbox-serve-prepared:%x", sum[:8]); got != want {
 		t.Fatalf("tag=%s want %s", got, want)
 	}

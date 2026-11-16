@@ -46,6 +46,40 @@ classification fields (`blockedStage`, `retryLikely`) when present.
 Use a run ID from this list with [`logs`](logs.md), [`events`](events.md), or
 [`attach`](attach.md) to inspect a specific run.
 
+## Close orphaned runs
+
+A run stays `running` on the broker until its client reports the finish. A
+client that is killed (`SIGKILL`, a tool timeout, a sleeping laptop) never
+does, and the record stays open. `history reap` closes such runs:
+
+```sh
+crabbox history reap --dry-run
+crabbox history reap --older-than 2h --json
+```
+
+```text
+--older-than <duration>  Least time since the run's last event (default 1h, minimum 1m).
+--limit <n>              Maximum running runs to inspect (default 500).
+--dry-run                Report what would be closed; change nothing.
+--json                   Print one record per inspected run.
+```
+
+A run is closed only when it has had no event for `--older-than` and every
+lease it used is released, expired, failed or gone. A run on a live lease is
+kept, however long it has been silent. A run that never got a lease is kept
+until it has been silent for 6 hours. If a lease lookup fails, the run is kept.
+
+Just before the close, the command reads the run again. It keeps the run if the
+run finished or got a new event since the first read. The broker cannot close a
+run on a condition, so a client that reports in the moment between that second
+read and the close still loses its record; keep `--older-than` well above the
+longest silence of a healthy command.
+
+A closed run becomes `failed` with exit code 1 and `blockedStage`
+`client-orphaned`; its log says that the command's real exit status is unknown.
+The command never stops a lease. It reads and closes only the runs your token
+can write. Exit code 1 means at least one run could not be closed.
+
 ## Related docs
 
 Local records are created by `run --record-local`, not by reading history.

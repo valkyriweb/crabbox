@@ -14,18 +14,61 @@ import (
 )
 
 // v2 adds the pinned Node.js toolchain; v3 adds the C and Rust toolchains;
-// v4 adds jq.
+// v4 adds jq; v5 adds Go, pip, venv, pytest, pnpm and the shared libraries
+// headless browsers need.
 // Each bump invalidates older prepared images.
-const servedPreparationRecipe = "v4"
+const servedPreparationRecipe = "v5"
 
 // servedToolchainPackages are installed only into prepared serve images, on
-// top of bootstrapPackages, so leases can build C and Rust code and process JSON with jq.
-const servedToolchainPackages = "build-essential pkg-config libssl-dev xz-utils unzip jq"
+// top of bootstrapPackages, so leases can build C, Rust and Go code, run Python
+// tests in a venv or with the distribution pytest, and process JSON with jq.
+// Go, pip and pytest come from the base distribution, not from a pinned release.
+const servedToolchainPackages = "build-essential pkg-config libssl-dev xz-utils unzip jq golang-go python3-pip python3-venv python3-pytest"
 
 // servedToolchainTools are the commands the readiness probe requires before it
 // treats a base image as already prepared; it also requires OpenSSL headers
-// (pkg-config openssl) and working cargo/rustc.
-const servedToolchainTools = "cc make pkg-config xz unzip jq cargo rustc"
+// (pkg-config openssl), working cargo/rustc, the pinned pnpm and a Python that
+// can create a venv.
+const servedToolchainTools = "cc make pkg-config xz unzip jq cargo rustc go pip3 pytest pnpm"
+
+// servedBrowserLibraries are the shared libraries and one metric-compatible
+// font family that headless Chromium needs. Browser binaries are not baked in:
+// they are large and tied to the version of the test framework a repository
+// pins, so a lease downloads them (a serve cache volume keeps them between
+// leases). The names are the pre-64-bit-time_t ones; the install script picks
+// the "t64" variant where the distribution renamed the package.
+const servedBrowserLibraries = "libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libfontconfig1 libfreetype6 libgbm1 libglib2.0-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 fonts-liberation"
+
+// servedBrowserLibrariesInstallScript installs servedBrowserLibraries. It runs
+// after apt-get update and before the package lists are removed.
+const servedBrowserLibrariesInstallScript = `browser_packages=""
+for browser_package in ` + servedBrowserLibraries + `; do
+  if apt-cache show "${browser_package}t64" >/dev/null 2>&1; then browser_package="${browser_package}t64"; fi
+  browser_packages="$browser_packages $browser_package"
+done
+apt-get install -y --no-install-recommends $browser_packages`
+
+// servedPnpmVersion is the pinned pnpm release; the readiness probe and the
+// install script must agree on it. This line of pnpm is plain JavaScript, so
+// one tarball serves every architecture. A repository that pins another pnpm
+// in its packageManager field gets that version from pnpm itself.
+const servedPnpmVersion = "11.28.12"
+
+// servedPnpmInstallScript installs the pinned, SHA256-verified pnpm tarball
+// into the pinned Node.js prefix without running package scripts, and links it
+// into /usr/local/bin. It runs after servedNodeInstallScript. It is idempotent
+// and fails closed (set -eu).
+const servedPnpmInstallScript = `pnpm_version=` + servedPnpmVersion + `
+pnpm_sha256=d0c42f9232c9685056b432f8b07631bbabd245d40ede9a982919c7a7ada40aa7
+if [ "$(/opt/node/bin/pnpm --version 2>/dev/null || true)" != "$pnpm_version" ]; then
+  pnpm_tmp="$(mktemp -d)"
+  curl -fsSL --retry 3 -o "$pnpm_tmp/pnpm.tgz" "https://registry.npmjs.org/pnpm/-/pnpm-$pnpm_version.tgz"
+  echo "$pnpm_sha256  $pnpm_tmp/pnpm.tgz" | sha256sum -c -
+  npm_config_cache="$pnpm_tmp/cache" npm_config_update_notifier=false /opt/node/bin/npm install -g --prefix /opt/node --no-audit --no-fund --ignore-scripts "$pnpm_tmp/pnpm.tgz"
+  rm -rf "$pnpm_tmp"
+fi
+for pnpm_bin in pnpm pnpx; do ln -sf "/opt/node/bin/$pnpm_bin" "/usr/local/bin/$pnpm_bin"; done
+[ "$(/usr/local/bin/pnpm --version)" = "$pnpm_version" ]`
 
 // servedRustupVersion pins rustup-init; the stable toolchain it installs is
 // shared read-only under /opt/rust.
@@ -208,7 +251,7 @@ func (r *ServedRuntime) cleanupPreparationContainer(name string) error {
 }
 
 func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id string, err error) {
-	probe := "for tool in " + bootstrapTools + " " + servedToolchainTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; { pkg-config --exists openssl && cargo --version && rustc --version; } >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
+	probe := "for tool in " + bootstrapTools + " " + servedToolchainTools + " node npm; do command -v \"$tool\" >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; done; [ \"$(node --version 2>/dev/null)\" = \"" + servedNodeVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; { pkg-config --exists openssl && cargo --version && rustc --version && python3 -c 'import ensurepip, venv'; } >/dev/null 2>&1 || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; [ \"$(pnpm --version 2>/dev/null)\" = \"" + servedPnpmVersion + "\" ] || { command -v apt-get >/dev/null 2>&1 && { echo prepare; exit 0; }; echo skip; exit 0; }; echo ready"
 	probeName := "crabbox-serve-probe-" + strings.ToLower(rand.Text())
 	result, err := r.b.docker(ctx, []string{"run", "--rm", "--name", probeName, "--entrypoint", "/bin/sh", base.ID, "-c", probe}, nil, r.b.rt.Stderr)
 	if err != nil {
@@ -261,7 +304,7 @@ func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id 
 	if len(base.Config.Entrypoint) == 0 {
 		args = append(args, "/bin/sh")
 	}
-	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + " " + servedToolchainPackages + "; " + servedNodeInstallScript + "\n" + servedRustInstallScript + "\nrm -f /etc/ssh/ssh_host_*; rm -rf /var/lib/apt/lists/*"
+	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + " " + servedToolchainPackages + "\n" + servedBrowserLibrariesInstallScript + "\n" + servedNodeInstallScript + "\n" + servedPnpmInstallScript + "\n" + servedRustInstallScript + "\nrm -f /etc/ssh/ssh_host_*; rm -rf /var/lib/apt/lists/*"
 	args = append(args, "-c", script)
 	if _, err := r.b.docker(ctx, args, r.b.rt.Stderr, r.b.rt.Stderr); err != nil {
 		return "", err
