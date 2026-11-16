@@ -558,7 +558,10 @@ jobs:
   apple-vm:
     name: Apple VM
     runs-on: xcode-27
-    timeout-minutes: 15
+    # 30, not 15: on 2026-11-16 the uncached `go test -race` build alone took
+    # 8.5 to over 10 minutes on this runner (3.7 the day before), and three
+    # runs in a row were cancelled at 15 minutes with no failing test.
+    timeout-minutes: 30
 
     steps:
       - name: Check out
