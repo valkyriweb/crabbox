@@ -282,7 +282,7 @@ func TestServedPrepare(t *testing.T) {
 							if noProxy := slices.Contains(a, "--http-proxy=false"); noProxy != (runtimeName == "podman") {
 								t.Fatalf("runtime=%s http-proxy=false=%v args=%v", runtimeName, noProxy, a)
 							}
-							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], servedNodeInstallScript) || !strings.Contains(a[len(a)-1], servedRustInstallScript) || !strings.Contains(a[len(a)-1], servedPnpmInstallScript) || !strings.Contains(a[len(a)-1], servedBrowserLibrariesInstallScript) || !strings.Contains(a[len(a)-1], servedToolchainPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "/var/lib/apt/lists/*") {
+							if !strings.Contains(a[len(a)-1], bootstrapPackages) || !strings.Contains(a[len(a)-1], servedNodeInstallScript) || !strings.Contains(a[len(a)-1], servedRustInstallScript) || !strings.Contains(a[len(a)-1], servedPnpmInstallScript) || !strings.Contains(a[len(a)-1], servedBrowserLibrariesInstallScript) || !strings.Contains(a[len(a)-1], servedToolchainPackages) || !strings.Contains(a[len(a)-1], "rm -f /etc/ssh/ssh_host_*") || !strings.Contains(a[len(a)-1], "apt-get clean") || strings.Contains(a[len(a)-1], "/var/lib/apt/lists") {
 								t.Fatal("invalid preparation script")
 							}
 							if req.Stdout != &warning || req.Stderr != &warning {
@@ -524,8 +524,8 @@ func TestServedRustInstallScriptPinsAndVerifies(t *testing.T) {
 			t.Fatalf("toolchain packages missing %q", pkg)
 		}
 	}
-	if servedPreparationRecipe != "v5" {
-		t.Fatalf("recipe=%q, want v5", servedPreparationRecipe)
+	if servedPreparationRecipe != "v6" {
+		t.Fatalf("recipe=%q, want v6", servedPreparationRecipe)
 	}
 }
 
@@ -586,7 +586,7 @@ func TestServedBrowserLibrariesInstallScriptResolvesRenamedPackages(t *testing.T
 }
 
 func TestServedPreparedTagCoversToolchainRecipe(t *testing.T) {
-	sum := sha256.Sum256([]byte("sha256:base\n" + bootstrapPackages + " " + servedToolchainPackages + "\nv5"))
+	sum := sha256.Sum256([]byte("sha256:base\n" + bootstrapPackages + " " + servedToolchainPackages + "\nv6"))
 	if got, want := servedPreparedTag("sha256:base"), fmt.Sprintf("crabbox-serve-prepared:%x", sum[:8]); got != want {
 		t.Fatalf("tag=%s want %s", got, want)
 	}
