@@ -259,7 +259,7 @@ too. The image environment is unchanged, so lease users keep their own
 `~/.cargo` for the registry and build cache; `/opt/rust` is world-readable and
 not writable by lease users. Rust and the C toolchain exist only in prepared
 images: lease-time fallback bootstrap does not install them. Preparation is
-bounded to 20 minutes.
+bounded to 60 minutes (`CRABBOX_SERVE_PREPARE_TIMEOUT`).
 Failure to pull or inspect the configured image still stops agent startup.
 
 The tag is `crabbox-serve-prepared:<hash>`, where the hash is the first 16 hex
@@ -267,7 +267,11 @@ digits of SHA-256 over the base runtime image ID, package lists, and recipe
 version. Subsequent agent starts reuse that tag. The image has labels
 `crabbox.serve.prepared=true`, `crabbox.serve.base-reference`, and
 `crabbox.serve.base-image-id`. Preparation preserves the base command,
-entrypoint, user, and environment, and removes SSH host keys and apt lists.
+entrypoint, user, and environment, removes SSH host keys and the apt download
+cache, and keeps the apt package lists from preparation time, so a lease can run
+`sudo apt-get install <pkg>` without `apt-get update` first. Lists age with the
+prepared image; if a package version was superseded since then, apt reports 404
+and `sudo apt-get update` fixes it.
 Each served container generates its own host keys, including when the
 configured image already contained keys.
 

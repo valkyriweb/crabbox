@@ -16,9 +16,10 @@ import (
 
 // v2 adds the pinned Node.js toolchain; v3 adds the C and Rust toolchains;
 // v4 adds jq; v5 adds Go, pip, venv, pytest, pnpm and the shared libraries
-// headless browsers need.
+// headless browsers need; v6 keeps the apt package lists so a lease can run
+// apt-get install without apt-get update first.
 // Each bump invalidates older prepared images.
-const servedPreparationRecipe = "v5"
+const servedPreparationRecipe = "v6"
 
 // servedToolchainPackages are installed only into prepared serve images, on
 // top of bootstrapPackages, so leases can build C, Rust and Go code, run Python
@@ -41,7 +42,7 @@ const servedToolchainTools = "cc make pkg-config xz unzip jq cargo rustc go pip3
 const servedBrowserLibraries = "libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libfontconfig1 libfreetype6 libgbm1 libglib2.0-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 fonts-liberation"
 
 // servedBrowserLibrariesInstallScript installs servedBrowserLibraries. It runs
-// after apt-get update and before the package lists are removed.
+// after apt-get update.
 const servedBrowserLibrariesInstallScript = `browser_packages=""
 for browser_package in ` + servedBrowserLibraries + `; do
   if apt-cache show "${browser_package}t64" >/dev/null 2>&1; then browser_package="${browser_package}t64"; fi
@@ -342,7 +343,7 @@ func (r *ServedRuntime) prepareImage(ctx context.Context, base servedImage) (id 
 	if len(base.Config.Entrypoint) == 0 {
 		args = append(args, "/bin/sh")
 	}
-	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + " " + servedToolchainPackages + "\n" + servedBrowserLibrariesInstallScript + "\n" + servedNodeInstallScript + "\n" + servedPnpmInstallScript + "\n" + servedRustInstallScript + "\nrm -f /etc/ssh/ssh_host_*; rm -rf /var/lib/apt/lists/*"
+	script := "set -eu; export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends " + bootstrapPackages + " " + servedToolchainPackages + "\n" + servedBrowserLibrariesInstallScript + "\n" + servedNodeInstallScript + "\n" + servedPnpmInstallScript + "\n" + servedRustInstallScript + "\nrm -f /etc/ssh/ssh_host_*; apt-get clean"
 	args = append(args, "-c", script)
 	if _, err := r.b.docker(ctx, args, r.b.rt.Stderr, r.b.rt.Stderr); err != nil {
 		return "", err
