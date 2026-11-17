@@ -712,3 +712,20 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	defer l.mu.Unlock()
 	return l.w.Write(p)
 }
+
+func TestServedPreparationDeadline(t *testing.T) {
+	t.Setenv("CRABBOX_SERVE_PREPARE_TIMEOUT", "")
+	if got := servedPreparationDeadline(); got != 60*time.Minute {
+		t.Fatalf("default deadline = %s, want 1h", got)
+	}
+	t.Setenv("CRABBOX_SERVE_PREPARE_TIMEOUT", "90m")
+	if got := servedPreparationDeadline(); got != 90*time.Minute {
+		t.Fatalf("override deadline = %s, want 90m", got)
+	}
+	for _, bad := range []string{"soon", "0s", "-5m"} {
+		t.Setenv("CRABBOX_SERVE_PREPARE_TIMEOUT", bad)
+		if got := servedPreparationDeadline(); got != 60*time.Minute {
+			t.Fatalf("invalid %q deadline = %s, want default 1h", bad, got)
+		}
+	}
+}

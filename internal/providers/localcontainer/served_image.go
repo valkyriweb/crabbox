@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -199,6 +200,22 @@ func (r *ServedRuntime) EnsureImage(ctx context.Context) error {
 // the next attempt.
 var servedPreparationRetryInterval = 10 * time.Minute
 
+// servedPreparationTimeout bounds one preparation attempt, including the
+// docker commit. Twenty minutes was too short under nested Docker in gVisor
+// (lue-dl360-worker-01): the install took about 12 minutes and the commit of
+// the ~2 GB layer was still running when the deadline killed it, every retry.
+// CRABBOX_SERVE_PREPARE_TIMEOUT (a Go duration, e.g. "90m") overrides it.
+var servedPreparationTimeout = 60 * time.Minute
+
+func servedPreparationDeadline() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("CRABBOX_SERVE_PREPARE_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return servedPreparationTimeout
+}
+
 // StartPreparation uses the agent lifetime, never a single lease's deadline.
 // Only one preparation runs per agent; image selection remains nonblocking.
 func (r *ServedRuntime) StartPreparation(ctx context.Context) {
@@ -213,7 +230,7 @@ func (r *ServedRuntime) StartPreparation(ctx context.Context) {
 	base, done := r.baseImage, r.preparationDone
 	r.imageMu.Unlock()
 	go func() {
-		bounded, cancel := context.WithTimeout(ctx, 20*time.Minute)
+		bounded, cancel := context.WithTimeout(ctx, servedPreparationDeadline())
 		defer cancel()
 		id, err := r.prepareImage(bounded, base)
 		if err != nil && r.b.rt.Stderr != nil {
