@@ -13,7 +13,6 @@ import type { Env, LeaseRecord, LeaseRequest, CreateAttemptRecord } from "./type
 export const serveBodyLimit = 32 * 1024;
 const machinePrefix = "serve-machine:";
 const onlineMS = 30_000;
-const lostMS = 90_000;
 const pruneMS = 7 * 24 * 60 * 60 * 1000;
 const maxMachines = 64;
 const maxLeases = 32;
@@ -451,7 +450,7 @@ export class ServeCoordinator {
       await Promise.all(
         records.map(async (l) => {
           const before = JSON.stringify(l);
-          this.expire(l, old ?? m, now);
+          this.expire(l, now);
           if (live(l) && l.state === "active") {
             l.sshJump = jumpForMachine(m, this.env);
           }
@@ -493,7 +492,7 @@ export class ServeCoordinator {
       state: l.state,
     };
   }
-  private expire(l: LeaseRecord, m: ServeMachine, now: number) {
+  private expire(l: LeaseRecord, now: number) {
     if (!live(l)) return;
     l.leasePolicy = { ...resolveLeasePolicy(this.env, l.owner, l.org), runtimeExtension: true };
     l.expiresAt = new Date(
@@ -502,10 +501,7 @@ export class ServeCoordinator {
         Date.parse(l.createdAt) + Math.min(l.ttlSeconds, l.leasePolicy.maxTTLSeconds) * 1000,
       ),
     ).toISOString();
-    if (now - m.lastHeartbeat >= lostMS) {
-      l.state = "failed";
-      l.failureError = "serve_machine_lost";
-    } else if (Math.min(Date.parse(l.expiresAt), idleDeadline(l)) <= now) {
+    if (Math.min(Date.parse(l.expiresAt), idleDeadline(l)) <= now) {
       l.state = "expired";
       l.failureError = "serve deadline elapsed";
     } else return;
@@ -536,15 +532,11 @@ export class ServeCoordinator {
         const records = await this.records(s, m);
         for (const l of records) {
           const before = JSON.stringify(l);
-          this.expire(l, m, now);
+          this.expire(l, now);
           if (!live(l)) await new ServeRelayControl(this.env).closeLease(l);
           if (JSON.stringify(l) !== before) await putLeaseRecord(s, l);
           if (live(l)) {
-            const deadline = Math.min(
-              m.lastHeartbeat + lostMS,
-              Date.parse(l.expiresAt),
-              idleDeadline(l),
-            );
+            const deadline = Math.min(Date.parse(l.expiresAt), idleDeadline(l));
             next = next === undefined ? deadline : Math.min(next, deadline);
           }
         }
@@ -803,7 +795,7 @@ export class ServeCoordinator {
         throw new ServeError("not_found", 404);
       const m = await s.get<ServeMachine>(machinePrefix + l.serve!.machineID);
       if (!m || !this.owned(m, r)) throw new ServeError("not_found", 404);
-      this.expire(l, m, Date.now());
+      this.expire(l, Date.now());
       if (!live(l)) {
         await new ServeRelayControl(this.env).closeLease(l);
         await putLeaseRecord(s, l);

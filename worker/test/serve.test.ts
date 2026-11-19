@@ -429,22 +429,28 @@ describe.each([false, true])("serve shared lifecycle durable=%s", (durable) => {
     expect((await f.storage.get<LeaseRecord>(`lease:${id}`))?.cleanupCompletedAt).toBeTruthy();
     expect((await f.create("cbx_000000000004")).status).toBe(202);
   });
-  it("marks offline leases lost; returning agent stops orphans", async () => {
+  it("preserves leases during a missed heartbeat and expires them at the real deadline", async () => {
     vi.useFakeTimers();
     const f = fixture(durable);
     await f.route("/v1/serve/heartbeat", machine());
     await f.create("cbx_000000000001");
+    await f.route("/v1/serve/leases/cbx_000000000001/ready", { machineID: mid, sshHostKey: key });
     vi.advanceTimersByTime(90001);
     await f.serve.maintain();
-    expect(await f.storage.get("lease:cbx_000000000001")).toMatchObject({
-      state: "failed",
-      failureError: "serve_machine_lost",
-    });
+    expect(await f.storage.get("lease:cbx_000000000001")).toMatchObject({ state: "active" });
     const m = machine();
     m.leases = [
       { id: "cbx_000000000001", state: "running" },
       { id: "cbx_000000000009", state: "running" },
     ];
+    expect(await (await f.route("/v1/serve/heartbeat", m)).json()).toMatchObject({
+      assignments: [{ id: "cbx_000000000001" }],
+      stop: ["cbx_000000000009"],
+    });
+    const lease = (await f.storage.get<LeaseRecord>("lease:cbx_000000000001"))!;
+    vi.setSystemTime(new Date(lease.expiresAt));
+    await f.serve.maintain();
+    expect(await f.storage.get("lease:cbx_000000000001")).toMatchObject({ state: "expired" });
     expect(await (await f.route("/v1/serve/heartbeat", m)).json()).toMatchObject({
       assignments: [],
       stop: ["cbx_000000000001", "cbx_000000000009"],
@@ -511,10 +517,16 @@ describe.each([false, true])("bounded serve maintenance durable=%s", (durable) =
         expect(reads).toHaveLength(batch * leases);
         expect(reads.length).toBeLessThanOrEqual(256);
         expect(batch).toBeLessThanOrEqual(16);
-        expect(wake === undefined || wake <= Date.now() + 15_000).toBe(true);
+        expect(
+          visited < count ? wake === Date.now() + 15_000 : wake !== undefined && wake > Date.now(),
+        ).toBe(true);
         const expectedCursor =
           visited < count ? { after: `serve-machine:${ids[visited - 1]}` } : undefined;
-        expect(await f.storage.get("serve-maintenance-cursor")).toEqual(expectedCursor);
+        const cursor = await f.storage.get<{ after: string; next: number }>(
+          "serve-maintenance-cursor",
+        );
+        expect(cursor?.after).toBe(expectedCursor?.after);
+        expect(cursor === undefined || cursor.next > Date.now()).toBe(true);
         expect(visited === count || wake !== undefined).toBe(true);
       }
       expect(exclusive).toHaveBeenCalledTimes(batches.length);
@@ -532,7 +544,7 @@ describe.each([false, true])("bounded serve maintenance durable=%s", (durable) =
       );
       const records = [...f.storage.values.values()] as LeaseRecord[];
       for (const lease of records.filter((l) => l.provider === "serve"))
-        expect(lease.failureError).toBe("serve_machine_lost");
+        expect(lease.state).toBe("provisioning");
     },
   );
   it("preserves earlier page deadlines and resets the cursor after a full page tail", async () => {
@@ -544,7 +556,7 @@ describe.each([false, true])("bounded serve maintenance durable=%s", (durable) =
         (value as ServeMachine).lastHeartbeat = Date.now();
     }
     expect(await f.serve.maintain()).toBe(Date.now() + 15_000);
-    expect(await f.serve.maintain()).toBe(Date.now() + 90_000);
+    expect(await f.serve.maintain()).toBeGreaterThan(Date.now() + 90_000);
     expect(await f.storage.get("serve-maintenance-cursor")).toBeUndefined();
     // A fresh sweep starts from the beginning again.
     await f.serve.maintain();
@@ -786,8 +798,7 @@ it("continues ordinary alarm maintenance after exactly one serve batch and rearm
     const rows = [...f.storage.values.values()].filter(
       (v) => (v as LeaseRecord).provider === "serve",
     ) as LeaseRecord[];
-    expect(rows.filter((l) => l.state === "failed")).toHaveLength(16);
-    expect(rows.filter((l) => l.state === "provisioning")).toHaveLength(4);
+    expect(rows.filter((l) => l.state === "provisioning")).toHaveLength(20);
   });
   const aws = vi.spyOn(internals, "runAWSOrphanSweepIfDue").mockResolvedValue();
   const azure = vi.spyOn(internals, "runAzureOrphanSweepIfDue").mockResolvedValue();
