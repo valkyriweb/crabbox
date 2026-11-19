@@ -267,13 +267,63 @@ func TestAgentReconciliationOwnershipAndDeadlines(t *testing.T) {
 			if err := a.poll(context.Background()); err != nil {
 				t.Fatal(err)
 			}
+			if len(f.removed) != 0 {
+				t.Fatalf("removed before grace=%v", f.removed)
+			}
+			if err := a.poll(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			if len(f.removed) != 1 || f.removed[0] != "own" {
 				t.Fatalf("removed=%v", f.removed)
 			}
 		})
 	}
 }
-func TestLocalDeadlinesWhileCoordinatorOffline(t *testing.T) {
+func TestAgentRemovalReasonsAndGraceReset(t *testing.T) {
+	const id = "cbx_123456abcdef"
+	fresh := assignment{ID: id, MachineID: "m", CPUs: 1, MemoryMB: 1, Image: "image", State: "running", ExpiresAt: time.Now().Add(time.Hour), IdleDeadline: time.Now().Add(time.Hour).UnixMilli()}
+	past := time.Now().Add(-time.Second)
+	for _, tc := range []struct {
+		name      string
+		replies   []heartbeat
+		wantAfter int
+		reason    string
+	}{
+		{"missing twice", []heartbeat{{}, {}}, 2, "missing from active after grace"},
+		{"reappears then missing", []heartbeat{{}, {Assignments: []assignment{fresh}}, {}, {}}, 4, "missing from active after grace"},
+		{"explicit stop", []heartbeat{{Stop: []string{id}}}, 1, "stop"},
+		{"deadline", []heartbeat{{Assignments: []assignment{{ID: id, MachineID: "m", CPUs: 1, MemoryMB: 1, Image: "image", ExpiresAt: past, IdleDeadline: fresh.IdleDeadline}}}}, 1, "deadline passed: " + past.Format(time.RFC3339Nano)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(tc.replies[calls])
+				calls++
+			}))
+			defer server.Close()
+			coord, err := core.NewCoordinatorClient(core.Config{Coordinator: server.URL, CoordToken: "synthetic"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := &fakeContainers{items: []localcontainer.ServedContainer{{ID: "owned", LeaseID: id, Labels: map[string]string{"crabbox.serve": "true", "crabbox.serve.machine": "m"}}}}
+			var logs bytes.Buffer
+			a := agent{coord: coord, containers: f, opts: options{stateDir: t.TempDir()}, state: localState{Machine: machine{MachineID: "m", CPUs: 2, MemoryMB: 2, Image: "image"}, Assignments: map[string]assignment{id: fresh}}, rt: core.Runtime{Stderr: &logs}}
+			for i := range tc.replies {
+				if err := a.poll(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if i+1 < tc.wantAfter && len(f.removed) != 0 {
+					t.Fatalf("early removal on pass %d", i+1)
+				}
+			}
+			if len(f.removed) != 1 || !strings.Contains(logs.String(), "lease "+id+": "+tc.reason) {
+				t.Fatalf("removed=%v logs=%q", f.removed, logs.String())
+			}
+		})
+	}
+}
+
+func TestOfflineCoordinatorCannotAuthorizeLocalRemoval(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
 	defer server.Close()
 	c, err := core.NewCoordinatorClient(core.Config{Coordinator: server.URL, CoordToken: "synthetic"})
@@ -293,8 +343,8 @@ func TestLocalDeadlinesWhileCoordinatorOffline(t *testing.T) {
 			if err := a.poll(context.Background()); err == nil {
 				t.Fatal("expected unreachable broker")
 			}
-			if len(f.removed) != 1 {
-				t.Fatal(f.removed)
+			if len(f.removed) != 0 {
+				t.Fatalf("offline coordinator cannot confirm deadline: %v", f.removed)
 			}
 		})
 	}
@@ -334,7 +384,7 @@ func TestServeTargetUsesSharedReadinessThroughProxy(t *testing.T) {
 	}
 }
 
-func TestRejectedOwnerStillCleansLocalDeadlines(t *testing.T) {
+func TestRejectedOwnerCannotAuthorizeLocalRemoval(t *testing.T) {
 	for _, kind := range []string{"ttl", "idle"} {
 		t.Run(kind, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -357,8 +407,8 @@ func TestRejectedOwnerStillCleansLocalDeadlines(t *testing.T) {
 			if err := a.poll(context.Background()); err == nil || !strings.Contains(err.Error(), "serve_not_enabled") {
 				t.Fatalf("error=%v", err)
 			}
-			if len(f.removed) != 1 {
-				t.Fatal(f.removed)
+			if len(f.removed) != 0 {
+				t.Fatalf("rejected heartbeat cannot confirm deadline: %v", f.removed)
 			}
 		})
 	}

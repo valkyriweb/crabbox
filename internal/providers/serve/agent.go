@@ -134,6 +134,7 @@ type agent struct {
 	relayMu                 sync.Mutex
 	relays                  map[string]bool
 	lastHeartbeatReturned   time.Time
+	missingAssignments      map[string]int
 	opts                    options
 	state                   localState
 	coord                   *core.CoordinatorClient
@@ -549,13 +550,6 @@ func (a *agent) poll(ctx context.Context) error {
 	}
 	a.state.Machine.Leases = []leaseView{}
 	for _, c := range containers {
-		l, ok := a.state.Assignments[c.LeaseID]
-		if ok && !deadline(l).After(time.Now()) {
-			if err := a.containers.Remove(bounded, c, a.state.Machine.MachineID); err != nil {
-				return err
-			}
-			continue
-		}
 		a.state.Machine.Leases = append(a.state.Machine.Leases, leaseView{ID: c.LeaseID, State: "running"})
 	}
 	containers, err = a.ownedContainers(bounded)
@@ -581,8 +575,25 @@ func (a *agent) poll(ctx context.Context) error {
 		}
 		active[l.ID] = l
 	}
+	stopped := make(map[string]bool, len(response.Stop))
 	for _, id := range response.Stop {
+		stopped[id] = true
 		delete(active, id)
+	}
+	if a.missingAssignments == nil {
+		a.missingAssignments = make(map[string]int)
+	}
+	for _, c := range containers {
+		if _, ok := active[c.LeaseID]; ok || stopped[c.LeaseID] {
+			delete(a.missingAssignments, c.LeaseID)
+			continue
+		}
+		a.missingAssignments[c.LeaseID]++
+		if a.missingAssignments[c.LeaseID] == 1 {
+			if previous, ok := a.state.Assignments[c.LeaseID]; ok && deadline(previous).After(time.Now()) {
+				active[c.LeaseID] = previous
+			}
+		}
 	}
 	a.state.Assignments = active
 	a.updateFrontDoor(containers)
@@ -597,10 +608,24 @@ func (a *agent) poll(ctx context.Context) error {
 	present := map[string]localcontainer.ServedContainer{}
 	for _, c := range containers {
 		l, ok := active[c.LeaseID]
-		if !ok || !deadline(l).After(time.Now()) {
-			if err := a.containers.Remove(bounded, c, a.state.Machine.MachineID); err != nil {
+		switch {
+		case stopped[c.LeaseID]:
+			if err := a.removeContainer(bounded, c, "stop"); err != nil {
 				return err
 			}
+			continue
+		case ok && !deadline(l).After(time.Now()):
+			if err := a.removeContainer(bounded, c, "deadline passed: "+deadline(l).Format(time.RFC3339Nano)); err != nil {
+				return err
+			}
+			continue
+		case !ok && a.missingAssignments[c.LeaseID] >= 2:
+			if err := a.removeContainer(bounded, c, "missing from active after grace"); err != nil {
+				return err
+			}
+			delete(a.missingAssignments, c.LeaseID)
+			continue
+		case !ok:
 			continue
 		}
 		present[c.LeaseID] = c
@@ -656,6 +681,15 @@ func (a *agent) poll(ctx context.Context) error {
 	}
 	return nil
 }
+func (a *agent) removeContainer(ctx context.Context, c localcontainer.ServedContainer, reason string) error {
+	out := a.rt.Stderr
+	if out == nil {
+		out = os.Stderr
+	}
+	fmt.Fprintf(out, "serve heartbeat: removing container %s lease %s: %s\n", c.ID, c.LeaseID, reason)
+	return a.containers.Remove(ctx, c, a.state.Machine.MachineID)
+}
+
 func (a *agent) failed(ctx context.Context, id, reason string) {
 	if len(reason) > 1024 {
 		reason = reason[:1024]
@@ -676,7 +710,7 @@ func (a *agent) shutdown() error {
 	a.state.Machine.Leases = []leaseView{}
 	if a.opts.drain {
 		for _, c := range containers {
-			if err := a.containers.Remove(ctx, c, a.state.Machine.MachineID); err != nil {
+			if err := a.removeContainer(ctx, c, "stop: drain on exit"); err != nil {
 				return err
 			}
 		}
