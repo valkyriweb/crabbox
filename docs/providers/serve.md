@@ -292,10 +292,13 @@ response (including errors) plus the interval. Slow container work cannot
 compress successive heartbeat requests below that interval.
 
 The coordinator considers machines online for 30 seconds after their last
-heartbeat. After 90 seconds without a heartbeat, live leases become failed/lost.
-Machine records offline for more than seven days are pruned once all their
-leases have confirmed cleanup. On return, the agent removes only containers
-labeled as belonging to its own machine UUID when the coordinator no longer recognizes their leases.
+heartbeat. Missed heartbeats do not fail existing leases: the coordinator
+retains them until their TTL or idle deadline, or an explicit release. Machine
+records offline for more than seven days are pruned once all their leases have
+confirmed cleanup. On return, the agent removes only containers labeled as
+belonging to its own machine UUID when the coordinator explicitly stops them,
+their confirmed deadline passes, or two successful heartbeat responses omit
+them. Each removal logs its reason.
 
 Both the agent and an in-container watchdog enforce the hard TTL and idle
 deadline. The watchdog keeps running when the agent exits or cannot contact the
