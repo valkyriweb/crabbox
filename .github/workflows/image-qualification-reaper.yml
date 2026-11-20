@@ -18,6 +18,9 @@ concurrency:
 jobs:
   reap:
     name: Recover abandoned qualification
+    # Forks inherit the schedule without inheriting qualification infrastructure.
+    # Keep explicit recovery and qualification-completion cleanup available.
+    if: ${{ github.event_name != 'schedule' || !github.event.repository.fork || vars.IMAGE_QUALIFICATION_REAPER_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: image-qualification

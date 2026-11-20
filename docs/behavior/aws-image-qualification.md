@@ -392,3 +392,20 @@ finalization idempotently, and retires the registry record.
 Cloud setup, enrollment, candidate deployment, and paid execution remain
 explicit maintainer actions. Merging this seam creates no Worker, secret,
 Durable Object namespace, AWS resource, or spend.
+
+### Scheduled recovery on forks
+
+Forks skip the hourly image qualification reaper unless the repository variable
+`IMAGE_QUALIFICATION_REAPER_ENABLED` is `true`. Configure this repository-level
+variable only after the qualification infrastructure and the `image-qualification`
+environment are ready: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, and
+`CRABBOX_IMAGE_QUALIFICATION_CONTROLLER_TOKEN` must be available to the reaper.
+Environment-level variables are not available when GitHub evaluates the job gate.
+Enable scheduled recovery before running paid qualification, and keep it enabled
+while qualification resources may remain. Missing or invalid configuration still
+fails enabled runs; skipping a schedule is not evidence of zero cloud resources.
+
+Manual recovery and cleanup triggered by completion of `Image qualification`
+remain available regardless of this variable. They retain the protected
+environment and default-branch checks. Non-fork repositories retain their existing
+hourly recovery behavior.
