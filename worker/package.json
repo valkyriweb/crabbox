@@ -21,7 +21,7 @@
     "format:check": "oxfmt --check .",
     "lint": "oxlint --config .oxlintrc.json .",
     "start:node": "node dist-node/server.mjs",
-    "test": "vitest run"
+    "test": "node --experimental-strip-types --test test/database-retry.node-test.mjs && vitest run"
   },
   "dependencies": {
     "@aws-sdk/credential-providers": "^3.1136.0",

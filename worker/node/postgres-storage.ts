@@ -1,6 +1,7 @@
 import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from "pg";
 
 import type { CoordinatorStorage, CoordinatorStorageView } from "../src/coordinator-runtime";
+import { retryDatabaseInitialization } from "./database-retry";
 
 const schema = "crabbox";
 const table = `${schema}.coordinator_kv`;
@@ -23,10 +24,21 @@ export class PostgresCoordinatorStorage implements CoordinatorStorage {
           10_000,
         ),
       });
+    // pg removes failed idle clients; handling this event lets subsequent queries
+    // reconnect after a database switchover instead of terminating the process.
+    if (typeof this.pool.on === "function") {
+      this.pool.on("error", () => {
+        console.warn("coordinator database idle connection lost; next query will reconnect");
+      });
+    }
     this.view = new PostgresCoordinatorStorageView(storageQuery(this.pool));
   }
 
   async initialize(): Promise<void> {
+    await retryDatabaseInitialization(() => this.initializeSchema());
+  }
+
+  private async initializeSchema(): Promise<void> {
     await this.pool.query(`create schema if not exists ${schema}`);
     await this.pool.query(`
       create table if not exists ${table} (
