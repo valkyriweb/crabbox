@@ -11,6 +11,7 @@ import (
 type crabboxKongCLI struct {
 	Version kong.VersionFlag `name:"version" short:"v" help:"Print version."`
 
+	Host           hostKongCmd           `cmd:"" passthrough:"" help:"Enroll and operate coordinator-managed SSH hosts."`
 	Serve          serveKongCmd          `cmd:"" passthrough:"" help:"Donate trusted container capacity to the coordinator."`
 	VersionCmd     versionKongCmd        `cmd:"" name:"version" help:"Print version."`
 	Init           initKongCmd           `cmd:"" passthrough:"" help:"Onboard the current repo for Crabbox."`
@@ -459,6 +460,7 @@ type imageDeleteKongCmd struct {
 }
 
 type adminKongCmd struct {
+	RetireCreate      adminRetireCreateKongCmd      `cmd:"" name:"retire-create" passthrough:"" help:"Preview or retire an exact create request after its cancellation token was lost."`
 	ExtendLifetime    adminExtendLifetimeKongCmd    `cmd:"" name:"extend-lifetime" passthrough:"" help:"Extend an enrolled lease deadline before stopping starts."`
 	RetainedReconcile adminRetainedReconcileKongCmd `cmd:"" name:"retained-reconcile" passthrough:"" help:"Inspect retained lease reconciliation progress."`
 	LifetimeReadback  adminLifetimeReadbackKongCmd  `cmd:"" name:"lifetime-readback" passthrough:"" help:"Read coordinator-observed instance and root volume state."`
@@ -475,6 +477,14 @@ type adminKongCmd struct {
 type adminLeasesKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
+type adminRetireCreateKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+
+func (c *adminRetireCreateKongCmd) Run(ctx context.Context, app App) error {
+	return app.adminRetireCreate(ctx, c.Args)
+}
+
 type adminExtendLifetimeKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
@@ -510,14 +520,18 @@ type adminDeleteKongCmd struct {
 }
 
 type actionsKongCmd struct {
-	Hydrate  actionsHydrateKongCmd  `cmd:"" passthrough:"" help:"Hydrate a lease from the configured repo workflow."`
-	Register actionsRegisterKongCmd `cmd:"" passthrough:"" help:"Register an existing Linux lease as a GitHub Actions runner."`
-	Dispatch actionsDispatchKongCmd `cmd:"" passthrough:"" help:"Dispatch the configured GitHub Actions workflow."`
+	Unregister actionsUnregisterKongCmd `cmd:"" passthrough:"" help:"Remove the exact GitHub Actions runner recorded in a lease claim or cleanup receipt."`
+	Hydrate    actionsHydrateKongCmd    `cmd:"" passthrough:"" help:"Hydrate a lease from the configured repo workflow."`
+	Register   actionsRegisterKongCmd   `cmd:"" passthrough:"" help:"Register an existing lease as a GitHub Actions runner."`
+	Dispatch   actionsDispatchKongCmd   `cmd:"" passthrough:"" help:"Dispatch the configured GitHub Actions workflow."`
 }
 type actionsHydrateKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type actionsRegisterKongCmd struct {
+	Args []string `arg:"" optional:""`
+}
+type actionsUnregisterKongCmd struct {
 	Args []string `arg:"" optional:""`
 }
 type actionsDispatchKongCmd struct {
@@ -893,6 +907,9 @@ func (c *actionsHydrateKongCmd) Run(ctx context.Context, app App) error {
 }
 func (c *actionsRegisterKongCmd) Run(ctx context.Context, app App) error {
 	return app.actionsRegister(ctx, c.Args)
+}
+func (c *actionsUnregisterKongCmd) Run(ctx context.Context, app App) error {
+	return app.actionsUnregister(ctx, c.Args)
 }
 func (c *actionsDispatchKongCmd) Run(ctx context.Context, app App) error {
 	return app.actionsDispatch(ctx, c.Args)

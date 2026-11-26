@@ -4,7 +4,9 @@ import { describe, expect, it } from "vitest";
 
 import { awsUserData, windowsBootstrapPowerShell } from "../src/bootstrap";
 import {
+  psQuote,
   sharedLinuxSSHRestart,
+  sharedLinuxBootstrapStart,
   googleLinuxSigningKeyFingerprint,
   defaultTailscaleVersion,
   defaultTailscaleAMD64SHA256,
@@ -93,7 +95,10 @@ describe("shared bootstrap composition fixtures", () => {
             "VC_redist",
             "Remove-Item -LiteralPath $setupCompletePath",
           );
-          fragments.push(sharedWindowsNativePrelude(), sharedWslTruffleHogInstall());
+          fragments.push(
+            sharedWindowsNativePrelude(),
+            psQuote(sharedWslTruffleHogInstall()).slice(1, -1),
+          );
           fragments.push("test -e /proc/sys/fs/binfmt_misc/WSLInterop");
         } else if (config.desktop) {
           fragments.push(sharedWindowsDesktopPrelude(), sharedWindowsDesktop());
@@ -106,6 +111,11 @@ describe("shared bootstrap composition fixtures", () => {
         );
       } else {
         fragments.push(
+          sharedLinuxBootstrapStart()
+            .trimEnd()
+            .split("\n")
+            .map((line) => `    ${line}`)
+            .join("\n"),
           sharedLinuxSSHRestart()
             .trimEnd()
             .split("\n")

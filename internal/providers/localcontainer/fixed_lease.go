@@ -28,6 +28,10 @@ func isReleasedFixedLocalContainerClaim(claim core.LeaseClaim) bool {
 }
 
 func fixedLocalContainerFingerprint(cfg core.Config, req core.AcquireRequest, publicKey string) (string, error) {
+	ociRuntime, err := localContainerOCIRuntime(cfg)
+	if err != nil {
+		return "", err
+	}
 	cacheVolumes, err := localContainerCacheVolumeMounts(cfg.Cache.Volumes)
 	if err != nil {
 		return "", err
@@ -52,6 +56,7 @@ func fixedLocalContainerFingerprint(cfg core.Config, req core.AcquireRequest, pu
 		{Name: "network", Value: strings.TrimSpace(cfg.LocalContainer.Network)},
 		{Name: "dockerSocket", Value: cfg.LocalContainer.DockerSocket},
 		{Name: "noHostname", Value: cfg.LocalContainer.NoHostname, OmitEmpty: true},
+		{Name: "ociRuntime", Value: ociRuntime, OmitEmpty: true},
 		{Name: "hostVolumes", Value: volumes, OmitEmpty: true},
 		{Name: "cacheVolumes", Value: cacheVolumes, OmitEmpty: true},
 		{Name: "desktop", Value: cfg.Desktop},
@@ -86,15 +91,16 @@ func (b *backend) acquireFixed(ctx context.Context, req core.AcquireRequest, cfg
 		pendingLease = lease
 	}
 	acquired, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
-		Kind:         fixedLocalContainerLeaseKind,
-		LeaseID:      leaseID,
-		CheckpointID: req.RequestedCheckpointID,
-		RepoRoot:     req.Repo.Root,
-		Reclaim:      req.Reclaim,
-		TargetOS:     cfg.TargetOS,
-		WindowsMode:  cfg.WindowsMode,
-		TTL:          cfg.TTL,
-		IdleTimeout:  cfg.IdleTimeout,
+		Kind:           fixedLocalContainerLeaseKind,
+		LeaseID:        leaseID,
+		CheckpointID:   req.RequestedCheckpointID,
+		RepoRoot:       req.Repo.Root,
+		LegacyRepoRoot: req.Repo.LegacyRoot,
+		Reclaim:        req.Reclaim,
+		TargetOS:       cfg.TargetOS,
+		WindowsMode:    cfg.WindowsMode,
+		TTL:            cfg.TTL,
+		IdleTimeout:    cfg.IdleTimeout,
 	}, core.FixedLeaseOperations[inspectContainer]{Admission: &core.FixedAdmission{}, DescribeIntent: func(ctx context.Context, _ *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
 		providerScope := strings.TrimSpace(b.claimScope(ctx))
 		if providerScope == "" {
@@ -221,7 +227,7 @@ func (b *backend) acquireFixed(ctx context.Context, req core.AcquireRequest, cfg
 		containerID := strings.TrimSpace(claim.CloudID)
 		if !container.State.Running {
 			notRunning := core.Exit(4, "lease_id_conflict: fixed local-container lease %s is bound to a non-running container", leaseID)
-			if observedErr := validateObservedContainer(container, containerID, leaseID); observedErr != nil {
+			if observedErr := b.validateObservedContainer(ctx, container, containerID, leaseID); observedErr != nil {
 				if recoveringUnboundAttempt {
 					return core.LeaseTarget{}, errors.Join(notRunning, observedErr)
 				}

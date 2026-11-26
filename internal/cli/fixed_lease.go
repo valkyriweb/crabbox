@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -44,17 +45,19 @@ type FixedLeaseBinding struct {
 }
 
 type FixedAcquireOptions struct {
-	Kind         FixedLeaseKind
-	LeaseID      string
-	CheckpointID string
-	RepoRoot     string
-	Reclaim      bool
-	TargetOS     string
-	WindowsMode  string
-	TTL          time.Duration
-	IdleTimeout  time.Duration
-	Now          func() time.Time
-	journal      bool
+	Retention      *SessionDiskRetentionPolicy
+	Kind           FixedLeaseKind
+	LeaseID        string
+	CheckpointID   string
+	RepoRoot       string
+	LegacyRepoRoot string
+	Reclaim        bool
+	TargetOS       string
+	WindowsMode    string
+	TTL            time.Duration
+	IdleTimeout    time.Duration
+	Now            func() time.Time
+	journal        bool
 }
 
 func AcquireFixedLease(
@@ -95,6 +98,9 @@ func AcquireFixedIntent(
 	acquire func(context.Context, *LeaseClaim, *FixedCreateIntent, func() error) error,
 	ctx context.Context,
 ) (LeaseClaim, error) {
+	if opts.Retention != nil && !opts.journal {
+		return LeaseClaim{}, Exit(4, "retained acquisition requires the fixed resource journal owner")
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -128,7 +134,7 @@ func AcquireFixedIntent(
 			}
 		}
 		if exists {
-			if claim.FixedCreateIntent == nil ||
+			if claim.FixedCreateIntent == nil || !reflect.DeepEqual(claim.FixedCreateIntent.Retention, opts.Retention) ||
 				claim.FixedCreateIntent.Version != opts.Kind.IntentVersion ||
 				claim.FixedCreateIntent.Fingerprint != binding.Fingerprint ||
 				claim.FixedCreateIntent.ProviderScope != binding.ProviderScope {
@@ -137,7 +143,7 @@ func AcquireFixedIntent(
 			if claim.Provider != opts.Kind.ClaimProvider {
 				return Exit(4, "lease_id_conflict: lease %s is bound to provider=%s", opts.LeaseID, claim.Provider)
 			}
-			if claim.RepoRoot != "" && claim.RepoRoot != opts.RepoRoot && !opts.Reclaim {
+			if claim.RepoRoot != "" && !ClaimRepositoryMatches(claim.RepoRoot, opts.RepoRoot, opts.LegacyRepoRoot) && !opts.Reclaim {
 				return Exit(4, "lease_id_conflict: lease %s is bound to another repository", opts.LeaseID)
 			}
 		} else {
@@ -155,6 +161,7 @@ func AcquireFixedIntent(
 			claim.Labels = maps.Clone(binding.InitialLabels)
 			claim.FixedCreateIntent = &FixedCreateIntent{
 				Version:       opts.Kind.IntentVersion,
+				Retention:     opts.Retention,
 				Fingerprint:   binding.Fingerprint,
 				ProviderScope: binding.ProviderScope,
 				CheckpointID:  opts.CheckpointID,
@@ -164,6 +171,11 @@ func AcquireFixedIntent(
 			}
 			if opts.journal {
 				claim.FixedCreateIntent.Journal = &FixedLeaseJournal{Version: 1, Phase: "prepared", Revision: 1}
+				if opts.Retention != nil {
+					if err := initializeSessionDiskRetention(claim.FixedCreateIntent, opts.LeaseID, current); err != nil {
+						return err
+					}
+				}
 			}
 			if err := persist(); err != nil {
 				return err
@@ -178,7 +190,7 @@ func AcquireFixedIntent(
 		if err != nil {
 			return Exit(4, "lease_id_conflict: lease %s has invalid fixed create timestamp", opts.LeaseID)
 		}
-		if opts.TTL > 0 && now().UTC().After(createdAt.Add(opts.TTL)) {
+		if opts.Retention == nil && opts.TTL > 0 && now().UTC().After(createdAt.Add(opts.TTL)) {
 			return Exit(4, "lease_id_conflict: fixed create intent for lease %s has expired", opts.LeaseID)
 		}
 
@@ -188,7 +200,8 @@ func AcquireFixedIntent(
 		claim.LastUsedAt = now().UTC().Format(time.RFC3339)
 		intent.State = "acquired"
 		if intent.Journal != nil && intent.Journal.Phase != "acquired" {
-			intent.Journal = &FixedLeaseJournal{Version: 1, Phase: "acquired", Revision: intent.Journal.Revision + 1, Submission: intent.Journal.Submission}
+			intent.Journal.Phase = "acquired"
+			intent.Journal.Revision++
 		}
 		if err := persist(); err != nil {
 			return err

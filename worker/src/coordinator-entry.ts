@@ -24,6 +24,7 @@ import {
 } from "./pairing";
 import { runtimeAdapterProxyPath, runtimeAdapterRelayMethodAllowed } from "./runtime-adapter-relay";
 import { serveDisabledResponse, serveBodyLimit } from "./serve";
+import { hostCredentialRequest, hostCredentialRouteAllowed } from "./ssh-host-auth";
 import { timingSafeEqual } from "./timing-safe";
 import type { Env } from "./types";
 
@@ -51,6 +52,19 @@ export async function prepareCoordinatorRequest(
   authContext: AuthRequestContext = {},
 ): Promise<PreparedCoordinatorRequest> {
   const url = new URL(request.url);
+  // Host credentials never enter user/admin authentication, including proxy fallback.
+  if (hostCredentialRequest(request)) {
+    if (!hostCredentialRouteAllowed(request))
+      return {
+        response: json({ error: "host_scope_forbidden" }, { status: 403 }),
+        authenticated: false,
+      };
+    return {
+      request: requestWithoutCoordinatorAuthContext(request),
+      authenticated: false,
+      bodyLimit: serveBodyLimit,
+    };
+  }
   if (request.method === "GET" && url.pathname === "/v1/health") {
     return {
       response: json(
@@ -242,7 +256,11 @@ async function authenticatedCoordinatorRequest(
     };
   }
   const serveRoute = new URL(request.url).pathname.startsWith("/v1/serve/");
-  const disabled = serveRoute ? serveDisabledResponse(env, auth.owner) : undefined;
+  const relayRoute = /^\/v1\/serve\/(?:relay\/[^/]+\/(?:agent|client)|leases\/[^/]+\/relay)$/.test(
+    new URL(request.url).pathname,
+  );
+  // Relay admission is bound to its provider and current principals in Fleet.
+  const disabled = serveRoute && !relayRoute ? serveDisabledResponse(env, auth.owner) : undefined;
   if (disabled)
     return {
       response: /\/v1\/serve\/(?:relay\/|leases\/[^/]+\/relay$)/.test(new URL(request.url).pathname)

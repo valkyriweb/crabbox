@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ func (k FixedLeaseKind) IsFixedClaim(claim LeaseClaim) bool {
 
 func (k FixedLeaseKind) TerminalClaim(claim LeaseClaim, now time.Time) LeaseClaim {
 	intent := *claim.FixedCreateIntent
+	intent.Journal = cloneFixedJournal(intent.Journal)
 	intent.State = "released"
 	terminalFixedJournal(&intent)
 	intent.Attempt = nil
@@ -49,6 +51,10 @@ func (k FixedLeaseKind) TerminalClaim(claim LeaseClaim, now time.Time) LeaseClai
 		CoordinatorRegistrationURL:          claim.CoordinatorRegistrationURL,
 		RuntimeAdapterRegistrationID:        claim.RuntimeAdapterRegistrationID,
 		RuntimeAdapterPendingRegistrationID: claim.RuntimeAdapterPendingRegistrationID,
+	}
+	if claim.ActionsRunner != nil {
+		binding := *claim.ActionsRunner
+		terminal.ActionsRunner = &binding
 	}
 	if len(k.TerminalIdentityLabels) != 0 {
 		terminal.CloudID = claim.CloudID
@@ -124,11 +130,12 @@ func (k FixedLeaseKind) ValidateTerminalClaim(claim, previous LeaseClaim, leaseI
 		}
 		if claim.CoordinatorRegistrationURL != previous.CoordinatorRegistrationURL ||
 			claim.RuntimeAdapterRegistrationID != previous.RuntimeAdapterRegistrationID ||
-			claim.RuntimeAdapterPendingRegistrationID != previous.RuntimeAdapterPendingRegistrationID {
-			return Exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed coordinator registration", k.Label, leaseID)
+			claim.RuntimeAdapterPendingRegistrationID != previous.RuntimeAdapterPendingRegistrationID ||
+			!reflect.DeepEqual(claim.ActionsRunner, previous.ActionsRunner) {
+			return Exit(4, "lease_id_conflict: fixed %s lease %s terminal tombstone changed registration", k.Label, leaseID)
 		}
 		if previous.LeaseID != leaseID ||
-			previousIntent.Version != intent.Version ||
+			previousIntent.Version != intent.Version || !reflect.DeepEqual(previousIntent.Retention, intent.Retention) ||
 			previousIntent.Fingerprint != intent.Fingerprint ||
 			previousIntent.ProviderScope != intent.ProviderScope ||
 			previousIntent.CheckpointID != intent.CheckpointID ||

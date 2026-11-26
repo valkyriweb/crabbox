@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const metadataPath = path.join(root, "docs", "providers", "provider-metadata.json");
+const rootReadmePath = path.join(root, "README.md");
 const readmePath = path.join(root, "docs", "providers", "README.md");
 const lifecycleGuidePath = path.join(root, "docs", "features", "provider-live-smoke.md");
 const benchmarkCategoriesPath = path.join(root, "internal", "cli", "provider_categories_generated.go");
@@ -37,15 +38,19 @@ const allowed = {
   gpu: new Set(["yes", "optional", "no", "unknown"])
 };
 
-try {
-  main();
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
 }
 
 function main() {
   const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  const rootReadme = fs.readFileSync(rootReadmePath, "utf8");
+  validateReadmeCategories(rootReadme, metadata);
   const benchmarkCategories = formatGoSource(renderBenchmarkCategories(metadata));
   if (check) {
     if (!fs.existsSync(benchmarkCategoriesPath) || fs.readFileSync(benchmarkCategoriesPath, "utf8") !== benchmarkCategories) {
@@ -59,6 +64,13 @@ function main() {
   validate(providers, metadata);
   const generated = render(providers, metadata);
   const readme = fs.readFileSync(readmePath, "utf8");
+  validateProviderCounts(rootReadme, providers, "README.md");
+  validateProviderCounts(readme, providers, "docs/providers/README.md");
+  validateProviderTargetCounts(readme, providers);
+  const tailscalePath = path.join(root, "docs", "features", "tailscale.md");
+  const tailscale = fs.readFileSync(tailscalePath, "utf8");
+  const nextTailscale = replaceGenerated(tailscale, renderTailscaleProviders(providers),
+    "<!-- BEGIN GENERATED TAILSCALE PROVIDERS -->", "<!-- END GENERATED TAILSCALE PROVIDERS -->", tailscalePath);
   const next = replaceGenerated(readme, generated, beginMarker, endMarker, readmePath);
   const lifecycleGuide = fs.readFileSync(lifecycleGuidePath, "utf8");
   const coverage = lifecycleCoverage(providers, metadata);
@@ -71,6 +83,9 @@ function main() {
   );
 
   if (check) {
+    if (nextTailscale !== tailscale) {
+      fail("Tailscale provider catalog is stale; run node scripts/generate-provider-matrix.mjs");
+    }
     if (next !== readme) {
       fail("provider decision matrix is stale; run node scripts/generate-provider-matrix.mjs");
     }
@@ -79,10 +94,29 @@ function main() {
     }
     console.log(`checked provider matrix: ${providers.length} providers`);
   } else {
+    fs.writeFileSync(tailscalePath, nextTailscale, "utf8");
     fs.writeFileSync(readmePath, next, "utf8");
     fs.writeFileSync(lifecycleGuidePath, nextLifecycleGuide, "utf8");
     console.log(`generated provider matrix: ${providers.length} providers`);
   }
+}
+
+export function renderTailscaleProviders(providers) {
+  const supported = providers.filter((provider) => provider.features.includes("tailscale"));
+  const links = (entries) => entries.map((provider) =>
+    `\u005b${provider.provider}\u005d(../providers/${provider.provider}.md)`).join(", ");
+  const peers = supported.filter((provider) => provider.reachability?.includes("tailnet-peer"));
+  const egress = supported.filter((provider) => provider.reachability?.includes("tailnet-egress"));
+  return [
+    "<!-- BEGIN GENERATED TAILSCALE PROVIDERS -->",
+    "",
+    `The compiled provider catalog declares Tailscale support for ${supported.length} providers.`,
+    "",
+    `- Bidirectional tailnet peers (including pond transport): ${links(peers)}.`,
+    `- Egress-only userspace access: ${links(egress)}. These providers do not advertise a bidirectional pond tailnet endpoint.`,
+    "",
+    "<!-- END GENERATED TAILSCALE PROVIDERS -->",
+  ].join("\n");
 }
 
 function readProviderMatrix() {
@@ -173,10 +207,10 @@ function render(providers, metadata) {
     "",
     "This table combines the live provider spec compiled into the CLI with curated",
     "selection metadata. Regenerate it with `node scripts/generate-provider-matrix.mjs`.",
-    "`scripts/check-docs.sh` fails when provider registration, metadata, docs paths, or",
-    "this generated table drift.",
+    "`scripts/check-docs.sh` fails when provider registration, metadata, docs paths,",
+    "stated counts, or this generated table drift.",
     "",
-    `Current built-in surface: ${providers.length} providers (${counts.get("ssh-lease") ?? 0} SSH lease, ${counts.get("delegated-run") ?? 0} delegated run, ${counts.get("service-control") ?? 0} service control).`,
+    `Current catalog: ${providers.length} entries, including \`external\` (${counts.get("ssh-lease") ?? 0} SSH lease, ${counts.get("delegated-run") ?? 0} delegated run, ${counts.get("service-control") ?? 0} service control).`,
     "",
     "Access terms:",
     "",
@@ -198,8 +232,83 @@ function render(providers, metadata) {
     );
   }
 
-  lines.push("", endMarker);
+  lines.push("", renderProviderCategories(metadata), "", endMarker);
   return lines.join("\n");
+}
+
+export function renderProviderCategories(metadata) {
+  const groups = new Map();
+  for (const [name, profile] of Object.entries(metadata)) {
+    if (!groups.has(profile.category)) groups.set(profile.category, []);
+    groups.get(profile.category).push(name);
+  }
+  const lines = [
+    "## Providers By Category",
+    "",
+    "The groups below match `crabbox providers --json` and the checked-in",
+    "`provider-metadata.json`. Categories describe use and hosting, while the separate",
+    "`coordinator` field describes routing: Daytona is categorized as `direct-cloud`",
+    "but also supports coordinator-managed leases.",
+    "",
+    "| Category | Entries | Providers |",
+    "| --- | --- | --- |"
+  ];
+  for (const category of [...groups.keys()].sort()) {
+    const names = groups.get(category).sort();
+    const links = names.map((name) => `[${escapeCell(name)}](${escapeLink(metadata[name].docs)})`);
+    lines.push(`| ${code(category)} | ${names.length} | ${links.join(", ")} |`);
+  }
+  return lines.join("\n");
+}
+
+export function validateReadmeCategories(readme, metadata) {
+  const start = readme.indexOf("<!-- BEGIN README PROVIDER LIST -->");
+  const end = readme.indexOf("<!-- END README PROVIDER LIST -->");
+  if (start < 0 || end < start) fail("missing provider list markers in README.md");
+  const sections = readme.slice(start, end).split(/^### /m).slice(1);
+  const seen = new Set();
+  const categories = new Set(Object.values(metadata).map((profile) => profile.category));
+  const seenCategories = new Set();
+  for (const section of sections) {
+    const category = section.match(/^Catalog category: `([^`]+)`/m)?.[1];
+    if (!categories.has(category)) fail(`README.md has an unknown or missing catalog category: ${category}`);
+    if (seenCategories.has(category)) fail(`README.md repeats catalog category ${category}`);
+    seenCategories.add(category);
+    for (const [, name, href] of section.matchAll(/^\| \[([^\]]+)\]\(([^)]+)\) \|/gm)) {
+      const profile = metadata[name];
+      if (!profile) fail(`README.md lists unknown provider ${name}`);
+      if (seen.has(name)) fail(`README.md lists provider ${name} more than once`);
+      seen.add(name);
+      if (profile.category !== category) {
+        fail(`README.md lists ${name} under ${category}; metadata category is ${profile.category}`);
+      }
+      if (href !== `docs/providers/${profile.docs}`) fail(`README.md has an incorrect docs link for ${name}`);
+    }
+  }
+  const missing = Object.keys(metadata).filter((name) => !seen.has(name));
+  if (missing.length) fail(`README.md provider list is missing: ${missing.join(", ")}`);
+}
+
+function validateProviderCounts(readme, providers, file) {
+  const summary = readme.match(/(\d+) built-in providers plus the `external` plugin\s+contract(?:\*\*)?(?::|\s*\()\s*(\d+) (?:catalog )?entries/);
+  if (!summary) fail(`${file} is missing the provider count summary`);
+  const externalCount = providers.filter((provider) => provider.provider === "external").length;
+  const builtInCount = providers.length - externalCount;
+  if (Number(summary[1]) !== builtInCount || Number(summary[2]) !== providers.length) {
+    fail(`${file} provider counts are stale: expected ${builtInCount} built-in providers plus ${externalCount} external entry (${providers.length} catalog entries)`);
+  }
+}
+
+function validateProviderTargetCounts(readme, providers) {
+  const summary = readme.match(/target declarations cover Linux on (\d+) entries, macOS on (\d+),\s+native Windows \(`windows\/normal`\) on (\d+), and WSL2 \(`windows\/wsl2`\) on (\d+)/);
+  if (!summary) fail("docs/providers/README.md is missing the provider target count summary");
+  const targets = ["linux", "macos", "windows/normal", "windows/wsl2"];
+  for (const [index, target] of targets.entries()) {
+    const count = providers.filter((provider) => provider.targets.includes(target)).length;
+    if (Number(summary[index + 1]) !== count) {
+      fail(`docs/providers/README.md target count is stale: expected ${count} entries for ${target}`);
+    }
+  }
 }
 
 function replaceGenerated(input, generated, startMarker, endMarker, targetPath) {

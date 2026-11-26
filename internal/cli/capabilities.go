@@ -42,12 +42,15 @@ func validateRequestedCapabilities(cfg Config) error {
 		return err
 	}
 	spec := provider.Spec()
+	features := ProviderFeaturesForConfig(provider, cfg)
+	if cfg.Tailscale.Enabled && !features.Has(FeatureTailscale) {
+		return Exit(2, "--tailscale is not supported for provider=%s; choose a provider advertising the tailscale feature in crabbox providers --json", spec.Name)
+	}
 	if configured, ok := provider.(ProviderConfiguredFeatures); ok {
 		if err := configured.ValidateRequestedCapabilities(cfg); err != nil {
 			return err
 		}
 	}
-	features := ProviderFeaturesForConfig(provider, cfg)
 	if cfg.Desktop && !features.Has(FeatureDesktop) {
 		return Exit(2, "desktop/VNC is not supported for provider=%s", spec.Name)
 	}
@@ -320,6 +323,10 @@ Write-Output ("BROWSER=" + $path)
 Write-Output ("CHROME_BIN=" + $path)`
 }
 
+func WindowsBrowserProbePowerShell() string {
+	return windowsBrowserProbeScript()
+}
+
 func parseEnvLines(input string) map[string]string {
 	env := map[string]string{}
 	for _, line := range strings.Split(input, "\n") {
@@ -426,7 +433,7 @@ const vncPasswordSSHMaxBytes = 64 << 10
 func runVNCPasswordSSH(ctx context.Context, target SSHTarget, remote string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, vncPasswordSSHWait)
 	defer cancel()
-	return runSSHOutputBoundedWithOptions(ctx, target, remote, vncPasswordSSHMaxBytes, vncPasswordSSHWait, "10", "3")
+	return runSSHOutputBoundedWithOptions(ctx, target, remote, vncPasswordSSHMaxBytes, sshCommandLimit{execution: vncPasswordSSHWait}, "10", "3")
 }
 
 // remoteVNCCredentialReadCommand builds a remote read operation, not a credential value.

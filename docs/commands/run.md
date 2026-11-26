@@ -5,6 +5,23 @@ streams the output back, and exits with the remote command's exit code. It is
 the core verb: lease (or reuse) a machine, ship your code, run something, get
 the result.
 
+On Unix, an early-closing stdout or stderr consumer (for example,
+`crabbox run -- <command> | head`) cancels the current operation and lets normal
+lease cleanup finish before Crabbox exits with status **141** (`128 + SIGPIPE`).
+In a shell with pipeline status reporting, the expected result is `141 0` when
+`head` succeeds: the output was interrupted, so Crabbox does not report a
+successful complete run. Cleanup diagnostics use stderr when it remains open;
+a closed stderr cannot interrupt cleanup again. Unix pipe/socket outputs are
+checked every 100 ms, so a disappearing consumer cancels even a quiet workload
+before its next write, including when a child inherits output directly. A SIGPIPE
+from an unrelated descriptor does not cancel a run with healthy stdout and stderr.
+Regular files, terminals, and `/dev/null` are not monitored as output pipes.
+Windows reports broken output pipes as exit status 1.
+
+Retention policies still apply: `--keep`, `--keep-on-failure`, and reused leases
+remain retained as documented. For a retained lease, cancellation alone does not
+guarantee that a remote workload has stopped; see the ownership guidance below.
+
 By default the source is Git. Opt into `sync.source: directory` with a nonempty
 `sync.include` to sync the effective current directory through the ordinary
 POSIX/WSL SSH managed-manifest transport. This still requires installed Git for
@@ -55,11 +72,11 @@ snippets, pipes, or shell expansion.
 On Cloudflare Sandbox, Superserve, Crownest, Vercel Sandbox, Nomad, CodeSandbox,
 OpenComputer, Docker Sandbox, Agent Sandbox, SmolVM, Upstash Box, Tensorlake,
 OpenSandbox, Blaxel, Cloudflare containers, Azure Dynamic Sessions, Anthropic
-Sandbox Runtime, Daytona, Freestyle, Islo, Modal, Cloud Run Sandbox, and Orgo,
-quoted or interpolated profile arguments retain their literal meaning through
-the delegated command transport. A value such as `&&` does not become a shell
-operator, and an executable named `FOO=x` is invoked rather than treated as an
-environment assignment. Explicit `--shell` still selects shell source.
+Sandbox Runtime, Daytona, Freestyle, Islo, Modal, Cloud Run Sandbox, Orgo, and
+Apple Machine, quoted or interpolated profile arguments retain their literal
+meaning through the delegated command transport. A value such as `&&` does not
+become a shell operator, and an executable named `FOO=x` is invoked rather than
+treated as an environment assignment. Explicit `--shell` still selects shell source.
 
 On POSIX SSH targets, `--shell` runs in a Bash login shell. Its startup and
 logout files are part of that shell's behavior: for example, `set -e` plus a
@@ -568,6 +585,14 @@ directly with inherited input/output streams, the remote working directory, and
 its actual exit status. Arguments to `--script` use the same transport to
 Windows PowerShell's `-File` entrypoint.
 
+Windows command arguments, forwarded environment values, and paths preserve
+typographic quotes (`‘ ’ ‚ ‛ “ ” „`) as literal data. The same quoting applies
+to Windows Sandbox, Hyper-V, and generated Windows bootstrap scripts. PowerShell
+recognizes smart quotes as delimiters, so Crabbox escapes all single-quote
+variants when generating literals; see Microsoft's
+[about_Quoting_Rules](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_quoting_rules)
+and [language specification §2.3.5.2](https://learn.microsoft.com/en-us/powershell/scripting/lang-spec/chapter-02#2352-string-literals).
+
 An explicitly selected interpreter still owns its syntax: `cmd /c` and `.cmd`/
 `.bat` launchers use cmd's expansion and quoting rules, and `powershell -Command`
 parses its command as PowerShell source. PowerShell scripts and cmdlets retain
@@ -581,7 +606,7 @@ for PowerShell expressions rather than nesting another `powershell -Command`.
 
 ### Native Windows background processes
 
-Managed native Windows leases install Node 24.19.0 and npm when either runtime
+Managed native Windows leases install Node 24.22.3 and npm when either runtime
 is missing or broken. The checksum-pinned x64 or ARM64 runtime lives in
 `C:\Program Files\nodejs` on the machine PATH; working existing installations
 are retained. Readiness requires both version commands to succeed.
@@ -1100,6 +1125,20 @@ limited to `request`, `network_ready`, `bootstrap`, and `unattributed`.
 Malformed vectors are discarded and valid legacy startup scalars remain the
 fallback. Failed runs also
 include `blockedStage`, `resourceExhaustion`, and `retryLikely` when classifiable.
+
+For `run --id <lease> --no-sync`, the final `runnerTotalMs` also includes local
+preparation and terminal history confirmation. Its named phases partition wall
+time, including waits for concurrent telemetry, without double counting.
+`commandMs` measures command execution rather than its preceding preparation.
+Coordinator-backed runs first emit a checked snapshot with
+`terminalPending: true`, then emit the final timing snapshot after terminal
+recording; consumers should use the last JSON record. The checked write retains
+the guarantee that a timing-sink failure before terminal recording affects the
+signed outcome. A failure writing the final snapshot affects the CLI exit, but
+cannot change a terminal record that is already committed. The benchmark timing
+store retains the checked snapshot, marked pending, so a store failure can still
+affect the signed outcome.
+
 Optional `failureEvidence` contains the provider's classification, sanitized
 `hint`, and bounded string-valued `details`. Invalid optional presentation fields
 do not erase valid OOM classification. The same snapshot is copied into local

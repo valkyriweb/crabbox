@@ -39,7 +39,7 @@ const shared = new Proxy({}, {
 const hasPowerShell = spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], { encoding: "utf8" }).status === 0;
 const nameFor = (name) => "shared" + name[0].toUpperCase() + name.slice(1);
 function parameters(fixture) {
-  return { cssStyle: "coordinator", ...fixture, version: sources.constants.defaultTailscaleVersion, amd64SHA: sources.constants.defaultTailscaleAMD64SHA256, arm64SHA: sources.constants.defaultTailscaleARM64SHA256 };
+  return { cssStyle: "coordinator", roots: [fixture.workRoot, "/var/cache/crabbox"], ...fixture, version: sources.constants.defaultTailscaleVersion, amd64SHA: sources.constants.defaultTailscaleAMD64SHA256, arm64SHA: sources.constants.defaultTailscaleARM64SHA256 };
 }
 function render(fragment, fixture) {
   const values = parameters(fixture);
@@ -60,6 +60,56 @@ test("generation is reproducible and every checked-in output is current", async 
   const first = generateSources(sources);
   assert.deepEqual(generateSources(await loadSources()), first);
   for (const [path, source] of first) assert.equal(await readFile(resolve(repoRoot, path), "utf8"), source, path);
+});
+
+test("early bootstrap quiesces scheduled APT on every boot without stopping package services", async (t) => {
+  const script = shared.sharedLinuxBootstrapStart();
+  const disable = "systemctl disable --now --no-block apt-daily.timer apt-daily-upgrade.timer";
+  const mask = "systemctl mask apt-daily.service apt-daily-upgrade.service";
+  assert.ok(script.includes(disable));
+  assert.ok(script.includes(mask));
+  assert.ok(script.indexOf(mask) < script.indexOf("cloud-init-per instance"));
+  assert.doesNotMatch(script, /mask[^\n]*--now|systemctl (?:stop|kill)[^\n]*apt-daily.*service|mask[^\n]*unattended-upgrades\.service/);
+  for (const shell of ["bash", "sh"]) {
+    run(shell, ["-n"], { input: script });
+    const directory = await temporary(t);
+    const log = join(directory, "calls");
+    // cloud-init-per has already run on a resumed instance. The guard must still run.
+    await writeFile(join(directory, "cloud-init-per"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const prelude = `systemctl() { printf '%s\\n' "$*" >>${shellQuote(log)}; return "\${SYSTEMCTL_RESULT:-0}"; }\n`;
+    for (const result of ["0", "1"]) {
+      await writeFile(log, "");
+      run(shell, ["-euc", prelude + script], { env: { ...process.env, PATH: directory + ":" + process.env.PATH, SYSTEMCTL_RESULT: result } });
+      assert.equal(await readFile(log, "utf8"), disable.slice("systemctl ".length) + "\n" + mask.slice("systemctl ".length) + "\n");
+    }
+    // An image without systemctl must also reach the instance bootstrap.
+    run(`/bin/${shell}`, ["-euc", script], { env: { PATH: directory } });
+  }
+});
+
+test("explicit package installs wait for an active scheduled transaction outside bootcmd", async (t) => {
+  const directory = await temporary(t);
+  const counter = join(directory, "counter");
+  await writeFile(join(directory, "apt-get"), `#!/bin/sh\n[ "$(cat ${shellQuote(counter)})" -eq 3 ]\n`, { mode: 0o755 });
+  const script = shared.sharedLinuxBootstrapPrelude();
+  assert.ok(!shared.sharedLinuxBootstrapStart().includes("systemctl show"));
+  for (const shell of ["bash", "sh"]) {
+    run(shell, ["-n"], { input: script });
+    await writeFile(counter, "0");
+    const fixture = `systemctl() {
+  count=$(cat ${shellQuote(counter)})
+  count=$((count + 1))
+  printf '%s' "$count" >${shellQuote(counter)}
+  case "$count" in 1) echo activating;; 2) echo deactivating;; *) echo inactive;; esac
+}
+sleep() { :; }
+`;
+    const env = { ...process.env, PATH: directory + ":" + process.env.PATH };
+    run(shell, ["-euc", fixture + script + "\nretry apt-get update\nretry apt-get install -y jq"], { env });
+    assert.equal(await readFile(counter, "utf8"), "3");
+    // Missing units/non-systemd must not break an explicit package install.
+    run(shell, ["-euc", "systemctl() { return 1; };\n" + script + "\nretry apt-get install -y jq"], { env });
+  }
 });
 
 test("bootstrap package hooks cannot restart cloud-init, even with inherited automatic mode", async (t) => {
@@ -147,9 +197,10 @@ test("compiled Go and TypeScript agree exactly for every shared fragment and fix
   }
   const constants = Object.keys(sources.constants).map((name) => `${JSON.stringify(name)}:${name},`);
   await writeFile(join(directory, "bootstrap.go"), (await readFile(resolve(repoRoot, "internal/cli/bootstrap_generated.go"), "utf8")).replace("package cli", "package main"));
+  await writeFile(join(directory, "quote.go"), (await readFile(resolve(repoRoot, "internal/cli/powershell_quote.go"), "utf8")).replace("package cli", "package main"));
   await writeFile(join(directory, "catalog.go"), (await readFile(resolve(repoRoot, "internal/cli/os_image.go"), "utf8")).replace("package cli", "package main"));
   await writeFile(join(directory, "main.go"), `package main\nimport("encoding/json";"os")\nfunc main(){json.NewEncoder(os.Stdout).Encode(map[string]any{"fragments":map[string]string{${entries.join("\n")}},"constants":map[string]string{${constants.join("\n")}},"images":osImageSpecs,"aliases":osImageAliases,"default":defaultOSImage})}\n`);
-  const actual = JSON.parse(run("go", ["run", join(directory, "main.go"), join(directory, "bootstrap.go"), join(directory, "catalog.go")]));
+  const actual = JSON.parse(run("go", ["run", join(directory, "main.go"), join(directory, "bootstrap.go"), join(directory, "catalog.go"), join(directory, "quote.go")]));
   for (const [key, value] of Object.entries(expected)) assert.ok(actual.fragments[key] === value, `fragment differs: ${key}`);
   assert.deepEqual(actual.constants, sources.constants);
   for (const name of Object.keys(sources.constants)) assert.equal(shared[name], sources.constants[name]);
@@ -161,7 +212,7 @@ test("compiled Go and TypeScript agree exactly for every shared fragment and fix
 
 test("shell and PowerShell literals preserve quoting-sensitive data without evaluation", async (t) => {
   const directory = await temporary(t);
-  for (const value of ["alice's $HOME `id` \\\" 🦀", "line\nREADY\nprintf injected\r", "", "{{user}} ${value}"]) {
+  for (const value of ["alice's $HOME `id` \\\" 🦀", "line\nREADY\nprintf injected\r", "", "{{user}} ${value}", "‘’‚‛“”„", "a’;throw 'injected';‘", "\n'@\n\"@\n"]) {
     assert.equal(run("bash", ["-c", `printf '%s' ${shellQuote(value)}`]), value);
     const header = shared.sharedWindowsHeader(value, value, value, [value]);
     const assignments = header.slice(header.indexOf("$user ="), header.indexOf('$base ='));

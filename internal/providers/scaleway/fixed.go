@@ -37,7 +37,8 @@ func (b *Backend) acquireFixed(ctx context.Context, req core.AcquireRequest) (co
 	cfg.ServerType, cfg.Scaleway.Region, cfg.Scaleway.Zone = cfg.Scaleway.Type, client.Region(), client.Zone()
 	var publicKey string
 	lease, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
-		Kind: fixedLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
+		LegacyRepoRoot: req.Repo.LegacyRoot,
+		Kind:           fixedLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
 		TargetOS: core.TargetLinux, TTL: cfg.TTL, IdleTimeout: cfg.IdleTimeout, Now: b.clockNow,
 	}, core.FixedLeaseOperations[*instance.Server]{
 		// A submitted request may still be in flight even when inventory is empty.
@@ -173,7 +174,9 @@ func (b *Backend) prepareFixedServer(ctx context.Context, client Client, cfg cor
 			return core.WaitForSSHReady(ctx, target, b.rt.Stderr, phase, timeout)
 		}
 	}
-	if err := wait(ctx, &ssh, "scaleway bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
+	if err := core.WaitForDirectBootstrap(ctx, cfg, server, &ssh, core.BootstrapWaitTimeout(cfg), func(ctx context.Context, target *core.SSHTarget, timeout time.Duration) error {
+		return wait(ctx, target, "scaleway bootstrap", timeout)
+	}); err != nil {
 		return core.LeaseTarget{}, err
 	}
 	labels["state"] = "ready"

@@ -13,6 +13,7 @@ import {
   windowsBootstrapPowerShell,
 } from "../src/bootstrap";
 import {
+  psQuote,
   sharedLinuxBootstrapPrelude,
   sharedGnomeDesktopTheme,
   sharedWindowsRuntime,
@@ -44,6 +45,37 @@ function expectRuntimeBeforeCore(script: string) {
   expect(script.split("function Ensure-CrabboxWindowsRuntime {")).toHaveLength(2);
   expect(script.split("\nEnsure-CrabboxWindowsRuntime\n")).toHaveLength(2);
 }
+
+describe("scheduled APT policy", () => {
+  it.each([false, true])("quiesces in bootcmd before readiness, private AWS=%s", (awsPrivate) => {
+    const script = cloudInit({ ...config, awsPrivate });
+    const block = script.split("\nbootcmd:\n  - |\n")[1]?.split(/\n(?=\S)/)[0];
+    const boot =
+      block
+        ?.split("\n")
+        .map((line) => line.slice(4))
+        .join("\n") + "\n";
+    expect(block).toBeDefined();
+    expect(boot).toBeDefined();
+    for (const command of [
+      "systemctl disable --now --no-block apt-daily.timer apt-daily-upgrade.timer",
+      "systemctl mask apt-daily.service apt-daily-upgrade.service",
+    ]) {
+      expect(boot).toContain(command);
+      const start = awsPrivate ? boot!.length : boot!.indexOf("cloud-init-per instance");
+      expect(boot!.indexOf(command)).toBeLessThan(start);
+    }
+    for (const shell of ["bash", "sh"]) {
+      const result = spawnSync(shell, ["-n"], { input: boot, encoding: "utf8" });
+      expect(result.stderr).toBe("");
+      expect(result.status).toBe(0);
+    }
+    const wait = script.indexOf("systemctl show --property=ActiveState");
+    expect(wait).toBeGreaterThan(script.indexOf("\nwrite_files:\n"));
+    expect(wait).toBeLessThan(script.indexOf("retry apt-get"));
+    expect(script).not.toMatch(/systemctl mask[^\n]*unattended-upgrades/);
+  });
+});
 
 describe("native Windows runtime readiness", () => {
   for (const architecture of ["amd64", "arm64"] as const) {
@@ -137,7 +169,7 @@ describe("native Windows runtime readiness", () => {
       expect(script).toContain("Restart-Service sshd -Force");
     }
     expect(shared).toContain(sharedWindowsNativePrelude());
-    expect(shared).toContain(sharedWslTruffleHogInstall());
+    expect(shared).toContain(psQuote(sharedWslTruffleHogInstall()).slice(1, -1));
     expect(shared.indexOf('$wslDistro = "Crabbox"')).toBeGreaterThan(
       shared.indexOf(sharedWindowsCore()) + sharedWindowsCore().length,
     );
@@ -727,12 +759,12 @@ describe("cloud-init bootstrap", () => {
     const got = cloudInit({ ...config, code: true });
     expect(got).not.toContain("https://code-server.dev/install.sh");
     expect(got).not.toContain("curl -fsSL https://code-server.dev/install.sh | sh");
-    expect(got).toContain("CS_VERSION='4.126.0'");
+    expect(got).toContain("CS_VERSION='4.146.0'");
     expect(got).toContain(
-      "x86_64) CS_ARCH=amd64; CS_SHA256='54b648d010c02b6583aa06bd8d2aaf109fc624479b9bc2ff71cb94807ac39afa'",
+      "x86_64) CS_ARCH=amd64; CS_SHA256='cf7e82ca5fe1df664d43a43d900c3c9710f8f3403a5e8d0e18f6a12d10d7401b'",
     );
     expect(got).toContain(
-      "aarch64|arm64) CS_ARCH=arm64; CS_SHA256='441614708ae81b13f14b26db41da8f46f88d7d092c08343a42a0c6c52c51a69d'",
+      "aarch64|arm64) CS_ARCH=arm64; CS_SHA256='3df88f7f1feecce3583ab0109c5f6bf14f90ae3a44939b4257ccd9850ef37a6e'",
     );
     expect(got).toContain(
       "https://github.com/coder/code-server/releases/download/v${CS_VERSION}/code-server-${CS_VERSION}-linux-${CS_ARCH}.tar.gz",
@@ -776,6 +808,64 @@ describe("cloud-init bootstrap", () => {
     expect(codeServerCleanup).toBeGreaterThan(codeServerTrap);
   });
 
+  it.skipIf(process.platform === "win32")(
+    "enrolls before exit-node selection and fails before readiness on selection errors",
+    () => {
+      for (const exitNode of ["exit.example.ts.net", "100.64.0.1"]) {
+        for (const fail of [false, true]) {
+          const dir = mkdtempSync(join(tmpdir(), "crabbox-tailscale-"));
+          try {
+            const got = cloudInit({
+              ...config,
+              tailscale: true,
+              tailscaleAuthKey: "synthetic",
+              tailscaleExitNode: exitNode,
+              tailscaleExitNodeAllowLanAccess: true,
+            });
+            const start = got.indexOf(`printf '%s' "$TS_AUTHKEY" | tailscale up`);
+            const end = got.indexOf(
+              `    printf '%s\\n' "$ts_ip" > /var/lib/crabbox/tailscale-ipv4`,
+            );
+            expect(start).toBeGreaterThanOrEqual(0);
+            expect(end).toBeGreaterThan(start);
+            const script = `tailscale() {
+  case "$1" in
+    up)
+      case "$*" in *--exit-node=*) return 1 ;; esac
+      touch "$JOINED" ;;
+    ip) test -f "$JOINED"; echo 100.64.0.2 ;;
+    set)
+      test -f "$JOINED"
+      test "$FAIL_SELECTION" != true
+      case "$*" in *"--exit-node=$EXIT_NODE --exit-node-allow-lan-access"*) : ;; *) return 1 ;; esac ;;
+    *) return 2 ;;
+  esac
+}
+TS_AUTHKEY=synthetic
+${got.slice(start, end)}
+echo ready
+`;
+            const result = spawnSync("bash", ["-euo", "pipefail", "-c", script], {
+              encoding: "utf8",
+              timeout: 5000,
+              env: {
+                ...process.env,
+                JOINED: join(dir, "joined"),
+                EXIT_NODE: exitNode,
+                FAIL_SELECTION: String(fail),
+              },
+            });
+            expect(result.error).toBeUndefined();
+            expect(result.status === 0).toBe(!fail);
+            expect(result.stdout.includes("ready")).toBe(!fail);
+          } finally {
+            rmSync(dir, { recursive: true, force: true });
+          }
+        }
+      }
+    },
+  );
+
   it("adds Tailscale setup only when requested", () => {
     const plain = cloudInit(config);
     expect(plain).not.toContain("tailscale up");
@@ -804,7 +894,18 @@ describe("cloud-init bootstrap", () => {
     expect(got).not.toContain("WantedBy=halt.target reboot.target shutdown.target");
     expect(got).toContain("install -d -m 0750 -o 'runner' -g 'runner' /var/lib/crabbox");
     expect(got).toContain(
-      "printf '%s' \"$TS_AUTHKEY\" | tailscale up --auth-key=file:/dev/stdin --hostname='crabbox-blue-lobster' --advertise-tags='tag:crabbox' --exit-node='mac-studio.tailnet.ts.net' --exit-node-allow-lan-access",
+      "printf '%s' \"$TS_AUTHKEY\" | tailscale up --auth-key=file:/dev/stdin --hostname='crabbox-blue-lobster' --advertise-tags='tag:crabbox'",
+    );
+    const upAt = got.indexOf("tailscale up ");
+    const joinedAt = got.indexOf('test -n "$ts_ip"');
+    const setAt = got.indexOf("tailscale set --exit-node=");
+    expect(upAt).toBeGreaterThanOrEqual(0);
+    expect(joinedAt).toBeGreaterThan(upAt);
+    expect(setAt).toBeGreaterThan(joinedAt);
+    const upLine = got.slice(upAt, got.indexOf("\n", upAt));
+    expect(upLine).not.toContain("--exit-node");
+    expect(got).toContain(
+      "tailscale set --exit-node='mac-studio.tailnet.ts.net' --exit-node-allow-lan-access",
     );
     expect(got).not.toContain('--auth-key="$TS_AUTHKEY"');
     expect(got).toContain(
@@ -887,7 +988,7 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("crabbox-sshd-$port");
     expect(got).toContain("tightvnc-2.8.85-gpl-setup-64bit.msi");
     expect(got).toContain("d8fbed7b27ebab86df6f780f6e86f723668f3715cee521ccaa4568812aef5f3e");
-    expect(got).toContain("d8de7a3152266c8bb13577eab850ea1df6dccf8c2aa48be5b4a1c58b7190d62c");
+    expect(got).toContain("c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559");
     expect(got).toContain("NewNetworkWindowOff");
     expect(got).toContain("DoNotOpenServerManagerAtLogon");
     expect(got).toContain("VALUE_OF_PASSWORD=$vncPassword");
@@ -945,8 +1046,8 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("function Assert-CrabboxFileSHA256");
     expect(got).toContain("OpenSSH-Win64.zip");
     expect(got).toContain("0ca131f3a78f404dc819a6336606caec0db1663a692ccc3af1e90232706ada54");
-    expect(got).toContain("Git-2.52.0-64-bit.exe");
-    expect(got).toContain("d8de7a3152266c8bb13577eab850ea1df6dccf8c2aa48be5b4a1c58b7190d62c");
+    expect(got).toContain("Git-2.56.1-64-bit.exe");
+    expect(got).toContain("c330c72e10b408cc39994bfefdb63542b0d93d21699325c3e0bd874af8a5a559");
     expect(got).toContain("$passwordPath = $windowsPasswordPath");
     expect(got).toContain("$credentialPaths = @($passwordPath)");
     expect(got).toContain("PubkeyAuthentication yes");
@@ -983,7 +1084,8 @@ describe("cloud-init bootstrap", () => {
       windowsMode: "wsl2",
       workRoot: "/work/crabbox",
     } as const;
-    const got = windowsBootstrapPowerShell(input);
+    // Inspect the embedded shell text after unescaping its PowerShell literal.
+    const got = windowsBootstrapPowerShell(input).replaceAll("''", "'");
     expect(got).toContain("$workRoot = 'C:\\crabbox'");
     expect(got).toContain("C:\\ProgramData\\crabbox\\windows.password");
     expect(got).toContain("Microsoft-Windows-Subsystem-Linux");
@@ -1006,17 +1108,17 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc");
     expect(got).toContain("test -w /proc/sys/fs/binfmt_misc/register");
     expect(got).toContain(":WSLInterop:M::MZ::/init:PF");
-    expect(got).toContain("trufflehog_version='3.95.9'");
+    expect(got).toContain("trufflehog_version='3.100.0'");
     expect(got).toContain("trufflehog_${trufflehog_version}_linux_amd64.tar.gz");
-    expect(got).toContain("f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e");
+    expect(got).toContain("b2d85eba59865e98f45c9fc9f77d2c6d62df529fdd5755af121304ea5a7cecbb");
     expect(got).toContain("sha256sum -c -");
     expect(got).toContain('mv -f "$trufflehog_candidate" /usr/local/bin/trufflehog');
     expect(got).toContain("trufflehog --no-update --version >/dev/null");
     const nodeInstall = got.indexOf(
       "bash /var/lib/crabbox/install-linux-developer-tools.sh --node-only",
     );
-    const readyScript = got.indexOf("cat >/usr/local/bin/crabbox-ready <<'READY'");
-    expect(nodeInstall).toBeGreaterThan(got.indexOf("$linuxSetup = @'"));
+    const readyScript = got.indexOf("cat >/usr/local/bin/crabbox-ready <<");
+    expect(nodeInstall).toBeGreaterThan(got.indexOf("$linuxSetup = "));
     expect(readyScript).toBeGreaterThan(nodeInstall);
     expect(got.slice(readyScript)).toContain("node --version >/dev/null");
     expect(got.slice(readyScript)).toContain("npm --version >/dev/null");
@@ -1049,7 +1151,7 @@ describe("cloud-init bootstrap", () => {
     } as const;
     const got = azureWindowsBootstrapPowerShell(input);
     expect(got).toContain("OpenSSH-Win64.zip");
-    expect(got).toContain("Git-2.52.0-64-bit.exe");
+    expect(got).toContain("Git-2.56.1-64-bit.exe");
     expect(got).toContain("administrators_authorized_keys");
     expect(got).toContain("Match Group administrators");
     expect(got).toContain("$sshPorts = @('2222', '22')");
@@ -1099,7 +1201,7 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("com.openssh.sshd");
     expect(got).toContain("com.apple.screensharing");
     expect(got).toContain("/usr/local/bin/crabbox-ready");
-    expect(got).toContain("node_version=24.19.0");
+    expect(got).toContain("node_version=24.22.3");
     expect(got).toContain("UsePAM yes");
     expect(got).toContain("KbdInteractiveAuthentication no");
     expect(got).toContain("node_arch=x64");
@@ -1109,3 +1211,50 @@ describe("cloud-init bootstrap", () => {
     expect(got).toContain("npm --version >/dev/null");
   });
 });
+
+it("keeps WSL here-string terminators inside work roots as data", (context) => {
+  if (
+    spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
+      timeout: 10_000,
+    }).status !== 0
+  ) {
+    context.skip();
+  }
+  const workRoot = "/work/‘’‚‛“”„$(`n)\n'@\nthrow 'injected'\n@'\n’@\nthrow 'injected'\n@‘\nend";
+  const source = windowsBootstrapPowerShell({
+    ...config,
+    target: "windows",
+    windowsMode: "wsl2",
+    workRoot,
+  });
+  const directory = mkdtempSync(join(tmpdir(), "crabbox-wsl-quotes-"));
+  try {
+    const file = join(directory, "bootstrap.ps1");
+    writeFileSync(file, "\ufeff" + source);
+    const result = spawnSync(
+      "pwsh",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `
+      $tokens=$null; $errors=$null
+      $ast=[System.Management.Automation.Language.Parser]::ParseFile(${psQuote(file)},[ref]$tokens,[ref]$errors)
+      if ($errors.Count) { throw ($errors | Out-String) }
+      $node=$ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$linuxSetup' },$true)
+      $literal=$node.Right.Expression
+      if ($literal -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { throw 'WSL setup must be a constant string' }
+      [Console]::Out.Write($literal.Value)
+    `,
+      ],
+      { encoding: "utf8", timeout: 30000 },
+    );
+    expect(result.status).toBe(0);
+    const quotedRoot = "'" + workRoot.replaceAll("'", "'\\''") + "'";
+    expect(result.stdout).toContain("mkdir -p " + quotedRoot);
+    expect(result.stdout).toContain("test -w " + quotedRoot);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+  // Cold pwsh starts on CI runners exceed the 5 s default; cover the probe and the 30 s parse.
+}, 60_000);

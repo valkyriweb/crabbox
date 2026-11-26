@@ -54,7 +54,8 @@ func (b *linodeLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireR
 	}
 	var publicKey string
 	lease, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
-		Kind: fixedLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
+		LegacyRepoRoot: req.Repo.LegacyRoot,
+		Kind:           fixedLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
 		TargetOS: core.TargetLinux, TTL: cfg.TTL, IdleTimeout: cfg.IdleTimeout, Now: func() time.Time { return core.ClockNow(b.RT.Clock) },
 	}, core.FixedLeaseOperations[linodeInstance]{Admission: &core.FixedAdmission{}, DescribeIntent: func(ctx context.Context, claim *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
 		if exists && (!fixedLeaseKind.IsFixedClaim(*claim) || claim.ProviderScope != account) {
@@ -152,7 +153,9 @@ func (b *linodeLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireR
 		server := serverFromLinode(item, cfg)
 		server.ImmutableID = claim.CloudImmutableID
 		target := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
-		if err := b.waitSSH(ctx, &target, "linode bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
+		if err := core.WaitForDirectBootstrap(ctx, cfg, server, &target, core.BootstrapWaitTimeout(cfg), func(ctx context.Context, target *core.SSHTarget, timeout time.Duration) error {
+			return b.waitSSH(ctx, target, "linode bootstrap", timeout)
+		}); err != nil {
 			return core.LeaseTarget{}, err
 		}
 		labels := maps.Clone(server.Labels)

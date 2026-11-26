@@ -45,7 +45,8 @@ func (b *digitalOceanLeaseBackend) acquireFixed(ctx context.Context, req core.Ac
 	var publicKey string
 	regionChecked := false
 	lease, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
-		Kind: fixedLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
+		LegacyRepoRoot: req.Repo.LegacyRoot,
+		Kind:           fixedLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
 		TargetOS: core.TargetLinux, TTL: cfg.TTL, IdleTimeout: cfg.IdleTimeout, Now: func() time.Time { return core.ClockNow(b.RT.Clock) },
 	}, core.FixedLeaseOperations[droplet]{Admission: &core.FixedAdmission{}, DescribeIntent: func(ctx context.Context, claim *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
 		if exists && (!fixedLeaseKind.IsFixedClaim(*claim) || claim.ProviderScope != account) {
@@ -161,7 +162,9 @@ func (b *digitalOceanLeaseBackend) acquireFixed(ctx context.Context, req core.Ac
 		server := serverFromDroplet(item, cfg)
 		server.ImmutableID = claim.CloudImmutableID
 		target := core.SSHTargetFromConfig(cfg, server.PublicNet.IPv4.IP)
-		if err := b.waitSSH(ctx, &target, "digitalocean bootstrap", core.BootstrapWaitTimeout(cfg)); err != nil {
+		if err := core.WaitForDirectBootstrap(ctx, cfg, server, &target, core.BootstrapWaitTimeout(cfg), func(ctx context.Context, target *core.SSHTarget, timeout time.Duration) error {
+			return b.waitSSH(ctx, target, "digitalocean bootstrap", timeout)
+		}); err != nil {
 			return core.LeaseTarget{}, err
 		}
 		labels := maps.Clone(server.Labels)

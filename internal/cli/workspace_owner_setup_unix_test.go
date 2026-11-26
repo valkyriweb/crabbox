@@ -29,6 +29,43 @@ func workspaceOwnerSetupFixture(t *testing.T) (string, *workspaceOwner) {
 	return home, owner
 }
 
+func TestWorkspaceOwnerCommandPreparation(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			home, owner := workspaceOwnerSetupFixture(t)
+			prepared := filepath.Join(home, "prepared")
+			workload := filepath.Join(home, "workload")
+			setup := "mkdir " + shellQuote(prepared)
+			if fail {
+				setup = "exit 19"
+			}
+			remote := "test -d " + shellQuote(prepared) + " && touch " + shellQuote(workload) + "; exit 23"
+			marker := workspaceOwnerSetupPrefix + strings.Repeat("a", 32)
+			script := remoteWorkspaceOwnerPOSIXWitnessScriptWithSetup(owner.key, owner.token, remote, marker, setup)
+			cmd, _ := boundedWorkspaceOwnerCommand(t, home, os.Getenv("PATH"), remoteWorkspaceOwnerPOSIXLauncher(owner.key, owner.token, script, marker))
+			out, err := cmd.CombinedOutput()
+			wantCode := 23
+			if fail {
+				wantCode = 74
+				if !strings.Contains(string(out), marker+" failed workspace") || strings.Contains(string(out), marker+" started") {
+					t.Fatalf("setup failure did not prevent workload handoff: %s", out)
+				}
+			}
+			if exitCode(err) != wantCode {
+				t.Fatalf("exit=%d want=%d output=%s", exitCode(err), wantCode, out)
+			}
+			_, statErr := os.Stat(workload)
+			if fail != os.IsNotExist(statErr) {
+				t.Fatalf("workload executed=%t after setup failure=%t", statErr == nil, fail)
+			}
+			req := workspaceOwnerRemoteRequest{Action: workspaceOwnerInspect, Key: owner.key, Token: owner.token}
+			if out, err := runPOSIXWorkspaceOwnerScript(t, home, remoteWorkspaceOwnerPOSIX(req)); err != nil || out != "OWNED" {
+				t.Fatalf("child not retired after setup/workload: %q %v", out, err)
+			}
+		})
+	}
+}
+
 // Override signal probes only inside the real locked protocol body. All kill
 // operations are denied, including termination; no AppArmor or privileges needed.
 func workspaceOwnerDenySignals(t *testing.T) string {
@@ -377,45 +414,64 @@ wait`
 
 func TestWorkspaceOwnerGitSeedPreservesOriginFailure(t *testing.T) {
 	for _, kind := range []string{"missing filesystem", "HTTP transport"} {
-		t.Run(kind, func(t *testing.T) {
-			home, owner := workspaceOwnerSetupFixture(t)
-			tools := t.TempDir()
-			writeExecutable(t, filepath.Join(tools, "ssh"), "#!/bin/sh\nfor arg; do remote=\"$arg\"; done\nHOME="+shellQuote(home)+"\nexport HOME\nexec /bin/sh -c \"$remote\"\n")
-			t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
-			target := SSHTarget{Host: "127.0.0.1", User: "runner", Port: "22", FallbackPorts: []string{}, TargetOS: targetLinux}
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			ctx = contextWithWorkspaceOwner(ctx, owner)
-			plan := gitCoherencePlan{
-				RemoteURL: filepath.Join(home, "absent-origin.git"),
-				Target:    strings.Repeat("a", 40),
-				Tree:      strings.Repeat("b", 40),
-				Branch:    "main",
-			}
-			diagnostic := gitOriginFilesystemError
-			if kind == "HTTP transport" {
-				plan.RemoteURL = newGitTransportFailureHTTPServer(t) + "/repo.git"
-				diagnostic = gitOriginTransportError
-			}
-			workdir := filepath.Join(home, "workspace")
-			if err := os.Mkdir(workdir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			out, err := runIdempotentSSHGitOriginAttempt(ctx, target, remoteGitSeed(workdir, plan), 0)
-			t.Logf("owned Git seed exit=%d combined diagnostics:\n%s", exitCode(err), out)
-			if got := exitCode(err); got != gitOriginRuntimeFallbackExitCode {
-				t.Fatalf("owned Git seed exit=%d want=%d diagnostic-bytes=%d", got, gitOriginRuntimeFallbackExitCode, len(out))
-			}
-			if len(out) > gitSeedDiagnosticLimit || !strings.Contains(out, "crabbox-git-seed phase=clone") || !diagnostic.MatchString(out) {
-				t.Fatalf("owned Git seed lost bounded clone diagnostics: diagnostic-bytes=%d", len(out))
-			}
-			if reason, fallback := gitOriginRuntimeFallbackResult(plan.RemoteURL, out, err); !fallback || reason != "origin_unavailable" {
-				t.Fatalf("owned Git seed fallback=%t reason=%q", fallback, reason)
-			}
-			if strings.Contains(out, owner.token) || strings.Contains(out, "CRABBOX_OWNER_SETUP_V1") {
-				t.Fatal("owned Git seed exposed workspace-owner protocol diagnostics")
-			}
-		})
+		for _, publication := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/publication-%t", kind, publication), func(t *testing.T) {
+				home, owner := workspaceOwnerSetupFixture(t)
+				tools := t.TempDir()
+				writeExecutable(t, filepath.Join(tools, "ssh"), "#!/bin/sh\nfor arg; do remote=\"$arg\"; done\nHOME="+shellQuote(home)+"\nexport HOME\nexec /bin/sh -c \"$remote\"\n")
+				t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
+				target := SSHTarget{Host: "127.0.0.1", User: "runner", Port: "22", FallbackPorts: []string{}, TargetOS: targetLinux}
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				ctx = contextWithWorkspaceOwner(ctx, owner)
+				plan := gitCoherencePlan{
+					RemoteURL: filepath.Join(home, "absent-origin.git"),
+					Target:    strings.Repeat("a", 40),
+					Tree:      strings.Repeat("b", 40),
+					Branch:    "main",
+				}
+				diagnostic := gitOriginFilesystemError
+				if kind == "HTTP transport" {
+					plan.RemoteURL = newGitTransportFailureHTTPServer(t) + "/repo.git"
+					diagnostic = gitOriginTransportError
+				}
+				workdir := filepath.Join(home, "workspace")
+				if err := os.Mkdir(workdir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				var out string
+				var err error
+				if publication {
+					var published bool
+					out, published, err = runIdempotentSSHGitOriginAttemptWithPublication(ctx, target, remoteGitSeed(workdir, plan), 0)
+					if published {
+						t.Fatal("failed seed reported publication")
+					}
+				} else {
+					out, err = runIdempotentSSHGitOriginAttempt(ctx, target, remoteGitSeed(workdir, plan), 0)
+				}
+				t.Logf("owned Git seed exit=%d combined diagnostics:\n%s", exitCode(err), out)
+				if got := exitCode(err); got != gitOriginRuntimeFallbackExitCode {
+					t.Fatalf("owned Git seed exit=%d want=%d diagnostic-bytes=%d", got, gitOriginRuntimeFallbackExitCode, len(out))
+				}
+				if len(out) > gitSeedDiagnosticLimit || !strings.Contains(out, "crabbox-git-seed phase=clone") || !diagnostic.MatchString(out) {
+					t.Fatalf("owned Git seed lost bounded clone diagnostics: diagnostic-bytes=%d", len(out))
+				}
+				if reason, fallback := gitOriginRuntimeFallbackResult(plan.RemoteURL, out, err); !fallback || reason != "origin_unavailable" {
+					t.Fatalf("owned Git seed fallback=%t reason=%q", fallback, reason)
+				}
+				if kind == "missing filesystem" {
+					var warning bytes.Buffer
+					reportRemoteGitSeedFailure(context.Background(), &warning, out, err, "aborting before file sync")
+					if !strings.Contains(warning.String(), "phase=clone reason=repository/ref") {
+						t.Fatalf("seed phase and diagnostic reordered: %q", warning.String())
+					}
+				}
+				if strings.Contains(out, owner.token) || strings.Contains(out, "CRABBOX_OWNER_SETUP_V1") {
+					t.Fatal("owned Git seed exposed workspace-owner protocol diagnostics")
+				}
+			})
+		}
 	}
 }
 
