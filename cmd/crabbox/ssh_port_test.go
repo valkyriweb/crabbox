@@ -22,9 +22,10 @@ func TestCloudProvidersRetainSSHPortFallback(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			for _, host := range []string{"192.0.2.10", "127.0.0.1"} {
+			// The fork never adds an implicit port-22 fallback for loopback hosts.
+			for host, want := range map[string][]string{"192.0.2.10": {"22"}, "127.0.0.1": {}} {
 				target := cli.SSHTargetFromConfig(cfg, host)
-				if target.Port != "2222" || !slices.Equal(target.FallbackPorts, []string{"22"}) {
+				if target.Port != "2222" || !slices.Equal(target.FallbackPorts, want) {
 					t.Fatalf("%s target port=%s fallbacks=%v", host, target.Port, target.FallbackPorts)
 				}
 			}
