@@ -1057,6 +1057,10 @@ type realSSHExecObservation struct {
 // Only these fixture-owned shell builtins may execute. Never run the incoming
 // command string, even after matching it, or inherit the runner's environment.
 func (s *forwardSSHServer) enableReadinessSessions(t *testing.T, root string, transportSucceeds bool) (*sync.Mutex, *[]realSSHExecObservation) {
+	return s.enableReadinessSessionsWithHold(t, root, transportSucceeds, nil)
+}
+
+func (s *forwardSSHServer) enableReadinessSessionsWithHold(t *testing.T, root string, transportSucceeds bool, holdProbe func(string) bool) (*sync.Mutex, *[]realSSHExecObservation) {
 	t.Helper()
 	var mu sync.Mutex
 	var observed []realSSHExecObservation
@@ -1075,10 +1079,13 @@ func (s *forwardSSHServer) enableReadinessSessions(t *testing.T, root string, tr
 				_ = request.Reply(false, nil)
 				continue
 			}
+			mu.Lock()
+			hold := holdProbe != nil && holdProbe(payload.Command)
+			mu.Unlock()
 			var fixedCommand string
 			switch payload.Command {
 			case "exit 0":
-				if transportSucceeds {
+				if transportSucceeds || hold {
 					fixedCommand = "exit 0"
 				}
 			case realSSHFailingReadiness:
@@ -1091,6 +1098,13 @@ func (s *forwardSSHServer) enableReadinessSessions(t *testing.T, root string, tr
 				return
 			}
 			if err := request.Reply(true, nil); err != nil {
+				return
+			}
+			if hold {
+				// Keep this accepted probe active until the real client times out
+				// and closes it. Fixture teardown also closes and joins sessions.
+				for range requests {
+				}
 				return
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -1157,7 +1171,27 @@ func TestWaitForSSHReadyRealSSHTimeoutDiagnostic(t *testing.T) {
 				t.Logf("client: %s", strings.TrimSpace(string(version)))
 				const user = "synthetic-readiness"
 				server := newForwardSSHServer(t, user)
-				mu, observed := server.enableReadinessSessions(t, root, transportSucceeds)
+				blockedCommand := realSSHFailingReadiness
+				if !transportSucceeds {
+					blockedCommand = "exit 0"
+				}
+				blocked := make(chan string, 1)
+				attempts := 0
+				mu, observed := server.enableReadinessSessionsWithHold(t, root, transportSucceeds, func(command string) bool {
+					if command != blockedCommand {
+						return false
+					}
+					attempts++
+					if attempts == 1 {
+						// Complete one cycle to retain real readiness, transport,
+						// and closed-fallback evidence before fixing the active stage.
+						return false
+					}
+					if attempts == 2 {
+						blocked <- command
+					}
+					return true
+				})
 				close(server.release)
 				knownHosts := filepath.Join(root, "known_hosts")
 				pins := fmt.Sprintf("[127.0.0.1]:%d %s\n", server.port(), server.hostKey)
@@ -1196,6 +1230,14 @@ func TestWaitForSSHReadyRealSSHTimeoutDiagnostic(t *testing.T) {
 				err = waitForSSHReady(t.Context(), &target, &progress, "bootstrap", 8*time.Second)
 				if err == nil {
 					t.Fatal("failing readiness unexpectedly succeeded")
+				}
+				select {
+				case command := <-blocked:
+					if command != blockedCommand {
+						t.Fatalf("active probe=%q want=%q", command, blockedCommand)
+					}
+				default:
+					t.Fatal("deadline expired before the intended active probe was reached")
 				}
 				message := err.Error()
 				t.Logf("timeout: %s; progress: %s", message, progress.String())
@@ -1246,4 +1288,76 @@ func TestWaitForSSHReadyRealSSHTimeoutDiagnostic(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestStaticExplicitPortBlocksRealSSHFallback(t *testing.T) {
+	isolateTestUserDirs(t)
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("OpenSSH unavailable")
+	}
+	server := newForwardSSHServer(t, "synthetic-static")
+	close(server.release)
+	var commands int
+	server.sessionHandler = func(incoming ssh.NewChannel, _ string) {
+		ch, requests, err := incoming.Accept()
+		if err != nil {
+			return
+		}
+		defer ch.Close()
+		for req := range requests {
+			if req.Type == "exec" {
+				server.mu.Lock()
+				commands++
+				server.mu.Unlock()
+				_ = req.Reply(true, nil)
+				_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+				return
+			}
+			_ = req.Reply(false, nil)
+		}
+	}
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(closed.Addr().String())
+	_ = closed.Close()
+	cfg := baseConfig()
+	cfg.Provider, cfg.Static.Host, cfg.Static.User, cfg.Static.Port = "ssh", "127.0.0.1", "synthetic-static", port
+	cfg.SSHFallbackPorts = []string{strconv.Itoa(server.port())}
+	cfg.sshFallbackPortsExplicit = true
+	cfg.explicitSSHFallbackPorts = cfg.SSHFallbackPorts
+	_, target, _, err := staticLease(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.NoControlMaster = true
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := waitForSSHReady(ctx, &target, io.Discard, "static test", time.Second); err == nil {
+		t.Fatal("unavailable explicit port reached a different SSH server")
+	}
+	server.mu.Lock()
+	connections, ran := len(server.conns), commands
+	server.mu.Unlock()
+	if connections != 0 || ran != 0 {
+		t.Fatalf("wrong SSH server: connections=%d commands=%d", connections, ran)
+	}
+
+	// Without an explicit port, this same reachable fallback remains supported.
+	cfg.Static.Port, cfg.SSHPort = "", port
+	_, target, _, err = staticLease(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.NoControlMaster = true
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel2()
+	if err := waitForSSHReady(ctx2, &target, io.Discard, "default test", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if target.Port != strconv.Itoa(server.port()) {
+		t.Fatalf("fallback selected %s", target.Port)
+	}
+	t.Log("real SSH: explicit unavailable port made zero fallback connections; automatic selection authenticated the fallback")
 }

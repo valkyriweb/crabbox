@@ -57,6 +57,10 @@ to request an audited extension.
 
 ## Output
 
+The ready line reports the same selected network as `status`, including for
+static SSH hosts. Its `network` field is the resolved plane (`public` or
+`tailscale`), rather than the requested `auto` mode.
+
 On success warmup prints two lines on stdout — the lease summary and the ready
 SSH endpoint — followed by a total-duration line:
 
@@ -73,6 +77,20 @@ either with later `run`, `status`, `ssh`, `inspect`, and `stop` commands.
 Scripts should prefer the canonical ID. On success, add `--timing-json` to emit a final
 JSON timing record (provider, lease ID, slug, total duration, exit code) on
 stderr.
+
+Azure Sandbox warmup also reports client-side provisioning steps in the existing
+`runnerPhases` and `creationEvents` fields: credential acquisition, create/inspect/
+list/resume requests, and polling waits grouped by observed lifecycle state.
+Creation events contain each step's cumulative duration and call count. Steps
+partition the client's time; request durations exclude credential acquisition,
+and `unattributed` retains local bookkeeping time. Failed or cancelled Sandbox
+warmup emits the same observational timing record on stderr with a nonzero exit
+code; it is not allocation rejection, readiness, or cleanup evidence. Timing
+output never authorizes another create or retry.
+
+The service does not expose separate disk-attachment or boot timestamps. Create
+and lifecycle waits therefore remain explicitly opaque server work; these client
+observations must not be presented as exact server disk/boot measurements.
 
 For a fixed-ID coordinator request rejected by a quota before lease admission,
 `--timing-json` emits a failure record on **stdout**, separately from diagnostic
@@ -161,14 +179,15 @@ The CLI's lease labels reflect these authoritative coordinator timestamps.
 Managed coordinator leases expire automatically regardless of keep. New direct
 GCP VMs also honor recorded expiry through their guest-side expiry guard when
 the attached service account can delete the VM. The expiry is the earlier of
-TTL and idle timeout; GCP guests still marked running or provisioning retain
-the 12-hour stale-state grace period. Kept guests without valid expiry metadata
-are left alone.
+TTL and idle timeout; GCP guests still marked running or provisioning get a
+one-hour stale-state grace period after it. Kept guests without valid expiry
+metadata are left alone.
 
-Manual `crabbox cleanup` always skips `keep=true` machines, including expired
-ones. It is separate from automatic expiry. For direct providers without an
-automatic idle reaper, use `warmup.keep: false` and schedule cleanup, or stop the
-lease explicitly. Existing GCP guests retain their installed guard; recreate
+`keep=true` does not exempt a direct machine from expiry: manual
+`crabbox cleanup` also deletes expired kept machines, using the same one-hour
+grace for running or provisioning ones. It is separate from automatic expiry.
+For direct providers without an automatic idle reaper, use `warmup.keep: false`
+and schedule cleanup, or stop the lease explicitly. Existing GCP guests retain their installed guard; recreate
 them to receive the updated idle reaper. See [cleanup](cleanup.md) and the
 provider documentation for supported lifecycle behavior.
 

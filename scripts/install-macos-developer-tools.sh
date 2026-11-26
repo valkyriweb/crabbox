@@ -2,13 +2,13 @@
 set -euo pipefail
 
 brew_update="${CRABBOX_MACOS_BREW_UPDATE:-1}"
-pnpm_version="${CRABBOX_MACOS_PNPM_VERSION:-11.1.0}"
+pnpm_version="${CRABBOX_MACOS_PNPM_VERSION:-11.28.13}"
 node_formula="${CRABBOX_MACOS_NODE_FORMULA:-node@24}"
 python_formula="${CRABBOX_MACOS_PYTHON_FORMULA:-python@3.13}"
 require_xcode="${CRABBOX_MACOS_REQUIRE_XCODE:-0}"
 xcode_developer_dir="${CRABBOX_MACOS_XCODE_DEVELOPER_DIR:-}"
 force_links="${CRABBOX_MACOS_FORCE_LINKS:-0}"
-trufflehog_version="3.95.9"
+trufflehog_version="3.100.0"
 trufflehog_bin_dir="${CRABBOX_MACOS_TRUFFLEHOG_BIN_DIR:-/usr/local/bin}"
 homebrew_install_commit="280cbc9adffcbdef15dd1c9d991ef2d1dd7cfc9c"
 homebrew_install_sha256="f3e91784ffeda32bc397de7acc1154724cc47522a459c9ac656cca176eeba457"
@@ -305,8 +305,8 @@ trufflehog_arch() {
 
 trufflehog_sha256_for_arch() {
   case "$1" in
-    amd64) printf '%s\n' "4306a58d25b85aad7b5fb6f5732df77c50a9161db2746b56e196649072218691" ;;
-    arm64) printf '%s\n' "944c6ea3a2993a9f808d08107b40e03ba92bc75972876a1ee47d567bfd6fa1b5" ;;
+    amd64) printf '%s\n' "e69972286bf313d551ad976b75da5395dc660ff316e2db9660e841e328c96210" ;;
+    arm64) printf '%s\n' "fb326527959216a858636640adcfb93720bb09a7d7e727237c1244cdb3af4ac3" ;;
     *)
       log "unsupported TruffleHog architecture: $1"
       return 1

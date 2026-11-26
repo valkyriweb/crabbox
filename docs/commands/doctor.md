@@ -16,6 +16,12 @@ readiness checks fail, such as missing AWS credentials or running Firecracker
 on a non-Linux host. For static provider metadata, use
 [`crabbox providers describe <name>`](providers.md#providers-describe).
 
+Coordinator-only providers such as `ssh-host` and `serve` report a failed
+readiness check when no coordinator is configured, including valid JSON and
+exit `1` with `--json`. Configure `broker.url` and authenticate with
+`crabbox login --url <coordinator-url>`, then retry the check. For direct access
+to an existing machine without a coordinator, select `--provider ssh`.
+
 ```sh
 crabbox doctor
 crabbox doctor --provider aws
@@ -193,7 +199,14 @@ tied to the run, such as the remote probe when no lease ID was recorded.
 `crabbox doctor --pond <name>` verifies the Tailscale policy row for an existing
 local pond claim set. The check confirms that the concrete
 `tag:cbx-pond-<owner>-<pond>` tag is declared in `tagOwners` and is allowed to
-reach itself through either `grants` or legacy `acls`. It reads the policy only
+reach itself through either `grants` or legacy `acls`.
+
+It checks every distinct pond tag recorded by eligible local members. Members
+without a recorded pond tag use the current owner's generated tag; this fallback
+also applies in ponds containing both kinds of member. Changing your current
+email does not replace tags already recorded on members.
+
+It reads the policy only
 when the pond has at least one locally claimed Tailscale-capable member and
 `TS_API_KEY` is exported (`TS_TAILNET` selects the tailnet); otherwise it skips
 with a reason. Self-hosted control planes that do not expose the Tailscale

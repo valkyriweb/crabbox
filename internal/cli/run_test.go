@@ -2707,7 +2707,7 @@ exit 0
 				State:              "active",
 				Host:               "127.0.0.1",
 				SSHUser:            "crabbox",
-				SSHPort:            "22",
+				SSHPort:            startTCPReadinessFixture(t),
 				SSHHostKey:         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICFNHmH+uXzuQadD4Pg9JhPQvl5fkM4L9spUDQ/mI+pc",
 				WorkRoot:           "/work/crabbox",
 				IdleTimeoutSeconds: 1800,
@@ -2876,6 +2876,8 @@ profiles:
 				}
 			},
 			mutateLease: func(lease *LeaseTarget) {
+				lease.Server.Labels["target"] = targetWindows
+				lease.Server.Labels["windows_mode"] = windowsModeNormal
 				lease.SSH.TargetOS = targetWindows
 				lease.SSH.WindowsMode = windowsModeNormal
 			},
@@ -4655,8 +4657,28 @@ func TestRunCommandReceiptPersistenceFailureFinishesWithRefreshedReceipt(t *test
 	gotFinishRetry := finishRetry
 	gotFinishReceipt := finishReceipt
 	mu.Unlock()
-	if !reflect.DeepEqual(gotEvents, []string{"timing", "finish"}) {
-		t.Fatalf("terminal events=%v, want timing then finish", gotEvents)
+	if !reflect.DeepEqual(gotEvents, []string{"timing", "finish", "timing"}) {
+		t.Fatalf("terminal events=%v, want checked timing, finish, final timing", gotEvents)
+	}
+	var reports []TimingReport
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		var report TimingReport
+		if json.Unmarshal([]byte(line), &report) == nil && report.RunnerTotalMs > 0 {
+			reports = append(reports, report)
+		}
+	}
+	if len(reports) != 2 || !reports[0].TerminalPending || reports[1].TerminalPending || reports[1].RunnerTotalMs < reports[0].RunnerTotalMs {
+		t.Fatalf("missing checked and final timing snapshots: %+v", reports)
+	}
+	var phaseTotal int64
+	for _, phase := range reports[1].RunnerPhases {
+		phaseTotal += phase.Ms
+		if phase.Name == "unattributed" {
+			t.Fatal("final snapshot left terminal work unattributed")
+		}
+	}
+	if phaseTotal != reports[1].RunnerTotalMs {
+		t.Fatalf("phase total=%d runner total=%d", phaseTotal, reports[1].RunnerTotalMs)
 	}
 	if gotFinishCalls != 1 || gotFinishCode != 2 || gotFinishReceipt.ExitCode != 2 {
 		t.Fatalf("finish calls=%d code=%d receipt exit=%d, want one failure finish", gotFinishCalls, gotFinishCode, gotFinishReceipt.ExitCode)
@@ -4982,7 +5004,7 @@ func runCommandSyncOnlyFinalization(t *testing.T, missingEvents bool) {
 	}
 }
 
-func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testing.T) {
+func TestRunCommandTerminalReceiptPreservesOriginalAfterCoordinatorFinishFailure(t *testing.T) {
 	dir := t.TempDir()
 	isolateRunTestUserDirs(t, dir)
 	sshPath := filepath.Join(dir, "ssh")
@@ -5114,8 +5136,8 @@ func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testin
 	if decodeErr != nil {
 		t.Fatalf("decode terminal receipt: %v", decodeErr)
 	}
-	if localReceipt.ExitCode != 7 {
-		t.Fatalf("local receipt exit=%d, want coordinator failure exit 7", localReceipt.ExitCode)
+	if localReceipt.ExitCode != 0 {
+		t.Fatalf("local receipt exit=%d, want original task exit 0", localReceipt.ExitCode)
 	}
 
 	mu.Lock()
@@ -5137,8 +5159,8 @@ func TestRunCommandTerminalReceiptMarksCoordinatorFinishFailureLocally(t *testin
 			t.Fatalf("finish attempt %d used a different receipt from local persistence:\nlocal=%+v\nremote=%+v", i+1, finishLocalReceipts[i], receipt)
 		}
 	}
-	if localReceipt == finishReceipts[0] {
-		t.Fatal("local failure receipt must differ from the ambiguous remote execution receipt")
+	if localReceipt != finishReceipts[0] {
+		t.Fatal("transport failure must not reconstruct or re-sign the original receipt")
 	}
 	if len(unexpectedCalls) != 0 {
 		t.Fatalf("unexpected coordinator calls: %v", unexpectedCalls)

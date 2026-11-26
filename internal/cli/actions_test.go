@@ -307,8 +307,7 @@ func TestGitHubActionsRunnerInstallScriptUsesOfficialRunner(t *testing.T) {
 		"sudo apt-get update >/tmp/crabbox-actions-runner-apt-update.log",
 		"sudo mkdir -p \"$HOME/.cache/node/corepack/v1\"",
 		"sudo chown -R \"$(id -u):$(id -g)\" \"$HOME/.cache\"",
-		"./config.sh --unattended --replace --ephemeral",
-		"crabbox-actions-runner.service",
+		"./config.sh --unattended --ephemeral",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("install script missing %q", want)
@@ -334,15 +333,22 @@ func TestGitHubActionsRunnerInstallPowerShellScriptUsesOfficialWindowsRunner(t *
 		"runner archive checksum mismatch",
 		".\\config.cmd",
 		"--ephemeral",
-		"New-ScheduledTaskAction",
-		"Start-ScheduledTask",
-		"C:\\ProgramData\\crabbox\\windows.password",
-		"Start-Process",
-		"run-crabbox.ps1",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("windows install script missing %q", want)
 		}
+	}
+	if strings.Contains(got, "Start-ScheduledTask") || strings.Contains(got, "Start-Process") || strings.Contains(got, "--replace") {
+		t.Fatal("installer can activate or replace a runner before durable ownership")
+	}
+	start := decodePowerShellCommand(t, githubActionsRunnerStartScript(SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}))
+	for _, want := range []string{"New-ScheduledTaskAction", "Start-ScheduledTask", `C:\ProgramData\crabbox\windows.password`, "Start-Process", "run-crabbox.ps1"} {
+		if !strings.Contains(start, want) {
+			t.Fatalf("Windows activation missing %q", want)
+		}
+	}
+	if strings.Contains(start, "New-ScheduledTaskTrigger") {
+		t.Fatal("runner task may not acquire an independent startup timer")
 	}
 	checksum := strings.Index(got, "Get-FileHash")
 	clearRunner := strings.Index(got, "Get-ChildItem -Force -LiteralPath $runnerDir | Remove-Item")
@@ -427,7 +433,6 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 	}{
 		{name: "default", fresh: true, wantNode: true, wantGo: true},
 		{name: "BOM registration", registration: "bom", fresh: true, wantNode: true, wantGo: true},
-		{name: "existing registration", change: "registered", wantNode: true, wantGo: true},
 		{name: "writable existing dotenv", change: "dotenv-writable", dotEnv: "LANG=C\n"},
 		{name: "malformed registration", registration: "malformed"},
 		{name: "malformed BOM registration", registration: "malformed-bom"},
@@ -544,11 +549,11 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 				write(filepath.Join(archives, archiveName), buf.String(), 0o644)
 				return fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
 			}
-			nodeDigest := pack("node", "24.19.0", "node-v24.19.0-linux-x64.tar.xz")
-			goDigest := pack("go", "1.27.0", "go1.27.0.linux-amd64.tar.gz")
-			nodeSlot := filepath.Join(image, "node", "24.19.0", "x64")
-			goSlot := filepath.Join(image, "go", "1.27.0", "x64")
-			destGo := filepath.Join(cache, "go", "1.27.0", "x64")
+			nodeDigest := pack("node", "24.22.3", "node-v24.22.3-linux-x64.tar.xz")
+			goDigest := pack("go", "1.27.4", "go1.27.4.linux-amd64.tar.gz")
+			nodeSlot := filepath.Join(image, "node", "24.22.3", "x64")
+			goSlot := filepath.Join(image, "go", "1.27.4", "x64")
+			destGo := filepath.Join(cache, "go", "1.27.4", "x64")
 			workFolder := tc.workFolder
 			if workFolder == "" {
 				workFolder = "_work"
@@ -604,8 +609,6 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 			write(filepath.Join(bin, "pgrep"), "#!/bin/sh\nexit "+map[bool]string{true: "0", false: "1"}[tc.change == "busy"]+"\n", 0o755)
 			unitState := "LoadState=not-found\\nActiveState=inactive\\nEnvironment=\\nEnvironmentFiles=\\nDropInPaths=\\n"
 			switch tc.change {
-			case "registered":
-				write(filepath.Join(runner, ".runner"), "old registration", 0o600)
 			case "dotenv-writable":
 				if err := os.Chmod(filepath.Join(runner, ".env"), 0o664); err != nil {
 					t.Fatal(err)
@@ -640,7 +643,7 @@ func TestGitHubActionsRunnerSeedsOnlyOwnedDefaultToolCache(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "archive":
-				write(filepath.Join(archives, "go1.27.0.linux-amd64.tar.gz"), "tampered", 0o644)
+				write(filepath.Join(archives, "go1.27.4.linux-amd64.tar.gz"), "tampered", 0o644)
 			case "tree":
 				write(filepath.Join(goSlot, "bin", "go"), "tampered", 0o755)
 			case "extra":
@@ -694,9 +697,9 @@ esac
 			script := strings.NewReplacer(
 				"/opt/hostedtoolcache", image,
 				"/opt/crabbox/toolchain-archives", archives,
-				"14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647", nodeDigest,
-				"675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685", goDigest,
-			).Replace(githubActionsRunnerInstallScript("2.337.0", true))
+				"4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb", nodeDigest,
+				"7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840", goDigest,
+			).Replace(githubActionsRunnerInstallScript("2.337.0", true) + "\n" + githubActionsRunnerStartScript(SSHTarget{TargetOS: targetLinux}))
 			// The installer runs in its own shell and must not alter the caller's umask.
 			cmd := exec.Command("bash", "-c", "umask 002; bash -c \"$1\"; result=$?; [ \"$(umask)\" = 0002 ] || exit 99; exit \"$result\"", "fixture", script)
 			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + root,
@@ -746,7 +749,7 @@ esac
 				tool, version string
 				present       bool
 			}{
-				{"node", "24.19.0", tc.wantNode}, {"go", "1.27.0", tc.wantGo},
+				{"node", "24.22.3", tc.wantNode}, {"go", "1.27.4", tc.wantGo},
 			} {
 				slot := filepath.Join(cache, expected.tool, expected.version, "x64")
 				_, err := os.Stat(slot + ".complete")
@@ -799,9 +802,6 @@ esac
 			}
 			order, _ := os.ReadFile(filepath.Join(root, "order"))
 			wantOrder := "configured\nstarted\n"
-			if tc.change == "registered" {
-				wantOrder = "removed\n" + wantOrder
-			}
 			if string(order) != wantOrder {
 				t.Fatalf("lifecycle order %q", order)
 			}
@@ -2307,6 +2307,9 @@ remote=""
 for arg do remote="$arg"; done
 printf '%s\n---\n' "$remote" >> "$CRABBOX_FAKE_SSH_LOG"
 case "$remote" in
+  *"systemctl show crabbox-actions-runner.service"*)
+    printf '%s\n' '{"settings":{"agentId":19,"agentName":"crabbox-cbx-gh","gitHubUrl":"https://github.com/example/repo","poolName":"Default","ephemeral":true},"active":true}'
+    ;;
   *"exact_git_root || exit 2"*"git remote get-url origin"*)
     printf '%s\n' 'https://github.com/example/repo.git'
     ;;
@@ -2322,6 +2325,7 @@ exit 0
 	ghScript := `#!/bin/sh
 case "$*" in
   *registration-token*) printf '%s\n' test-token ;;
+  *"actions/runners/19"*) printf '%s\n' '{"id":19,"name":"crabbox-cbx-gh","labels":[{"name":"crabbox","type":"custom"},{"name":"crabbox-cbx-gh","type":"custom"},{"name":"crabbox-profile-default","type":"custom"},{"name":"crabbox-class-beast","type":"custom"}]}' ;;
   *"workflow run"*) : > "$CRABBOX_FAKE_DISPATCHED" ;;
 esac
 `
@@ -2370,7 +2374,7 @@ esac
 		t.Fatalf("%v\n%s", err, logData)
 	}
 	bound, err := ReadLeaseClaim("cbx_gh")
-	if err != nil || inspections != 2 || bound.ActionsWorkspace == nil || bound.ActionsWorkspace.Origin != "https://github.com/example/repo" {
+	if err != nil || inspections != 2 || bound.ActionsRunner == nil || bound.ActionsRunner.RunnerID != 19 || bound.ActionsWorkspace == nil || bound.ActionsWorkspace.Origin != "https://github.com/example/repo" {
 		t.Fatalf("verified producer did not bind after child join: inspections=%d err=%v", inspections, err)
 	}
 	logData, err := os.ReadFile(logPath)

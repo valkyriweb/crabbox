@@ -53,6 +53,7 @@ export function publicLeaseRecord(record: LeaseRecord): PublicLeaseRecord {
   delete publicRecord.provisioningRequestSettledAt;
   delete publicRecord.provisioningRecoveryObservedAt;
   delete publicRecord.provisioningRecoveryMissingSince;
+  delete publicRecord.sshHostAllocation;
   delete publicRecord.fixedCreateIntentVersion;
   delete publicRecord.fixedCreateIntentHash;
   delete publicRecord.createAttemptID;
@@ -108,6 +109,7 @@ export function publicRunRecord(record: RunRecord): RunRecord {
   delete publicRecord.terminalReceipt;
   delete publicRecord.terminalFinishSHA256;
   delete publicRecord.terminalLogPrefix;
+  delete publicRecord.storedLogBytes;
   delete publicRecord.createRequestSHA256;
   if (!record.leaseOwners) {
     return publicRecord;

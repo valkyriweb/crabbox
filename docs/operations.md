@@ -317,39 +317,120 @@ environment API token fails the job.
 Each upload is tagged with the full commit SHA. After all deployment steps,
 verification requires one Cloudflare version receiving 100% of traffic and
 an uncached public `/v1/health` response with that version ID and SHA tag.
+Health verification polls every five seconds for up to three minutes to allow
+edge propagation. If it expires, the error includes the last reported version ID
+and tag. Each request still has a timeout of at most ten seconds.
 The deployment must remain unchanged across the check. A gradual rollout,
 stale route, unavailable API, or missing version metadata fails visibly.
 Verification only reads deployment metadata and health; it creates no lease.
 If manually clearing the Daytona snapshot creates a new untagged version,
 verification fails too; inspect the final version before rerunning the deploy.
 
-Before deployment, the workflow compares the live `CRABBOX_LEASE_POLICY_OVERRIDES`
-binding with the production value in `worker/wrangler.jsonc`. The guard takes no
-arguments and compares the complete documents, treating an absent binding, `{}`,
-and empty `owners`/`orgs` groups as equivalent. A difference stops deployment
-before upload and reports only the affected groups and keys, without policy
-values. Source policies must pass the same field, type, and range validation as
-the runtime. Unreadable bindings, invalid document shapes, and Cloudflare API
-errors always stop deployment.
+#### GitHub credential header migration
 
-Production source declares no individual memberships or lease policy overrides;
-every owner uses the global lease defaults (30-minute TTL and idle timeout,
-4-hour maximum). Individual memberships and exceptions belong in runtime
-configuration managed outside the repository, not in source-controlled vars.
+The private Worker-to-Durable-Object grant header is moving from
+`x-crabbox-github-sealed-credential` to `x-crabbox-github-credential-token`.
+Cloudflare's [header redaction](https://developers.cloudflare.com/workers/runtime-apis/handlers/tail/#tailrequest)
+recognizes the new token-named header. This does not change stored grants or CLI tokens.
 
-For an intentional one-time replacement of a known live override document,
-dispatch the **Deploy Coordinator** workflow (`coordinator-deploy.yml`) with
-`replace_live_lease_policy: true`. This sets
-`CRABBOX_ACKNOWLEDGE_LEASE_POLICY_REPLACEMENT=1` for the guard step only: it
-prints the same key summary and permits replacement, including repair of readable,
-shape-valid live policies with invalid fields or values. The source must still be
-valid; unreadable bindings, invalid document shapes, and API errors fail closed.
-Push-triggered deployments never acknowledge replacement. When removing
-existing overrides from source, the first push-triggered deployment therefore
-fails by design until a maintainer
-reviews the difference and dispatches that acknowledged replacement once.
+Deploy in separate releases; Worker and Durable Object versions can overlap:
 
-Worker source lives in `worker/`. Run the gate, then deploy:
+1. **Stage A (reader compatibility):** read both names, prefer the legacy name,
+   and keep writing only the legacy name. Strip caller-supplied new-name values.
+   Verify the existing deployment proof shows Stage A at 100% and record its
+   version ID and source SHA before advancing. The health route verifies the
+   Worker version only; also verify an actual Fleet Durable Object invocation
+   runs Stage A before advancing. Existing logs remain unredacted until Stage B.
+2. **Stage B (redacted writer):** only after that receipt, write only the new name,
+   strip legacy caller input, and keep both readers. Never ship both headers.
+   Verify Stage B's version and an authenticated grant-bearing invocation shows
+   `REDACTED` for the new header; do not copy the grant into the receipt.
+3. Remove the legacy reader in a later release only after Stage B has converged
+   and no old writers or pre-Stage-A rollback targets remain. Until then, roll
+   Stage B back only to Stage A or a later compatible reader.
+
+Do not combine Stage A and Stage B into one deployment. A source commit or
+successful upload alone is not the Stage A convergence receipt.
+
+Git owns coordinator defaults and deployment settings in `worker/wrangler.jsonc`.
+The existing runtime binding `CRABBOX_LEASE_POLICY_OVERRIDES` owns operator-managed
+owner/org exceptions. Keep individual memberships and exceptions outside source
+control; do not add this binding to Wrangler source or enable `keep_vars`.
+Ordinary owners retain the global defaults (30-minute TTL and idle timeout,
+4-hour maximum) unless runtime policy gives them an exception.
+
+Both the workflow and `npm run deploy --prefix worker` use
+`scripts/deploy-coordinator.mjs`. After asset preparation, it captures the complete
+live override document and the serving deployment/version, checks that settings
+and serving-version bindings agree, and validates the document with the runtime
+validator. It copies Git's raw configuration into a private temporary file beside
+the source (preserving relative paths), adds only the runtime-owned override
+binding, and runs the existing guard against that exact file. The guard rereads
+policy and deployment identity before upload. All unrelated override entries and
+fields survive; other vars and deployment settings still come from Git.
+
+Absent bindings, `{}`, and empty `owners`/`orgs` groups all mean no exceptions and
+are deployed without an override binding. Empty owner/org entries are preserved.
+A present empty string is invalid JSON, not permission to discard policy.
+Unreadable/duplicate/non-plaintext bindings, malformed documents, runtime-invalid
+values, and API errors stop an ordinary deployment before upload. Child output is
+withheld because Wrangler can print runtime configuration; failures identify the
+stage and safe recovery steps without printing policy values. For preparation
+failures, run the pinned dependency/asset validators in a credential-free checkout;
+for upload failures, inspect Cloudflare deployment/audit state, configuration and
+token permissions before retrying. Temporary configuration is removed on
+success, failure, and handled cancellation (a forced process/host kill cannot
+promise cleanup).
+
+After upload the helper checks Wrangler's exact uploaded version against the
+serving version and the complete policy digest. The workflow's final health proof
+checks that digest again after optional secret changes. A failed command or
+readback after upload can mean production changed: inspect it before retrying.
+There is no automatic rollback or retry.
+
+Cloudflare's reads and Wrangler upload are **not atomic**. The workflow concurrency
+group serializes its own runs, but not dashboard edits or other deploy tools. An
+external write between the final read and upload can be overwritten, even without
+a readback mismatch if our desired policy wins. Coordinate all writers during
+rollouts; drift checks and readback reduce risk but cannot eliminate that race.
+
+For intentional complete replacement/removal, first capture a fresh read-only
+baseline with the API token supplied through the environment:
+
+```sh
+node scripts/verify-coordinator-lease-policy.mjs --snapshot
+```
+
+It prints deployment/version IDs, the canonical policy SHA-256, and validity,
+without policy contents. Privately read and review the **complete** live document
+as well; the digest alone does not review its contents. Dispatch **Deploy
+Coordinator** (`coordinator-deploy.yml`) with all three inputs:
+
+- `replace_live_lease_policy: true` (explicit acknowledgment);
+- `lease_policy_replacement`: the complete reviewed JSON document (`{}` removes
+  all exceptions; omit just one entry/field to remove only that exception);
+- `lease_policy_expected_sha256`: the reviewed baseline digest from `--snapshot`.
+
+These inputs can be supplied via a private JSON file to `gh workflow run
+coordinator-deploy.yml --ref main --json`. Do not place individual exceptions in
+repository files, shell history, or logs. The helper reads replacement inputs
+directly from the runner's `GITHUB_EVENT_PATH` only for `workflow_dispatch`. It
+never interpolates policy JSON into the workflow's `env` or `run` fields: Actions
+prints those before executing the helper. Outside Actions, the manual helper
+still accepts `CRABBOX_ACKNOWLEDGE_LEASE_POLICY_REPLACEMENT`,
+`CRABBOX_LEASE_POLICY_REPLACEMENT` and `CRABBOX_EXPECTED_LIVE_LEASE_POLICY_SHA256`
+through the process environment; do not copy that manual route into step env.
+Workflow inputs are policy only, never credentials, and remain accessible to
+authorized dispatch/event administrators. A stale digest stops the deploy;
+readable, shape-valid but runtime-invalid live policies can be repaired through
+this explicit mechanism. Replacement must pass runtime validation. Unreadable
+bindings and invalid document shapes still fail closed and need separately
+reviewed operator repair. Push-triggered deployments never acknowledge
+replacement. Ordinary dispatches leave all three inputs unset.
+
+Run the gate, then use the guarded deployment entrypoint (the workflow is the
+preferred production path). Manual deployment needs `CLOUDFLARE_ACCOUNT_ID`,
+`CLOUDFLARE_API_TOKEN`, and the full deployed `GITHUB_SHA` in the environment:
 
 ```sh
 npm ci --prefix worker
@@ -358,8 +439,12 @@ npm run lint --prefix worker
 npm run check --prefix worker
 npm test --prefix worker
 npm run build --prefix worker
-npx wrangler deploy --config worker/wrangler.jsonc
+GITHUB_SHA="$(git rev-parse HEAD)" npm run deploy --prefix worker
 ```
+
+Raw `wrangler deploy` bypasses this policy-preservation procedure. Use it only for
+separately reviewed operations with an equivalent complete-config guard and
+readback; it is not the ordinary production deployment path.
 
 The repeatable deploy proof is:
 
@@ -367,7 +452,7 @@ The repeatable deploy proof is:
 scripts/deploy-worker-smoke.sh
 ```
 
-It runs Worker format, lint, typecheck, tests, dry-run build, deploy, and public health checks for the comma-separated deployment URLs in `CRABBOX_DEPLOY_SMOKE_URLS`. To include a short AWS lease smoke after deploy:
+It requires the same deployment environment above and runs Worker format, lint, typecheck, tests, dry-run build, guarded deploy, and public health checks for the comma-separated deployment URLs in `CRABBOX_DEPLOY_SMOKE_URLS`. To include a short AWS lease smoke after deploy:
 
 ```sh
 CRABBOX_DEPLOY_SMOKE_URLS="https://$BROKER_HOST/v1/health" \
@@ -536,7 +621,8 @@ CRABBOX_RUNTIME_ADAPTER_OWNER     stable service owner for route-scoped access
 CRABBOX_RUNTIME_ADAPTER_ORG       stable organization for route-scoped access
 DAYTONA_CRABBOX_KEY               required for brokered Daytona leases
 CRABBOX_DAYTONA_*                 optional Daytona API, snapshot, target, user, work-root, and SSH-token settings
-CRABBOX_RUN_RETENTION_DAYS        terminal run history retention; default 30 days, minimum 1
+CRABBOX_RUN_RETENTION_DAYS        maximum terminal log retention; default 30 days, minimum 1
+CRABBOX_RUN_LOG_BUDGET_BYTES      aggregate stored log budget; default 536870912 (512 MiB), positive integer bytes
 CRABBOX_GITHUB_CLIENT_ID          required for browser login
 CRABBOX_GITHUB_CLIENT_SECRET      required for browser login
 CRABBOX_SESSION_SECRET            required for browser login; must differ from CRABBOX_SHARED_TOKEN
@@ -582,6 +668,24 @@ CRABBOX_AZURE_ORPHAN_SWEEP_DELETE   optional; set 1 to release coordinator-owned
 CRABBOX_AZURE_ORPHAN_SWEEP_INTERVAL_SECONDS optional; default 3600
 CRABBOX_AZURE_ORPHAN_SWEEP_GRACE_SECONDS    optional; default 900
 ```
+
+Run-log retention is a maximum, not a guarantee: storage pressure evicts the oldest
+terminal log payloads first. Run records, results, receipts, events, and lease
+records remain; running logs are never evicted. The 512 MiB default leaves ample
+headroom below Cloudflare SQLite's 10 GB database limit. Keep this budget well
+below that limit to allow for metadata, events, and temporary writes; it bounds
+log payload bytes, not the total database size. Both Worker and Node runtimes
+honor it. `/v1/capacity/run-logs` returns `storedBytes`, `budgetBytes`,
+`accountingComplete`, and `pressure`; structured
+`coordinator.run_log_storage_pressure` warnings begin at 80% utilization.
+
+Existing payloads are accounted from run metadata in pages of 128 during
+maintenance. Until accounting completes, new terminal payloads are omitted with
+an explicit eviction marker, while run completion remains available. Maintenance
+continues once per second while migration or over-budget eviction is pending.
+Age pruning visits up to 128 records and removes up to 16 MiB of terminal log
+payloads per pass (one final log may cross that byte bound).
+
 
 Normal SSH-based AWS workspace bridges use a dedicated `crabbox-workspaces`
 security group, separate from ordinary runner ingress. Workers TCP egress has

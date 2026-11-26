@@ -367,6 +367,7 @@ func (b *coordinatorLeaseBackend) acquireOnceWithLeaseID(ctx context.Context, ke
 	if cfg.TargetOS == targetLinux {
 		ctx = context.WithValue(ctx, creationObservationsKey{}, observations)
 	}
+	ctx = WithCheckpointReadinessLifetime(ctx, server)
 	waitCtx, cancelWait := context.WithCancelCause(ctx)
 	defer cancelWait(nil)
 	stopHeartbeat, err := startCoordinatorHeartbeat(waitCtx, b.coord, leaseID, cfg.Provider, cfg.IdleTimeout, nil, leaseTelemetryCollectorForTarget(target), b.rt.Stderr)
@@ -384,6 +385,14 @@ func (b *coordinatorLeaseBackend) acquireOnceWithLeaseID(ctx context.Context, ke
 			reportCoordinatorAcquisitionRollback(b.rt.Stderr, leaseID, "bootstrap error", released, releaseErr)
 		}
 		return LeaseTarget{}, err
+	}
+	if _, fixedWait := checkpointReadinessFromContext(ctx); fixedWait {
+		if !coordinatorLeaseStillActive(waitCtx, b.coord, leaseID, cancelWait, b.rt.Stderr) {
+			return LeaseTarget{}, context.Cause(waitCtx)
+		}
+		if err := context.Cause(waitCtx); err != nil {
+			return LeaseTarget{}, err
+		}
 	}
 	timing := coordinatorRunnerTiming(lease)
 	if timing == nil {
@@ -555,6 +564,9 @@ func (b *coordinatorLeaseBackend) createCoordinatorLeaseWithProgressMode(ctx con
 	defer func() {
 		if err == nil && lease.PolicyNotice != "" {
 			fmt.Fprintln(b.rt.Stderr, lease.PolicyNotice)
+		}
+		if err == nil && lease.PricingFallback != nil {
+			fmt.Fprintf(b.rt.Stderr, "warning: cost estimate fallback reason=%s: %s\n", lease.PricingFallback.Reason, lease.PricingFallback.Message)
 		}
 	}()
 	started := time.Now()
@@ -1104,6 +1116,7 @@ func (b *coordinatorLeaseBackend) Status(ctx context.Context, req StatusRequest)
 		ServerType:                   lease.ServerType,
 		Host:                         lease.Host,
 		Network:                      resolved.Network,
+		NetworkFallbackReason:        resolved.FallbackReason,
 		NetworkDiagnostics:           lease.Network,
 		Tailscale:                    lease.Tailscale,
 		SSHHost:                      target.Host,
@@ -1435,6 +1448,8 @@ func (b *coordinatorLeaseBackend) releaseLeaseUnderClaimFence(ctx context.Contex
 			}
 		}
 		if coordinatorReleaseCleanupFailed(released) || coordinatorReleaseCleanupPending(released) || coordinatorExpiryCleanupCompleted(released) {
+			// Failed or retrying cleanup may leave the resource and its guest files.
+			outcome.TeardownAccepted = !coordinatorReleaseCleanupFailed(released)
 			fmt.Fprintf(b.rt.Stderr, "warning: coordinator accepted release for %s; remote cleanup remains pending and local claim/SSH artifacts were preserved\n", req.Lease.LeaseID)
 			return false, nil
 		}

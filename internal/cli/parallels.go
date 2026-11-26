@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -38,6 +39,11 @@ var errParallelsDHCPLeaseMissing = errors.New("no Parallels DHCP lease for VM MA
 
 var errParallelsGuestToolsUnavailable = errors.New("Parallels guest tools unavailable")
 
+// errParallelsGuestLinkLocalOnly marks an IP wait that ended while Tools still
+// reported only a self-assigned link-local address. The guest booted but its
+// DHCP request went unanswered, so a fresh clone can still succeed.
+var errParallelsGuestLinkLocalOnly = errors.New("Parallels guest has only a link-local address")
+
 // Acquisition owns clone mode and rollback; resolving an existing VM does not.
 type ParallelsIPWaitPurpose uint8
 
@@ -62,6 +68,7 @@ type ParallelsVM struct {
 	OS           string
 	Home         string
 	IP           string
+	LinkLocalIP  string
 	IPSource     string
 	MACs         []string
 	Template     bool
@@ -686,13 +693,14 @@ func (c *ParallelsClient) BootstrapMacOSOverSSH(ctx context.Context, ip string, 
 }
 
 func (c *ParallelsClient) runWindowsPowerShellFile(ctx context.Context, vmID, name, script string) error {
+	ctx, cancel := ParallelsStartupContext(ctx, c.Cfg)
+	defer cancel()
 	base := `C:\ProgramData\crabbox`
 	ps1 := base + `\` + name + `.ps1`
 	b64 := ps1 + `.b64`
-	if err := c.runWindowsPowerShell(ctx, vmID, fmt.Sprintf(`New-Item -ItemType Directory -Force -Path %s | Out-Null
-foreach ($path in @(%s, %s)) {
-  if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-}`, psQuote(base), psQuote(ps1), psQuote(b64))); err != nil {
+	if err := c.runWindowsPowerShellStaging(ctx, vmID, fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path %s | Out-Null
+[IO.File]::Open(%s, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite).Dispose()`, psQuote(base), psQuote(b64))); err != nil {
 		return err
 	}
 	encoded := base64.StdEncoding.EncodeToString([]byte(script))
@@ -703,25 +711,109 @@ foreach ($path in @(%s, %s)) {
 			end = len(encoded)
 		}
 		chunk := encoded[start:end]
-		if err := c.runWindowsPowerShell(ctx, vmID, fmt.Sprintf(`Add-Content -Encoding ASCII -LiteralPath %s -Value %s`, psQuote(b64), psQuote(chunk))); err != nil {
+		// Tools can lose the result after a write. Replaying an offset overwrite
+		// preserves bytes even if the previous invocation already completed.
+		write := fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+$bytes = [Text.Encoding]::ASCII.GetBytes(%s)
+$file = [IO.File]::Open(%s, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+try {
+  $file.Position = %d
+  $file.Write($bytes, 0, $bytes.Length)
+} finally { $file.Dispose() }`, psQuote(chunk), psQuote(b64), start)
+		if err := c.runWindowsPowerShellStaging(ctx, vmID, write); err != nil {
 			return err
 		}
 	}
-	run := fmt.Sprintf(`$raw = (Get-Content -Raw -LiteralPath %s) -replace '\s',''
+	// A fresh receipt distinguishes this dispatch from an older successful run.
+	receipt := ps1 + ".result"
+	token := rand.Text()
+	// Ignore a longer previous upload's tail, but verify the entire decoded
+	// payload before executing it. Never replay this invocation after result loss.
+	run := fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+$raw = [IO.File]::ReadAllText(%s).Substring(0, %d)
 $bytes = [Convert]::FromBase64String($raw)
-$text = [Text.Encoding]::UTF8.GetString($bytes)
-[IO.File]::WriteAllText(%s, $text, [Text.UTF8Encoding]::new($false))
-& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File %s`, psQuote(b64), psQuote(ps1), psQuote(ps1))
-	return c.runWindowsPowerShell(ctx, vmID, run)
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $hash = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+if ($hash -ne %s) { throw 'Windows bootstrap upload SHA-256 mismatch' }
+[IO.File]::WriteAllBytes(%s, $bytes)
+& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File %s
+$code = $LASTEXITCODE
+[IO.File]::WriteAllText(%s, %s + ':' + $code, [Text.Encoding]::ASCII)
+exit $code`, psQuote(b64), len(encoded), psQuote(fmt.Sprintf("%x", sha256.Sum256([]byte(script)))), psQuote(ps1), psQuote(ps1), psQuote(receipt), psQuote(token))
+	result, err := c.runWindowsPowerShell(ctx, vmID, run)
+	if !parallelsWindowsToolsResultLost(result, err) {
+		return err
+	}
+	return c.waitWindowsPowerShellReceipt(ctx, vmID, receipt, token, err)
 }
 
-func (c *ParallelsClient) runWindowsPowerShell(ctx context.Context, vmID, script string) error {
+func (c *ParallelsClient) runWindowsPowerShellStaging(ctx context.Context, vmID, script string) error {
+	const attempts = 3
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		result, err := c.runWindowsPowerShell(ctx, vmID, script)
+		if !parallelsWindowsToolsResultLost(result, err) || attempt == attempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-time.After(time.Duration(attempt) * ParallelsGuestExecProbeInterval):
+		}
+		if err := c.WaitForGuestExec(ctx, vmID, c.Cfg, c.Cfg.Parallels.StartupTimeout); err != nil {
+			return err
+		}
+	}
+}
+
+// The retained result-loss signatures are exit 255 with one of these Tools
+// messages. Exit 255 alone (also used by SSH) is not retryable.
+func parallelsWindowsToolsResultLost(result LocalCommandResult, err error) bool {
+	if err == nil || result.ExitCode != 255 {
+		return false
+	}
+	message := strings.ToLower(result.Stderr + "\n" + result.Stdout)
+	return strings.Contains(message, "prljob_getresult: invalid argument") ||
+		strings.Contains(message, "prljob_getretcode: invalid argument")
+}
+
+func (c *ParallelsClient) waitWindowsPowerShellReceipt(ctx context.Context, vmID, path, token string, original error) error {
+	probe := fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+try {
+  if (Test-Path -LiteralPath %s) { [IO.File]::ReadAllText(%s) }
+} catch [IO.IOException] { }`, psQuote(path), psQuote(path))
+	for ctx.Err() == nil {
+		probeCtx, cancel := context.WithTimeout(ctx, parallelsIPProbeTimeout)
+		result, err := c.runWindowsPowerShell(probeCtx, vmID, probe)
+		probeExpired := probeCtx.Err() != nil
+		cancel()
+		if err == nil && !probeExpired {
+			if value, found := strings.CutPrefix(strings.TrimSpace(result.Stdout), token+":"); found {
+				code, parseErr := strconv.Atoi(value)
+				if parseErr == nil && code == 0 {
+					return nil
+				}
+				if parseErr == nil {
+					return fmt.Errorf("Windows bootstrap completed with exit code %d after result loss: %w", code, original)
+				}
+			}
+		} else if !probeExpired && !parallelsWindowsToolsResultLost(result, err) {
+			return fmt.Errorf("Windows bootstrap outcome unknown: %w; receipt check: %w", original, err)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(ParallelsGuestExecProbeInterval):
+		}
+	}
+	return fmt.Errorf("Windows bootstrap outcome unknown: %w; receipt check: %w", original, context.Cause(ctx))
+}
+
+func (c *ParallelsClient) runWindowsPowerShell(ctx context.Context, vmID, script string) (LocalCommandResult, error) {
 	args := strings.Fields(PowershellCommand(script))
 	result, err := c.prlctl(ctx, nil, append([]string{"exec", vmID}, args...)...)
-	if err != nil {
-		return commandOutputError("parallels windows powershell", result, err)
-	}
-	return nil
+	return result, commandOutputError("parallels windows powershell", result, err)
 }
 
 func (c *ParallelsClient) EnsureGuestReady(ctx context.Context, vmID string, cfg Config) error {
@@ -745,7 +837,7 @@ func (c *ParallelsClient) EnsureGuestReady(ctx context.Context, vmID string, cfg
 	return nil
 }
 
-func (c *ParallelsClient) WaitForIP(ctx context.Context, id string, timeout time.Duration, purpose ParallelsIPWaitPurpose) (ParallelsVM, error) {
+func (c *ParallelsClient) WaitForIP(ctx context.Context, id string, timeout time.Duration, purpose ParallelsIPWaitPurpose) (_ ParallelsVM, err error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Minute
 	}
@@ -760,6 +852,24 @@ func (c *ParallelsClient) WaitForIP(ctx context.Context, id string, timeout time
 	var lastDHCPError error
 	var lastQueryError error
 	useDHCPFallback := c.Cfg.TargetOS == targetMacOS && strings.TrimSpace(c.Cfg.Parallels.BootstrapKey) != ""
+	// A wait that runs out of time while Tools report only a link-local address
+	// is retryable: the guest booted but DHCP never answered it, and a fresh
+	// clone can still succeed. Acquisition shares its startup deadline with this
+	// wait, so the timeout usually arrives as the parent's deadline.
+	defer func() {
+		if err == nil || !vmObserved || last.LinkLocalIP == "" || errors.Is(err, errParallelsGuestToolsUnavailable) {
+			return
+		}
+		var exitErr ExitError
+		switch {
+		case ctx.Err() == nil && AsExitError(err, &exitErr):
+			err = fmt.Errorf("%w: %w", errParallelsGuestLinkLocalOnly, err)
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			hint := parallelsIPTimeoutHint(c.Cfg, last, true, useDHCPFallback, lastDHCPError, purpose)
+			err = fmt.Errorf("%w: %w: %w", errParallelsGuestLinkLocalOnly,
+				Exit(5, "timed out waiting for Parallels VM %s IP; last_state=%s; %s", id, blank(last.State, "-"), hint), err)
+		}
+	}()
 	waitError := func(reason string) error {
 		if parentDeadline, ok := ctx.Deadline(); ok && !time.Now().Before(parentDeadline) {
 			<-ctx.Done()
@@ -902,6 +1012,9 @@ func parallelsIPTimeoutHint(cfg Config, last ParallelsVM, vmObserved, dhcpFallba
 	toolsIP := "unknown"
 	if vmObserved {
 		toolsIP = "none"
+		if last.LinkLocalIP != "" {
+			toolsIP = last.LinkLocalIP + " (link-local: the guest's DHCP request was not answered)"
+		}
 	}
 	parts := []string{"clone_mode=" + mode + " macs=" + macs + " tools_ip=" + toolsIP}
 	parts = append(parts, "--parallels-startup-timeout bounds the overall IP wait; increasing it does not disable Tools fail-fast")
@@ -919,6 +1032,10 @@ func parallelsIPTimeoutHint(cfg Config, last ParallelsVM, vmObserved, dhcpFallba
 		} else {
 			parts = append(parts, "inspect the existing VM on the Parallels host with `prlctl capture <existing-vm-id> --file <png>`")
 		}
+	}
+	if running && vmObserved && last.LinkLocalIP != "" {
+		parts = append(parts, "the guest booted and reports only a self-assigned address, so check the DHCP server of the guest's Parallels network (`prlsrvctl net info Shared` for the default network)")
+		return "hint: " + strings.Join(parts, "; ")
 	}
 	if running && purpose == ParallelsIPWaitAcquisition && mode == "linked" {
 		parts = append(parts, "the template snapshot may not boot as a linked clone; retry with parallels.cloneMode=full (--parallels-clone-mode full) and clear parallels.sourceSnapshot and parallels.sourceSnapshotId with --parallels-source-snapshot= --parallels-source-snapshot-id= (full clones use the source VM's current state and cannot select a source snapshot)")
@@ -1578,14 +1695,9 @@ func parseParallelsVMs(data string) ([]ParallelsVM, error) {
 			State:    firstJSONField(item, "State", "status"),
 			OS:       firstJSONField(item, "OS", "os"),
 			Home:     firstJSONField(item, "Home", "home"),
-			IP:       cleanParallelsIP(firstJSONField(item, "ip_configured")),
 			Template: strings.EqualFold(firstJSONField(item, "Template"), "yes"),
 		}
-		if vm.IP == "" {
-			if network, ok := item["Network"].(map[string]any); ok {
-				vm.IP = firstParallelsNetworkIP(network)
-			}
-		}
+		vm.IP, vm.LinkLocalIP = parallelsGuestIP(item)
 		vm.MACs = parallelsNetworkMACs(item)
 		out = append(out, vm)
 	}
@@ -1753,32 +1865,34 @@ func firstJSONField(item map[string]any, keys ...string) string {
 	return ""
 }
 
-func firstParallelsNetworkIP(network map[string]any) string {
-	values, ok := network["ipAddresses"].([]any)
-	if !ok {
-		return ""
+// parallelsGuestIP picks the first non-link-local address in ip_configured,
+// then the first non-link-local IPv4 in Network.ipAddresses. If none is usable,
+// it retains the first link-local address for timeout diagnostics.
+func parallelsGuestIP(item map[string]any) (ip, linkLocal string) {
+	candidates := strings.Fields(firstJSONField(item, "ip_configured"))
+	if network, ok := item["Network"].(map[string]any); ok {
+		values, _ := network["ipAddresses"].([]any)
+		for _, value := range values {
+			if entry, ok := value.(map[string]any); ok && entry["type"] == "ipv4" {
+				if address, ok := entry["ip"].(string); ok {
+					candidates = append(candidates, strings.TrimSpace(address))
+				}
+			}
+		}
 	}
-	for _, value := range values {
-		item, ok := value.(map[string]any)
-		if !ok || item["type"] != "ipv4" {
+	for _, candidate := range candidates {
+		if candidate == "" || candidate == "-" {
 			continue
 		}
-		if ip, ok := item["ip"].(string); ok {
-			return cleanParallelsIP(ip)
+		if parsed := net.ParseIP(candidate); parsed != nil && parsed.IsLinkLocalUnicast() {
+			if linkLocal == "" {
+				linkLocal = candidate
+			}
+			continue
 		}
+		return candidate, ""
 	}
-	return ""
-}
-
-func cleanParallelsIP(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" || value == "-" {
-		return ""
-	}
-	if strings.Contains(value, " ") {
-		return strings.Fields(value)[0]
-	}
-	return value
+	return "", linkLocal
 }
 
 func parallelsHostMatchesTarget(host ParallelsHostConfig, target string) bool {

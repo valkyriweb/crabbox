@@ -1,5 +1,6 @@
 import type { AWSQualificationTransportBinding } from "./aws-qualification-contract";
 import type { LeaseLifetimePolicy } from "./lease-lifetime";
+import type { PricingFallback } from "./provider-pricing";
 import type { ServeRelayBackend } from "./serve-relay";
 
 export interface AWSCredentials {
@@ -127,6 +128,7 @@ export interface Env {
   CRABBOX_DURABLE_PROVISIONING_ADMISSION?: string;
   CRABBOX_USER_TOKEN_TTL_SECONDS?: string;
   CRABBOX_RUN_RETENTION_DAYS?: string;
+  CRABBOX_RUN_LOG_BUDGET_BYTES?: string;
   CRABBOX_GITHUB_CLIENT_ID?: string;
   CRABBOX_GITHUB_CLIENT_SECRET?: string;
   CRABBOX_GITHUB_ALLOWED_ORG?: string;
@@ -227,6 +229,8 @@ export interface LeaseClientIdentity {
 export interface LeaseRequest {
   clientIdentity?: LeaseClientIdentity;
   serveMachine?: string;
+  sshHost?: string;
+  hostCapabilities?: string[];
   lifetimePolicy?: import("./lease-lifetime").LeaseLifetimeRequest;
   leaseID?: string;
   createAttemptID?: string;
@@ -333,6 +337,7 @@ export interface CreateAttemptRecord {
   checkpointUseClaimHash?: string;
   createdAt: string;
   updatedAt: string;
+  retirement?: { at: string; actor: string; reason: string; createdBefore: string };
 }
 
 export interface ImageCapabilities {
@@ -388,6 +393,14 @@ export interface LeaseRegistrationRequest {
 }
 
 export const coordinatorProviderRegistry = [
+  {
+    runtimeExtension: true,
+    provider: "ssh-host",
+    label: "Managed SSH hosts",
+    requiredSecrets: [],
+    adminAudit: false,
+    supportsCapacityMarket: false,
+  },
   {
     runtimeExtension: true,
     provider: "serve",
@@ -509,6 +522,16 @@ export interface HetznerCleanupEvidence {
 
 export type ProviderCleanupEvidence = HetznerCleanupEvidence;
 
+// Provider-observed acquisition identity, not process or artifact closure evidence.
+export interface AWSRootDiskIdentity {
+  leaseID: string;
+  instanceID: string;
+  volumeID: string;
+  deviceName: string;
+  region: string;
+  providerScope: string;
+}
+
 export interface LeaseRecord {
   clientIdentity?: LeaseClientIdentity;
   leasePolicy?: import("./config").LeasePolicy;
@@ -531,6 +554,7 @@ export interface LeaseRecord {
   cleanupConfirmedBy?: "retained-reconcile" | "retained-reconcile-legacy-attested";
   serve?: import("./serve").ServeAssignment;
   serveIntent?: string;
+  sshHostAllocation?: import("./ssh-host").HostAllocation;
   serveUsageRecordedAt?: string;
   sshHostKeyFingerprint?: string;
   imageEvidence?: {
@@ -594,6 +618,7 @@ export interface LeaseRecord {
   awsSSMCommandID?: string;
   awsSSMCommandStatus?: string;
   awsSSMLogGroup?: string;
+  awsOriginalRootDisk?: AWSRootDiskIdentity;
   capacityHints?: CapacityHint[];
   serverID: number;
   providerResourceID?: string;
@@ -608,6 +633,7 @@ export interface LeaseRecord {
   sshFallbackPorts?: string[];
   serveRelaySessions?: string[];
   sshJump?: {
+    relayOnly?: boolean;
     host: string;
     port: number;
     hostKey: string;
@@ -624,6 +650,7 @@ export interface LeaseRecord {
   idleTimeoutSeconds?: number;
   estimatedHourlyUSD: number;
   maxEstimatedUSD: number;
+  pricingFallback?: PricingFallback;
   state: "provisioning" | "active" | "released" | "expired" | "failed";
   createdAt: string;
   updatedAt: string;
@@ -1020,6 +1047,7 @@ export interface CoordinatorCheckpointRecord {
   updatedAt: string;
   lastUsedAt: string;
   nextSweepAt?: string;
+  imageRefreshAt?: string;
   createClaim?: CoordinatorCheckpointCreateClaim;
   deleteClaim?: CoordinatorCheckpointDeleteClaim;
   deleteRequestedAt?: string;
@@ -1139,6 +1167,8 @@ export interface RunRecord {
   durationMs?: number;
   logBytes: number;
   logTruncated: boolean;
+  logEvicted?: "storage_pressure" | "retention";
+  storedLogBytes?: number;
   blockedStage?: string;
   retryLikely?: string;
   results?: TestResultSummary;
@@ -1368,6 +1398,7 @@ export interface ProviderMachine {
   awsMetadataHttpTokens?: string;
   awsMetadataHttpPutResponseHopLimit?: number;
   awsMetadataInstanceTags?: string;
+  awsRootDeviceName?: string;
   awsRootVolumeID?: string;
   awsRootDeleteOnTermination?: boolean;
   labels: Record<string, string>;

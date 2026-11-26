@@ -1,6 +1,10 @@
 import {
+  psQuote,
   sharedLinuxSSHRestart,
+  sharedLinuxOwnershipRepair,
   sharedLinuxBootstrapStart,
+  sharedLinuxAptQuiesce,
+  sharedLinuxAptWait,
   sharedLinuxBootstrapActivate,
   sharedLinuxBootstrapPrelude,
   sharedLinuxOptionalPackages,
@@ -95,9 +99,8 @@ export function cloudInit(
   let core = `    #!/bin/bash
     exec > >(tee -a /var/log/cloud-init-output.log) 2>&1
 ${indentRuncmdScript(sharedLinuxBootstrapPrelude())}${sshRestart}${indentRuncmdScript(linuxMinimalReadinessBootstrap)}
-    mkdir -p ${config.workRoot} /var/cache/crabbox/pnpm /var/cache/crabbox/npm
-    chown -R ${config.sshUser}:${config.sshUser} ${config.workRoot} /var/cache/crabbox
-    install -d /var/lib/crabbox
+    mkdir -p ${shellQuote(config.workRoot)} /var/cache/crabbox/pnpm /var/cache/crabbox/npm
+${indentRuncmdScript(sharedLinuxOwnershipRepair(config.sshUser, [config.workRoot, "/var/cache/crabbox"]))}    install -d /var/lib/crabbox
 ${sshRestart}`;
   let final = "    systemctl start crabbox-bootstrap.service\n";
   let workspaceAfter = "crabbox-bootstrap.service cloud-config.service";
@@ -185,6 +188,9 @@ function privateAWSCloudInit(config: LeaseConfig): string {
   return `#cloud-config
 package_update: false
 package_upgrade: false
+bootcmd:
+  - |
+${indentRuncmdScript(sharedLinuxAptQuiesce())}
 ssh_pwauth: false
 disable_root: true
 users:
@@ -213,6 +219,7 @@ runcmd:
   - |
     bash -euxo pipefail <<'BOOT'
     export DEBIAN_FRONTEND=noninteractive
+${indentRuncmdScript(sharedLinuxAptWait())}
     if grep -RIl 'http://' /etc/apt 2>/dev/null | grep -q .; then
       grep -RIl 'http://' /etc/apt | xargs -r sed -i 's|http://|https://|g'
     fi
@@ -380,8 +387,18 @@ function windowsWSL2BootstrapPowerShell(config: LeaseConfig): string {
 	  wsl.exe --set-default $wslDistro | Out-Host
 	  if ($LASTEXITCODE -ne 0) { throw "wsl --set-default failed with exit $LASTEXITCODE" }
 	}
-	$linuxSetup = @'
-set -euo pipefail
+	$linuxSetup = ${psQuote(windowsWSL2LinuxSetup(workRoot))}
+	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
+	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
+	wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh
+	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
+	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
+	Restart-Service sshd -Force
+	`;
+}
+
+function windowsWSL2LinuxSetup(workRoot: string): string {
+  return `set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p ${shellQuote(workRoot)} /var/cache/crabbox/pnpm /var/cache/crabbox/npm /var/lib/crabbox
 cat >/etc/apt/apt.conf.d/80-crabbox-retries <<'APT'
@@ -419,15 +436,7 @@ test -w ${shellQuote(workRoot)}
 READY
 chmod 0755 /usr/local/bin/crabbox-ready
 touch /var/lib/crabbox/bootstrapped
-crabbox-ready
-'@
-	$linuxSetup = $linuxSetup.Replace(([string][char]13 + [string][char]10), ([string][char]10))
-	[IO.File]::WriteAllText($wslSetup, $linuxSetup, (New-Object Text.UTF8Encoding($false)))
-	wsl.exe -d $wslDistro --user root --exec bash /mnt/c/ProgramData/crabbox/wsl/linux-setup.sh
-	if ($LASTEXITCODE -ne 0) { throw "WSL setup failed with exit $LASTEXITCODE" }
-	Set-Content -NoNewline -Encoding ASCII -Path $setupCompletePath -Value (Get-Date).ToString("o")
-	Restart-Service sshd -Force
-	`;
+crabbox-ready`;
 }
 
 export function azureWindowsBootstrapPowerShell(config: LeaseConfig): string {
@@ -888,11 +897,15 @@ function tailscaleBootstrap(config: LeaseConfig): string {
     `--hostname=${shellQuote(config.tailscaleHostname)}`,
     `--advertise-tags=${shellQuote(config.tailscaleTags.join(","))}`,
   ];
+  // tailscale up rejects a MagicDNS name while this node is still starting
+  // and has no peers. Select the exit node only after an address is present.
+  let selectExitNode = "";
   if (config.tailscaleExitNode) {
-    upArgs.push(`--exit-node=${shellQuote(config.tailscaleExitNode)}`);
+    selectExitNode = `    tailscale set --exit-node=${shellQuote(config.tailscaleExitNode)}`;
     if (config.tailscaleExitNodeAllowLanAccess) {
-      upArgs.push("--exit-node-allow-lan-access");
+      selectExitNode += " --exit-node-allow-lan-access";
     }
+    selectExitNode += "\n";
   }
   return `    ${tailscaleInstallBootstrap(config)}
     systemctl enable --now tailscaled || service tailscaled start || true
@@ -915,7 +928,7 @@ function tailscaleBootstrap(config: LeaseConfig): string {
       sleep 5
     done
     test -n "$ts_ip"
-    printf '%s\\n' "$ts_ip" > /var/lib/crabbox/tailscale-ipv4
+${selectExitNode}    printf '%s\\n' "$ts_ip" > /var/lib/crabbox/tailscale-ipv4
     printf '%s\\n' ${shellQuote(config.tailscaleHostname)} > /var/lib/crabbox/tailscale-hostname
     tailscale version 2>/dev/null | head -n1 > /var/lib/crabbox/tailscale-version || true
     if [ -n ${shellQuote(config.tailscaleExitNode)} ]; then
@@ -928,10 +941,6 @@ function tailscaleBootstrap(config: LeaseConfig): string {
     fi
     chown ${shellQuote(`${sshUser}:${sshUser}`)} /var/lib/crabbox/tailscale-* || true
     chmod 0640 /var/lib/crabbox/tailscale-* || true`;
-}
-
-function psQuote(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function shellQuote(value: string): string {

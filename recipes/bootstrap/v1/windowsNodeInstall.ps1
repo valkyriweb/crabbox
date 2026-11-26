@@ -14,11 +14,11 @@ function Ensure-CrabboxNode {
   $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
   $env:Path = $machinePath
   if (Test-CrabboxNode) { return }
-  $nodeVersion = "24.19.0"
+  $nodeVersion = "24.22.3"
   $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
   switch ($architecture) {
-    "X64" { $nodeArch = "x64"; $nodeSHA256 = "57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73" }
-    "Arm64" { $nodeArch = "arm64"; $nodeSHA256 = "8502f4a50b458d4cc38ed8f2001556c2cd239d464920f74017926ccb1e1c157f" }
+    "X64" { $nodeArch = "x64"; $nodeSHA256 = "e612af99f626ab415ea225af6bce5c971feb448cb5cae250bb1c3fa50c5f7d9f" }
+    "Arm64" { $nodeArch = "arm64"; $nodeSHA256 = "b3cc74a295b39d4f273271e96f58c06dd2b35757ca12abec64c7d0598b434f14" }
     default { throw "unsupported Windows Node architecture: $architecture" }
   }
   $archiveName = "node-v$nodeVersion-win-$nodeArch"

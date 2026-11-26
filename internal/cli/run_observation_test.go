@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestImageEvidenceLocalHistoryRoundTrip(t *testing.T) {
@@ -234,7 +235,7 @@ func TestRunObservationCoordinatorTerminalAcknowledgment(t *testing.T) {
 					t.Fatal("existing failure lifecycle changed")
 				}
 			} else {
-				err := recorder.Finish(t.Context(), SSHTarget{}, 1, 0, 0, "", false, nil, FailureClassification{}, &receipt)
+				err := recorder.Finish(t.Context(), SSHTarget{}, 1, 0, 100*time.Millisecond, "", false, nil, FailureClassification{}, &receipt)
 				if (err == nil) != (mode == "verified-receipt") {
 					t.Fatalf("Finish=%v", err)
 				}
@@ -281,5 +282,46 @@ func TestRunObservationPolicyIgnoresRepositoryFiles(t *testing.T) {
 	}
 	if !cfg.RecordLocal {
 		t.Fatal("trusted user policy not applied")
+	}
+}
+
+func TestRunObservationFailedAcquisitionHasNoExitCode(t *testing.T) {
+	setupLocalContainerRunSessionTest(t, "")
+	runEnvProfileTestAcquireLease = func(AcquireRequest) (LeaseTarget, error) {
+		return LeaseTarget{}, Exit(5, "fixture bootstrap failed")
+	}
+	var stdout, stderr bytes.Buffer
+	app := App{Stdout: &stdout, Stderr: &stderr}
+	err := app.runCommand(t.Context(), []string{"--record-local", "--provider", "local-container", "--no-sync", "--no-hydrate", "--", "true"})
+	if code := ExitCodeForError(err, 1); code != 5 {
+		t.Fatalf("run err=%v code=%d", err, code)
+	}
+	records, err := listLocalHistory(localHistoryFilter{})
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+	record := records[0]
+	if record.ExitCode != nil || record.RunStatus != RunStatusFailed || record.ErrorKind != RunErrorProvider || record.Phase != string(RunPhaseAcquire) || record.RecordingState != "terminal" {
+		t.Fatalf("failed acquisition=%+v", record)
+	}
+	stdout.Reset()
+	if err := app.Run(t.Context(), []string{"history", "--source", "local"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"state=terminal", "status=failed", "error=provider-error", "phase=acquire exit=-"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("history missing %q: %s", want, stdout.String())
+		}
+	}
+	stdout.Reset()
+	if err := app.Run(t.Context(), []string{"history", "--source", "local", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var history historyReadEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &history); err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Records) != 1 || history.Records[0].Local == nil || history.Records[0].Local.ExitCode != nil || history.Records[0].Local.RunStatus != RunStatusFailed {
+		t.Fatalf("JSON history misreports failed acquisition: %s", stdout.String())
 	}
 }

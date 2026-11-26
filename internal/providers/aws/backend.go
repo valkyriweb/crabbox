@@ -128,7 +128,9 @@ func (b *awsLeaseBackend) acquireOnce(ctx context.Context, keep bool, requestedS
 	if err := waitAWSAcquireReady(ctx, func(ctx context.Context) error {
 		return client.CheckAcquireState(ctx, server.CloudID)
 	}, func(ctx context.Context) error {
-		return bootstrapAWSWindowsDesktop(ctx, cfg, &target, publicKey, b.RT.Stderr)
+		return core.WaitForDirectBootstrap(ctx, cfg, server, &target, core.BootstrapWaitTimeout(cfg), func(ctx context.Context, target *core.SSHTarget, _ time.Duration) error {
+			return bootstrapAWSWindowsDesktop(ctx, cfg, target, publicKey, b.RT.Stderr)
+		})
 	}); err != nil {
 		return core.LeaseTarget{}, err
 	}
@@ -169,15 +171,16 @@ func (b *awsLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequ
 	var resolvedCfg core.Config
 	var accountID, providerScope, publicKey, fingerprint string
 	acquired, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
-		Kind:         fixedAWSLeaseKind,
-		LeaseID:      leaseID,
-		CheckpointID: req.RequestedCheckpointID,
-		RepoRoot:     req.Repo.Root,
-		Reclaim:      req.Reclaim,
-		TargetOS:     cfg.TargetOS,
-		WindowsMode:  cfg.WindowsMode,
-		TTL:          cfg.TTL,
-		IdleTimeout:  cfg.IdleTimeout,
+		LegacyRepoRoot: req.Repo.LegacyRoot,
+		Kind:           fixedAWSLeaseKind,
+		LeaseID:        leaseID,
+		CheckpointID:   req.RequestedCheckpointID,
+		RepoRoot:       req.Repo.Root,
+		Reclaim:        req.Reclaim,
+		TargetOS:       cfg.TargetOS,
+		WindowsMode:    cfg.WindowsMode,
+		TTL:            cfg.TTL,
+		IdleTimeout:    cfg.IdleTimeout,
 	}, core.FixedLeaseOperations[core.Server]{PlanDuringSubmit: true, Admission: &core.FixedAdmission{}, DeferredAdmission: true, DescribeIntent: func(ctx context.Context, claim *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
 		var err error
 		client, err = newAWSClient(ctx, cfg)
@@ -328,10 +331,16 @@ func (b *awsLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRequ
 				return core.LeaseTarget{}, err
 			}
 			target := sshTargetForBootstrap(resolvedCfg, server.PublicNet.IPv4.IP, leaseID, intent.Slug)
+			ctx = core.WithCheckpointReadinessLifetime(ctx, server)
 			if err := waitAWSAcquireReady(ctx, func(ctx context.Context) error {
+				if err := core.CheckCheckpointReadinessLifetime(ctx, server); err != nil {
+					return err
+				}
 				return serverClient.CheckAcquireState(ctx, server.CloudID)
 			}, func(ctx context.Context) error {
-				return bootstrapAWSWindowsDesktop(ctx, resolvedCfg, &target, publicKey, b.RT.Stderr)
+				return core.WaitForDirectBootstrap(ctx, resolvedCfg, server, &target, core.BootstrapWaitTimeout(resolvedCfg), func(ctx context.Context, target *core.SSHTarget, _ time.Duration) error {
+					return bootstrapAWSWindowsDesktop(ctx, resolvedCfg, target, publicKey, b.RT.Stderr)
+				})
 			}); err != nil {
 				return core.LeaseTarget{}, err
 			}

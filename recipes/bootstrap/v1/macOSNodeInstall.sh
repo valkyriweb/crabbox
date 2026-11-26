@@ -3,10 +3,10 @@ set +x
 set -euo pipefail
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # Match recipes/devtools/v1's Linux Node LTS baseline.
-node_version=24.19.0
+node_version=24.22.3
 case "$(uname -m)" in
-  x86_64) node_arch=x64; node_sha=d1b5e999db158c62fe8f7267a4476b035d8bd93b1a605bac24a3f0dd166e3316 ;;
-  arm64) node_arch=arm64; node_sha=8294b7aa9b03997481c06babf1e8b270c859358f27da57a11509afe537ac381d ;;
+  x86_64) node_arch=x64; node_sha=977614af0504c81045e7fd85596dbca0e5f951b96681516dadafedcca8c447f7 ;;
+  arm64) node_arch=arm64; node_sha=ff6e17d4874b76d272212b908cc020d6e815fba5a6c7eaaa06add725840307fd ;;
   *) echo 'unsupported macOS Node architecture' >&2; exit 1 ;;
 esac
 if node --version >/dev/null 2>&1 && npm --version >/dev/null 2>&1; then

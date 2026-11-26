@@ -49,7 +49,8 @@ func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRe
 	cfg.ServerType = (Provider{}).ServerTypeForConfig(cfg)
 	var publicKey string
 	lease, err := core.AcquireFixedResource(ctx, core.FixedAcquireOptions{
-		Kind: fixedAzureLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
+		LegacyRepoRoot: req.Repo.LegacyRoot,
+		Kind:           fixedAzureLeaseKind, LeaseID: req.RequestedLeaseID, RepoRoot: req.Repo.Root, Reclaim: req.Reclaim,
 		TargetOS: cfg.TargetOS, WindowsMode: cfg.WindowsMode, TTL: cfg.TTL, IdleTimeout: cfg.IdleTimeout,
 	}, core.FixedLeaseOperations[core.Server]{Admission: &core.FixedAdmission{}, DescribeIntent: func(ctx context.Context, claim *core.LeaseClaim, exists bool) (core.FixedLeaseBinding, error) {
 		if exists && (!fixedAzureLeaseKind.IsFixedClaim(*claim) || claim.ProviderScope != scope) {
@@ -175,7 +176,9 @@ func (b *azureLeaseBackend) acquireFixed(ctx context.Context, req core.AcquireRe
 			return core.LeaseTarget{}, err
 		}
 		target := core.SSHTargetFromConfig(cfg, core.AzureServerHost(server, cfg.Azure.Network))
-		if err := bootstrapManagedWindowsDesktop(ctx, cfg, &target, publicKey, b.RT.Stderr); err != nil {
+		if err := core.WaitForDirectBootstrap(ctx, cfg, server, &target, core.BootstrapWaitTimeout(cfg), func(ctx context.Context, target *core.SSHTarget, _ time.Duration) error {
+			return bootstrapManagedWindowsDesktop(ctx, cfg, target, publicKey, b.RT.Stderr)
+		}); err != nil {
 			return core.LeaseTarget{}, err
 		}
 		server.Labels["state"] = "ready"

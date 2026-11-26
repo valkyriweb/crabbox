@@ -19,12 +19,14 @@ func staticPortCandidates(t *testing.T, cfg Config) []string {
 }
 
 func TestStaticLeaseExplicitStaticPortNeverFallsBack(t *testing.T) {
-	cfg := baseConfig()
-	cfg.Provider = staticProvider
-	cfg.Static.Host = "127.0.0.1"
-	cfg.Static.Port = "2224"
-	if got, want := staticPortCandidates(t, cfg), []string{"2224"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates=%v want %v", got, want)
+	for _, host := range []string{"127.0.0.1", "localhost", "::1", "build.example"} {
+		for _, port := range []string{"2224", "2222", "22"} {
+			cfg := baseConfig()
+			cfg.Provider, cfg.Static.Host, cfg.Static.Port = staticProvider, host, port
+			if got, want := staticPortCandidates(t, cfg), []string{port}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("host=%s candidates=%v want %v", host, got, want)
+			}
+		}
 	}
 }
 
@@ -48,52 +50,46 @@ func TestStaticLeaseDefaultPortKeepsFallback(t *testing.T) {
 	}
 }
 
-func TestStaticLeaseExplicitFallbackPortsAreHonored(t *testing.T) {
-	cfg := baseConfig()
-	cfg.Provider = staticProvider
-	cfg.Static.Host = "build.example"
-	cfg.Static.Port = "2224"
-	cfg.SSHFallbackPorts = []string{"2225"}
-	cfg.sshFallbackPortsExplicit = true
-	cfg.explicitSSHFallbackPorts = []string{"2225"}
-	if got, want := staticPortCandidates(t, cfg), []string{"2224", "2225"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates=%v want %v", got, want)
-	}
-}
-
-func TestStaticLeaseLoopbackDefaultPortNeverFallsBackTo22(t *testing.T) {
-	for _, host := range []string{"127.0.0.1", "::1", "localhost"} {
+func TestStaticLeaseExplicitPortOverridesFallbackList(t *testing.T) {
+	for _, explicitSSH := range []bool{false, true} {
 		cfg := baseConfig()
 		cfg.Provider = staticProvider
-		cfg.Static.Host = host
-		if got, want := staticPortCandidates(t, cfg), []string{"2222"}; !reflect.DeepEqual(got, want) {
-			t.Fatalf("host=%s candidates=%v want %v", host, got, want)
+		cfg.Static.Host = "build.example"
+		if explicitSSH {
+			cfg.SSHPort = "2224"
+			MarkSSHPortExplicit(&cfg)
+		} else {
+			cfg.Static.Port = "2224"
+		}
+		cfg.SSHFallbackPorts = []string{"22", "2225"}
+		cfg.sshFallbackPortsExplicit = true
+		cfg.explicitSSHFallbackPorts = []string{"22", "2225"}
+		if got, want := staticPortCandidates(t, cfg), []string{"2224"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("explicitSSH=%t candidates=%v want %v", explicitSSH, got, want)
 		}
 	}
 }
 
-func TestNonStaticLoopbackLeaseNeverFallsBackTo22(t *testing.T) {
-	cfg := baseConfig()
-	cfg.Provider = "aws"
-	target := sshTargetForLeaseConnection(cfg, "127.0.0.1", "crabbox", "2203", "", nil)
-	if got, want := sshPortCandidates(target.Port, target.FallbackPorts), []string{"2203"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates=%v want %v", got, want)
-	}
-	remote := sshTargetForLeaseConnection(cfg, "192.0.2.10", "crabbox", "2203", "", nil)
-	if got, want := sshPortCandidates(remote.Port, remote.FallbackPorts), []string{"2203", "22"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("remote candidates=%v want %v", got, want)
-	}
-}
-
-func TestLoopbackLeaseHonorsExplicitFallbackPorts(t *testing.T) {
-	cfg := baseConfig()
-	cfg.Provider = "aws"
-	cfg.SSHFallbackPorts = []string{"22"}
-	cfg.sshFallbackPortsExplicit = true
-	cfg.explicitSSHFallbackPorts = []string{"22"}
-	target := sshTargetForLeaseConnection(cfg, "127.0.0.1", "crabbox", "2203", "", nil)
-	if got, want := sshPortCandidates(target.Port, target.FallbackPorts), []string{"2203", "22"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates=%v want %v", got, want)
+// The fork keeps loopback static hosts off port 22 (the operator's own sshd);
+// an explicit ssh.fallbackPorts list is still honoured.
+func TestStaticLeaseDefaultPortOnLoopbackKeepsFallback(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1", "localhost", "build.example"} {
+		cfg := baseConfig()
+		cfg.Provider = staticProvider
+		cfg.Static.Host = host
+		want := []string{"2222", "22"}
+		if host != "build.example" {
+			want = []string{"2222"}
+		}
+		if got := staticPortCandidates(t, cfg); !reflect.DeepEqual(got, want) {
+			t.Fatalf("host=%s candidates=%v want %v", host, got, want)
+		}
+		cfg.SSHFallbackPorts = []string{"2225"}
+		cfg.sshFallbackPortsExplicit = true
+		cfg.explicitSSHFallbackPorts = []string{"2225"}
+		if got, want := staticPortCandidates(t, cfg), []string{"2222", "2225"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("host=%s candidates=%v want %v", host, got, want)
+		}
 	}
 }
 
@@ -142,8 +138,7 @@ func TestStaticRemoteExplicitPortInputsNeverFallBack(t *testing.T) {
 	}
 }
 
-// openLoopbackSSHPort gives a static loopback test a listening port, since a
-// loopback static host never falls back to the machine's own port 22.
+// openLoopbackSSHPort gives static tests a fixture-owned listening endpoint.
 func openLoopbackSSHPort(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -165,6 +160,89 @@ func openLoopbackSSHPort(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return port
+}
+
+func TestStaticPortInputs(t *testing.T) {
+	for _, source := range []string{"flag", "environment", "user config", "repo config"} {
+		t.Run(source, func(t *testing.T) {
+			clearConfigEnv(t)
+			isolateTestUserDirs(t)
+			cfg := baseConfig()
+			cfg.Provider, cfg.Static.Host = staticProvider, "localhost"
+			switch source {
+			case "flag":
+				fs := newFlagSet("run", io.Discard)
+				flags := registerLeaseCreateFlags(fs, cfg)
+				if err := parseFlags(fs, []string{"--static-port", "2224"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := applyLeaseCreateFlagsForLease(&cfg, fs, flags, "static_test"); err != nil {
+					t.Fatal(err)
+				}
+			case "environment":
+				t.Setenv("CRABBOX_STATIC_PORT", "2224")
+				if err := applyEnv(&cfg); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				path := filepath.Join(t.TempDir(), "config.yaml")
+				if err := os.WriteFile(path, []byte("static:\n  port: '2224'\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				file, err := readFileConfig(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if source == "repo config" {
+					err = applyFileConfigWithTrust(&cfg, file, false)
+				} else {
+					err = applyFileConfig(&cfg, file)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := staticPortCandidates(t, cfg); !reflect.DeepEqual(got, []string{"2224"}) {
+				t.Fatalf("candidates=%v", got)
+			}
+		})
+	}
+}
+
+func TestStaticLeaseLoopbackDefaultPortNeverFallsBackTo22(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1", "localhost"} {
+		cfg := baseConfig()
+		cfg.Provider = staticProvider
+		cfg.Static.Host = host
+		if got, want := staticPortCandidates(t, cfg), []string{"2222"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("host=%s candidates=%v want %v", host, got, want)
+		}
+	}
+}
+
+func TestNonStaticLoopbackLeaseNeverFallsBackTo22(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	target := sshTargetForLeaseConnection(cfg, "127.0.0.1", "crabbox", "2203", "", nil)
+	if got, want := sshPortCandidates(target.Port, target.FallbackPorts), []string{"2203"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates=%v want %v", got, want)
+	}
+	remote := sshTargetForLeaseConnection(cfg, "192.0.2.10", "crabbox", "2203", "", nil)
+	if got, want := sshPortCandidates(remote.Port, remote.FallbackPorts), []string{"2203", "22"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("remote candidates=%v want %v", got, want)
+	}
+}
+
+func TestLoopbackLeaseHonorsExplicitFallbackPorts(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Provider = "aws"
+	cfg.SSHFallbackPorts = []string{"22"}
+	cfg.sshFallbackPortsExplicit = true
+	cfg.explicitSSHFallbackPorts = []string{"22"}
+	target := sshTargetForLeaseConnection(cfg, "127.0.0.1", "crabbox", "2203", "", nil)
+	if got, want := sshPortCandidates(target.Port, target.FallbackPorts), []string{"2203", "22"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidates=%v want %v", got, want)
+	}
 }
 
 func TestLeaseTargetDropsAdvertisedPort22ForLoopback(t *testing.T) {

@@ -73,6 +73,7 @@ var benchmarkProviderCategories = map[string]string{
 	"smolvm":                     "delegated-sandbox",
 	"sprites":                    "direct-cloud",
 	"ssh":                        "byo-ssh",
+	"ssh-host":                   "byo-ssh",
 	"superserve":                 "delegated-sandbox",
 	"tart":                       "local-vm",
 	"tencentcloud":               "direct-cloud",
@@ -84,6 +85,7 @@ var benchmarkProviderCategories = map[string]string{
 	"vercel-sandbox":             "delegated-sandbox",
 	"vultr":                      "direct-cloud",
 	"wandb":                      "gpu-cloud",
+	"warpbuild":                  "delegated-sandbox",
 	"windows-sandbox":            "local-sandbox",
 	"xcp-ng":                     "self-hosted-virtualization",
 }

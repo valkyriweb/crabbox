@@ -11,6 +11,8 @@ import {
   provisioningDuePrefix,
 } from "../src/coordinator-runtime";
 import { FleetCoordinator, FleetDurableObject } from "../src/fleet";
+import { maintainLeaseIndex } from "../src/lease-maintenance-index";
+import { leaseMaintenanceIndex, putLeaseRecord } from "../src/lease-record-store";
 import { orgKeyForLabel } from "../src/org-identity";
 import type { Env, LeaseRecord } from "../src/types";
 import {
@@ -40,6 +42,7 @@ import { NodeCoordinatorRuntime } from "../node/node-runtime";
 const now = new Date("2026-09-02T12:00:00.000Z");
 const owner = "github:12345";
 const org = orgKeyForLabel("org-a");
+const generation = "capacity-test-generation";
 
 type CapacityTransaction = Parameters<Parameters<ProvisioningTestStorage["transaction"]>[0]>[0];
 type StorageMutation =
@@ -50,9 +53,21 @@ type StorageMutation =
 
 class CapacityStorage extends ProvisioningTestStorage {
   readonly mutations: StorageMutation[] = [];
-  beforeList?: (options: { prefix?: string; startAfter?: string }) => Promise<void>;
+  readonly reads: Array<{ noCache?: boolean; allowConcurrency?: boolean } | undefined> = [];
+  beforeList?: (options: {
+    prefix?: string;
+    startAfter?: string;
+    allowConcurrency?: boolean;
+  }) => Promise<void>;
   initialize = vi.fn<() => Promise<void>>(async () => {});
   close = vi.fn<() => Promise<void>>(async () => {});
+  override get<T>(
+    key: string,
+    options?: { noCache?: boolean; allowConcurrency?: boolean },
+  ): Promise<T | undefined> {
+    this.reads.push(options);
+    return super.get<T>(key);
+  }
   override list = vi.fn<
     <T>(options?: {
       prefix?: string;
@@ -72,6 +87,11 @@ class CapacityStorage extends ProvisioningTestStorage {
     return super.transaction(async (transaction) => {
       // Observe transaction-local effects too; the shared fixture still owns commit/rollback.
       const { put, delete: remove, setAlarm, deleteAlarm } = transaction;
+      const list = transaction.list.bind(transaction);
+      transaction.list = async <Value>(options?: Parameters<CapacityTransaction["list"]>[0]) => {
+        await this.beforeList?.(options ?? {});
+        return list<Value>(options);
+      };
       transaction.put = async (key, value) => {
         this.mutations.push({ kind: "put", key });
         await put.call(transaction, key, value);
@@ -136,6 +156,8 @@ async function fixture(
   kind: "cloudflare" | "node",
   envOverrides: Partial<Env> = {},
   beforeStartup?: (storage: CapacityStorage) => void,
+  runtimeGeneration = generation,
+  waitForRecovery = true,
 ) {
   vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
   vi.setSystemTime(now);
@@ -184,6 +206,8 @@ async function fixture(
         },
       } as unknown as DurableObjectState,
       env,
+      {},
+      runtimeGeneration,
     );
     fleet = durable;
     runtime = (durable as unknown as { runtime: CloudflareCoordinatorRuntime }).runtime;
@@ -203,14 +227,20 @@ async function fixture(
     const mutex = new AsyncMutex();
     node.setOperationRunner((callback) => mutex.run(callback));
     runtime = node;
-    fleet = new FleetCoordinator(node, env);
+    fleet = new FleetCoordinator(node, env, {}, {}, runtimeGeneration);
     dispatch = (request) =>
       fleetRequestQueue(request) === "direct"
         ? fleet.fetch(request)
         : mutex.run(() => fleet.fetch(request));
     cleanups.push(() => node.stop());
-    await node.start(() => fleet.alarm());
+    await node.start(
+      () => fleet.alarm(),
+      () => fleet.startCapacityIndexRecovery(),
+    );
   }
+  const recovery = (fleet as unknown as { capacityIndexRecovery: Promise<void> })
+    .capacityIndexRecovery;
+  if (waitForRecovery) await recovery;
   expect(initializers).toHaveLength(kind === "cloudflare" ? 1 : 0);
   expect(network).not.toHaveBeenCalled();
   const effects = () => ({
@@ -242,7 +272,7 @@ async function fixture(
   const readonly = () => {
     expect(effects()).toEqual(startup.effects);
   };
-  return { storage, env, fleet, runtime, fetch, seed, readonly, startup, jobs };
+  return { storage, env, fleet, runtime, fetch, seed, readonly, startup, jobs, recovery };
 }
 
 type Admission = {
@@ -531,18 +561,22 @@ for (const kind of ["cloudflare", "node"] as const) {
       ]);
     });
 
-    it("scans every bounded page of leases and reservations and propagates scan failures", async () => {
+    it("reads indexed leases and reservation pages and propagates scan failures", async () => {
       const f = await fixture(kind);
       for (let i = 0; i < 260; i++) {
         f.seed(lease(`canonical-${i.toString().padStart(3, "0")}`));
         f.seed(lease(`reservation-${i.toString().padStart(3, "0")}`), "provider-access:");
       }
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      const start = f.storage.listOptions.length;
       expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 520 });
-      for (const prefix of ["lease:", "provider-access:"]) {
-        const calls = f.storage.list.mock.calls.filter(([options]) => options?.prefix === prefix);
+      for (const prefix of [leaseMaintenanceIndex.prefix, "provider-access:"]) {
+        const calls = f.storage.listOptions
+          .slice(start)
+          .filter((options) => options?.prefix === prefix);
         expect(calls).toHaveLength(3);
-        for (const [options] of calls) expect(options).toMatchObject({ limit: 128, noCache: true });
-        expect(calls[1]?.[0]?.startAfter).toBeDefined();
+        for (const options of calls) expect(options).toMatchObject({ limit: 128, noCache: true });
+        expect(calls[1]?.startAfter).toBeDefined();
       }
       f.storage.beforeList = async (options) => {
         if (options.startAfter) throw new Error("synthetic scan failure");
@@ -550,14 +584,13 @@ for (const kind of ["cloudflare", "node"] as const) {
       const response = await f.fetch();
       expect(response.status).toBe(500);
       expect(await response.text()).toContain("synthetic scan failure");
-      f.readonly();
     });
 
-    it("serializes the snapshot behind admission on the runtime's lifecycle boundary", async () => {
+    it("does not queue a capacity snapshot behind the lifecycle mutex", async () => {
       const f = await fixture(kind);
       const request = new Request("https://coordinator.test/v1/capacity");
-      expect(coordinatorRequestQueue(request)).toBe("lifecycle");
-      expect(fleetRequestQueue(request)).toBe("lifecycle");
+      expect(coordinatorRequestQueue(request)).toBe("direct");
+      expect(fleetRequestQueue(request)).toBe("direct");
       let release!: () => void;
       let started!: () => void;
       const entered = new Promise<void>((resolve) => {
@@ -573,18 +606,283 @@ for (const kind of ["cloudflare", "node"] as const) {
         f.seed(lease("admitted"), "provider-access:");
       });
       await entered;
-      const calls = f.storage.list.mock.calls.length;
-      let finished = false;
-      const pendingSnapshot = f.fetch().then((response) => {
-        finished = true;
-        return response;
-      });
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      expect(finished).toBe(false);
-      expect(f.storage.list.mock.calls).toHaveLength(calls);
-      release();
+      try {
+        expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 0 });
+      } finally {
+        release();
+      }
       await pendingAdmission;
-      expect(await (await pendingSnapshot).json()).toMatchObject({ activeLeases: 1 });
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      f.readonly();
+    });
+
+    it("bounds cold historical reads and never returns a partial capacity count", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 5000; i++) f.seed(lease(`history-${i}`, { state: "released" }));
+      f.seed(lease("z-active"));
+      const start = f.storage.listOptions.length;
+      const response = await f.fetch();
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("2");
+      expect(await response.json()).toMatchObject({
+        error: "capacity_unavailable",
+        retryable: true,
+      });
+      expect(f.storage.listOptions.slice(start)).toEqual([
+        { prefix: "lease:", limit: 129, noCache: true, allowConcurrency: true },
+      ]);
+      f.readonly();
+    });
+
+    it("keeps repeated indexed snapshots independent of retained history and tracks live writes", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 5000; i++) f.seed(lease(`history-${i}`, { state: "released" }));
+      f.seed(lease("active"));
+      // More than one maintenance pass is required; partial backfill is not admission proof.
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      expect((await f.fetch()).status).toBe(503);
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      const start = f.storage.listOptions.length;
+      const reads: string[] = [];
+      f.storage.beforeGet = async (key) => {
+        reads.push(key);
+      };
+      for (let i = 0; i < 3; i++) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- prove successive snapshots, not concurrent requests.
+        expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      }
+      expect(f.storage.listOptions.slice(start).map((options) => options?.prefix)).toEqual(
+        Array.from({ length: 3 }, () => [leaseMaintenanceIndex.prefix, "provider-access:"]).flat(),
+      );
+      expect(reads.filter((key) => key.startsWith("lease:"))).toEqual(
+        Array.from({ length: 3 }, () => "lease:active"),
+      );
+      await f.storage.transaction((storage) => putLeaseRecord(storage, lease("new")));
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 2 });
+      await f.storage.transaction((storage) =>
+        putLeaseRecord(storage, lease("active", { state: "released" })),
+      );
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      // A stale superset entry is harmless because the current lease is reread.
+      f.storage.values.set(`${leaseMaintenanceIndex.prefix}history-0`, 1);
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+    }, 30_000);
+
+    it.each([200, 5000])(
+      "keeps capacity available across restarts with %i retained leases",
+      async (history) => {
+        const first = await fixture(kind);
+        for (let i = 0; i < history; i++) first.seed(lease(`history-${i}`, { state: "released" }));
+        await first.storage.transaction((storage) => putLeaseRecord(storage, lease("active")));
+        await maintainLeaseIndex(first.storage, leaseMaintenanceIndex, now.getTime(), generation);
+        if (history > 4096)
+          await maintainLeaseIndex(first.storage, leaseMaintenanceIndex, now.getTime(), generation);
+        expect(await (await first.fetch()).json()).toMatchObject({ activeLeases: 1 });
+
+        let persisted = first.storage.values;
+        for (let restart = 0; restart < 3; restart++) {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- recreate successive runtimes over the previous durable state.
+          const restarted = await fixture(
+            kind,
+            {},
+            (storage) => {
+              storage.values = structuredClone(persisted);
+            },
+            `restarted-generation-${restart}`,
+          );
+          const pages = restarted.storage.listOptions.filter(
+            (options) => options?.prefix === "lease:",
+          );
+          expect(pages.length).toBeGreaterThan(0);
+          expect(pages.every((options) => options!.limit! <= 128)).toBe(true);
+          const start = restarted.storage.listOptions.length;
+          // oxlint-disable-next-line eslint/no-await-in-loop -- verify each new runtime before recreating it.
+          const response = await restarted.fetch();
+          expect(response.status).toBe(200);
+          // oxlint-disable-next-line eslint/no-await-in-loop -- inspect each completed response.
+          expect(await response.json()).toMatchObject({ activeLeases: 1 });
+          expect(
+            restarted.storage.listOptions.slice(start).map((options) => options?.prefix),
+          ).toEqual([leaseMaintenanceIndex.prefix, "provider-access:"]);
+          restarted.readonly();
+          persisted = restarted.storage.values;
+        }
+      },
+      30_000,
+    );
+
+    it("recovers unindexed rollback writes before serving capacity after restart", async () => {
+      const first = await fixture(kind);
+      for (let i = 0; i < 200; i++) first.seed(lease(`history-${i}`, { state: "released" }));
+      await maintainLeaseIndex(first.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      first.seed(lease("unindexed"));
+      const restarted = await fixture(
+        kind,
+        {},
+        (storage) => {
+          storage.values = structuredClone(first.storage.values);
+        },
+        "after-rollback",
+      );
+      expect(await (await restarted.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      restarted.readonly();
+    });
+
+    it("leaves lifecycle writes available during startup capacity recovery", async () => {
+      let entered!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const f = await fixture(
+        kind,
+        {},
+        (storage) => {
+          for (let i = 0; i < 200; i++)
+            storage.values.set(`lease:history-${i}`, lease(`history-${i}`, { state: "released" }));
+          storage.beforeList = async (options) => {
+            if (options.prefix === "lease:" && "limit" in options && options.limit === 128) {
+              entered();
+              await gate;
+            }
+          };
+        },
+        generation,
+        false,
+      );
+      await started;
+      let timer!: ReturnType<typeof setTimeout>;
+      try {
+        const result = await Promise.race([
+          f.runtime.runExclusive(async () => {
+            await f.runtime.storage.transaction((storage) => putLeaseRecord(storage, lease("new")));
+            return "written";
+          }),
+          new Promise<string>((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), 1000);
+          }),
+        ]);
+        expect(result).toBe("written");
+      } finally {
+        clearTimeout(timer);
+        release();
+      }
+      await f.recovery;
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+    });
+
+    it("keeps failed startup recovery unavailable until maintenance repairs the index", async () => {
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      const f = await fixture(kind, {}, (storage) => {
+        for (let i = 0; i < 200; i++)
+          storage.values.set(`lease:history-${i}`, lease(`history-${i}`, { state: "released" }));
+        storage.values.set("lease:unindexed", lease("unindexed"));
+        storage.failKey = leaseMaintenanceIndex.stateKey;
+      });
+      expect(log).toHaveBeenCalledWith(
+        "capacity lease index recovery failed; scheduled maintenance will retry",
+      );
+      expect((await f.fetch()).status).toBe(503);
+      delete f.storage.failKey;
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+    });
+
+    it("refuses an old-generation index until rollback history has been audited", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 130; i++) f.seed(lease(`history-${i}`, { state: "released" }));
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), "old-generation");
+      // Simulate an older deployment that could not maintain this index.
+      f.seed(lease("unindexed"));
+      expect((await f.fetch()).status).toBe(503);
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+    });
+
+    it("keeps released running compute in indexed capacity until its stop is confirmed", async () => {
+      const f = await fixture(kind);
+      const retained = lease("retained", {
+        state: "released",
+        releaseDeletesServer: false,
+        lifetimePolicy: {
+          mode: "enforce",
+          workload: "batch",
+          deadlineAt: "2026-09-03T00:00:00Z",
+          retainSeconds: 3600,
+          compute: { state: "running", accumulatedMs: 0, runningSince: now.toISOString() },
+        },
+      });
+      f.seed(retained);
+      await maintainLeaseIndex(f.storage, leaseMaintenanceIndex, now.getTime(), generation);
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 1 });
+      await f.storage.transaction((storage) =>
+        putLeaseRecord(storage, {
+          ...retained,
+          lifetimePolicy: {
+            ...retained.lifetimePolicy!,
+            compute: { state: "stopped", accumulatedMs: 0 },
+          },
+        }),
+      );
+      expect(await (await f.fetch()).json()).toMatchObject({ activeLeases: 0 });
+    });
+
+    it("leaves the lifecycle mutex available while a capacity read awaits storage", async () => {
+      const f = await fixture(kind);
+      const transactions = vi.spyOn(f.storage, "transaction");
+      const readStart = f.storage.reads.length;
+      let entered!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      f.storage.beforeList = async (options) => {
+        expect(options.allowConcurrency).toBe(true);
+        entered();
+        await gate;
+      };
+      const snapshot = f.fetch();
+      await started;
+      // A native transaction closes the input gate even when its reads opt out.
+      expect(transactions).toHaveBeenCalledTimes(kind === "cloudflare" ? 0 : 1);
+      expect(f.storage.reads.slice(readStart)).toEqual(
+        kind === "cloudflare" ? [{ noCache: true, allowConcurrency: true }] : [],
+      );
+      let timer!: ReturnType<typeof setTimeout>;
+      try {
+        const outcome = await Promise.race([
+          f.runtime.runExclusive(async () => "lifecycle"),
+          new Promise<string>((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), 1000);
+          }),
+        ]);
+        expect(outcome).toBe("lifecycle");
+      } finally {
+        clearTimeout(timer);
+        release();
+      }
+      expect((await snapshot).status).toBe(200);
+      f.readonly();
+    });
+
+    it("bounds retained reservation scans without deleting records or publishing an undercount", async () => {
+      const f = await fixture(kind);
+      for (let i = 0; i < 5000; i++)
+        f.seed(lease(`stale-${i}`, { expiresAt: now.toISOString() }), "provider-access:");
+      f.seed(lease("z-live"), "provider-access:");
+      const start = f.storage.listOptions.length;
+      expect((await f.fetch()).status).toBe(503);
+      expect(
+        f.storage.listOptions
+          .slice(start)
+          .filter((options) => options?.prefix === "provider-access:"),
+      ).toHaveLength(33);
       f.readonly();
     });
 
